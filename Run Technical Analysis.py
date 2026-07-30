@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State
 from SmartApi import SmartConnect
 
 # ==================== CREDENTIALS (set these as Render environment variables) ====================
@@ -421,13 +421,14 @@ def get_days_to_expiry():
     return max(delta, 0) + 1  # at least same-day time value
 
 
-def compute_expected_move(spot, df_recent):
+def compute_expected_move(spot, df_recent, vix_val=None):
     """
     Preferred: India VIX implied expected move = spot * (VIX/100) * sqrt(days_to_expiry/365)
     Fallback:  ATR-based realized-vol expected move if VIX isn't available.
     """
     dte = get_days_to_expiry()
-    vix_val = fetch_ltp(vix_exchange, "INDIA VIX", vix_token) if vix_token else None
+    if vix_val is None and vix_token:
+        vix_val = fetch_ltp(vix_exchange, "INDIA VIX", vix_token)
 
     if vix_val:
         em = spot * (vix_val / 100.0) * math.sqrt(dte / 365.0)
@@ -451,9 +452,9 @@ def round_to_step(value, step):
     return round(value / step) * step
 
 
-def build_iron_condor(spot, df_recent):
+def build_iron_condor(spot, df_recent, vix_val=None):
     step = STD_PARAMS['STRIKE_STEP']
-    expected_move, vix_val, em_source = compute_expected_move(spot, df_recent)
+    expected_move, vix_val, em_source = compute_expected_move(spot, df_recent, vix_val)
 
     call_leg_dist = STD_PARAMS['IC_SD_MULTIPLIER'] * expected_move
     put_leg_dist = STD_PARAMS['IC_SD_MULTIPLIER'] * expected_move
@@ -521,6 +522,42 @@ def build_iron_condor(spot, df_recent):
     return result
 
 
+def compute_ic_unrealized_pnl(ic, stored_entry):
+    """
+    The dashboard recomputes 'best' strikes every refresh, so there's no server-side
+    position book. To show a meaningful unrealized P&L we snapshot the entry premiums
+    the first time a given strike combination is suggested (stored client-side via
+    dcc.Store) and mark it to the current live premiums on every refresh after that.
+    If the suggested strikes change (vol moved enough to re-center the condor), the
+    old snapshot is retired and a fresh one starts -- same as rolling into a new trade.
+
+    Returns (pnl_points, pnl_rupees, new_entry_snapshot, is_new_entry).
+    """
+    if not ic['data_is_live']:
+        return None, None, stored_entry, False
+
+    strikes_key = (ic['call_short_strike'], ic['call_hedge_strike'], ic['put_short_strike'], ic['put_hedge_strike'])
+
+    if not stored_entry or tuple(stored_entry.get('strikes', [])) != strikes_key:
+        new_entry = {
+            "strikes": list(strikes_key),
+            "entry_premiums": ic['premiums'],
+            "entry_credit": ic['total_credit'],
+            "entry_time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        return 0.0, 0.0, new_entry, True
+
+    entry_prem = stored_entry['entry_premiums']
+    cur = ic['premiums']
+    # short legs profit as premium falls, long (hedge) legs profit as premium rises
+    pnl_points = (
+        (entry_prem['call_short'] - cur['call_short']) + (cur['call_hedge'] - entry_prem['call_hedge']) +
+        (entry_prem['put_short'] - cur['put_short']) + (cur['put_hedge'] - entry_prem['put_hedge'])
+    )
+    pnl_rupees = pnl_points * STD_PARAMS['LOT_SIZE']
+    return pnl_points, pnl_rupees, stored_entry, False
+
+
 def estimate_delta(spot, strike, expected_move, opt_type):
     """Rough moneyness-based delta approximation (not a full Black-Scholes model,
     but far more realistic than a flat 0.50 for every strike)."""
@@ -560,6 +597,165 @@ def build_atm_directional(spot, df, expected_move):
     return atm_strike, last_signal, legs
 
 
+# ==================== MARKET INSIGHTS ====================
+
+def _find_local_extrema(values, order=3):
+    """Simple swing high/low finder: a point is an extreme if it's the max/min
+    within +/- `order` bars either side. No extra dependency (no scipy needed)."""
+    n = len(values)
+    highs, lows = [], []
+    for i in range(order, n - order):
+        window = values[i - order:i + order + 1]
+        if values[i] == max(window):
+            highs.append(i)
+        if values[i] == min(window):
+            lows.append(i)
+    return highs, lows
+
+
+def detect_rsi_divergence(df, lookback=50, order=3):
+    """Compares the last two swing highs/lows in price against RSI at those same bars."""
+    sub = df.tail(lookback).reset_index(drop=True)
+    if len(sub) < order * 2 + 5 or sub['RSI'].isna().sum() > len(sub) * 0.5:
+        return "Not enough data yet"
+
+    closes = sub['Close'].values
+    highs_idx, lows_idx = _find_local_extrema(closes, order)
+    messages = []
+
+    if len(highs_idx) >= 2:
+        i1, i2 = highs_idx[-2], highs_idx[-1]
+        p1, p2 = sub['Close'].iloc[i1], sub['Close'].iloc[i2]
+        r1, r2 = sub['RSI'].iloc[i1], sub['RSI'].iloc[i2]
+        if pd.notna(r1) and pd.notna(r2) and p2 > p1 and r2 < r1:
+            messages.append("BEARISH divergence (price higher-high, RSI lower-high)")
+
+    if len(lows_idx) >= 2:
+        i1, i2 = lows_idx[-2], lows_idx[-1]
+        p1, p2 = sub['Close'].iloc[i1], sub['Close'].iloc[i2]
+        r1, r2 = sub['RSI'].iloc[i1], sub['RSI'].iloc[i2]
+        if pd.notna(r1) and pd.notna(r2) and p2 < p1 and r2 > r1:
+            messages.append("BULLISH divergence (price lower-low, RSI higher-low)")
+
+    return "; ".join(messages) if messages else "No clear divergence"
+
+
+def compute_market_insights(df, vix_val):
+    latest = df.iloc[-1]
+    price = latest['Close']
+    regime = latest['Regime']
+    adx = latest['ADX']
+
+    # --- VWAP ---
+    vwap = latest['VWAP']
+    vwap_dist_pct = ((price - vwap) / vwap * 100) if vwap else 0
+    vwap_bias = "ABOVE VWAP (bullish bias)" if price > vwap else "BELOW VWAP (bearish bias)" if price < vwap else "AT VWAP"
+
+    # --- RSI ---
+    rsi = latest['RSI']
+    if pd.isna(rsi):
+        rsi_state = "N/A"
+    elif rsi >= STD_PARAMS['RSI_OVERBOUGHT']:
+        rsi_state = "OVERBOUGHT"
+    elif rsi <= STD_PARAMS['RSI_OVERSOLD']:
+        rsi_state = "OVERSOLD"
+    else:
+        rsi_state = "NEUTRAL"
+    divergence = detect_rsi_divergence(df)
+
+    # --- Bollinger Bands: squeeze / expansion + position in band ---
+    bb_upper, bb_lower, bb_mid = latest['BB_Upper'], latest['BB_Lower'], latest['BB_Mid']
+    df = df.copy()
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']
+    bb_width = df['BB_Width'].iloc[-1]
+    hist_widths = df['BB_Width'].dropna().tail(40)
+    pct_rank = (hist_widths <= bb_width).mean() * 100 if len(hist_widths) >= 5 else 50
+
+    if pd.isna(bb_width):
+        bb_state = "N/A"
+    elif pct_rank <= 20:
+        bb_state = "SQUEEZE FORMING (volatility contracting -- breakout building)"
+    elif pct_rank >= 80:
+        bb_state = "BANDS EXPANDED (volatility high / trending move underway)"
+    else:
+        bb_state = "NORMAL WIDTH"
+
+    if pd.isna(bb_upper) or pd.isna(bb_lower):
+        bb_position = "N/A"
+    elif price >= bb_upper:
+        bb_position = "AT/ABOVE UPPER BAND (walking the band -- overextended or strong trend)"
+    elif price <= bb_lower:
+        bb_position = "AT/BELOW LOWER BAND (walking the band -- overextended or strong trend)"
+    else:
+        pos_in_band = (price - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
+        bb_position = f"{pos_in_band * 100:.0f}% up the band range (mean-reverting zone)"
+
+    # --- Volume (proxy for the index -- see caveat below) ---
+    today = latest['Date'] if 'Date' in df.columns else None
+    today_vol = df[df['Date'] == today]['Volume'].sum() if today is not None else df['Volume'].sum()
+    recent_avg = df['Volume'].tail(6).mean()
+    prior_avg = df['Volume'].tail(30).head(24).mean() if len(df) >= 30 else recent_avg
+    if prior_avg and recent_avg > prior_avg * 1.15:
+        vol_trend = "RISING (participation increasing)"
+    elif prior_avg and recent_avg < prior_avg * 0.85:
+        vol_trend = "FALLING (participation cooling)"
+    else:
+        vol_trend = "STEADY"
+
+    # --- VIX read ---
+    if vix_val is None:
+        vix_state = "unavailable"
+    elif vix_val < 12:
+        vix_state = "LOW (complacent, range-bound bias)"
+    elif vix_val < 16:
+        vix_state = "MODERATE"
+    elif vix_val < 20:
+        vix_state = "ELEVATED (caution, bigger swings likely)"
+    else:
+        vix_state = "HIGH (fear regime, expect large moves)"
+
+    return {
+        "price": price, "regime": regime, "adx": adx,
+        "vwap": vwap, "vwap_dist_pct": vwap_dist_pct, "vwap_bias": vwap_bias,
+        "rsi": rsi, "rsi_state": rsi_state, "divergence": divergence,
+        "bb_state": bb_state, "bb_position": bb_position, "bb_width_pct": bb_width * 100 if pd.notna(bb_width) else None,
+        "today_vol": today_vol, "vol_trend": vol_trend,
+        "vix_val": vix_val, "vix_state": vix_state,
+    }
+
+
+def generate_market_insights_card(df, vix_val):
+    if df.empty:
+        return html.Div()
+    ins = compute_market_insights(df, vix_val)
+
+    regime_color = {"BULL": "#00e676", "BEAR": "#ff1744", "SIDEWAYS": "#ffea00"}.get(ins['regime'], "#aaa")
+
+    def row(label, value, color="#ccc"):
+        return html.Div([html.Span(f"{label}: ", style={'color': '#888'}), html.B(value, style={'color': color})],
+                         style={'fontSize': '12px', 'marginBottom': '4px'})
+
+    return html.Div(style={'backgroundColor': '#1e1e1e', 'border': '1px solid #29b6f6', 'borderRadius': '8px', 'padding': '12px', 'marginBottom': '15px'}, children=[
+        html.H4("MARKET INSIGHTS -- FULL SITUATION READ", style={'color': '#29b6f6', 'marginTop': '0', 'textAlign': 'center', 'fontSize': '16px'}),
+        html.Div(style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '20px', 'justifyContent': 'center'}, children=[
+            html.Div(style={'flex': '1 1 260px'}, children=[
+                row("Trend Regime", f"{ins['regime']} (ADX {ins['adx']:.1f})" if pd.notna(ins['adx']) else ins['regime'], regime_color),
+                row("VWAP", f"{ins['vwap']:.2f} -- {ins['vwap_bias']} ({ins['vwap_dist_pct']:+.2f}%)"),
+                row("India VIX", f"{fmt(ins['vix_val'], decimals=2)} -- {ins['vix_state']}"),
+                row("Volume (session, proxy)", f"{ins['today_vol']:,.0f} -- {ins['vol_trend']}"),
+            ]),
+            html.Div(style={'flex': '1 1 260px'}, children=[
+                row("RSI (14)", f"{ins['rsi']:.1f} -- {ins['rsi_state']}" if pd.notna(ins['rsi']) else "N/A"),
+                row("RSI Divergence", ins['divergence'], "#ff9800" if "divergence" in ins['divergence'].lower() and "No" not in ins['divergence'] else "#ccc"),
+                row("Bollinger Bands", ins['bb_state'] + (f" ({ins['bb_width_pct']:.2f}% width)" if ins['bb_width_pct'] else "")),
+                row("Price vs Bands", ins['bb_position']),
+            ]),
+        ]),
+        html.Div("Volume is a High-Low range proxy -- the NIFTY 50 index itself carries no traded volume; for true volume, wire this to NIFTY futures data.",
+                 style={'color': '#666', 'fontSize': '10px', 'textAlign': 'center', 'marginTop': '8px'})
+    ])
+
+
 # ==================== DASHBOARD CARDS ====================
 
 def fmt(v, prefix="", suffix="", decimals=2):
@@ -568,15 +764,16 @@ def fmt(v, prefix="", suffix="", decimals=2):
     return f"{prefix}{v:,.{decimals}f}{suffix}"
 
 
-def generate_options_dashboard_cards(df):
+def generate_options_dashboard_cards(df, vix_val=None, stored_entry=None):
     if df.empty:
-        return html.Div("No Data Available", style={'color': 'white'})
+        return html.Div("No Data Available", style={'color': 'white'}), stored_entry
 
     curr_spot = df.iloc[-1]['Close']
     curr_regime = df.iloc[-1]['Regime']
 
-    ic = build_iron_condor(curr_spot, df)
+    ic = build_iron_condor(curr_spot, df, vix_val)
     atm_strike, last_signal, legs = build_atm_directional(curr_spot, df, ic['expected_move'])
+    ic_pnl_pts, ic_pnl_rs, new_entry, is_new_entry = compute_ic_unrealized_pnl(ic, stored_entry)
 
     live_tag = "LIVE" if ic['data_is_live'] else f"ESTIMATED (no live premium -- check API session)"
     live_color = "#00e676" if ic['data_is_live'] else "#ff9800"
@@ -623,6 +820,12 @@ def generate_options_dashboard_cards(df):
                              style={'color': '#00e676', 'fontSize': '12px', 'fontWeight': 'bold'}),
                     html.Div(f"\U0001F6D1 COMBINED IC STOP-LOSS: {fmt(ic['combined_sl_points'])} pts (~\u20b9{fmt(ic['combined_sl_points']*STD_PARAMS['LOT_SIZE']) if ic['combined_sl_points'] else 'N/A'}/lot)",
                              style={'color': '#ff1744', 'fontSize': '13px', 'fontWeight': 'bold'}),
+                    html.Hr(style={'borderColor': '#333', 'margin': '4px 0'}),
+                    html.Div(
+                        "Position just marked -- tracking unrealized P&L from here" if is_new_entry and ic['data_is_live']
+                        else (f"UNREALIZED P&L: {ic_pnl_pts:+.2f} pts ({ic_pnl_rs:+.2f} \u20b9/lot)" if ic_pnl_pts is not None else "UNREALIZED P&L: N/A (live premiums unavailable)"),
+                        style={'color': '#00e676' if (ic_pnl_pts or 0) >= 0 else '#ff1744', 'fontSize': '13px', 'fontWeight': 'bold'}
+                    ),
                 ])
             ]),
 
@@ -648,7 +851,7 @@ def generate_options_dashboard_cards(df):
                 ])
             ])
         ])
-    ])
+    ]), new_entry
 
 
 # ==================== DASH APP ====================
@@ -659,10 +862,12 @@ server = app.server
 app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'fontFamily': 'Segoe UI, sans-serif'}, children=[
     html.H3("Dynamic Regime Strategy Engine: NIFTY 50", style={'color': '#ffffff', 'textAlign': 'center', 'margin': '10px 0'}),
     html.Div(id='session-warning'),
+    html.Div(id='market-insights-panel'),
     html.Div(id='options-trading-banner'),
     html.Div(id='strategy-performance-cards', style={'display': 'flex', 'justifyContent': 'center', 'flexWrap': 'wrap', 'gap': '8px', 'marginBottom': '15px'}),
     dcc.Graph(id='multi-indicator-graph', config={'responsive': True}),
-    dcc.Interval(id='interval-component', interval=STD_PARAMS['REFRESH_MS'], n_intervals=0)
+    dcc.Interval(id='interval-component', interval=STD_PARAMS['REFRESH_MS'], n_intervals=0),
+    dcc.Store(id='ic-entry-store', storage_type='session')  # holds the IC entry snapshot for unrealized P&L
 ])
 
 
@@ -670,10 +875,13 @@ app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'f
     [Output('multi-indicator-graph', 'figure'),
      Output('strategy-performance-cards', 'children'),
      Output('options-trading-banner', 'children'),
-     Output('session-warning', 'children')],
-    Input('interval-component', 'n_intervals')
+     Output('session-warning', 'children'),
+     Output('market-insights-panel', 'children'),
+     Output('ic-entry-store', 'data')],
+    Input('interval-component', 'n_intervals'),
+    State('ic-entry-store', 'data')
 )
-def update_dashboard(n):
+def update_dashboard(n, ic_entry_store):
     warning = html.Div() if session_active else html.Div(
         "SmartAPI session inactive -- set SMARTAPI_KEY / SMARTAPI_CLIENT_CODE / SMARTAPI_PASSWORD / SMARTAPI_TOTP_SECRET as env vars on Render. Showing indicator chart only where data is cached.",
         style={'color': '#ff1744', 'textAlign': 'center', 'fontSize': '12px', 'marginBottom': '8px'}
@@ -685,7 +893,7 @@ def update_dashboard(n):
         fig.update_layout(template="plotly_dark", annotations=[{
             "text": "NIFTY 50 DATA NOT FOUND OR API DOWN", "showarrow": False, "font": {"size": 18, "color": "#ff1744"}
         }])
-        return fig, [html.Div("Data Not Found", style={'color': '#ff1744', 'fontSize': '16px'})], html.Div(), warning
+        return fig, [html.Div("Data Not Found", style={'color': '#ff1744', 'fontSize': '16px'})], html.Div(), warning, html.Div(), ic_entry_store
 
     backtest_df = fetch_recent_days(STD_PARAMS['BACKTEST_DAYS'])
     if backtest_df.empty:
@@ -705,7 +913,9 @@ def update_dashboard(n):
         ])
     ]
 
-    options_banner = generate_options_dashboard_cards(df)
+    vix_val = fetch_ltp(vix_exchange, "INDIA VIX", vix_token) if vix_token else None
+    options_banner, ic_entry_store = generate_options_dashboard_cards(df, vix_val, ic_entry_store)
+    insights_panel = generate_market_insights_card(df, vix_val)
 
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04,
@@ -737,7 +947,7 @@ def update_dashboard(n):
         template="plotly_dark", height=700, xaxis_rangeslider_visible=False, showlegend=False,
         margin=dict(l=20, r=20, t=40, b=20)
     )
-    return fig, card_elements, options_banner, warning
+    return fig, card_elements, options_banner, warning, insights_panel, ic_entry_store
 
 
 if __name__ == '__main__':
