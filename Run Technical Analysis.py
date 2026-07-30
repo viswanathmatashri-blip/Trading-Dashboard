@@ -78,16 +78,27 @@ def load_scrip_master_df():
 
 def resolve_nifty_token(df_master):
     try:
+        # Match NIFTY 50 index token in NSE segment
         matched = df_master[
-            (df_master['symbol'].str.upper() == "NIFTY") |
-            (df_master['name'].str.upper() == "NIFTY 50") |
-            (df_master['symbol'].str.upper() == "NIFTY 50")
+            (df_master['name'].str.upper() == "NIFTY 50") & 
+            (df_master['exch_seg'].str.upper().isin(["NSE", "INDICES", "NSE_IND"]))
         ]
         if not matched.empty:
             return str(matched.iloc[0]['token']), matched.iloc[0]['exch_seg']
+            
+        # Fallback search if exact match fails
+        matched = df_master[
+            (df_master['symbol'].str.contains("NIFTY 50", case=False, na=False)) |
+            (df_master['name'].str.contains("NIFTY 50", case=False, na=False))
+        ]
+        if not matched.empty:
+            return str(matched.iloc[0]['token']), matched.iloc[0]['exch_seg']
+            
     except Exception as e:
         print(f"Nifty token resolve error: {e}")
-    return "99926000", "NSE"
+    
+    # Angel One's hardcoded default token for NIFTY 50 index is 99926000 (NSE)
+    return "99926000", "NSE
 
 
 def resolve_india_vix_token(df_master):
@@ -355,8 +366,11 @@ def backtest_signal_col(df, col_name, sl_pct=0.002, rr_ratio=1.5):
 # ==================== DATA FETCH ====================
 
 def _get_candles_for_range(from_dt, to_dt):
+    # Ensure exchange is 'NSE' for index candle data calls
+    candle_exchange = "NSE" if exchange in ["NSE", "INDICES", "NSE_IND", None] else exchange
+    
     params = {
-        "exchange": exchange or "NSE",
+        "exchange": candle_exchange,
         "symboltoken": token,
         "interval": "FIVE_MINUTE",
         "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
@@ -367,7 +381,6 @@ def _get_candles_for_range(from_dt, to_dt):
         return None
     df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
     return df
-
 
 def fetch_today_or_previous():
     """Data for the chart: today if the market has printed candles, else the most recent session."""
