@@ -1,0 +1,7 @@
+dash
+plotly
+pandas
+numpy
+pyotp
+smartapi-python
+gunicorn
