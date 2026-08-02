@@ -14,10 +14,10 @@ from dash import Dash, dcc, html, Input, Output, State
 from SmartApi import SmartConnect
 
 # ==================== CREDENTIALS (set these as Render environment variables) ====================
-API_KEY     = os.environ.get("SMARTAPI_KEY", "")
-CLIENT_CODE = os.environ.get("SMARTAPI_CLIENT_CODE", "")
-PASSWORD    = os.environ.get("SMARTAPI_PASSWORD", "")
-TOTP_SECRET = os.environ.get("SMARTAPI_TOTP_SECRET", "")
+API_KEY     = os.environ.get("SMARTAPI_KEY", "o2b7s4Oo")
+CLIENT_CODE = os.environ.get("SMARTAPI_CLIENT_CODE", "AACK311190")
+PASSWORD    = os.environ.get("SMARTAPI_PASSWORD", "8547")
+TOTP_SECRET = os.environ.get("SMARTAPI_TOTP_SECRET", "YCRQCDQ7NPUHKYH7RS73NXQ5VE")
 # NOTE: secrets were hardcoded with real-looking values in the original file. That is a
 # credential-leak risk on its own (anyone with the source has your login). They have been
 # removed here -- set them as environment variables on Render / your host, never in the file.
