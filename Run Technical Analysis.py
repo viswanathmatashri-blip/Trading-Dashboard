@@ -18,20 +18,15 @@ API_KEY     = os.environ.get("SMARTAPI_KEY", "o2b7s4Oo")
 CLIENT_CODE = os.environ.get("SMARTAPI_CLIENT_CODE", "AACK311190")
 PASSWORD    = os.environ.get("SMARTAPI_PASSWORD", "8547")
 TOTP_SECRET = os.environ.get("SMARTAPI_TOTP_SECRET", "YCRQCDQ7NPUHKYH7RS73NXQ5VE")
-# NOTE: secrets were hardcoded with real-looking values in the original file. That is a
-# credential-leak risk on its own (anyone with the source has your login). They have been
-# removed here -- set them as environment variables on Render / your host, never in the file.
 # ===================================================================================================
 
 IST = ZoneInfo("Asia/Kolkata")
 
-
 def now_ist():
     return datetime.now(IST)
 
-
 SCRIP_MASTER_FILE = "/tmp/scrip_master.json"
-POSITIONS_DB_FILE = "/tmp/positions.db"   # server-side, survives across dashboard refreshes/rebalances
+POSITIONS_DB_FILE = "/tmp/positions.db"
 SELECTED_SYMBOL = "NIFTY 50"
 
 STD_PARAMS = {
@@ -43,39 +38,30 @@ STD_PARAMS = {
     "RR_RATIO": 1.5,
     "LOT_SIZE": 65,
     "STRIKE_STEP": 50,
-    "BACKTEST_DAYS": 20,          # FLAW #2 fix: was 5 (too small to judge anything); widened for a sturdier sample
+    "BACKTEST_DAYS": 20,
 
-    # ---- Iron Condor: delta/skew-based strike selection (replaces flawed symmetric SD sizing) ----
-    "IC_TARGET_DELTA": 0.15,          # sell strikes at ~15 delta on each side (a normal, well-understood target)
-    "IC_PUT_IV_SKEW": 1.12,           # index put IV richer than ATM -- crude but directionally correct skew model
-    "IC_CALL_IV_SKEW": 0.96,          # index call IV cheaper than ATM
-    "IC_RISK_FREE_RATE": 0.065,       # approx short-term INR risk-free rate, used only inside Black-Scholes solves
-    "IC_WING_STEP_MULTIPLES": 20,     # how many strike-steps we're willing to widen the wing while searching
-    "IC_MIN_WING": 100,               # floor for hedge width so risk stays defined
-    "IC_MIN_CREDIT_TO_MAXLOSS": 0.30, # FLAW #7 fix: won't suggest a condor unless credit >= 30% of max loss
-    "IC_SL_FRACTION_OF_MAXLOSS": 0.50,# FLAW #3 fix: stop-loss defined as a fraction of *max possible loss* on that
-                                       # side, evaluated against LIVE PREMIUM P&L -- valid at any DTE, not just at expiry
-    "IC_MIN_DTE_FOR_NEW_ENTRY": 1,    # FLAW #8 fix: don't open/rebalance into a fresh condor on 0 DTE (pin/gamma risk)
-    "IC_AVOID_DATES": [],             # FLAW #9 partial fix: populate with known binary-event dates (RBI policy days,
-                                       # budget day, major macro prints) -- the code will refuse new entries on these
-                                       # dates. This list needs to be maintained externally; it is NOT auto-populated.
+    # ---- Iron Condor Settings ----
+    "IC_TARGET_DELTA": 0.15,
+    "IC_PUT_IV_SKEW": 1.12,
+    "IC_CALL_IV_SKEW": 0.96,
+    "IC_RISK_FREE_RATE": 0.065,
+    "IC_WING_STEP_MULTIPLES": 20,
+    "IC_MIN_WING": 100,
+    "IC_MIN_CREDIT_TO_MAXLOSS": 0.30,
+    "IC_SL_FRACTION_OF_MAXLOSS": 0.50,
+    "IC_MIN_DTE_FOR_NEW_ENTRY": 1,
+    "IC_AVOID_DATES": [],
 
-    # ---- Cost model (FLAW #6 fix) ----
-    # These are placeholders, not verified current regulatory/brokerage figures -- STT rules and broker
-    # pricing both change. Replace with your actual broker's charges before trusting the P&L numbers.
-    "EST_ROUND_TRIP_COST_PER_LOT": 45.0,   # rough all-in (brokerage + STT + exchange + GST + stamp) per leg per lot
+    # ---- Cost model ----
+    "EST_ROUND_TRIP_COST_PER_LOT": 45.0,
     "IC_NUM_LEGS": 4,
 
     "REFRESH_MS": int(os.environ.get("REFRESH_MS", 30000)),
-
-    # ---- Backtest caching (fixes worker OOM/timeout from re-fetching ~20 days of candles
-    # for BOTH the directional and iron-condor backtests on every 30s refresh tick) ----
-    "BACKTEST_CACHE_TTL_SEC": int(os.environ.get("BACKTEST_CACHE_TTL_SEC", 900)),  # recompute at most every 15 min
+    "BACKTEST_CACHE_TTL_SEC": int(os.environ.get("BACKTEST_CACHE_TTL_SEC", 900)),
 }
 
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
-
 
 # ==================== SCRIP MASTER / TOKEN RESOLUTION ====================
 
@@ -91,7 +77,6 @@ def download_scrip_master():
         urllib.request.urlretrieve(url, SCRIP_MASTER_FILE)
         print("Scrip Master saved.")
 
-
 def load_scrip_master_df():
     download_scrip_master()
     filtered_rows = []
@@ -103,11 +88,9 @@ def load_scrip_master_df():
             symbol = str(row.get('symbol', '')).upper()
             exch = str(row.get('exch_seg', '')).upper()
             
-            # Keep ONLY NIFTY 50, INDIA VIX, and NFO Options for NIFTY
             if name in ["NIFTY 50", "INDIA VIX"] or (name == "NIFTY" and exch == "NFO"):
                 filtered_rows.append(row)
                 
-    # Memory footprint drops from ~300MB down to <5MB!
     return pd.DataFrame(filtered_rows)
 
 def resolve_nifty_token(df_master):
@@ -129,8 +112,7 @@ def resolve_nifty_token(df_master):
     except Exception as e:
         print(f"Nifty token resolve error: {e}")
 
-    return "99926000", "NSE"   # NOTE: original file had a syntax error here (unterminated string) -- fixed.
-
+    return "99926000", "NSE"
 
 def resolve_india_vix_token(df_master):
     try:
@@ -143,7 +125,6 @@ def resolve_india_vix_token(df_master):
     except Exception as e:
         print(f"VIX token resolve error: {e}")
     return None, None
-
 
 def build_nifty_option_chain(df_master):
     try:
@@ -165,7 +146,6 @@ def build_nifty_option_chain(df_master):
         print(f"Option chain build error: {e}")
         return df_master.iloc[0:0], None
 
-
 def get_option_token(options_df, strike, opt_type):
     try:
         row = options_df[
@@ -179,10 +159,7 @@ def get_option_token(options_df, strike, opt_type):
         pass
     return None, None, None
 
-
 def nearest_available_strike(options_df, strike, opt_type, step):
-    """Real option chains only have strikes at fixed steps, and not every step is guaranteed to
-    be listed. Snap to the nearest strike that actually exists in the chain for this opt_type."""
     try:
         side = options_df[options_df['symbol'].str.upper().str.endswith(opt_type)]
         if side.empty:
@@ -194,7 +171,6 @@ def nearest_available_strike(options_df, strike, opt_type, step):
     except Exception:
         return strike
 
-
 _df_master = load_scrip_master_df()
 token, exchange = resolve_nifty_token(_df_master)
 vix_token, vix_exchange = resolve_india_vix_token(_df_master)
@@ -204,7 +180,6 @@ nifty_options_df, current_expiry = build_nifty_option_chain(_df_master)
 
 smart_api = SmartConnect(api_key=API_KEY)
 session_active = False
-
 
 def login_smartapi():
     global session_active
@@ -223,9 +198,7 @@ def login_smartapi():
         session_active = False
         return False
 
-
 login_smartapi()
-
 
 def api_call(fn, *args, retry_on_auth_fail=True, **kwargs):
     global session_active
@@ -241,7 +214,6 @@ def api_call(fn, *args, retry_on_auth_fail=True, **kwargs):
         print(f"API call error ({fn}): {e}")
         return None
 
-
 def fetch_ltp(exch_seg, tradingsymbol, sym_token):
     if not session_active or not sym_token:
         return None
@@ -253,38 +225,7 @@ def fetch_ltp(exch_seg, tradingsymbol, sym_token):
         pass
     return None
 
-
-def fetch_quote_depth(exch_seg, tradingsymbol, sym_token):
-    """Best-effort bid/ask fetch (FLAW #6 partial fix). SmartAPI's market-data quote endpoint
-    exposes depth; LTP alone can be stale for thin OTM strikes. Falls back to LTP-only (with a
-    synthetic spread flag) if depth isn't available so the rest of the pipeline keeps working."""
-    if not session_active or not sym_token:
-        return None, None, None
-    try:
-        resp = api_call(
-            smart_api.getMarketData, "FULL",
-            {"exchangeTokens": {exch_seg: [str(sym_token)]}}
-        )
-        if isinstance(resp, dict) and resp.get('status') and resp.get('data', {}).get('fetched'):
-            row = resp['data']['fetched'][0]
-            bid = row.get('depth', {}).get('buy', [{}])[0].get('price')
-            ask = row.get('depth', {}).get('sell', [{}])[0].get('price')
-            ltp = row.get('ltp')
-            if bid and ask:
-                return float(bid), float(ask), float(ltp) if ltp else (float(bid) + float(ask)) / 2
-    except Exception as e:
-        print(f"Quote depth fetch failed, falling back to LTP: {e}")
-    ltp = fetch_ltp(exch_seg, tradingsymbol, sym_token)
-    return None, None, ltp
-
-
 def fetch_ltp_batch(exch_seg, tokens):
-    """Fetch LTPs for many tokens in ONE request instead of one blocking call per strike.
-    size_wing() used to call fetch_ltp up to ~20 times per side (per side, per refresh tick)
-    while searching for a hedge strike that clears the risk/reward bar -- that alone was
-    enough sequential network I/O to make a single dashboard callback slow enough to trip a
-    gunicorn worker timeout. Returns {token_str: ltp}. Falls back to {} on any failure so
-    callers can gracefully treat missing entries as unavailable."""
     tokens = [str(t) for t in tokens if t]
     if not session_active or not tokens:
         return {}
@@ -302,38 +243,29 @@ def fetch_ltp_batch(exch_seg, tokens):
         print(f"Batch LTP fetch failed: {e}")
         return {}
 
-
 def safe_get_candle_data(params):
     resp = api_call(smart_api.getCandleData, params)
     if isinstance(resp, dict) and resp.get('status') and resp.get('data'):
         return resp['data']
     return None
 
-
-# ==================== BLACK-SCHOLES ENGINE (no scipy dependency) ====================
-# Used for: (a) delta/skew-aware strike selection instead of a flat symmetric SD offset,
-# and (b) simulating historical option premiums for the iron-condor backtester, since a
-# real historical options tick database isn't wired in here.
+# ==================== BLACK-SCHOLES & GREEKS ENGINE ====================
 
 def _norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-
 def _norm_pdf(x):
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
-
 def bs_price(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0:
-        intrinsic = max(S - K, 0) if opt_type == "CE" else max(K - S, 0)
-        return intrinsic
+        return max(S - K, 0) if opt_type == "CE" else max(K - S, 0)
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     if opt_type == "CE":
         return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
     else:
         return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
-
 
 def bs_delta(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0:
@@ -347,25 +279,42 @@ def bs_delta(S, K, T, r, sigma, opt_type):
     else:
         return _norm_cdf(d1) - 1.0
 
+def bs_greeks(S, K, T, r, sigma, opt_type, position="BUY"):
+    """Calculates Delta, Gamma, and Vega for a given position type."""
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "vega": 0.0}
+    
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    
+    # Raw option Greeks (Long Position)
+    if opt_type == "CE":
+        delta = _norm_cdf(d1)
+    else:
+        delta = _norm_cdf(d1) - 1.0
+        
+    gamma = _norm_pdf(d1) / (S * sigma * math.sqrt(T))
+    vega = (S * _norm_pdf(d1) * math.sqrt(T)) / 100.0  # Normalized for 1% change in IV
+
+    # Adjust signs based on position side (BUY vs SELL)
+    multiplier = 1.0 if position == "BUY" else -1.0
+    return {
+        "delta": round(delta * multiplier, 3),
+        "gamma": round(gamma * multiplier, 5),
+        "vega": round(vega * multiplier, 3)
+    }
 
 def strike_for_target_delta(S, T, r, sigma, target_abs_delta, opt_type, step):
-    """Bisection over strike (delta is monotonic in K) to find the strike whose BS delta
-    magnitude is closest to target_abs_delta, then snap to the exchange strike step."""
     lo, hi = S * 0.80, S * 1.20
     for _ in range(60):
         mid = (lo + hi) / 2.0
         d = bs_delta(S, mid, T, r, sigma, opt_type)
         mag = abs(d)
         if opt_type == "CE":
-            # delta magnitude falls as K rises
             if mag > target_abs_delta:
                 lo = mid
             else:
                 hi = mid
         else:
-            # for puts, |delta| also falls as K rises above spot... but puts are typically
-            # placed below spot, where |delta| rises as K falls. Handle both regimes safely
-            # by just comparing magnitude vs target directly using monotonic search on K.
             if mag > target_abs_delta:
                 hi = mid
             else:
@@ -373,21 +322,7 @@ def strike_for_target_delta(S, T, r, sigma, target_abs_delta, opt_type, step):
     result = (lo + hi) / 2.0
     return round(result / step) * step
 
-
-def implied_vol(price, S, K, T, r, opt_type, lo=0.02, hi=3.0):
-    if price is None or price <= 0 or T <= 0:
-        return None
-    for _ in range(60):
-        mid = (lo + hi) / 2.0
-        p = bs_price(S, K, T, r, mid, opt_type)
-        if p > price:
-            hi = mid
-        else:
-            lo = mid
-    return (lo + hi) / 2.0
-
-
-# ==================== INDICATORS (unchanged core math) ====================
+# ==================== INDICATORS ====================
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -398,7 +333,6 @@ def calculate_rsi(series, period=14):
     rs = avg_gain / avg_loss.replace(0, 1e-9)
     return 100 - (100 / (1 + rs))
 
-
 def calculate_atr(df, period=14):
     df = df.copy()
     tr = np.maximum(
@@ -406,7 +340,6 @@ def calculate_atr(df, period=14):
         np.maximum(abs(df['High'] - df['Close'].shift(1)), abs(df['Low'] - df['Close'].shift(1)))
     )
     return tr.ewm(alpha=1 / period, adjust=False).mean()
-
 
 def calculate_adx(df, period=14):
     df = df.copy()
@@ -423,7 +356,6 @@ def calculate_adx(df, period=14):
     minus_di = 100 * (df['-DM'].ewm(alpha=1 / period, adjust=False).mean() / tr_smooth)
     dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
     return dx.ewm(alpha=1 / period, adjust=False).mean()
-
 
 def calculate_indicators(df):
     df = df.copy()
@@ -458,7 +390,6 @@ def calculate_indicators(df):
     df['ADX'] = calculate_adx(df)
     df['ATR'] = calculate_atr(df)
     return df
-
 
 def generate_individual_signals(df):
     df = calculate_indicators(df).reset_index(drop=True)
@@ -502,7 +433,6 @@ def generate_individual_signals(df):
                 df.loc[i, 'Combined_Sig'] = -1
     return df
 
-
 def backtest_signal_col(df, col_name, sl_pct=0.002, rr_ratio=1.5):
     trades = []
     in_pos, entry, pos_type, tp, sl = False, 0, 0, 0, 0
@@ -529,7 +459,6 @@ def backtest_signal_col(df, col_name, sl_pct=0.002, rr_ratio=1.5):
                 sl, tp = entry + dist, entry - dist * rr_ratio
     return (sum(trades) if trades else 0.0), len(trades)
 
-
 # ==================== DATA FETCH ====================
 
 def _get_candles_for_range(from_dt, to_dt, sym_token=None, seg=None):
@@ -548,7 +477,6 @@ def _get_candles_for_range(from_dt, to_dt, sym_token=None, seg=None):
     df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
     return df
 
-
 def fetch_today_or_previous():
     now = now_ist()
     today_open = now.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
@@ -565,10 +493,7 @@ def fetch_today_or_previous():
             return generate_individual_signals(df), True
     return pd.DataFrame(), False
 
-
 def fetch_recent_days_raw(n_days, sym_token=None, seg=None):
-    """Like fetch_recent_days but returns per-day frames (not concatenated+indicatored) --
-    needed by the iron-condor backtester which needs one full session per simulated day."""
     now = now_ist()
     frames = []
     d = 0
@@ -583,9 +508,8 @@ def fetch_recent_days_raw(n_days, sym_token=None, seg=None):
         if df is not None and not df.empty:
             df['Timestamp'] = pd.to_datetime(df['Timestamp'])
             frames.append(df)
-    frames.reverse()  # oldest first
+    frames.reverse()
     return frames
-
 
 def fetch_recent_days(n_days=5):
     frames = fetch_recent_days_raw(n_days)
@@ -595,7 +519,6 @@ def fetch_recent_days(n_days=5):
     combined = combined.sort_values('Timestamp').reset_index(drop=True)
     return generate_individual_signals(combined)
 
-
 # ==================== VOLATILITY-BASED EXPECTED MOVE ====================
 
 def get_days_to_expiry(as_of=None):
@@ -604,7 +527,6 @@ def get_days_to_expiry(as_of=None):
     ref = as_of or now_ist().date()
     delta = (current_expiry - ref).days
     return max(delta, 0) + 1
-
 
 def compute_expected_move(spot, df_recent, vix_val=None, dte=None):
     dte = dte if dte is not None else get_days_to_expiry()
@@ -624,11 +546,7 @@ def compute_expected_move(spot, df_recent, vix_val=None, dte=None):
 
     return spot * 0.006 * math.sqrt(dte), None, "STATIC"
 
-
-# ==================== POSITION PERSISTENCE (FLAW #5 fix) ====================
-# Server-side SQLite instead of a client-side dcc.Store. Every time the "optimal" strikes
-# change (vol moved enough to re-center), the OLD position is explicitly closed and its
-# realized P&L is logged, before a new position is opened. Nothing is silently discarded.
+# ==================== POSITION PERSISTENCE ====================
 
 def _db():
     conn = sqlite3.connect(POSITIONS_DB_FILE)
@@ -649,7 +567,6 @@ def _db():
     """)
     return conn
 
-
 def get_open_position():
     conn = _db()
     row = conn.execute("SELECT * FROM ic_positions WHERE status='OPEN' ORDER BY id DESC LIMIT 1").fetchone()
@@ -663,7 +580,6 @@ def get_open_position():
     rec["entry_premiums"] = json.loads(rec["entry_premiums"])
     return rec
 
-
 def open_position(strikes_key, entry_premiums, entry_credit):
     conn = _db()
     conn.execute(
@@ -673,7 +589,6 @@ def open_position(strikes_key, entry_premiums, entry_credit):
     )
     conn.commit()
     conn.close()
-
 
 def close_position(pos_id, exit_premiums, pnl_points, pnl_rupees, reason):
     conn = _db()
@@ -686,33 +601,17 @@ def close_position(pos_id, exit_premiums, pnl_points, pnl_rupees, reason):
     conn.commit()
     conn.close()
 
-
-def get_closed_positions_summary(limit=20):
-    conn = _db()
-    rows = conn.execute(
-        "SELECT entry_time, exit_time, close_reason, realized_pnl_points, realized_pnl_rupees "
-        "FROM ic_positions WHERE status='CLOSED' ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-# ==================== IRON CONDOR: DELTA/SKEW STRIKE SELECTION, COSTS, PREMIUM-BASED SL ====================
+# ==================== IRON CONDOR: DELTA/SKEW STRIKE SELECTION & GREEKS ====================
 
 def round_to_step(value, step):
     return round(value / step) * step
 
-
 def estimated_round_trip_cost_points():
-    """Approximate all-in cost (both legs, both sides, entry+exit) converted to index points
-    so it can be netted against credit/P&L directly. Placeholder constants -- see STD_PARAMS note."""
     total_rupees = STD_PARAMS['EST_ROUND_TRIP_COST_PER_LOT'] * STD_PARAMS['IC_NUM_LEGS']
     return total_rupees / STD_PARAMS['LOT_SIZE']
 
-
 def is_avoid_date(d):
     return d.isoformat() in set(STD_PARAMS.get("IC_AVOID_DATES", []))
-
 
 def build_iron_condor(spot, df_recent, vix_val=None):
     step = STD_PARAMS['STRIKE_STEP']
@@ -725,8 +624,6 @@ def build_iron_condor(spot, df_recent, vix_val=None):
     call_iv = base_iv * STD_PARAMS['IC_CALL_IV_SKEW']
     put_iv = base_iv * STD_PARAMS['IC_PUT_IV_SKEW']
 
-    # ---- FLAW #1 & #4 fix: delta-targeted, skew-aware strike selection instead of a flat,
-    # miscommented symmetric SD multiplier that was actually placing strikes too close to spot ----
     target_delta = STD_PARAMS['IC_TARGET_DELTA']
     call_short_strike = strike_for_target_delta(spot, T, r, call_iv, target_delta, "CE", step)
     put_short_strike = strike_for_target_delta(spot, T, r, put_iv, target_delta, "PE", step)
@@ -735,24 +632,15 @@ def build_iron_condor(spot, df_recent, vix_val=None):
 
     gate_reasons = []
     if dte < STD_PARAMS['IC_MIN_DTE_FOR_NEW_ENTRY']:
-        gate_reasons.append(f"DTE {dte} below minimum {STD_PARAMS['IC_MIN_DTE_FOR_NEW_ENTRY']} -- gamma/pin risk too high for a fresh entry")
+        gate_reasons.append(f"DTE {dte} below minimum {STD_PARAMS['IC_MIN_DTE_FOR_NEW_ENTRY']} -- gamma/pin risk too high")
     if is_avoid_date(now_ist().date()):
-        gate_reasons.append("Today is on the manually-configured event-avoid list")
+        gate_reasons.append("Today is on event-avoid list")
 
-    # ---- fetch real premiums for the short legs first (needed to size wings by risk/reward) ----
     tok_cs, tsym_cs, exch_cs = get_option_token(nifty_options_df, call_short_strike, "CE")
     tok_ps, tsym_ps, exch_ps = get_option_token(nifty_options_df, put_short_strike, "PE")
     call_short_prem = fetch_ltp(exch_cs, tsym_cs, tok_cs) if tok_cs else None
     put_short_prem = fetch_ltp(exch_ps, tsym_ps, tok_ps) if tok_ps else None
 
-    # ---- FLAW #7 fix: search outward for the narrowest wing that still clears the minimum
-    # credit-to-max-loss ratio, instead of a fixed 0.35x-expected-move wing with a 100pt floor.
-    #
-    # Performance fix: this used to call fetch_ltp (one blocking round-trip) once PER candidate
-    # wing width, up to IC_WING_STEP_MULTIPLES times per side, every 30s refresh tick -- up to
-    # ~40 sequential network calls in a single dashboard callback, which is what was tripping
-    # the gunicorn worker timeout / apparent OOM. Now: resolve every candidate strike's token
-    # up front, fetch them ALL in one batched request per side, then search in memory. ----
     def resolve_wing_candidates(short_strike, opt_type):
         candidates = []
         for mult in range(1, STD_PARAMS['IC_WING_STEP_MULTIPLES'] + 1):
@@ -780,7 +668,6 @@ def build_iron_condor(spot, df_recent, vix_val=None):
                 continue
             if credit / max_loss >= STD_PARAMS['IC_MIN_CREDIT_TO_MAXLOSS']:
                 return wing, hedge_strike, hedge_prem, True
-        # nothing in range cleared the bar -- return the widest tried, flagged as not meeting bar
         return last[0], last[1], ltp_map.get(str(last[2])), False
 
     call_candidates = resolve_wing_candidates(call_short_strike, "CE")
@@ -794,6 +681,14 @@ def build_iron_condor(spot, df_recent, vix_val=None):
     }
     data_is_live = all(v is not None for v in premiums.values())
     cost_pts = estimated_round_trip_cost_points()
+
+    # ---- CALCULATE GREEKS FOR THE 4 LEGS ----
+    greeks = {
+        "buy_put": bs_greeks(spot, put_hedge_strike, T, r, put_iv, "PE", "BUY"),
+        "buy_call": bs_greeks(spot, call_hedge_strike, T, r, call_iv, "CE", "BUY"),
+        "sell_put": bs_greeks(spot, put_short_strike, T, r, put_iv, "PE", "SELL"),
+        "sell_call": bs_greeks(spot, call_short_strike, T, r, call_iv, "CE", "SELL"),
+    }
 
     call_credit = (premiums['call_short'] - premiums['call_hedge']) if data_is_live else None
     put_credit = (premiums['put_short'] - premiums['put_hedge']) if data_is_live else None
@@ -813,6 +708,7 @@ def build_iron_condor(spot, df_recent, vix_val=None):
         "cost_pts": cost_pts,
         "call_meets_rr": call_meets_rr, "put_meets_rr": put_meets_rr,
         "gate_reasons": gate_reasons, "entry_allowed": (len(gate_reasons) == 0),
+        "greeks": greeks
     }
 
     if not data_is_live:
@@ -825,8 +721,6 @@ def build_iron_condor(spot, df_recent, vix_val=None):
 
     call_max_loss = call_wing - call_credit
     put_max_loss = put_wing - put_credit
-    # ---- FLAW #3 fix: SL is a fraction of MAX LOSS, checked against live premium P&L directly
-    # (see compute_ic_unrealized_pnl) -- not a spot level derived from an expiry-only approximation ----
     call_sl_points = STD_PARAMS['IC_SL_FRACTION_OF_MAXLOSS'] * call_max_loss
     put_sl_points = STD_PARAMS['IC_SL_FRACTION_OF_MAXLOSS'] * put_max_loss
 
@@ -840,12 +734,7 @@ def build_iron_condor(spot, df_recent, vix_val=None):
     })
     return result
 
-
 def compute_ic_unrealized_pnl(ic):
-    """Uses the SQLite-backed position (see above) instead of client-side session storage.
-    When strikes change, the OLD position is closed with its realized P&L logged (FLAW #5 fix),
-    and stop-loss evaluation happens purely off live premium P&L vs. IC_SL_FRACTION_OF_MAXLOSS
-    (FLAW #3 fix), valid at any DTE."""
     if not ic['data_is_live']:
         return {"pnl_points": None, "pnl_rupees": None, "status": "NO_LIVE_DATA", "just_opened": False}
 
@@ -854,7 +743,6 @@ def compute_ic_unrealized_pnl(ic):
 
     if open_pos is None or tuple(open_pos['strikes']) != strikes_key:
         if open_pos is not None:
-            # strikes recentered -- close the old position at current live premiums, log realized P&L
             cur = ic['premiums']
             entry_prem = open_pos['entry_premiums']
             pnl_pts = (
@@ -891,7 +779,6 @@ def compute_ic_unrealized_pnl(ic):
 
     return {"pnl_points": pnl_points, "pnl_rupees": pnl_rupees, "status": "OPEN", "just_opened": False}
 
-
 def estimate_delta(spot, strike, expected_move, opt_type):
     if expected_move <= 0:
         expected_move = spot * 0.005
@@ -902,11 +789,7 @@ def estimate_delta(spot, strike, expected_move, opt_type):
     else:
         return min(max(1 - call_delta, 0.03), 0.97)
 
-
 def build_atm_directional(spot, df, expected_move):
-    """Directional ATM buying strategy -- kept for context in the dashboard but note this is a
-    long-premium (theta-negative) strategy, structurally different from the condor above; its
-    risk profile (small frequent losses, occasional large win) is the mirror image of short vol."""
     atm_strike = round_to_step(spot, STD_PARAMS['STRIKE_STEP'])
     last_signal = df.iloc[-1]['Combined_Sig'] if not df.empty else 0
 
@@ -930,19 +813,10 @@ def build_atm_directional(spot, df, expected_move):
         }
     return atm_strike, last_signal, legs
 
-
-# ==================== IRON CONDOR BACKTEST (FLAW #2 fix) ====================
-# No historical options tick database is wired in, so premiums are RECONSTRUCTED with
-# Black-Scholes using historical spot closes and a historical IV proxy (VIX daily close,
-# or ATR-implied vol if VIX candles aren't available). This is a modeled approximation,
-# not real fills -- but it is a large improvement over having literally no backtest for
-# the strategy that is actually being traded (the original code only backtested the
-# unrelated directional signal).
+# ==================== IRON CONDOR BACKTEST ====================
 
 def backtest_iron_condor(n_days=None, day_frames=None, vix_frames=None):
     n_days = n_days or STD_PARAMS['BACKTEST_DAYS']
-    # Accept pre-fetched frames so the caller can share one round of network calls between
-    # the directional backtest and this one, instead of each fetching ~20 days independently.
     if day_frames is None:
         day_frames = fetch_recent_days_raw(n_days)
     if vix_frames is None:
@@ -968,9 +842,6 @@ def backtest_iron_condor(n_days=None, day_frames=None, vix_frames=None):
         spot_high = float(day_df['High'].max())
         spot_low = float(day_df['Low'].min())
 
-        # simulate as a same-week (5 DTE median) condor opened at day open, marked at day close --
-        # a simplification standing in for a full multi-day hold since we only have one day frame
-        # per simulated iteration here.
         dte = 5
         T = dte / 365.0
         vix_val = vix_by_date.get(day_date)
@@ -990,8 +861,6 @@ def backtest_iron_condor(n_days=None, day_frames=None, vix_frames=None):
         put_hedge_p0 = bs_price(spot_open, put_hedge_k, T, r, put_iv, "PE")
         credit0 = (call_short_p0 - call_hedge_p0) + (put_short_p0 - put_hedge_p0) - cost_pts
 
-        # mark at day's worst intraday excursion (conservative) using same-day BS reprice with
-        # slightly decayed T, then at close
         T_end = max(T - (1.0 / 365.0), 1e-4)
         call_short_p1 = bs_price(spot_high, call_short_k, T_end, r, call_iv, "CE")
         call_hedge_p1 = bs_price(spot_high, call_hedge_k, T_end, r, call_iv, "CE")
@@ -1034,18 +903,9 @@ def backtest_iron_condor(n_days=None, day_frames=None, vix_frames=None):
         "note": "Modeled via Black-Scholes on historical spot + VIX -- not real historical fills.",
     }
 
-
 # ==================== CACHED BACKTEST LAYER ====================
-# Both backtests are relatively expensive (many sequential, blocking SmartAPI candle calls).
-# Running them on every dashboard refresh tick (every REFRESH_MS, default 30s) is what was
-# causing the worker to be killed -- gunicorn's request timeout (or the host's memory limit)
-# gets hit because a single callback was doing ~40-60 blocking network calls back to back,
-# repeatedly, every 30 seconds. Fix: compute both backtests together off ONE shared fetch of
-# day frames, cache the result, and only recompute when the cache goes stale (default 15 min).
-# The fast 30s loop still refreshes live spot/premiums/insights -- just not the backtests.
 
 _backtest_cache = {"computed_at": None, "directional_pnl": 0.0, "directional_trades": 0, "ic_result": None}
-
 
 def get_cached_backtests():
     now = now_ist()
@@ -1078,16 +938,13 @@ def get_cached_backtests():
             "ic_result": ic_result,
         })
     except Exception as e:
-        # On failure, keep serving the last good cached values (if any) rather than raising
-        # inside the dashboard callback -- a network hiccup shouldn't crash the whole page.
         print(f"Backtest cache refresh failed, keeping stale values: {e}")
         if _backtest_cache["computed_at"] is None:
             _backtest_cache.update({"computed_at": now, "directional_pnl": 0.0, "directional_trades": 0, "ic_result": None})
 
     return _backtest_cache
 
-
-# ==================== MARKET INSIGHTS (unchanged) ====================
+# ==================== MARKET INSIGHTS ====================
 
 def _find_local_extrema(values, order=3):
     n = len(values)
@@ -1099,7 +956,6 @@ def _find_local_extrema(values, order=3):
         if values[i] == min(window):
             lows.append(i)
     return highs, lows
-
 
 def detect_rsi_divergence(df, lookback=50, order=3):
     sub = df.tail(lookback).reset_index(drop=True)
@@ -1125,7 +981,6 @@ def detect_rsi_divergence(df, lookback=50, order=3):
             messages.append("BULLISH divergence (price lower-low, RSI higher-low)")
 
     return "; ".join(messages) if messages else "No clear divergence"
-
 
 def compute_market_insights(df, vix_val):
     latest = df.iloc[-1]
@@ -1205,12 +1060,10 @@ def compute_market_insights(df, vix_val):
         "vix_val": vix_val, "vix_state": vix_state,
     }
 
-
 def fmt(v, prefix="", suffix="", decimals=2):
     if v is None:
         return "N/A"
     return f"{prefix}{v:,.{decimals}f}{suffix}"
-
 
 def generate_market_insights_card(df, vix_val):
     if df.empty:
@@ -1241,7 +1094,6 @@ def generate_market_insights_card(df, vix_val):
         html.Div("Volume is a High-Low range proxy -- the NIFTY 50 index itself carries no traded volume; for true volume, wire this to NIFTY futures data.",
                  style={'color': '#666', 'fontSize': '10px', 'textAlign': 'center', 'marginTop': '8px'})
     ])
-
 
 # ==================== DASHBOARD CARDS ====================
 
@@ -1298,6 +1150,8 @@ def generate_options_dashboard_cards(df, vix_val=None):
             pnl_line += f" -- STOP-LOSS TRIGGERED ({pnl['status']}), POSITION CLOSED"
             pnl_color = '#ff1744'
 
+    greeks = ic['greeks']
+
     return html.Div(style={'backgroundColor': '#1e1e1e', 'border': '1px solid #ffd700', 'borderRadius': '8px', 'padding': '12px', 'marginBottom': '15px'}, children=[
         html.H4("LIVE OPTIONS TRADING SUGGESTIONS & STOP-LOSS TRACKER", style={'color': '#ffd700', 'marginTop': '0', 'textAlign': 'center', 'fontSize': '16px'}),
         html.Div(f"Data quality: {live_tag} | Expected move: {fmt(ic['expected_move'])} pts ({ic['em_source']}"
@@ -1309,25 +1163,44 @@ def generate_options_dashboard_cards(df, vix_val=None):
         html.Div(style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px'}, children=[
 
             html.Div(style={'flex': '1 1 320px', 'backgroundColor': '#2a2a2a', 'padding': '12px', 'borderRadius': '6px'}, children=[
-                html.H5("Iron Condor -- Delta/Skew-Sized Strikes", style={'color': '#00e676', 'marginTop': '0', 'fontSize': '14px'}),
+                html.H5("Iron Condor -- Delta/Skew-Sized Strikes & Greeks", style={'color': '#00e676', 'marginTop': '0', 'fontSize': '14px'}),
                 html.Div(f"Spot: {curr_spot:.2f}  |  Call wing: {ic['call_wing']} pts  |  Put wing: {ic['put_wing']} pts", style={'color': '#fff', 'fontSize': '12px'}),
                 html.Hr(style={'borderColor': '#444'}),
+                
+                # Legs with output Delta, Gamma & Vega
                 html.Ul(style={'color': '#ccc', 'fontSize': '11px', 'paddingLeft': '16px'}, children=[
-                    html.Li([f"SELL Call: ", html.B(f"{ic['call_short_strike']:.0f} CE"), f"  Premium: {fmt(ic['premiums']['call_short'],'\u20b9')}"]),
-                    html.Li([f"BUY Call Hedge: ", html.B(f"{ic['call_hedge_strike']:.0f} CE" if ic['call_hedge_strike'] else "N/A"), f"  Premium: {fmt(ic['premiums']['call_hedge'],'\u20b9')}"]),
-                    html.Li([f"SELL Put: ", html.B(f"{ic['put_short_strike']:.0f} PE"), f"  Premium: {fmt(ic['premiums']['put_short'],'\u20b9')}"]),
-                    html.Li([f"BUY Put Hedge: ", html.B(f"{ic['put_hedge_strike']:.0f} PE" if ic['put_hedge_strike'] else "N/A"), f"  Premium: {fmt(ic['premiums']['put_hedge'],'\u20b9')}"]),
+                    html.Li([
+                        f"BUY PUT: ", html.B(f"{ic['put_hedge_strike']:.0f} PE" if ic['put_hedge_strike'] else "N/A"), 
+                        f" | Prem: {fmt(ic['premiums']['put_hedge'],'\u20b9')}",
+                        html.Div(f"   -> Δ: {greeks['buy_put']['delta']}, Γ: {greeks['buy_put']['gamma']}, ν: {greeks['buy_put']['vega']}", style={'color': '#29b6f6'})
+                    ]),
+                    html.Li([
+                        f"BUY CALL: ", html.B(f"{ic['call_hedge_strike']:.0f} CE" if ic['call_hedge_strike'] else "N/A"), 
+                        f" | Prem: {fmt(ic['premiums']['call_hedge'],'\u20b9')}",
+                        html.Div(f"   -> Δ: {greeks['buy_call']['delta']}, Γ: {greeks['buy_call']['gamma']}, ν: {greeks['buy_call']['vega']}", style={'color': '#29b6f6'})
+                    ]),
+                    html.Li([
+                        f"SELL PUT: ", html.B(f"{ic['put_short_strike']:.0f} PE"), 
+                        f" | Prem: {fmt(ic['premiums']['put_short'],'\u20b9')}",
+                        html.Div(f"   -> Δ: {greeks['sell_put']['delta']}, Γ: {greeks['sell_put']['gamma']}, ν: {greeks['sell_put']['vega']}", style={'color': '#29b6f6'})
+                    ]),
+                    html.Li([
+                        f"SELL CALL: ", html.B(f"{ic['call_short_strike']:.0f} CE"), 
+                        f" | Prem: {fmt(ic['premiums']['call_short'],'\u20b9')}",
+                        html.Div(f"   -> Δ: {greeks['sell_call']['delta']}, Γ: {greeks['sell_call']['gamma']}, ν: {greeks['sell_call']['vega']}", style={'color': '#29b6f6'})
+                    ]),
                 ]),
+                
                 html.Div(style={'backgroundColor': '#121212', 'padding': '8px', 'borderRadius': '4px', 'marginTop': '8px'}, children=[
                     html.Div(f"Call credit: {fmt(ic['call_credit'])} pts | Max loss: {fmt(ic['call_max_loss'])} pts | Breakeven: {fmt(ic['call_breakeven'])}", style={'color': '#ccc', 'fontSize': '11px'}),
-                    html.Div(f"\U0001F6D1 CALL SL: lose {fmt(ic['call_sl_points'])} pts on that leg (={STD_PARAMS['IC_SL_FRACTION_OF_MAXLOSS']*100:.0f}% of max loss) -- checked live vs. premium, not spot",
+                    html.Div(f"\U0001F6D1 CALL SL: lose {fmt(ic['call_sl_points'])} pts on that leg (={STD_PARAMS['IC_SL_FRACTION_OF_MAXLOSS']*100:.0f}% of max loss)",
                              style={'color': '#ff1744', 'fontSize': '12px', 'fontWeight': 'bold'}),
                     html.Hr(style={'borderColor': '#333', 'margin': '4px 0'}),
                     html.Div(f"Put credit: {fmt(ic['put_credit'])} pts | Max loss: {fmt(ic['put_max_loss'])} pts | Breakeven: {fmt(ic['put_breakeven'])}", style={'color': '#ccc', 'fontSize': '11px'}),
                     html.Div(f"\U0001F6D1 PUT SL: lose {fmt(ic['put_sl_points'])} pts on that leg (={STD_PARAMS['IC_SL_FRACTION_OF_MAXLOSS']*100:.0f}% of max loss)",
                              style={'color': '#ff1744', 'fontSize': '12px', 'fontWeight': 'bold'}),
                     html.Hr(style={'borderColor': '#333', 'margin': '4px 0'}),
-                    html.Div(f"Gross credit: {fmt(ic['total_credit_gross'])} pts  |  Est. costs: -{fmt(ic['cost_pts'])} pts  |  Net credit: {fmt(ic['total_credit_net'])} pts (~\u20b9{fmt(ic['total_credit_net']*STD_PARAMS['LOT_SIZE']) if ic['total_credit_net'] else 'N/A'}/lot)",
+                    html.Div(f"Gross credit: {fmt(ic['total_credit_gross'])} pts  |  Est. costs: -{fmt(ic['cost_pts'])} pts  |  Net credit: {fmt(ic['total_credit_net'])} pts",
                              style={'color': '#00e676', 'fontSize': '12px', 'fontWeight': 'bold'}),
                     html.Hr(style={'borderColor': '#333', 'margin': '4px 0'}),
                     html.Div(pnl_line, style={'color': pnl_color, 'fontSize': '13px', 'fontWeight': 'bold'}),
@@ -1356,7 +1229,6 @@ def generate_options_dashboard_cards(df, vix_val=None):
         ])
     ])
 
-
 def generate_condor_backtest_card(bt):
     if not bt or bt.get("trades", 0) == 0:
         return html.Div(
@@ -1373,14 +1245,38 @@ def generate_condor_backtest_card(bt):
         html.Div(bt['note'], style={'color': '#666', 'fontSize': '9px', 'marginTop': '4px'}),
     ])
 
-
 # ==================== DASH APP ====================
 
 app = Dash(__name__, meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
 server = app.server
 
 app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'fontFamily': 'Segoe UI, sans-serif'}, children=[
-    html.H3("Dynamic Regime Strategy Engine: NIFTY 50", style={'color': '#ffffff', 'textAlign': 'center', 'margin': '10px 0'}),
+    
+    # Top Section with Title and Request Information at Top Right
+    html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'flex-start', 'marginBottom': '15px'}, children=[
+        html.H3("Dynamic Regime Strategy Engine: NIFTY 50", style={'color': '#ffffff', 'margin': '0'}),
+        
+        # Top-Right Requested Order & Checks Info Box
+        html.Div(style={
+            'backgroundColor': '#1e1e1e', 
+            'border': '1px solid #ff9800', 
+            'borderRadius': '6px', 
+            'padding': '10px 15px', 
+            'textAlign': 'left', 
+            'color': '#ffffff',
+            'fontSize': '12px'
+        }, children=[
+            html.Div(html.B("BASKETING ORDER"), style={'color': '#ff9800', 'marginBottom': '4px'}),
+            html.Div("1. BUY PUT"),
+            html.Div("2. BUY CALL"),
+            html.Div("3. SELL PUT"),
+            html.Div("4. SELL CALL"),
+            html.Hr(style={'borderColor': '#444', 'margin': '6px 0'}),
+            html.Div(html.B("Option Selling Check"), style={'color': '#ffea00', 'marginBottom': '2px'}),
+            html.Div("BUY CALL > SELL CALL > SELL PUT > BUY PUT", style={'color': '#00e676', 'fontWeight': 'bold'})
+        ])
+    ]),
+    
     html.Div(id='session-warning'),
     html.Div(id='market-insights-panel'),
     html.Div(id='options-trading-banner'),
@@ -1388,7 +1284,6 @@ app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'f
     dcc.Graph(id='multi-indicator-graph', config={'responsive': True}),
     dcc.Interval(id='interval-component', interval=STD_PARAMS['REFRESH_MS'], n_intervals=0),
 ])
-
 
 @app.callback(
     [Output('multi-indicator-graph', 'figure'),
@@ -1400,7 +1295,7 @@ app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'f
 )
 def update_dashboard(n):
     warning = html.Div() if session_active else html.Div(
-        "SmartAPI session inactive -- set SMARTAPI_KEY / SMARTAPI_CLIENT_CODE / SMARTAPI_PASSWORD / SMARTAPI_TOTP_SECRET as env vars on Render. Showing indicator chart only where data is cached.",
+        "SmartAPI session inactive -- set SMARTAPI_KEY / SMARTAPI_CLIENT_CODE / SMARTAPI_PASSWORD / SMARTAPI_TOTP_SECRET as env vars.",
         style={'color': '#ff1744', 'textAlign': 'center', 'fontSize': '12px', 'marginBottom': '8px'}
     )
 
@@ -1412,9 +1307,6 @@ def update_dashboard(n):
         }])
         return fig, [html.Div("Data Not Found", style={'color': '#ff1744', 'fontSize': '16px'})], html.Div(), warning, html.Div()
 
-    # Backtests are cached (TTL-based) instead of re-fetched on every 30s tick -- this is the
-    # fix for the worker SIGKILL / OOM you hit: the old per-tick fetch of ~20 days of NIFTY +
-    # ~20 days of VIX candles for two separate backtests was ~40-60 blocking calls every 30s.
     cached = get_cached_backtests()
     comb_pnl, comb_t = cached["directional_pnl"], cached["directional_trades"]
     current_regime = df.iloc[-1]['Regime'] if 'Regime' in df.columns else "UNKNOWN"
@@ -1466,7 +1358,6 @@ def update_dashboard(n):
         margin=dict(l=20, r=20, t=40, b=20)
     )
     return fig, card_elements, options_banner, warning, insights_panel
-
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8050))
