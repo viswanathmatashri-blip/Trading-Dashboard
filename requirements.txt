@@ -8,3 +8,6 @@ logzero
 websocket-client
 gunicorn
 streamlit
+scipy
+py_vollib
+requests
