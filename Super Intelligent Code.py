@@ -39,7 +39,7 @@ class Config:
 # ENHANCED AUTHENTICATION WITH DETAILED DEBUGGING
 # ==============================================================================
 
-def authenticate_with_debug() -> Optional[SmartConnect]:
+    def authenticate_with_debug() -> Optional[SmartConnect]:
     """
     Enhanced authentication with comprehensive debugging
     Handles TOTP sync issues, timing problems, and credential validation
