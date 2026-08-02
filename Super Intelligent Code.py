@@ -16,12 +16,27 @@ from SmartApi import SmartConnect
 # ==============================================================================
 st.set_page_config(page_title="Institutional Quant Iron Condor", page_icon="⚡", layout="wide")
 
-# Fetch credentials securely via st.secrets or Environment Variables
-API_KEY = st.secrets.get("API_KEY", os.getenv("API_KEY", ""))
-CLIENT_CODE = st.secrets.get("CLIENT_CODE", os.getenv("CLIENT_CODE", ""))
-PIN = st.secrets.get("PIN", os.getenv("PIN", ""))
-TOTP_SECRET = st.secrets.get("TOTP_SECRET", os.getenv("TOTP_SECRET", ""))
+import os
+import streamlit as st
 
+# Helper to fetch secrets safely without throwing StreamlitSecretNotFoundError
+def get_secret(key: str, default: str = "") -> str:
+    # 1. First check environment variables (Render's preferred method)
+    env_val = os.getenv(key)
+    if env_val:
+        return env_val
+    
+    # 2. Try fetching from Streamlit secrets (for local dev / Streamlit Community Cloud)
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+# Safely fetch credentials
+API_KEY = get_secret("API_KEY")
+CLIENT_CODE = get_secret("CLIENT_CODE")
+PIN = get_secret("PIN")
+TOTP_SECRET = get_secret("TOTP_SECRET")
 RISK_FREE_RATE = 0.068  # Benchmark Repo rate (~6.8%)
 LOT_SIZE = 65           # NIFTY Lot Size
 MIN_OI_THRESHOLD = 10000
