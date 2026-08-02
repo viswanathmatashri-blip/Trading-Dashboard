@@ -67,6 +67,10 @@ STD_PARAMS = {
     "IC_NUM_LEGS": 4,
 
     "REFRESH_MS": int(os.environ.get("REFRESH_MS", 30000)),
+
+    # ---- Backtest caching (fixes worker OOM/timeout from re-fetching ~20 days of candles
+    # for BOTH the directional and iron-condor backtests on every 30s refresh tick) ----
+    "BACKTEST_CACHE_TTL_SEC": int(os.environ.get("BACKTEST_CACHE_TTL_SEC", 900)),  # recompute at most every 15 min
 }
 
 MARKET_OPEN = (9, 15)
@@ -260,6 +264,31 @@ def fetch_quote_depth(exch_seg, tradingsymbol, sym_token):
         print(f"Quote depth fetch failed, falling back to LTP: {e}")
     ltp = fetch_ltp(exch_seg, tradingsymbol, sym_token)
     return None, None, ltp
+
+
+def fetch_ltp_batch(exch_seg, tokens):
+    """Fetch LTPs for many tokens in ONE request instead of one blocking call per strike.
+    size_wing() used to call fetch_ltp up to ~20 times per side (per side, per refresh tick)
+    while searching for a hedge strike that clears the risk/reward bar -- that alone was
+    enough sequential network I/O to make a single dashboard callback slow enough to trip a
+    gunicorn worker timeout. Returns {token_str: ltp}. Falls back to {} on any failure so
+    callers can gracefully treat missing entries as unavailable."""
+    tokens = [str(t) for t in tokens if t]
+    if not session_active or not tokens:
+        return {}
+    try:
+        resp = api_call(smart_api.getMarketData, "LTP", {"exchangeTokens": {exch_seg: tokens}})
+        out = {}
+        if isinstance(resp, dict) and resp.get('status') and resp.get('data', {}).get('fetched'):
+            for row in resp['data']['fetched']:
+                tok = str(row.get('symbolToken') or row.get('symboltoken') or row.get('token') or "")
+                ltp = row.get('ltp')
+                if tok and ltp is not None:
+                    out[tok] = float(ltp)
+        return out
+    except Exception as e:
+        print(f"Batch LTP fetch failed: {e}")
+        return {}
 
 
 def safe_get_candle_data(params):
@@ -705,16 +734,32 @@ def build_iron_condor(spot, df_recent, vix_val=None):
     put_short_prem = fetch_ltp(exch_ps, tsym_ps, tok_ps) if tok_ps else None
 
     # ---- FLAW #7 fix: search outward for the narrowest wing that still clears the minimum
-    # credit-to-max-loss ratio, instead of a fixed 0.35x-expected-move wing with a 100pt floor ----
-    def size_wing(short_strike, opt_type, short_prem):
-        if short_prem is None:
-            return max(STD_PARAMS['IC_MIN_WING'], round_to_step(0.35 * expected_move, step)), None, None, False
+    # credit-to-max-loss ratio, instead of a fixed 0.35x-expected-move wing with a 100pt floor.
+    #
+    # Performance fix: this used to call fetch_ltp (one blocking round-trip) once PER candidate
+    # wing width, up to IC_WING_STEP_MULTIPLES times per side, every 30s refresh tick -- up to
+    # ~40 sequential network calls in a single dashboard callback, which is what was tripping
+    # the gunicorn worker timeout / apparent OOM. Now: resolve every candidate strike's token
+    # up front, fetch them ALL in one batched request per side, then search in memory. ----
+    def resolve_wing_candidates(short_strike, opt_type):
+        candidates = []
         for mult in range(1, STD_PARAMS['IC_WING_STEP_MULTIPLES'] + 1):
             wing = max(STD_PARAMS['IC_MIN_WING'], mult * step)
             hedge_strike = short_strike + wing if opt_type == "CE" else short_strike - wing
             hedge_strike = nearest_available_strike(nifty_options_df, hedge_strike, opt_type, step)
             tok_h, tsym_h, exch_h = get_option_token(nifty_options_df, hedge_strike, opt_type)
-            hedge_prem = fetch_ltp(exch_h, tsym_h, tok_h) if tok_h else None
+            if tok_h:
+                candidates.append((wing, hedge_strike, tok_h, exch_h))
+        return candidates
+
+    def size_wing(short_strike, opt_type, short_prem, candidates):
+        if short_prem is None or not candidates:
+            return max(STD_PARAMS['IC_MIN_WING'], round_to_step(0.35 * expected_move, step)), None, None, False
+        exch_h = candidates[0][3]
+        ltp_map = fetch_ltp_batch(exch_h, [c[2] for c in candidates])
+        last = candidates[-1]
+        for wing, hedge_strike, tok_h, _ in candidates:
+            hedge_prem = ltp_map.get(str(tok_h))
             if hedge_prem is None:
                 continue
             credit = short_prem - hedge_prem
@@ -724,10 +769,12 @@ def build_iron_condor(spot, df_recent, vix_val=None):
             if credit / max_loss >= STD_PARAMS['IC_MIN_CREDIT_TO_MAXLOSS']:
                 return wing, hedge_strike, hedge_prem, True
         # nothing in range cleared the bar -- return the widest tried, flagged as not meeting bar
-        return wing, hedge_strike, hedge_prem, False
+        return last[0], last[1], ltp_map.get(str(last[2])), False
 
-    call_wing, call_hedge_strike, call_hedge_prem, call_meets_rr = size_wing(call_short_strike, "CE", call_short_prem)
-    put_wing, put_hedge_strike, put_hedge_prem, put_meets_rr = size_wing(put_short_strike, "PE", put_short_prem)
+    call_candidates = resolve_wing_candidates(call_short_strike, "CE")
+    put_candidates = resolve_wing_candidates(put_short_strike, "PE")
+    call_wing, call_hedge_strike, call_hedge_prem, call_meets_rr = size_wing(call_short_strike, "CE", call_short_prem, call_candidates)
+    put_wing, put_hedge_strike, put_hedge_prem, put_meets_rr = size_wing(put_short_strike, "PE", put_short_prem, put_candidates)
 
     premiums = {
         "call_short": call_short_prem, "call_hedge": call_hedge_prem,
@@ -880,10 +927,14 @@ def build_atm_directional(spot, df, expected_move):
 # the strategy that is actually being traded (the original code only backtested the
 # unrelated directional signal).
 
-def backtest_iron_condor(n_days=None):
+def backtest_iron_condor(n_days=None, day_frames=None, vix_frames=None):
     n_days = n_days or STD_PARAMS['BACKTEST_DAYS']
-    day_frames = fetch_recent_days_raw(n_days)
-    vix_frames = fetch_recent_days_raw(n_days, sym_token=vix_token, seg=vix_exchange) if vix_token else []
+    # Accept pre-fetched frames so the caller can share one round of network calls between
+    # the directional backtest and this one, instead of each fetching ~20 days independently.
+    if day_frames is None:
+        day_frames = fetch_recent_days_raw(n_days)
+    if vix_frames is None:
+        vix_frames = fetch_recent_days_raw(n_days, sym_token=vix_token, seg=vix_exchange) if vix_token else []
 
     vix_by_date = {}
     for vf in vix_frames:
@@ -970,6 +1021,58 @@ def backtest_iron_condor(n_days=None):
         "max_drawdown_pts": float(drawdown.max()) if len(drawdown) else 0.0,
         "note": "Modeled via Black-Scholes on historical spot + VIX -- not real historical fills.",
     }
+
+
+# ==================== CACHED BACKTEST LAYER ====================
+# Both backtests are relatively expensive (many sequential, blocking SmartAPI candle calls).
+# Running them on every dashboard refresh tick (every REFRESH_MS, default 30s) is what was
+# causing the worker to be killed -- gunicorn's request timeout (or the host's memory limit)
+# gets hit because a single callback was doing ~40-60 blocking network calls back to back,
+# repeatedly, every 30 seconds. Fix: compute both backtests together off ONE shared fetch of
+# day frames, cache the result, and only recompute when the cache goes stale (default 15 min).
+# The fast 30s loop still refreshes live spot/premiums/insights -- just not the backtests.
+
+_backtest_cache = {"computed_at": None, "directional_pnl": 0.0, "directional_trades": 0, "ic_result": None}
+
+
+def get_cached_backtests():
+    now = now_ist()
+    ttl = STD_PARAMS['BACKTEST_CACHE_TTL_SEC']
+    stale = (
+        _backtest_cache["computed_at"] is None
+        or (now - _backtest_cache["computed_at"]).total_seconds() > ttl
+    )
+    if not stale:
+        return _backtest_cache
+
+    n_days = STD_PARAMS['BACKTEST_DAYS']
+    try:
+        day_frames = fetch_recent_days_raw(n_days)
+        vix_frames = fetch_recent_days_raw(n_days, sym_token=vix_token, seg=vix_exchange) if vix_token else []
+
+        if day_frames:
+            combined = pd.concat(day_frames, ignore_index=True).sort_values('Timestamp').reset_index(drop=True)
+            combined = generate_individual_signals(combined)
+            comb_pnl, comb_t = backtest_signal_col(combined, 'Combined_Sig', STD_PARAMS['SL_PCT'], STD_PARAMS['RR_RATIO'])
+        else:
+            comb_pnl, comb_t = 0.0, 0
+
+        ic_result = backtest_iron_condor(n_days, day_frames=day_frames, vix_frames=vix_frames)
+
+        _backtest_cache.update({
+            "computed_at": now,
+            "directional_pnl": comb_pnl,
+            "directional_trades": comb_t,
+            "ic_result": ic_result,
+        })
+    except Exception as e:
+        # On failure, keep serving the last good cached values (if any) rather than raising
+        # inside the dashboard callback -- a network hiccup shouldn't crash the whole page.
+        print(f"Backtest cache refresh failed, keeping stale values: {e}")
+        if _backtest_cache["computed_at"] is None:
+            _backtest_cache.update({"computed_at": now, "directional_pnl": 0.0, "directional_trades": 0, "ic_result": None})
+
+    return _backtest_cache
 
 
 # ==================== MARKET INSIGHTS (unchanged) ====================
@@ -1297,11 +1400,11 @@ def update_dashboard(n):
         }])
         return fig, [html.Div("Data Not Found", style={'color': '#ff1744', 'fontSize': '16px'})], html.Div(), warning, html.Div()
 
-    backtest_df = fetch_recent_days(STD_PARAMS['BACKTEST_DAYS'])
-    if backtest_df.empty:
-        backtest_df = df
-
-    comb_pnl, comb_t = backtest_signal_col(backtest_df, 'Combined_Sig', STD_PARAMS['SL_PCT'], STD_PARAMS['RR_RATIO'])
+    # Backtests are cached (TTL-based) instead of re-fetched on every 30s tick -- this is the
+    # fix for the worker SIGKILL / OOM you hit: the old per-tick fetch of ~20 days of NIFTY +
+    # ~20 days of VIX candles for two separate backtests was ~40-60 blocking calls every 30s.
+    cached = get_cached_backtests()
+    comb_pnl, comb_t = cached["directional_pnl"], cached["directional_trades"]
     current_regime = df.iloc[-1]['Regime'] if 'Regime' in df.columns else "UNKNOWN"
 
     color = '#00e676' if comb_pnl >= 0 else '#ff1744'
@@ -1313,7 +1416,7 @@ def update_dashboard(n):
             html.Div(f"Trades: {comb_t}  (last {STD_PARAMS['BACKTEST_DAYS']} sessions)", style={'color': '#ffffff', 'fontSize': '10px'}),
             html.Div(f"State: {current_regime}", style={'color': '#ffea00', 'fontSize': '9px', 'fontWeight': 'bold'})
         ]),
-        generate_condor_backtest_card(backtest_iron_condor(STD_PARAMS['BACKTEST_DAYS'])),
+        generate_condor_backtest_card(cached["ic_result"]),
     ]
 
     vix_val = fetch_ltp(vix_exchange, "INDIA VIX", vix_token) if vix_token else None
