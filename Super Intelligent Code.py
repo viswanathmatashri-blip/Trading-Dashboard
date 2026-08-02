@@ -35,14 +35,14 @@ print("✅ All imports successful!")
 
 @dataclass
 class Config:
-    """Centralized configuration management"""
-    # API Credentials
-    API_KEY: str = "o2b7s4Oo"
-    CLIENT_CODE: str = "AACK311190"
-    PIN: str = "8547"
-    TOTP_SECRET: str = "YCRQCDQ7NPUHKYH7RS73NXQ5VE"
-    
-    # Market Parameters
+    """Centralized configuration management"""   
+# ==================== CREDENTIALS (set these as Render environment variables) ====================
+API_KEY     = os.environ.get("SMARTAPI_KEY", "o2b7s4Oo")
+CLIENT_CODE = os.environ.get("SMARTAPI_CLIENT_CODE", "AACK311190")
+PASSWORD    = os.environ.get("SMARTAPI_PASSWORD", "8547")
+TOTP_SECRET = os.environ.get("SMARTAPI_TOTP_SECRET", "YCRQCDQ7NPUHKYH7RS73NXQ5VE")
+# =================================================================================================== 
+# Market Parameters
     RISK_FREE_RATE: float = 0.068  # Benchmark Repo rate
     NIFTY_DIVIDEND_YIELD: float = 0.013  # 1.3% annual dividend
     LOT_SIZE: int = 65
