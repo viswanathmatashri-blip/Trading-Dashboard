@@ -43,9 +43,9 @@ class Config:
     TOTP_SECRET: str = "YCRQCDQ7NPUHKYH7RS73NXQ5VE"
     
     # Market Parameters
-RISK_FREE_RATE: float = 0.068  # Benchmark Repo rate
-NIFTY_DIVIDEND_YIELD: float = 0.013  # 1.3% annual dividend
-LOT_SIZE: int = 65
+    RISK_FREE_RATE: float = 0.068  # Benchmark Repo rate
+    NIFTY_DIVIDEND_YIELD: float = 0.013  # 1.3% annual dividend
+    LOT_SIZE: int = 65
     
     # Option Chain Settings
     OPTION_CHAIN_TTL: int = 1800  # 30 minutes
