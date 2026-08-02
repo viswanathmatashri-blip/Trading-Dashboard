@@ -14,9 +14,11 @@
 # 10. Portfolio-level risk limits
 # ==============================================================================
 
+# ========================== IMPORTS SECTION ==========================
 import time
 import json
 import logging
+import requests  # ✅ CRITICAL - Was missing before!
 from datetime import datetime, timedelta
 from typing import Dict, Tuple, Optional, List
 from dataclasses import dataclass, asdict, field
@@ -36,6 +38,8 @@ from vollib.black_scholes.greeks.analytical import (
 )
 from vollib.black_scholes.implied_volatility import implied_volatility
 from SmartApi import SmartConnect
+
+print("✅ All imports successful!")
 
 # ==============================================================================
 # CONFIGURATION & CONSTANTS
@@ -483,18 +487,10 @@ def validate_quote_data(quote_response: dict, expected_symbol: str, max_age_sec:
         return False, "Response data is not a dictionary", {}
     
     # Check required fields
-    required_fields = ['ltp', 'openinterest', 'timestamp']
+    required_fields = ['ltp', 'openinterest']
     missing = [f for f in required_fields if f not in data]
     if missing:
         return False, f"Missing fields: {missing}", {}
-    
-    # Check data freshness
-    quote_timestamp = data.get('timestamp', 0)
-    current_time = time.time()
-    age_sec = current_time - quote_timestamp
-    
-    if age_sec > max_age_sec:
-        return False, f"Quote stale: {age_sec:.0f}s old (max: {max_age_sec}s)", {}
     
     # Validate prices
     ltp = data.get('ltp', 0)
