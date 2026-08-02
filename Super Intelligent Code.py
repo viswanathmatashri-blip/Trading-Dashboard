@@ -15,7 +15,7 @@ from SmartApi import SmartConnect
 # ==============================================================================
 st.set_page_config(page_title="Quant Iron Condor Live", page_icon="⚡", layout="wide")
 
-API_KEY = "o2b7s4oo"
+API_KEY = "o2b7s4Oo"
 CLIENT_CODE = "AACK311190"
 PIN = "8547"
 TOTP_SECRET = "YCRQCDQ7NPUHKYH7RS73NXQ5VE"
@@ -32,8 +32,9 @@ def authenticate():
     smartApi = SmartConnect(api_key=API_KEY)
     totp = pyotp.TOTP(TOTP_SECRET).now()
     session = smartApi.generateSession(CLIENT_CODE, PIN, totp)
-    if not session.get('status'):
-        raise ConnectionError(f"SmartAPI Login Failed: {session.get('message')}")
+    if not isinstance(session, dict) or not session.get('status'):
+        msg = session.get('message', 'Authentication Failed') if isinstance(session, dict) else 'Invalid Auth Response'
+        raise ConnectionError(f"SmartAPI Login Failed: {msg}")
     return smartApi
 
 
@@ -98,13 +99,14 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
             ce_res = smartApi.ltpData("NFO", ce_symbol, ce_token)
             pe_res = smartApi.ltpData("NFO", pe_symbol, pe_token)
             
+            # SAFE DICTIONARY CHECKS
             if not isinstance(ce_res, dict) or not ce_res.get('status') or not isinstance(ce_res.get('data'), dict):
                 continue
             if not isinstance(pe_res, dict) or not pe_res.get('status') or not isinstance(pe_res.get('data'), dict):
                 continue
 
-            ce_price = float(ce_res['data']['ltp'])
-            pe_price = float(pe_res['data']['ltp'])
+            ce_price = float(ce_res['data'].get('ltp', 0))
+            pe_price = float(pe_res['data'].get('ltp', 0))
             ce_oi = float(ce_res['data'].get('openinterest', 100000))
             pe_oi = float(pe_res['data'].get('openinterest', 100000))
             
@@ -137,7 +139,7 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
 
 
 # ==============================================================================
-# 3. MATHEMATICAL OPTIMIZER ENGINE (DYNAMIC SKEW & DELTA BALANCE)
+# 3. MATHEMATICAL OPTIMIZER ENGINE
 # ==============================================================================
 def find_optimal_iron_condor(df, spot, T):
     if df is None or df.empty:
@@ -147,7 +149,7 @@ def find_optimal_iron_condor(df, spot, T):
     optimal_condor = None
     strikes = df['strike'].values
     
-    MIN_OTM_BUFFER = spot * 0.008  # Dynamic buffer based on spot
+    MIN_OTM_BUFFER = spot * 0.008
     
     for i in range(len(strikes) - 3):
         long_put_k = strikes[i]
@@ -220,22 +222,26 @@ def find_optimal_iron_condor(df, spot, T):
 
 
 # ==============================================================================
-# 4. STREAMLIT LIVE DASHBOARD (WITH 1-SECOND AUTO-REFRESH)
+# 4. STREAMLIT DASHBOARD
 # ==============================================================================
 st.title("⚡ Quantitative Iron Condor Engine (Live Stream)")
 
-# Auto-refresh toggle
-live_mode = st.sidebar.checkbox("Enable 1-Second Live Refresh", value=True)
+live_mode = st.sidebar.checkbox("Enable Live Refresh", value=True)
 
 try:
     smartApi = authenticate()
     chain, expiry_dt = get_nifty_option_chain()
     
-    # Get live NIFTY Index Spot Price
+    # Safely fetch NIFTY Spot Price
     spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
-    spot_price = float(spot_res['data']['ltp'])
     
-    # Run full mathematical quantitative engine
+    if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
+        err_msg = spot_res.get('message', 'Market Data Unavailable') if isinstance(spot_res, dict) else 'Invalid API Response'
+        st.warning(f"⚠️ Spot Price Fetch Warning: {err_msg}. (Markets may be closed outside trading hours).")
+        spot_price = 24383.60  # Default benchmark fallback outside market hours
+    else:
+        spot_price = float(spot_res['data']['ltp'])
+    
     df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt)
     result = find_optimal_iron_condor(df_quant, spot_price, T)
 
@@ -271,7 +277,6 @@ try:
 except Exception as e:
     st.error(f"Execution Error: {str(e)}")
 
-# Sleep for 1 second and trigger automatic rerun
 if live_mode:
-    time.sleep(1.0)
+    time.sleep(2.0)
     st.rerun()
