@@ -37,10 +37,10 @@ print("✅ All imports successful!")
 class Config:
     """Centralized configuration management"""
     # API Credentials
-    API_KEY = "o2b7s4Oo"
-    CLIENT_CODE = "AACK311190"
-    PIN = "8547"
-    TOTP_SECRET = "YCRQCDQ7NPUHKYH7RS73NXQ5VE"
+    API_KEY: str = "o2b7s4Oo"
+    CLIENT_CODE: str = "AACK311190"
+    PIN: str = "8547"
+    TOTP_SECRET: str = "YCRQCDQ7NPUHKYH7RS73NXQ5VE"
     
     # Market Parameters
     RISK_FREE_RATE: float = 0.068  # Benchmark Repo rate
