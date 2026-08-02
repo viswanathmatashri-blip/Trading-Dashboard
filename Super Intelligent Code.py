@@ -16,17 +16,10 @@ from SmartApi import SmartConnect
 # ==============================================================================
 st.set_page_config(page_title="Institutional Quant Iron Condor", page_icon="⚡", layout="wide")
 
-import os
-import streamlit as st
-
-# Helper to fetch secrets safely without throwing StreamlitSecretNotFoundError
 def get_secret(key: str, default: str = "") -> str:
-    # 1. First check environment variables (Render's preferred method)
     env_val = os.getenv(key)
     if env_val:
         return env_val
-    
-    # 2. Try fetching from Streamlit secrets (for local dev / Streamlit Community Cloud)
     try:
         return st.secrets.get(key, default)
     except Exception:
@@ -37,11 +30,12 @@ API_KEY = get_secret("API_KEY")
 CLIENT_CODE = get_secret("CLIENT_CODE")
 PIN = get_secret("PIN")
 TOTP_SECRET = get_secret("TOTP_SECRET")
-RISK_FREE_RATE = 0.068  # Benchmark Repo rate (~6.8%)
-LOT_SIZE = 65           # NIFTY Lot Size
-MIN_OI_THRESHOLD = 10000
-MAX_SPREAD_PCT = 0.025  # Maximum allowed bid-ask spread (2.5%)
-SLIPPAGE_PER_LEG = 1.5  # Estimated INR slippage buffer per leg execution
+
+# QUANT PARAMETERS
+RISK_FREE_RATE = 0.068       # Benchmark Repo rate (~6.8%)
+LOT_SIZE = 65                # NIFTY Lot Size
+MIN_OI_THRESHOLD = 2500      # Optimized to allow protective outer wings
+TRADING_DAYS_PER_YEAR = 252.0
 
 @st.cache_resource(ttl=3600)
 def authenticate():
@@ -96,14 +90,13 @@ def get_nifty_option_chain():
 # 2. QUANT ENGINE WITH REAL-TIME GREEKS & LIQUIDITY FILTERS
 # ==============================================================================
 def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
-    # Dynamic time-to-expiry calculation down to exact remaining hours
     now = pd.Timestamp.now()
     expiry_end = expiry_dt + pd.Timedelta(hours=15, minutes=30)
     remaining_seconds = max((expiry_end - now).total_seconds(), 3600)
     T = remaining_seconds / (365.0 * 86400.0)
     
     records = []
-    strikes = chain[(chain['strike'] >= spot_price * 0.93) & (chain['strike'] <= spot_price * 1.07)]['strike'].unique()
+    strikes = chain[(chain['strike'] >= spot_price * 0.92) & (chain['strike'] <= spot_price * 1.08)]['strike'].unique()
     strikes.sort()
     
     for K in strikes:
@@ -130,15 +123,13 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
             ce_oi = float(ce_res['data'].get('openinterest', 0))
             pe_oi = float(pe_res['data'].get('openinterest', 0))
             
-            # --- TIER 1: LIQUIDITY FILTER ---
+            # Liquidity Filter
             if ce_price <= 0 or pe_price <= 0 or ce_oi < MIN_OI_THRESHOLD or pe_oi < MIN_OI_THRESHOLD:
                 continue
 
-            # Calculate individual IVs accounting for skew
             ce_iv = implied_volatility(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
             pe_iv = implied_volatility(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
             
-            # Individual leg Greeks
             ce_g = gamma('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
             pe_g = gamma('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
             ce_v = vega('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
@@ -164,7 +155,7 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
 
 
 # ==============================================================================
-# 3. OPTIMIZER WITH SLIPPAGE, RISK BUFFERS & SENSITIVITY ANALYSIS
+# 3. OPTIMIZER WITH STRICT RISK CONTROLS & ADAPTIVE BUFFERS
 # ==============================================================================
 def find_optimal_iron_condor(df, spot, T):
     if df is None or df.empty:
@@ -174,15 +165,17 @@ def find_optimal_iron_condor(df, spot, T):
     optimal_condor = None
     strikes = np.sort(df['strike'].unique())
     
-    MIN_OTM_BUFFER = spot * 0.008  # Safety distance from spot
+    # Adaptive OTM Distance (Minimum 0.4% distance or IV-based expected move)
+    avg_chain_iv = np.mean(df['ce_iv'].tolist() + df['pe_iv'].tolist()) if not df.empty else 0.12
+    expected_1d_move = spot * (avg_chain_iv * np.sqrt(1 / 365.0))
+    MIN_OTM_BUFFER = max(spot * 0.004, expected_1d_move * 0.5)
     
-    # Iterate over available strikes explicitly
     for i in range(len(strikes)):
         long_put_k = strikes[i]
         
         for j in range(i + 1, len(strikes)):
             short_put_k = strikes[j]
-            put_wing = short_put_k - long_put_k
+            wing_width = short_put_k - long_put_k
             
             if short_put_k >= spot or (spot - short_put_k) < MIN_OTM_BUFFER:
                 continue
@@ -193,49 +186,46 @@ def find_optimal_iron_condor(df, spot, T):
                 if short_call_k <= spot or (short_call_k - spot) < MIN_OTM_BUFFER:
                     continue
                     
-                long_call_k = short_call_k + put_wing  # Ensure symmetric wings
+                long_call_k = short_call_k + wing_width  # Symmetric Wings
                 if long_call_k not in strikes:
                     continue
                     
-                wing_width = put_wing
-                
-                # Extract pricing and Greeks
                 lp_row = df[df['strike'] == long_put_k].iloc[0]
                 sp_row = df[df['strike'] == short_put_k].iloc[0]
                 sc_row = df[df['strike'] == short_call_k].iloc[0]
                 lc_row = df[df['strike'] == long_call_k].iloc[0]
                 
-                # Gross Premium
                 raw_credit = (sp_row['pe_price'] + sc_row['ce_price']) - (lp_row['pe_price'] + lc_row['ce_price'])
                 
-                # Adjust credit for estimated execution slippage (4 legs total)
-                net_credit = raw_credit - (SLIPPAGE_PER_LEG * 4)
+                # Proportional Slippage Deduction (4% of premium earned)
+                net_credit = raw_credit * 0.96
                 max_loss = wing_width - net_credit
                 
-                if net_credit <= 0 or max_loss <= 0:
+                # Zero Compromise on Loss Safety Rules
+                if net_credit <= 1.0 or max_loss <= 0:
                     continue
                     
-                # Position Net Greeks
                 net_gamma = (sp_row['pe_gamma'] + sc_row['ce_gamma']) - (lp_row['pe_gamma'] + lc_row['ce_gamma'])
                 net_vega = (sp_row['pe_vega'] + sc_row['ce_vega']) - (lp_row['pe_vega'] + lc_row['ce_vega'])
                 net_theta = (sp_row['pe_theta'] + sc_row['ce_theta']) - (lp_row['pe_theta'] + lc_row['ce_theta'])
                 
-                # Monte-Carlo / Delta-based Probability of Profit (PoP) approximation
+                # Black-Scholes Delta / Normal Distribution PoP
                 sigma_avg = np.mean([sp_row['pe_iv'], sc_row['ce_iv']])
                 d1_upper = (np.log(spot / short_call_k) + (RISK_FREE_RATE + 0.5 * sigma_avg**2) * T) / (sigma_avg * np.sqrt(T))
                 d1_lower = (np.log(spot / short_put_k) + (RISK_FREE_RATE + 0.5 * sigma_avg**2) * T) / (sigma_avg * np.sqrt(T))
                 pop = norm.cdf(d1_upper) - norm.cdf(d1_lower)
                 
-                if pop < 0.55:  # Reject trades with low probability
+                if pop < 0.52:  # Strict probability floor
                     continue
                     
-                # Financial Calculations
                 base_margin = max_loss * LOT_SIZE
-                buffered_margin = base_margin * 1.40  # TIER 2: 40% Dynamic Margin Cushion
+                buffered_margin = base_margin * 1.30  # Safety Buffer: +30% Margin Cushion
                 expected_value = (net_credit * pop) - (max_loss * (1 - pop))
                 
-                # Risk-Adjusted Scoring (Penalize high Gamma & high Vega risk)
-                utility_score = (expected_value * LOT_SIZE / buffered_margin) / (1.0 + (net_gamma * 100))
+                if expected_value <= 0:  # Hard safety rule: Positive EV strictly required
+                    continue
+                    
+                utility_score = (expected_value * LOT_SIZE / buffered_margin) / (1.0 + (net_gamma * 20))
                 
                 if utility_score > best_score:
                     best_score = utility_score
@@ -255,8 +245,8 @@ def find_optimal_iron_condor(df, spot, T):
                         'pop': pop * 100,
                         'expected_value': expected_value * LOT_SIZE,
                         'net_gamma': net_gamma,
-                        'net_vega_shock_5pct': net_vega * 0.05 * LOT_SIZE, # Impact of a 5% IV spike
-                        'net_theta_daily': (net_theta / 365.0) * LOT_SIZE,
+                        'net_vega_shock_5pct': net_vega * 0.05 * LOT_SIZE,
+                        'net_theta_daily': (net_theta / TRADING_DAYS_PER_YEAR) * LOT_SIZE,
                         'return_on_margin': (net_credit * LOT_SIZE / buffered_margin) * 100
                     }
                 
@@ -264,7 +254,7 @@ def find_optimal_iron_condor(df, spot, T):
 
 
 # ==============================================================================
-# 4. STREAMLIT DASHBOARD
+# 4. STREAMLIT DASHBOARD UI
 # ==============================================================================
 st.title("⚡ Dynamic Risk-Managed Iron Condor Engine")
 
@@ -304,11 +294,11 @@ try:
         ])
         st.table(trade_df)
 
-        st.subheader("📊 Financials & Slippage Buffer")
+        st.subheader("📊 Financials & Risk Buffers")
         f1, f2, f3, f4 = st.columns(4)
         f1.metric("Net Credit (Post-Slippage)", f"₹{result['net_credit_rupees']:,.2f}", f"{result['net_credit_pts']:.2f} pts")
         f2.metric("Max Loss Limit", f"₹{result['max_loss_rupees']:,.2f}")
-        f3.metric("Required Margin (+40% Cushion)", f"₹{result['buffered_margin']:,.2f}")
+        f3.metric("Required Margin (+30% Cushion)", f"₹{result['buffered_margin']:,.2f}")
         f4.metric("Net EV per Trade", f"₹{result['expected_value']:,.2f}")
 
         st.markdown("---")
@@ -320,7 +310,7 @@ try:
         r4.metric("Net Position Gamma", f"{result['net_gamma']:.4f}")
 
     else:
-        st.warning("No valid Iron Condor setup met the minimum PoP, EV, and liquidity criteria for this tick.")
+        st.warning("No valid Iron Condor setup met the minimum PoP, EV, and safety criteria for this tick.")
 
 except Exception as e:
     st.error(f"Execution Error: {str(e)}")
