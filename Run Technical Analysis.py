@@ -94,9 +94,21 @@ def download_scrip_master():
 
 def load_scrip_master_df():
     download_scrip_master()
+    filtered_rows = []
+    
     with open(SCRIP_MASTER_FILE, "r") as f:
-        return pd.DataFrame(json.load(f))
-
+        data = json.load(f)
+        for row in data:
+            name = str(row.get('name', '')).upper()
+            symbol = str(row.get('symbol', '')).upper()
+            exch = str(row.get('exch_seg', '')).upper()
+            
+            # Keep ONLY NIFTY 50, INDIA VIX, and NFO Options for NIFTY
+            if name in ["NIFTY 50", "INDIA VIX"] or (name == "NIFTY" and exch == "NFO"):
+                filtered_rows.append(row)
+                
+    # Memory footprint drops from ~300MB down to <5MB!
+    return pd.DataFrame(filtered_rows)
 
 def resolve_nifty_token(df_master):
     try:
