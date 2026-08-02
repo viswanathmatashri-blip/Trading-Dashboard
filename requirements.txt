@@ -7,3 +7,4 @@ smartapi-python
 logzero
 websocket-client
 gunicorn
+streamlit
