@@ -35,12 +35,160 @@ print("✅ All imports successful!")
 
 @dataclass
 class Config:
-    """Centralized configuration management"""   
-# ==================== CREDENTIALS (set these as Render environment variables) ====================
-    API_KEY     = os.environ.get("SMARTAPI_KEY", "o2b7s4Oo")
-    CLIENT_CODE = os.environ.get("SMARTAPI_CLIENT_CODE", "AACK311190")
-    PASSWORD    = os.environ.get("SMARTAPI_PASSWORD", "8547")
-    TOTP_SECRET = os.environ.get("SMARTAPI_TOTP_SECRET", "YCRQCDQ7NPUHKYH7RS73NXQ5VE")
+ # ==============================================================================
+# ENHANCED AUTHENTICATION WITH DETAILED DEBUGGING
+# ==============================================================================
+
+def authenticate_with_debug() -> Optional[SmartConnect]:
+    """
+    Enhanced authentication with comprehensive debugging
+    Handles TOTP sync issues, timing problems, and credential validation
+    """
+    try:
+        st.info("🔐 Authenticating with Angel Broking API...")
+        
+        # Step 1: Validate credentials exist
+        if not Config.API_KEY or Config.API_KEY == "o2b7s4Oo":
+            st.error("❌ API_KEY not configured. Please set your credentials.")
+            return None
+        
+        if not Config.CLIENT_CODE or Config.CLIENT_CODE == "AACK311190":
+            st.error("❌ CLIENT_CODE not configured. Please set your credentials.")
+            return None
+        
+        if not Config.PIN or Config.PIN == "8547":
+            st.error("❌ PIN not configured. Please set your credentials.")
+            return None
+        
+        if not Config.TOTP_SECRET or Config.TOTP_SECRET == "YCRQCDQ7NPUHKYH7RS73NXQ5VE":
+            st.error("❌ TOTP_SECRET not configured. Please set your credentials.")
+            return None
+        
+        st.write(f"✅ Using API Key: {Config.API_KEY[:4]}...{Config.API_KEY[-4:]}")
+        st.write(f"✅ Using Client Code: {Config.CLIENT_CODE}")
+        
+        # Step 2: Initialize SmartConnect
+        logger.info(f"Initializing SmartConnect with API Key: {Config.API_KEY}")
+        smartApi = SmartConnect(api_key=Config.API_KEY)
+        
+        # Step 3: Generate TOTP (time-based OTP)
+        logger.info("Generating TOTP code...")
+        totp = pyotp.TOTP(Config.TOTP_SECRET)
+        otp_code = totp.now()
+        logger.info(f"TOTP Generated: {otp_code}")
+        
+        # Step 4: Generate session
+        logger.info(f"Calling generateSession with CLIENT_CODE={Config.CLIENT_CODE}, PIN={Config.PIN}, OTP={otp_code}")
+        session = smartApi.generateSession(Config.CLIENT_CODE, Config.PIN, otp_code)
+        
+        logger.info(f"Session response: {session}")
+        
+        # Step 5: Validate response
+        if not session:
+            st.error("❌ Session response is empty or None")
+            logger.error("Session is None")
+            return None
+        
+        if not isinstance(session, dict):
+            st.error(f"❌ Session response is not a dictionary. Got: {type(session)}")
+            logger.error(f"Session type error: {type(session)}")
+            return None
+        
+        # Step 6: Check status
+        status = session.get('status')
+        message = session.get('message', 'No message provided')
+        data = session.get('data')
+        
+        st.write(f"📊 Response Status: {status}")
+        st.write(f"📊 Response Message: {message}")
+        
+        if not status or status == False:
+            st.error(f"❌ Authentication Failed: {message}")
+            logger.error(f"Session failed: {message}")
+            
+            # Additional debugging
+            if message:
+                if "Invalid" in message and "credentials" in message.lower():
+                    st.error("🔴 **CREDENTIALS INVALID**")
+                    st.info("Please verify:")
+                    st.write("1. API Key is correct")
+                    st.write("2. Client Code is correct")
+                    st.write("3. PIN is correct")
+                    st.write("4. TOTP Secret is correct and hasn't expired")
+                elif "Invalid OTP" in message or "otp" in message.lower():
+                    st.error("🔴 **INVALID OTP/TOTP**")
+                    st.info("Solutions:")
+                    st.write("1. Check if TOTP secret is correct")
+                    st.write("2. Check server time synchronization")
+                    st.write("3. Try again (OTP expires every 30 seconds)")
+                elif "timeout" in message.lower():
+                    st.error("🔴 **CONNECTION TIMEOUT**")
+                    st.info("Solutions:")
+                    st.write("1. Check internet connection")
+                    st.write("2. Check if Angel Broking API is online")
+                    st.write("3. Try again in a few seconds")
+            
+            return None
+        
+        # Success
+        st.success("✅ SmartAPI authentication successful!")
+        logger.info("✅ SmartAPI authentication successful")
+        
+        return smartApi
+    
+    except Exception as e:
+        st.error(f"❌ Authentication Error: {str(e)}")
+        logger.error(f"Authentication exception: {e}", exc_info=True)
+        return None
+
+
+# ==============================================================================
+# IMPROVED CREDENTIAL VERIFICATION
+# ==============================================================================
+
+def verify_credentials() -> bool:
+    """
+    Verify credentials are properly set before attempting auth
+    """
+    st.subheader("🔐 Credential Verification")
+    
+    issues = []
+    
+    if not Config.API_KEY or Config.API_KEY == "xxx" or len(Config.API_KEY) < 5:
+        issues.append("❌ API_KEY is invalid or not set")
+    else:
+        st.write(f"✅ API_KEY appears valid (length: {len(Config.API_KEY)})")
+    
+    if not Config.CLIENT_CODE or Config.CLIENT_CODE == "xxx" or len(Config.CLIENT_CODE) < 3:
+        issues.append("❌ CLIENT_CODE is invalid or not set")
+    else:
+        st.write(f"✅ CLIENT_CODE appears valid: {Config.CLIENT_CODE}")
+    
+    if not Config.PIN or Config.PIN == "xx" or len(Config.PIN) < 2:
+        issues.append("❌ PIN is invalid or not set")
+    else:
+        st.write(f"✅ PIN appears valid (length: {len(Config.PIN)})")
+    
+    if not Config.TOTP_SECRET or Config.TOTP_SECRET == "xxxxx" or len(Config.TOTP_SECRET) < 10:
+        issues.append("❌ TOTP_SECRET is invalid or not set")
+    else:
+        st.write(f"✅ TOTP_SECRET appears valid (length: {len(Config.TOTP_SECRET)})")
+        # Test TOTP generation
+        try:
+            totp = pyotp.TOTP(Config.TOTP_SECRET)
+            test_otp = totp.now()
+            st.write(f"✅ TOTP can be generated successfully (current: {test_otp})")
+        except Exception as e:
+            issues.append(f"❌ TOTP generation failed: {e}")
+    
+    if issues:
+        st.error("**Issues found:**")
+        for issue in issues:
+            st.write(issue)
+        return False
+    
+    st.success("✅ All credentials appear valid!")
+    return True
 # =================================================================================================== 
 # Market Parameters
     RISK_FREE_RATE: float = 0.068  # Benchmark Repo rate
