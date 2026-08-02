@@ -44,7 +44,7 @@ class Config:
     Enhanced authentication with comprehensive debugging
     Handles TOTP sync issues, timing problems, and credential validation
     """
-    try:
+        try:
         st.info("🔐 Authenticating with Angel Broking API...")
         
         # Step 1: Validate credentials exist
