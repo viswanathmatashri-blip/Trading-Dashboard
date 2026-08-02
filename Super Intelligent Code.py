@@ -6,8 +6,8 @@ import pandas as pd
 import pyotp
 import streamlit as st
 from scipy.interpolate import UnivariateSpline
-from py_vollib.black_scholes.greeks.analytical import gamma
-from py_vollib.black_scholes.implied_volatility import implied_volatility
+from vollib.black_scholes.greeks.analytical import gamma
+from vollib.black_scholes.implied_volatility import implied_volatility
 from SmartApi import SmartConnect
 
 # ==============================================================================
