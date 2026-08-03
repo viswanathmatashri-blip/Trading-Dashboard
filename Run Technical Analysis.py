@@ -234,7 +234,7 @@ session_active = False
 
 def login_smartapi():
     global session_active
-    if not (CLIENT_CODE and PASSWORD and TOTP_SECRET and API_KEY):
+    if not (CLIENT_CODE and PIN and TOTP_SECRET and API_KEY):
         print("Credentials missing -- set SMARTAPI_* environment variables on Render.")
         session_active = False
         return False
