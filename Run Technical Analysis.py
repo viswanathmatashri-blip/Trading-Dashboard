@@ -13,12 +13,15 @@ from zoneinfo import ZoneInfo
 from dash import Dash, dcc, html, Input, Output, State
 from SmartApi import SmartConnect
 
-# ==================== CREDENTIALS (set these as Render environment variables) ====================
-API_KEY     = os.environ.get("SMARTAPI_KEY", "o2b7s4Oo")
-CLIENT_CODE = os.environ.get("SMARTAPI_CLIENT_CODE", "AACK311190")
-PASSWORD    = os.environ.get("SMARTAPI_PASSWORD", "8547")
-TOTP_SECRET = os.environ.get("SMARTAPI_TOTP_SECRET", "YCRQCDQ7NPUHKYH7RS73NXQ5VE")
-# ===================================================================================================
+def get_secret(key: str, default: str = "") -> str:
+    env_val = os.getenv(key)
+    if env_val:
+        return env_val
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
 
 IST = ZoneInfo("Asia/Kolkata")
 
