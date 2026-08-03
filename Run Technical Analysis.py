@@ -240,7 +240,7 @@ def login_smartapi():
         return False
     try:
         totp_code = pyotp.TOTP(TOTP_SECRET).now()
-        smart_api.generateSession(CLIENT_CODE, PIM, totp_code)
+        smart_api.generateSession(CLIENT_CODE, PIN, totp_code)
         session_active = True
         print("SmartAPI session established.")
         return True
