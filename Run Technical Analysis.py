@@ -21,7 +21,11 @@ def get_secret(key: str, default: str = "") -> str:
         return st.secrets.get(key, default)
     except Exception:
         return default
-
+# Safely fetch credentials
+API_KEY = get_secret("API_KEY")
+CLIENT_CODE = get_secret("CLIENT_CODE")
+PIN = get_secret("PIN")
+TOTP_SECRET = get_secret("TOTP_SECRET")
 
 IST = ZoneInfo("Asia/Kolkata")
 
