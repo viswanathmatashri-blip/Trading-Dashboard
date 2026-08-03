@@ -1364,7 +1364,7 @@ def update_dashboard(n):
     # ... [Keep rest of your chart rendering code unchanged] ...
 
     return fig, card_elements, options_banner, warning, insights_panel, get_auth_badge()
-)
+
 def update_dashboard(n):
     warning = html.Div() if session_active else html.Div(
         "SmartAPI session inactive -- set SMARTAPI_KEY / SMARTAPI_CLIENT_CODE / SMARTAPI_PASSWORD / SMARTAPI_TOTP_SECRET as env vars.",
