@@ -13,19 +13,53 @@ from zoneinfo import ZoneInfo
 from dash import Dash, dcc, html, Input, Output, State
 from SmartApi import SmartConnect
 
-def get_secret(key: str, default: str = "") -> str:
-    env_val = os.getenv(key)
-    if env_val:
-        return env_val
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
-# Safely fetch credentials
+# ==================== CREDENTIALS & GLOBAL STATE ====================
+
 API_KEY = get_secret("API_KEY")
 CLIENT_CODE = get_secret("CLIENT_CODE")
-PIN = get_secret("PIN")
+PIN = get_secret("PIN")  # Using PIN for SmartAPI session
 TOTP_SECRET = get_secret("TOTP_SECRET")
+
+smart_api = SmartConnect(api_key=API_KEY)
+session_active = False
+auth_status_msg = "NOT INITIALIZED"
+
+
+def login_smartapi():
+    global session_active, auth_status_msg
+    
+    # Check for missing credentials
+    if not (CLIENT_CODE and PIN and TOTP_SECRET and API_KEY):
+        auth_status_msg = "AUTH FAILED: Missing API Credentials/Secrets"
+        print(auth_status_msg)
+        session_active = False
+        return False
+        
+    try:
+        totp_code = pyotp.TOTP(TOTP_SECRET).now()
+        # Fixed: Passed PIN instead of undefined PASSWORD
+        res = smart_api.generateSession(CLIENT_CODE, PIN, totp_code)
+        
+        if isinstance(res, dict) and res.get('status'):
+            session_active = True
+            auth_status_msg = "CONNECTED: SmartAPI Live Session Active"
+            print("SmartAPI session established.")
+            return True
+        else:
+            msg = res.get('message', 'Unknown Error') if isinstance(res, dict) else str(res)
+            auth_status_msg = f"AUTH FAILED: {msg}"
+            session_active = False
+            print(auth_status_msg)
+            return False
+
+    except Exception as e:
+        auth_status_msg = f"AUTH ERROR: {str(e)}"
+        print(auth_status_msg)
+        session_active = False
+        return False
+
+# Attempt login on startup
+login_smartapi()
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -1253,15 +1287,37 @@ def generate_condor_backtest_card(bt):
     ])
 
 # ==================== DASH APP ====================
+# ==================== DASH APP LAYOUT ====================
 
 app = Dash(__name__, meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
 server = app.server
 
+# Helper function to generate styled Auth Badge
+def get_auth_badge():
+    if session_active:
+        status_color = "#00e676"  # Vibrant Green
+        status_text = f"SUCCESS -- {auth_status_msg}"
+    else:
+        status_color = "#ff1744"  # Alert Red
+        status_text = f"FAILED -- {auth_status_msg}"
+
+    return html.Div([
+        html.Span("API AUTH STATUS: ", style={'color': '#aaa', 'fontWeight': 'bold'}),
+        html.Span(status_text, style={'color': status_color, 'fontWeight': 'bold'})
+    ], style={'marginTop': '4px', 'fontSize': '12px'})
+
+
 app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'fontFamily': 'Segoe UI, sans-serif'}, children=[
     
-    # Top Section with Title and Request Information at Top Right
+    # Top Section with Title, Auth Status, and Basketing Order
     html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'flex-start', 'marginBottom': '15px'}, children=[
-        html.H3("Dynamic Regime Strategy Engine: NIFTY 50", style={'color': '#ffffff', 'margin': '0'}),
+        
+        # Title and Authentication Status Section
+        html.Div(children=[
+            html.H3("Dynamic Regime Strategy Engine: NIFTY 50", style={'color': '#ffffff', 'margin': '0'}),
+            # Auth Status directly below title
+            html.Div(id='top-auth-status-container', children=[get_auth_badge()])
+        ]),
         
         # Top-Right Requested Order & Checks Info Box
         html.Div(style={
@@ -1291,14 +1347,23 @@ app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'f
     dcc.Graph(id='multi-indicator-graph', config={'responsive': True}),
     dcc.Interval(id='interval-component', interval=STD_PARAMS['REFRESH_MS'], n_intervals=0),
 ])
-
 @app.callback(
     [Output('multi-indicator-graph', 'figure'),
      Output('strategy-performance-cards', 'children'),
      Output('options-trading-banner', 'children'),
      Output('session-warning', 'children'),
-     Output('market-insights-panel', 'children')],
+     Output('market-insights-panel', 'children'),
+     Output('top-auth-status-container', 'children')],  # Added Auth output
     Input('interval-component', 'n_intervals'),
+)
+def update_dashboard(n):
+    # Ensure active session attempt on dynamic refresh if currently failed
+    if not session_active:
+        login_smartapi()
+
+    # ... [Keep rest of your chart rendering code unchanged] ...
+
+    return fig, card_elements, options_banner, warning, insights_panel, get_auth_badge()
 )
 def update_dashboard(n):
     warning = html.Div() if session_active else html.Div(
