@@ -40,8 +40,7 @@ TRADING_DAYS_PER_YEAR = 252.0
 @st.cache_resource(ttl=3600)
 def authenticate():
     if not API_KEY or not CLIENT_CODE:
-        st.error("🔑 Credentials missing! Configure Streamlit secrets or environment variables.")
-        st.stop()
+        raise ValueError("🔑 Credentials missing! Configure Streamlit secrets or environment variables.")
     smartApi = SmartConnect(api_key=API_KEY)
     totp = pyotp.TOTP(TOTP_SECRET).now()
     session = smartApi.generateSession(CLIENT_CODE, PIN, totp)
@@ -155,21 +154,22 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
 
 
 # ==============================================================================
-# 3. OPTIMIZER WITH STRICT RISK CONTROLS & ADAPTIVE BUFFERS
+# 3. OPTIMIZER WITH STRICT RISK CONTROLS & SELECTION AUDIT LOGGING
 # ==============================================================================
 def find_optimal_iron_condor(df, spot, T):
     if df is None or df.empty:
-        return None
+        return None, pd.DataFrame()
         
     best_score = -np.inf
     optimal_condor = None
     strikes = np.sort(df['strike'].unique())
     
-    # Adaptive OTM Distance (Minimum 0.4% distance or IV-based expected move)
     avg_chain_iv = np.mean(df['ce_iv'].tolist() + df['pe_iv'].tolist()) if not df.empty else 0.12
     expected_1d_move = spot * (avg_chain_iv * np.sqrt(1 / 365.0))
     MIN_OTM_BUFFER = max(spot * 0.004, expected_1d_move * 0.5)
     
+    audit_logs = []
+
     for i in range(len(strikes)):
         long_put_k = strikes[i]
         
@@ -178,16 +178,31 @@ def find_optimal_iron_condor(df, spot, T):
             wing_width = short_put_k - long_put_k
             
             if short_put_k >= spot or (spot - short_put_k) < MIN_OTM_BUFFER:
+                audit_logs.append({
+                    'combo': f"{long_put_k}/{short_put_k}/X/X",
+                    'status': 'Rejected',
+                    'reason': f"Short Put ({short_put_k}) too close to spot (Min Buffer: {MIN_OTM_BUFFER:.1f} pts)"
+                })
                 continue
                 
             for k in range(j + 1, len(strikes)):
                 short_call_k = strikes[k]
                 
                 if short_call_k <= spot or (short_call_k - spot) < MIN_OTM_BUFFER:
+                    audit_logs.append({
+                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/X",
+                        'status': 'Rejected',
+                        'reason': f"Short Call ({short_call_k}) too close to spot (Min Buffer: {MIN_OTM_BUFFER:.1f} pts)"
+                    })
                     continue
                     
                 long_call_k = short_call_k + wing_width  # Symmetric Wings
                 if long_call_k not in strikes:
+                    audit_logs.append({
+                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'status': 'Rejected',
+                        'reason': f"Symmetric Long Call Strike ({long_call_k}) not present in liquid chain"
+                    })
                     continue
                     
                 lp_row = df[df['strike'] == long_put_k].iloc[0]
@@ -197,60 +212,93 @@ def find_optimal_iron_condor(df, spot, T):
                 
                 raw_credit = (sp_row['pe_price'] + sc_row['ce_price']) - (lp_row['pe_price'] + lc_row['ce_price'])
                 
-                # Proportional Slippage Deduction (4% of premium earned)
                 net_credit = raw_credit * 0.96
                 max_loss = wing_width - net_credit
                 
-                # Zero Compromise on Loss Safety Rules
                 if net_credit <= 1.0 or max_loss <= 0:
+                    audit_logs.append({
+                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'status': 'Rejected',
+                        'reason': f"Insufficient Credit ({net_credit:.2f} pts) or Invalid Max Loss ({max_loss:.2f})"
+                    })
                     continue
                     
                 net_gamma = (sp_row['pe_gamma'] + sc_row['ce_gamma']) - (lp_row['pe_gamma'] + lc_row['ce_gamma'])
                 net_vega = (sp_row['pe_vega'] + sc_row['ce_vega']) - (lp_row['pe_vega'] + lc_row['ce_vega'])
                 net_theta = (sp_row['pe_theta'] + sc_row['ce_theta']) - (lp_row['pe_theta'] + lc_row['ce_theta'])
                 
-                # Black-Scholes Delta / Normal Distribution PoP
                 sigma_avg = np.mean([sp_row['pe_iv'], sc_row['ce_iv']])
                 d1_upper = (np.log(spot / short_call_k) + (RISK_FREE_RATE + 0.5 * sigma_avg**2) * T) / (sigma_avg * np.sqrt(T))
                 d1_lower = (np.log(spot / short_put_k) + (RISK_FREE_RATE + 0.5 * sigma_avg**2) * T) / (sigma_avg * np.sqrt(T))
                 pop = norm.cdf(d1_upper) - norm.cdf(d1_lower)
                 
-                if pop < 0.52:  # Strict probability floor
+                if pop < 0.52:
+                    audit_logs.append({
+                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'status': 'Rejected',
+                        'reason': f"PoP ({pop*100:.1f}%) below minimum required threshold (52.0%)"
+                    })
                     continue
                     
                 base_margin = max_loss * LOT_SIZE
-                buffered_margin = base_margin * 1.30  # Safety Buffer: +30% Margin Cushion
+                buffered_margin = base_margin * 1.30  
                 expected_value = (net_credit * pop) - (max_loss * (1 - pop))
                 
-                if expected_value <= 0:  # Hard safety rule: Positive EV strictly required
+                if expected_value <= 0:
+                    audit_logs.append({
+                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'status': 'Rejected',
+                        'reason': f"Negative or Zero Expected Value (EV: ₹{expected_value * LOT_SIZE:.2f})"
+                    })
                     continue
                     
                 utility_score = (expected_value * LOT_SIZE / buffered_margin) / (1.0 + (net_gamma * 20))
                 
+                cand_details = {
+                    'long_put': long_put_k,
+                    'short_put': short_put_k,
+                    'short_call': short_call_k,
+                    'long_call': long_call_k,
+                    'wing_width': wing_width,
+                    'raw_credit_pts': raw_credit,
+                    'net_credit_pts': net_credit,
+                    'net_credit_rupees': net_credit * LOT_SIZE,
+                    'max_loss_rupees': max_loss * LOT_SIZE,
+                    'stop_loss_level': net_credit * 2.0 * LOT_SIZE,
+                    'base_margin': base_margin,
+                    'buffered_margin': buffered_margin,
+                    'pop': pop * 100,
+                    'expected_value': expected_value * LOT_SIZE,
+                    'net_gamma': net_gamma,
+                    'net_vega_shock_5pct': net_vega * 0.05 * LOT_SIZE,
+                    'net_theta_daily': (net_theta / TRADING_DAYS_PER_YEAR) * LOT_SIZE,
+                    'return_on_margin': (net_credit * LOT_SIZE / buffered_margin) * 100,
+                    'utility_score': utility_score
+                }
+
                 if utility_score > best_score:
+                    if optimal_condor is not None:
+                        audit_logs.append({
+                            'combo': f"{optimal_condor['long_put']:.0f}/{optimal_condor['short_put']:.0f}/{optimal_condor['short_call']:.0f}/{optimal_condor['long_call']:.0f}",
+                            'status': 'Outranked',
+                            'reason': f"Outranked by higher utility score ({utility_score:.4f} > {best_score:.4f})"
+                        })
                     best_score = utility_score
-                    optimal_condor = {
-                        'long_put': long_put_k,
-                        'short_put': short_put_k,
-                        'short_call': short_call_k,
-                        'long_call': long_call_k,
-                        'wing_width': wing_width,
-                        'raw_credit_pts': raw_credit,
-                        'net_credit_pts': net_credit,
-                        'net_credit_rupees': net_credit * LOT_SIZE,
-                        'max_loss_rupees': max_loss * LOT_SIZE,
-                        'stop_loss_level': net_credit * 2.0 * LOT_SIZE,  # Hard Stop-Loss @ 2x credit earned
-                        'base_margin': base_margin,
-                        'buffered_margin': buffered_margin,
-                        'pop': pop * 100,
-                        'expected_value': expected_value * LOT_SIZE,
-                        'net_gamma': net_gamma,
-                        'net_vega_shock_5pct': net_vega * 0.05 * LOT_SIZE,
-                        'net_theta_daily': (net_theta / TRADING_DAYS_PER_YEAR) * LOT_SIZE,
-                        'return_on_margin': (net_credit * LOT_SIZE / buffered_margin) * 100
-                    }
-                
-    return optimal_condor
+                    optimal_condor = cand_details
+                    audit_logs.append({
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
+                        'status': 'Selected (Current Best)',
+                        'reason': f"Passed all risk criteria; Highest Utility Score ({utility_score:.4f})"
+                    })
+                else:
+                    audit_logs.append({
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
+                        'status': 'Rejected',
+                        'reason': f"Passed criteria, but utility score ({utility_score:.4f}) lower than best ({best_score:.4f})"
+                    })
+
+    df_audit = pd.DataFrame(audit_logs)
+    return optimal_condor, df_audit
 
 
 # ==============================================================================
@@ -260,8 +308,11 @@ st.title("⚡ Dynamic Risk-Managed Iron Condor Engine")
 
 live_mode = st.sidebar.checkbox("Enable Live Refresh (5s)", value=False)
 
+# API CONNECTION STATUS BANNER
 try:
     smartApi = authenticate()
+    st.success(f"🟢 **API Connection Status:** Successfully connected to SmartAPI (Client ID: `{CLIENT_CODE}`)")
+    
     chain, expiry_dt = get_nifty_option_chain()
     
     spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
@@ -272,7 +323,7 @@ try:
         spot_price = float(spot_res['data']['ltp'])
     
     df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt)
-    result = find_optimal_iron_condor(df_quant, spot_price, T)
+    result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T)
 
     st.subheader("📌 Live Market Dashboard")
     m1, m2, m3, m4 = st.columns(4)
@@ -312,8 +363,22 @@ try:
     else:
         st.warning("No valid Iron Condor setup met the minimum PoP, EV, and safety criteria for this tick.")
 
+    # AUDIT TRAIL DISPLAY
+    st.markdown("---")
+    st.subheader("🔍 Iron Condor Selection Audit Trail")
+    if not df_audit.empty:
+        status_filter = st.multiselect(
+            "Filter Evaluation Status", 
+            options=df_audit['status'].unique(), 
+            default=df_audit['status'].unique()
+        )
+        filtered_audit = df_audit[df_audit['status'].isin(status_filter)]
+        st.dataframe(filtered_audit, use_container_width=True)
+    else:
+        st.info("No strike combinations evaluated.")
+
 except Exception as e:
-    st.error(f"Execution Error: {str(e)}")
+    st.error(f"🔴 **API Connection Status:** Connection Failed! Details: {str(e)}")
 
 if live_mode:
     time.sleep(5.0)
