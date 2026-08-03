@@ -240,7 +240,7 @@ def login_smartapi():
         return False
     try:
         totp_code = pyotp.TOTP(TOTP_SECRET).now()
-        smart_api.generateSession(CLIENT_CODE, PASSWORD, totp_code)
+        smart_api.generateSession(CLIENT_CODE, PIM, totp_code)
         session_active = True
         print("SmartAPI session established.")
         return True
@@ -1377,7 +1377,7 @@ def update_dashboard(n):
 
 def update_dashboard(n):
     warning = html.Div() if session_active else html.Div(
-        "SmartAPI session inactive -- set SMARTAPI_KEY / SMARTAPI_CLIENT_CODE / SMARTAPI_PASSWORD / SMARTAPI_TOTP_SECRET as env vars.",
+        "SmartAPI session inactive -- set SMARTAPI_KEY / SMARTAPI_CLIENT_CODE / SMARTAPI_PIN / SMARTAPI_TOTP_SECRET as env vars.",
         style={'color': '#ff1744', 'textAlign': 'center', 'fontSize': '12px', 'marginBottom': '8px'}
     )
 
