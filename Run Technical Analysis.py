@@ -13,6 +13,16 @@ from zoneinfo import ZoneInfo
 from dash import Dash, dcc, html, Input, Output, State
 from SmartApi import SmartConnect
 
+def get_secret(key: str, default: str = "") -> str:
+    """Safely fetch secrets from environment variables or Streamlit secrets."""
+    env_val = os.getenv(key)
+    if env_val:
+        return env_val
+    try:
+        import streamlit as st
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
 # ==================== CREDENTIALS & GLOBAL STATE ====================
 
 API_KEY = get_secret("API_KEY")
