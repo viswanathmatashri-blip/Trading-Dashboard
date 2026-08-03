@@ -11,10 +11,9 @@ from scipy.optimize import brentq
 from SmartApi import SmartConnect
 
 # ==============================================================================
-# PURE SCIPY BLACK-SCHOLES & GREEKS ENGINE (NO VOLLIB DEPENDENCY)
+# PURE SCIPY BLACK-SCHOLES & GREEKS ENGINE
 # ==============================================================================
 def bs_price(flag, S, K, T, r, sigma):
-    """Calculate Black-Scholes option price."""
     if T <= 0 or sigma <= 0:
         return max(0.0, (S - K) if flag == 'c' else (K - S))
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
@@ -25,34 +24,27 @@ def bs_price(flag, S, K, T, r, sigma):
         return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 def bs_implied_volatility(price, S, K, T, r, flag):
-    """Calculate Implied Volatility using Brent's method solver."""
     intrinsic = max(0.0, (S - K) if flag == 'c' else (K - S))
     if price <= intrinsic:
-        return 0.10  # Fallback IV if price is below intrinsic value
+        return 0.10
     
-    # Objective function for root finder
     f = lambda sigma: bs_price(flag, S, K, T, r, sigma) - price
     
     try:
         return brentq(f, 1e-4, 5.0, xtol=1e-4)
     except Exception:
-        return 0.15  # Default fallback IV on convergence failure
+        return 0.15
 
 def bs_greeks(flag, S, K, T, r, sigma):
-    """Calculate analytical Gamma, Vega, and Theta."""
     if T <= 0 or sigma <= 0:
         return 0.0, 0.0, 0.0
     
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
     
-    # Gamma (Same for Call and Put)
     gamma_val = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    
-    # Vega (Same for Call and Put)
     vega_val = S * norm.pdf(d1) * np.sqrt(T)
     
-    # Theta
     p1 = -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
     if flag == 'c':
         p2 = r * K * np.exp(-r * T) * norm.cdf(d2)
@@ -78,16 +70,14 @@ def get_secret(key: str, default: str = "") -> str:
     except Exception:
         return default
 
-# Safely fetch credentials
 API_KEY = get_secret("API_KEY")
 CLIENT_CODE = get_secret("CLIENT_CODE")
 PIN = get_secret("PIN")
 TOTP_SECRET = get_secret("TOTP_SECRET")
 
-# QUANT PARAMETERS
-RISK_FREE_RATE = 0.068       # Benchmark Repo rate (~6.8%)
-LOT_SIZE = 65                # NIFTY Lot Size
-MIN_OI_THRESHOLD = 2500      # Open Interest Threshold
+RISK_FREE_RATE = 0.068       
+LOT_SIZE = 65                
+MIN_OI_THRESHOLD = 2500      
 TRADING_DAYS_PER_YEAR = 252.0
 
 @st.cache_resource(ttl=3600)
@@ -141,8 +131,34 @@ def get_nifty_option_chain(_log_placeholder):
     return chain, nearest_expiry
 
 
+def extract_oi_and_price(market_data_res):
+    """Safely extract price and Open Interest from various SmartAPI payload structures."""
+    if not isinstance(market_data_res, dict) or not market_data_res.get('status'):
+        return 0.0, 0.0
+    
+    data = market_data_res.get('data', {})
+    
+    # Check if data contains 'fetched' array or direct dict
+    if isinstance(data, dict) and 'fetched' in data and len(data['fetched']) > 0:
+        item = data['fetched'][0]
+    elif isinstance(data, list) and len(data) > 0:
+        item = data[0]
+    elif isinstance(data, dict):
+        item = data
+    else:
+        return 0.0, 0.0
+
+    # Extract Price (ltp)
+    price = float(item.get('ltp', item.get('lastPrice', 0)))
+    
+    # Extract Open Interest across potential keys
+    oi = float(item.get('op', item.get('openInterest', item.get('openinterest', item.get('oi', 0)))))
+    
+    return price, oi
+
+
 # ==============================================================================
-# 2. QUANT ENGINE WITH DETAILED EXECUTION LOGGING & INEQUALITY CHECKS
+# 2. QUANT ENGINE USING FULL MARKET DATA API
 # ==============================================================================
 def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
     log_placeholder.info("⏳ Step 3/4: Processing individual strikes & calculating Greeks...")
@@ -166,28 +182,20 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
             log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Missing CE/PE contract rows in chain)")
             continue
             
-        ce_symbol, ce_token = ce_row.iloc[0]['tradingsymbol'], ce_row.iloc[0]['token']
-        pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], pe_row.iloc[0]['token']
+        ce_symbol, ce_token = ce_row.iloc[0]['tradingsymbol'], str(ce_row.iloc[0]['token'])
+        pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], str(pe_row.iloc[0]['token'])
         
         try:
-            ce_res = smartApi.ltpData("NFO", ce_symbol, ce_token)
-            pe_res = smartApi.ltpData("NFO", pe_symbol, pe_token)
-            
-            if not isinstance(ce_res, dict) or not ce_res.get('status') or not isinstance(ce_res.get('data'), dict):
-                log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Failed API response for CE leg)")
-                continue
-            if not isinstance(pe_res, dict) or not pe_res.get('status') or not isinstance(pe_res.get('data'), dict):
-                log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Failed API response for PE leg)")
-                continue
+            # SWITCHED TO getMarketData("FULL", ...) TO RETRIEVE VALID OPEN INTEREST
+            ce_res = smartApi.getMarketData("FULL", {"NFO": [ce_token]})
+            pe_res = smartApi.getMarketData("FULL", {"NFO": [pe_token]})
 
-            ce_price = float(ce_res['data'].get('ltp', 0))
-            pe_price = float(pe_res['data'].get('ltp', 0))
-            ce_oi = float(ce_res['data'].get('openinterest', 0))
-            pe_oi = float(pe_res['data'].get('openinterest', 0))
+            ce_price, ce_oi = extract_oi_and_price(ce_res)
+            pe_price, pe_oi = extract_oi_and_price(pe_res)
 
             log_placeholder.write(f"📊 Strike {K:.0f} Metrics -> CE Price: ₹{ce_price:.2f}, PE Price: ₹{pe_price:.2f} | CE OI: {ce_oi:.0f}, PE OI: {pe_oi:.0f}")
 
-            # Inequality Checks
+            # Inequality Filters
             reasons = []
             if ce_price <= 0:
                 reasons.append(f"CE Price ({ce_price:.2f}) <= 0.00")
@@ -202,7 +210,6 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
                 log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped -> Reason: {', '.join(reasons)}")
                 continue
 
-            # Robust Custom IV & Greeks
             ce_iv = bs_implied_volatility(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
             pe_iv = bs_implied_volatility(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
 
@@ -232,7 +239,7 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
 
 
 # ==============================================================================
-# 3. OPTIMIZER WITH STRICT RISK CONTROLS & SELECTION AUDIT LOGGING
+# 3. OPTIMIZER WITH STRICT RISK CONTROLS & AUDIT
 # ==============================================================================
 def find_optimal_iron_condor(df, spot, T, log_placeholder):
     log_placeholder.info("⏳ Step 4/4: Evaluating Iron Condor combinations...")
@@ -390,7 +397,6 @@ st.title("⚡ Dynamic Risk-Managed Iron Condor Engine")
 
 live_mode = st.sidebar.checkbox("Enable Live Refresh (5s)", value=False)
 
-# TOP-RIGHT EXECUTION PROGRESS MONITOR
 with st.sidebar:
     st.markdown("---")
     st.subheader("🖥️ Execution Log Monitor")
@@ -456,7 +462,6 @@ try:
     else:
         st.warning("No valid Iron Condor setup met the minimum PoP, EV, and safety criteria for this tick.")
 
-    # AUDIT TRAIL DISPLAY
     st.markdown("---")
     st.subheader("🔍 Iron Condor Selection Audit Trail")
     if not df_audit.empty:
