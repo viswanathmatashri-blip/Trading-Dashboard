@@ -9,6 +9,7 @@ import streamlit as st
 from scipy.stats import norm
 from vollib.black_scholes.greeks.analytical import gamma, vega, theta
 from vollib.black_scholes.implied_volatility import implied_volatility
+from vollib.black_scholes.exceptions import BelowIntrinsicException
 from SmartApi import SmartConnect
 
 # ==============================================================================
@@ -88,8 +89,24 @@ def get_nifty_option_chain(_log_placeholder):
     return chain, nearest_expiry
 
 
+# Safe IV Calculation Helper to avoid crashing on ITM pricing anomalies
+def calculate_safe_iv(price, spot, K, T, rate, flag):
+    try:
+        # Check intrinsic lower bound manually
+        intrinsic = max(0.0, (spot - K) if flag == 'c' else (K - spot))
+        if price <= intrinsic:
+            return None, f"Price (₹{price:.2f}) <= Intrinsic (₹{intrinsic:.2f})"
+        
+        iv = implied_volatility(price, spot, K, T, rate, flag)
+        return iv, None
+    except BelowIntrinsicException:
+        return None, f"Price (₹{price:.2f}) below intrinsic value"
+    except Exception as e:
+        return None, str(e)
+
+
 # ==============================================================================
-# 2. QUANT ENGINE (BATCHED MARKET DATA TO PREVENT RATE LIMITS & PARSE ERRORS)
+# 2. QUANT ENGINE (SAFE IV CALCULATION & RESILIENT BATCH FETCHING)
 # ==============================================================================
 def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
     log_placeholder.info("⏳ Step 3/4: Batch-fetching market data & calculating Greeks...")
@@ -101,7 +118,6 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
     strikes = chain[(chain['strike'] >= spot_price * 0.92) & (chain['strike'] <= spot_price * 1.08)]['strike'].unique()
     strikes.sort()
     
-    # 1. Collect all CE & PE tokens for batch query
     token_map = {}
     tokens_to_fetch = []
     
@@ -115,7 +131,6 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
             token_map[K] = {'ce_token': ce_tok, 'pe_token': pe_tok}
             tokens_to_fetch.extend([ce_tok, pe_tok])
 
-    # 2. Batch Request to SmartAPI in chunks of 50 tokens
     market_data_lookup = {}
     chunk_size = 50
     for i in range(0, len(tokens_to_fetch), chunk_size):
@@ -130,7 +145,6 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
         except Exception as batch_err:
             log_placeholder.write(f"⚠️ Batch fetch warning (Chunk {i//chunk_size + 1}): {str(batch_err)}")
 
-    # 3. Process each strike pair using cached lookup table
     records = []
     total_strikes = len(strikes)
     
@@ -150,14 +164,12 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
         ce_oi = float(ce_data.get('opnInterest', ce_data.get('openinterest', 0)))
         pe_oi = float(pe_data.get('opnInterest', pe_data.get('openinterest', 0)))
 
-        # Display Live Metrics
         log_placeholder.write(
             f"📊 Strike {K:.0f} ({idx+1}/{total_strikes}) -> "
             f"CE Price: ₹{ce_price:.2f}, PE Price: ₹{pe_price:.2f} | "
             f"CE OI: {ce_oi:.0f}, PE OI: {pe_oi:.0f}"
         )
 
-        # Inequality & Liquidity Filters
         reasons = []
         if ce_price <= 0:
             reasons.append(f"CE Price ({ce_price:.2f}) <= 0.00")
@@ -172,10 +184,15 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
             log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped -> Reason: {', '.join(reasons)}")
             continue
 
-        try:
-            ce_iv = implied_volatility(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
-            pe_iv = implied_volatility(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
+        ce_iv, ce_err = calculate_safe_iv(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
+        pe_iv, pe_err = calculate_safe_iv(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
 
+        if ce_err or pe_err:
+            err_msg = ce_err if ce_err else pe_err
+            log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped -> Reason: {err_msg}")
+            continue
+
+        try:
             ce_g = gamma('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
             pe_g = gamma('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
             ce_v = vega('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
@@ -231,31 +248,49 @@ def find_optimal_iron_condor(df, spot, T, log_placeholder):
             short_put_k = strikes[j]
             wing_width = short_put_k - long_put_k
             
-            if short_put_k >= spot or (spot - short_put_k) < MIN_OTM_BUFFER:
+            # Enforce Short Put MUST be OTM (below spot) and outside minimum safety buffer
+            if short_put_k >= spot:
                 audit_logs.append({
-                    'combo': f"{long_put_k}/{short_put_k}/X/X",
+                    'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/X/X",
                     'status': 'Rejected',
-                    'reason': f"Short Put ({short_put_k}) too close to spot (Buffer: {spot - short_put_k:.1f} < {MIN_OTM_BUFFER:.1f})"
+                    'reason': f"Short Put ({short_put_k:.0f}) is In-The-Money (>= Spot {spot:.1f})"
+                })
+                continue
+
+            if (spot - short_put_k) < MIN_OTM_BUFFER:
+                audit_logs.append({
+                    'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/X/X",
+                    'status': 'Rejected',
+                    'reason': f"Short Put ({short_put_k:.0f}) too close to spot (Buffer: {spot - short_put_k:.1f} < {MIN_OTM_BUFFER:.1f})"
                 })
                 continue
                 
             for k in range(j + 1, len(strikes)):
                 short_call_k = strikes[k]
                 
-                if short_call_k <= spot or (short_call_k - spot) < MIN_OTM_BUFFER:
+                # Enforce Short Call MUST be OTM (above spot) and outside minimum safety buffer
+                if short_call_k <= spot:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/X",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/X",
                         'status': 'Rejected',
-                        'reason': f"Short Call ({short_call_k}) too close to spot (Buffer: {short_call_k - spot:.1f} < {MIN_OTM_BUFFER:.1f})"
+                        'reason': f"Short Call ({short_call_k:.0f}) is In-The-Money (<= Spot {spot:.1f})"
+                    })
+                    continue
+
+                if (short_call_k - spot) < MIN_OTM_BUFFER:
+                    audit_logs.append({
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/X",
+                        'status': 'Rejected',
+                        'reason': f"Short Call ({short_call_k:.0f}) too close to spot (Buffer: {short_call_k - spot:.1f} < {MIN_OTM_BUFFER:.1f})"
                     })
                     continue
                     
                 long_call_k = short_call_k + wing_width
                 if long_call_k not in strikes:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Rejected',
-                        'reason': f"Symmetric Long Call Strike ({long_call_k}) not in liquid strikes"
+                        'reason': f"Symmetric Long Call Strike ({long_call_k:.0f}) not in liquid strikes"
                     })
                     continue
                     
@@ -271,7 +306,7 @@ def find_optimal_iron_condor(df, spot, T, log_placeholder):
                 
                 if net_credit <= 1.0 or max_loss <= 0:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Rejected',
                         'reason': f"Credit ({net_credit:.2f}) <= 1.0 or Max Loss ({max_loss:.2f}) <= 0"
                     })
@@ -288,7 +323,7 @@ def find_optimal_iron_condor(df, spot, T, log_placeholder):
                 
                 if pop < 0.52:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Rejected',
                         'reason': f"PoP ({pop*100:.1f}%) < 52.0%"
                     })
@@ -300,7 +335,7 @@ def find_optimal_iron_condor(df, spot, T, log_placeholder):
                 
                 if expected_value <= 0:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Rejected',
                         'reason': f"Expected Value (EV: ₹{expected_value * LOT_SIZE:.2f}) <= 0"
                     })
