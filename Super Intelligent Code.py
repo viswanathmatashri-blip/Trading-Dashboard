@@ -12,7 +12,7 @@ from vollib.black_scholes.implied_volatility import implied_volatility
 from SmartApi import SmartConnect
 
 # ==============================================================================
-# STREAMLIT CONFIGURATION & SECURE AUTHENTICATION
+# 1. STREAMLIT CONFIGURATION & SECURE AUTHENTICATION
 # ==============================================================================
 st.set_page_config(page_title="Institutional Quant Iron Condor", page_icon="⚡", layout="wide")
 
@@ -89,7 +89,7 @@ def get_nifty_option_chain(_log_placeholder):
 
 
 # ==============================================================================
-# 2. QUANT ENGINE WITH DETAILED EXECUTION LOGGING & INEQUALITY CHECKS
+# 2. QUANT ENGINE (UPDATED TO USE GETMARKETDATA FULL FOR ACCURATE OI)
 # ==============================================================================
 def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
     log_placeholder.info("⏳ Step 3/4: Processing individual strikes & calculating Greeks...")
@@ -113,29 +113,32 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
             log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Missing CE/PE contract rows in chain)")
             continue
             
-        ce_symbol, ce_token = ce_row.iloc[0]['tradingsymbol'], ce_row.iloc[0]['token']
-        pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], pe_row.iloc[0]['token']
+        ce_token = str(ce_row.iloc[0]['token'])
+        pe_token = str(pe_row.iloc[0]['token'])
         
         try:
-            ce_res = smartApi.ltpData("NFO", ce_symbol, ce_token)
-            pe_res = smartApi.ltpData("NFO", pe_symbol, pe_token)
+            # Using FULL market data mode (exchangeSegment: 2 is NFO) to capture actual Open Interest
+            ce_res = smartApi.getMarketData("FULL", {"exchangeSegment": 2, "tokens": [ce_token]})
+            pe_res = smartApi.getMarketData("FULL", {"exchangeSegment": 2, "tokens": [pe_token]})
             
-            if not isinstance(ce_res, dict) or not ce_res.get('status') or not isinstance(ce_res.get('data'), dict):
-                log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Failed API response for CE leg)")
-                continue
-            if not isinstance(pe_res, dict) or not pe_res.get('status') or not isinstance(pe_res.get('data'), dict):
-                log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Failed API response for PE leg)")
+            ce_data = ce_res.get('data', {}).get('fetched', [{}])[0] if isinstance(ce_res, dict) and ce_res.get('status') else {}
+            pe_data = pe_res.get('data', {}).get('fetched', [{}])[0] if isinstance(pe_res, dict) and pe_res.get('status') else {}
+
+            if not ce_data or not pe_data:
+                log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Failed API market data response)")
                 continue
 
-            ce_price = float(ce_res['data'].get('ltp', 0))
-            pe_price = float(pe_res['data'].get('ltp', 0))
-            ce_oi = float(ce_res['data'].get('openinterest', 0))
-            pe_oi = float(pe_res['data'].get('openinterest', 0))
+            ce_price = float(ce_data.get('ltp', 0))
+            pe_price = float(pe_data.get('ltp', 0))
+            
+            # Fetch Open Interest (Key in FULL mode payload is 'opnInterest')
+            ce_oi = float(ce_data.get('opnInterest', ce_data.get('openinterest', 0)))
+            pe_oi = float(pe_data.get('opnInterest', pe_data.get('openinterest', 0)))
 
-            # Detailed Output: Print exact Price and OI values
+            # Detailed Output Log
             log_placeholder.write(f"📊 Strike {K:.0f} Metrics -> CE Price: ₹{ce_price:.2f}, PE Price: ₹{pe_price:.2f} | CE OI: {ce_oi:.0f}, PE OI: {pe_oi:.0f}")
 
-            # Specific Inequality Filter Checks with Explicit Skipped Reasons
+            # Specific Inequality Filter Checks
             reasons = []
             if ce_price <= 0:
                 reasons.append(f"CE Price ({ce_price:.2f}) <= 0.00")
