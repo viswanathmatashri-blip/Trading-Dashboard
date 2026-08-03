@@ -51,12 +51,14 @@ def authenticate():
 
 
 @st.cache_data(ttl=1800)
-def get_nifty_option_chain():
+def get_nifty_option_chain(log_placeholder):
+    log_placeholder.info("⏳ Step 1/4: Fetching master NIFTY option chain file...")
     url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     response = requests.get(url, headers=headers, timeout=15)
     if response.status_code != 200:
+        log_placeholder.warning("⚠️ Primary master URL failed, retrying fallback URL...")
         url = "https://margincalculator.angelbroking.com/OpenAPI_Data/files/OpenAPIScripMaster.json"
         response = requests.get(url, headers=headers, timeout=15)
         
@@ -82,13 +84,15 @@ def get_nifty_option_chain():
     nearest_expiry = upcoming_expiries.min()
     
     chain = nifty_opts[nifty_opts['expiry_dt'] == nearest_expiry].copy()
+    log_placeholder.success(f"✅ Option chain received for expiry date: **{nearest_expiry.strftime('%d-%b-%Y')}**")
     return chain, nearest_expiry
 
 
 # ==============================================================================
 # 2. QUANT ENGINE WITH REAL-TIME GREEKS & LIQUIDITY FILTERS
 # ==============================================================================
-def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
+def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
+    log_placeholder.info("⏳ Step 3/4: Processing individual strikes & calculating Greeks...")
     now = pd.Timestamp.now()
     expiry_end = expiry_dt + pd.Timedelta(hours=15, minutes=30)
     remaining_seconds = max((expiry_end - now).total_seconds(), 3600)
@@ -98,7 +102,10 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
     strikes = chain[(chain['strike'] >= spot_price * 0.92) & (chain['strike'] <= spot_price * 1.08)]['strike'].unique()
     strikes.sort()
     
-    for K in strikes:
+    total_strikes = len(strikes)
+    for idx, K in enumerate(strikes):
+        log_placeholder.write(f"🔄 Evaluating Strike **{K:.0f}** ({idx+1}/{total_strikes})...")
+        
         ce_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('CE'))]
         pe_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('PE'))]
         
@@ -122,13 +129,18 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
             ce_oi = float(ce_res['data'].get('openinterest', 0))
             pe_oi = float(pe_res['data'].get('openinterest', 0))
             
-            # Liquidity Filter
+            # Liquidity Filter Check
             if ce_price <= 0 or pe_price <= 0 or ce_oi < MIN_OI_THRESHOLD or pe_oi < MIN_OI_THRESHOLD:
+                log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Low Open Interest / Zero Price)")
                 continue
+
+            log_placeholder.write(f"📊 Strike {K:.0f}: CE={ce_price} (OI: {ce_oi:.0f}), PE={pe_price} (OI: {pe_oi:.0f})")
 
             ce_iv = implied_volatility(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
             pe_iv = implied_volatility(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
             
+            log_placeholder.write(f"📈 Calculated Implied Volatility: CE IV={ce_iv*100:.1f}%, PE IV={pe_iv*100:.1f}%")
+
             ce_g = gamma('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
             pe_g = gamma('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
             ce_v = vega('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
@@ -146,17 +158,20 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
                 'ce_theta': ce_t, 'pe_theta': pe_t,
                 'gex': net_gex
             })
-        except Exception:
+        except Exception as e:
+            log_placeholder.write(f"❌ Error processing Strike {K:.0f}: {str(e)}")
             continue
             
     df_quant = pd.DataFrame(records)
+    log_placeholder.success(f"✅ Quant Engine Complete: Filtered {len(df_quant)} liquid strike pairs.")
     return df_quant, T
 
 
 # ==============================================================================
 # 3. OPTIMIZER WITH STRICT RISK CONTROLS & SELECTION AUDIT LOGGING
 # ==============================================================================
-def find_optimal_iron_condor(df, spot, T):
+def find_optimal_iron_condor(df, spot, T, log_placeholder):
+    log_placeholder.info("⏳ Step 4/4: Evaluating Iron Condor combinations...")
     if df is None or df.empty:
         return None, pd.DataFrame()
         
@@ -169,6 +184,7 @@ def find_optimal_iron_condor(df, spot, T):
     MIN_OTM_BUFFER = max(spot * 0.004, expected_1d_move * 0.5)
     
     audit_logs = []
+    combo_count = 0
 
     for i in range(len(strikes)):
         long_put_k = strikes[i]
@@ -205,13 +221,13 @@ def find_optimal_iron_condor(df, spot, T):
                     })
                     continue
                     
+                combo_count += 1
                 lp_row = df[df['strike'] == long_put_k].iloc[0]
                 sp_row = df[df['strike'] == short_put_k].iloc[0]
                 sc_row = df[df['strike'] == short_call_k].iloc[0]
                 lc_row = df[df['strike'] == long_call_k].iloc[0]
                 
                 raw_credit = (sp_row['pe_price'] + sc_row['ce_price']) - (lp_row['pe_price'] + lc_row['ce_price'])
-                
                 net_credit = raw_credit * 0.96
                 max_loss = wing_width - net_credit
                 
@@ -285,6 +301,7 @@ def find_optimal_iron_condor(df, spot, T):
                         })
                     best_score = utility_score
                     optimal_condor = cand_details
+                    log_placeholder.write(f"🎯 New Best Condor Found: {long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f} (Utility: {utility_score:.4f})")
                     audit_logs.append({
                         'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Selected (Current Best)',
@@ -298,6 +315,7 @@ def find_optimal_iron_condor(df, spot, T):
                     })
 
     df_audit = pd.DataFrame(audit_logs)
+    log_placeholder.success(f"✅ Evaluated {combo_count} valid Iron Condor structures.")
     return optimal_condor, df_audit
 
 
@@ -308,22 +326,33 @@ st.title("⚡ Dynamic Risk-Managed Iron Condor Engine")
 
 live_mode = st.sidebar.checkbox("Enable Live Refresh (5s)", value=False)
 
-# API CONNECTION STATUS BANNER
+# TOP-RIGHT EXECUTION PROGRESS MONITOR
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("🖥️ Execution Log Monitor")
+    exec_status = st.status("Initializing Quantum Engine...", expanded=True)
+
 try:
+    exec_status.write("🔑 Authenticating with SmartAPI...")
     smartApi = authenticate()
     st.success(f"🟢 **API Connection Status:** Successfully connected to SmartAPI (Client ID: `{CLIENT_CODE}`)")
+    exec_status.write("✅ Authentication Successful.")
+
+    chain, expiry_dt = get_nifty_option_chain(exec_status)
     
-    chain, expiry_dt = get_nifty_option_chain()
-    
+    exec_status.info("⏳ Step 2/4: Fetching live NIFTY index spot price...")
     spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
     if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
-        st.warning("⚠️ Spot Price Fetch Warning: Market closed or feed delayed. Using fallback benchmark.")
+        exec_status.warning("⚠️ Spot Price Fetch Warning: Market closed or feed delayed. Using fallback benchmark.")
         spot_price = 24383.60
     else:
         spot_price = float(spot_res['data']['ltp'])
+        exec_status.success(f"✅ NIFTY Spot Price Received: **₹{spot_price:,.2f}**")
     
-    df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt)
-    result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T)
+    df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt, exec_status)
+    result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T, exec_status)
+
+    exec_status.update(label="🚀 Execution Complete!", state="complete", expanded=False)
 
     st.subheader("📌 Live Market Dashboard")
     m1, m2, m3, m4 = st.columns(4)
@@ -378,6 +407,8 @@ try:
         st.info("No strike combinations evaluated.")
 
 except Exception as e:
+    exec_status.update(label="❌ Execution Failed", state="error", expanded=True)
+    exec_status.error(f"Error: {str(e)}")
     st.error(f"🔴 **API Connection Status:** Connection Failed! Details: {str(e)}")
 
 if live_mode:
