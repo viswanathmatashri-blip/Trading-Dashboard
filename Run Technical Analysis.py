@@ -1296,8 +1296,7 @@ def generate_condor_backtest_card(bt):
         html.Div(bt['note'], style={'color': '#666', 'fontSize': '9px', 'marginTop': '4px'}),
     ])
 
-# ==================== DASH APP ====================
-# ==================== DASH APP LAYOUT ====================
+# ==================== DASH APP LAYOUT & CALLBACK ====================
 
 app = Dash(__name__, meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
 server = app.server
@@ -1357,13 +1356,14 @@ app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'f
     dcc.Graph(id='multi-indicator-graph', config={'responsive': True}),
     dcc.Interval(id='interval-component', interval=STD_PARAMS['REFRESH_MS'], n_intervals=0),
 ])
+
 @app.callback(
     [Output('multi-indicator-graph', 'figure'),
      Output('strategy-performance-cards', 'children'),
      Output('options-trading-banner', 'children'),
      Output('session-warning', 'children'),
      Output('market-insights-panel', 'children'),
-     Output('top-auth-status-container', 'children')],  # Added Auth output
+     Output('top-auth-status-container', 'children')],
     Input('interval-component', 'n_intervals'),
 )
 def update_dashboard(n):
@@ -1371,11 +1371,6 @@ def update_dashboard(n):
     if not session_active:
         login_smartapi()
 
-    # ... [Keep rest of your chart rendering code unchanged] ...
-
-    return fig, card_elements, options_banner, warning, insights_panel, get_auth_badge()
-
-def update_dashboard(n):
     warning = html.Div() if session_active else html.Div(
         "SmartAPI session inactive -- set SMARTAPI_KEY / SMARTAPI_CLIENT_CODE / SMARTAPI_PIN / SMARTAPI_TOTP_SECRET as env vars.",
         style={'color': '#ff1744', 'textAlign': 'center', 'fontSize': '12px', 'marginBottom': '8px'}
@@ -1387,7 +1382,7 @@ def update_dashboard(n):
         fig.update_layout(template="plotly_dark", annotations=[{
             "text": "NIFTY 50 DATA NOT FOUND OR API DOWN", "showarrow": False, "font": {"size": 18, "color": "#ff1744"}
         }])
-        return fig, [html.Div("Data Not Found", style={'color': '#ff1744', 'fontSize': '16px'})], html.Div(), warning, html.Div()
+        return fig, [html.Div("Data Not Found", style={'color': '#ff1744', 'fontSize': '16px'})], html.Div(), warning, html.Div(), get_auth_badge()
 
     cached = get_cached_backtests()
     comb_pnl, comb_t = cached["directional_pnl"], cached["directional_trades"]
@@ -1439,7 +1434,8 @@ def update_dashboard(n):
         template="plotly_dark", height=700, xaxis_rangeslider_visible=False, showlegend=False,
         margin=dict(l=20, r=20, t=40, b=20)
     )
-    return fig, card_elements, options_banner, warning, insights_panel
+    
+    return fig, card_elements, options_banner, warning, insights_panel, get_auth_badge()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8050))
