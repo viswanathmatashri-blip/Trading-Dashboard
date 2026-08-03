@@ -89,70 +89,90 @@ def get_nifty_option_chain(_log_placeholder):
 
 
 # ==============================================================================
-# 2. QUANT ENGINE (UPDATED TO USE GETMARKETDATA FULL FOR ACCURATE OI)
+# 2. QUANT ENGINE (BATCHED MARKET DATA TO PREVENT RATE LIMITS & PARSE ERRORS)
 # ==============================================================================
 def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
-    log_placeholder.info("⏳ Step 3/4: Processing individual strikes & calculating Greeks...")
+    log_placeholder.info("⏳ Step 3/4: Batch-fetching market data & calculating Greeks...")
     now = pd.Timestamp.now()
     expiry_end = expiry_dt + pd.Timedelta(hours=15, minutes=30)
     remaining_seconds = max((expiry_end - now).total_seconds(), 3600)
     T = remaining_seconds / (365.0 * 86400.0)
     
-    records = []
     strikes = chain[(chain['strike'] >= spot_price * 0.92) & (chain['strike'] <= spot_price * 1.08)]['strike'].unique()
     strikes.sort()
     
-    total_strikes = len(strikes)
-    for idx, K in enumerate(strikes):
-        log_placeholder.write(f"🔄 **Evaluating Strike {K:.0f}** ({idx+1}/{total_strikes})...")
-        
+    # 1. Collect all CE & PE tokens for batch query
+    token_map = {}
+    tokens_to_fetch = []
+    
+    for K in strikes:
         ce_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('CE'))]
         pe_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('PE'))]
         
-        if ce_row.empty or pe_row.empty:
-            log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Missing CE/PE contract rows in chain)")
+        if not ce_row.empty and not pe_row.empty:
+            ce_tok = str(ce_row.iloc[0]['token'])
+            pe_tok = str(pe_row.iloc[0]['token'])
+            token_map[K] = {'ce_token': ce_tok, 'pe_token': pe_tok}
+            tokens_to_fetch.extend([ce_tok, pe_tok])
+
+    # 2. Batch Request to SmartAPI in chunks of 50 tokens
+    market_data_lookup = {}
+    chunk_size = 50
+    for i in range(0, len(tokens_to_fetch), chunk_size):
+        chunk = tokens_to_fetch[i:i + chunk_size]
+        try:
+            res = smartApi.getMarketData("FULL", {"NFO": chunk})
+            if isinstance(res, dict) and res.get('status') and res.get('data', {}).get('fetched'):
+                for item in res['data']['fetched']:
+                    tok = str(item.get('symbolToken', ''))
+                    if tok:
+                        market_data_lookup[tok] = item
+        except Exception as batch_err:
+            log_placeholder.write(f"⚠️ Batch fetch warning (Chunk {i//chunk_size + 1}): {str(batch_err)}")
+
+    # 3. Process each strike pair using cached lookup table
+    records = []
+    total_strikes = len(strikes)
+    
+    for idx, K in enumerate(strikes):
+        if K not in token_map:
+            log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Missing CE/PE contract rows)")
             continue
             
-        ce_token = str(ce_row.iloc[0]['token'])
-        pe_token = str(pe_row.iloc[0]['token'])
+        ce_tok = token_map[K]['ce_token']
+        pe_tok = token_map[K]['pe_token']
         
+        ce_data = market_data_lookup.get(ce_tok, {})
+        pe_data = market_data_lookup.get(pe_tok, {})
+        
+        ce_price = float(ce_data.get('ltp', 0))
+        pe_price = float(pe_data.get('ltp', 0))
+        ce_oi = float(ce_data.get('opnInterest', ce_data.get('openinterest', 0)))
+        pe_oi = float(pe_data.get('opnInterest', pe_data.get('openinterest', 0)))
+
+        # Display Live Metrics
+        log_placeholder.write(
+            f"📊 Strike {K:.0f} ({idx+1}/{total_strikes}) -> "
+            f"CE Price: ₹{ce_price:.2f}, PE Price: ₹{pe_price:.2f} | "
+            f"CE OI: {ce_oi:.0f}, PE OI: {pe_oi:.0f}"
+        )
+
+        # Inequality & Liquidity Filters
+        reasons = []
+        if ce_price <= 0:
+            reasons.append(f"CE Price ({ce_price:.2f}) <= 0.00")
+        if pe_price <= 0:
+            reasons.append(f"PE Price ({pe_price:.2f}) <= 0.00")
+        if ce_oi < MIN_OI_THRESHOLD:
+            reasons.append(f"CE OI ({ce_oi:.0f}) < {MIN_OI_THRESHOLD}")
+        if pe_oi < MIN_OI_THRESHOLD:
+            reasons.append(f"PE OI ({pe_oi:.0f}) < {MIN_OI_THRESHOLD}")
+
+        if reasons:
+            log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped -> Reason: {', '.join(reasons)}")
+            continue
+
         try:
-            # Using FULL market data mode (exchangeSegment: 2 is NFO) to capture actual Open Interest
-            ce_res = smartApi.getMarketData("FULL", {"exchangeSegment": 2, "tokens": [ce_token]})
-            pe_res = smartApi.getMarketData("FULL", {"exchangeSegment": 2, "tokens": [pe_token]})
-            
-            ce_data = ce_res.get('data', {}).get('fetched', [{}])[0] if isinstance(ce_res, dict) and ce_res.get('status') else {}
-            pe_data = pe_res.get('data', {}).get('fetched', [{}])[0] if isinstance(pe_res, dict) and pe_res.get('status') else {}
-
-            if not ce_data or not pe_data:
-                log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped (Failed API market data response)")
-                continue
-
-            ce_price = float(ce_data.get('ltp', 0))
-            pe_price = float(pe_data.get('ltp', 0))
-            
-            # Fetch Open Interest (Key in FULL mode payload is 'opnInterest')
-            ce_oi = float(ce_data.get('opnInterest', ce_data.get('openinterest', 0)))
-            pe_oi = float(pe_data.get('opnInterest', pe_data.get('openinterest', 0)))
-
-            # Detailed Output Log
-            log_placeholder.write(f"📊 Strike {K:.0f} Metrics -> CE Price: ₹{ce_price:.2f}, PE Price: ₹{pe_price:.2f} | CE OI: {ce_oi:.0f}, PE OI: {pe_oi:.0f}")
-
-            # Specific Inequality Filter Checks
-            reasons = []
-            if ce_price <= 0:
-                reasons.append(f"CE Price ({ce_price:.2f}) <= 0.00")
-            if pe_price <= 0:
-                reasons.append(f"PE Price ({pe_price:.2f}) <= 0.00")
-            if ce_oi < MIN_OI_THRESHOLD:
-                reasons.append(f"CE OI ({ce_oi:.0f}) < {MIN_OI_THRESHOLD}")
-            if pe_oi < MIN_OI_THRESHOLD:
-                reasons.append(f"PE OI ({pe_oi:.0f}) < {MIN_OI_THRESHOLD}")
-
-            if reasons:
-                log_placeholder.write(f"⚠️ Strike {K:.0f}: Skipped -> Reason: {', '.join(reasons)}")
-                continue
-
             ce_iv = implied_volatility(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
             pe_iv = implied_volatility(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
 
@@ -176,8 +196,8 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
             
             log_placeholder.write(f"✅ Strike {K:.0f}: Passed all filters & quantified.")
 
-        except Exception as e:
-            log_placeholder.write(f"❌ Strike {K:.0f}: Error during calculation ({str(e)})")
+        except Exception as calc_err:
+            log_placeholder.write(f"❌ Strike {K:.0f}: Error during pricing calculation ({str(calc_err)})")
             continue
             
     df_quant = pd.DataFrame(records)
