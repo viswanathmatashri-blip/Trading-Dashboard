@@ -50,15 +50,16 @@ def authenticate():
     return smartApi
 
 
+# Leading underscore in _log_placeholder prevents Streamlit caching hash errors
 @st.cache_data(ttl=1800)
-def get_nifty_option_chain(log_placeholder):
-    log_placeholder.info("⏳ Step 1/4: Fetching master NIFTY option chain file...")
+def get_nifty_option_chain(_log_placeholder):
+    _log_placeholder.info("⏳ Step 1/4: Fetching master NIFTY option chain file...")
     url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     response = requests.get(url, headers=headers, timeout=15)
     if response.status_code != 200:
-        log_placeholder.warning("⚠️ Primary master URL failed, retrying fallback URL...")
+        _log_placeholder.warning("⚠️ Primary master URL failed, retrying fallback URL...")
         url = "https://margincalculator.angelbroking.com/OpenAPI_Data/files/OpenAPIScripMaster.json"
         response = requests.get(url, headers=headers, timeout=15)
         
@@ -84,7 +85,7 @@ def get_nifty_option_chain(log_placeholder):
     nearest_expiry = upcoming_expiries.min()
     
     chain = nifty_opts[nifty_opts['expiry_dt'] == nearest_expiry].copy()
-    log_placeholder.success(f"✅ Option chain received for expiry date: **{nearest_expiry.strftime('%d-%b-%Y')}**")
+    _log_placeholder.success(f"✅ Option chain received for expiry date: **{nearest_expiry.strftime('%d-%b-%Y')}**")
     return chain, nearest_expiry
 
 
