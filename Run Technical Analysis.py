@@ -89,16 +89,24 @@ MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 
 @st.cache_resource(ttl=3600)
-def authenticate():
+def authenticate(status_container=None):
+    if status_container:
+        status_container.write("🔑 Checking SmartAPI credentials...")
     if not API_KEY or not CLIENT_CODE:
         st.error("🔑 Credentials missing! Configure Streamlit secrets or environment variables.")
         st.stop()
+    
+    if status_container:
+        status_container.write("🌐 Generating TOTP & Initializing SmartConnect API session...")
     smartApi = SmartConnect(api_key=API_KEY)
     totp = pyotp.TOTP(TOTP_SECRET).now()
     session = smartApi.generateSession(CLIENT_CODE, PIN, totp)
     if not isinstance(session, dict) or not session.get('status'):
         msg = session.get('message', 'Authentication Failed') if isinstance(session, dict) else 'Invalid Auth Response'
         raise ConnectionError(f"SmartAPI Login Failed: {msg}")
+        
+    if status_container:
+        status_container.write("✅ SmartAPI Connected successfully.")
     return smartApi
 
 @st.cache_data(ttl=1800)
@@ -137,7 +145,9 @@ def get_nifty_option_chain():
 
 # ==================== BLACK-SCHOLES & GREEKS ENGINE ====================
 
-def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
+def run_quant_engine(smartApi, chain, spot_price, expiry_dt, status_container=None):
+    if status_container:
+        status_container.write("📐 Calculating Time-To-Expiry (TTE) in years...")
     now = pd.Timestamp.now()
     expiry_end = expiry_dt + pd.Timedelta(hours=15, minutes=30)
     remaining_seconds = max((expiry_end - now).total_seconds(), 3600)
@@ -147,7 +157,11 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
     strikes = chain[(chain['strike'] >= spot_price * 0.92) & (chain['strike'] <= spot_price * 1.08)]['strike'].unique()
     strikes.sort()
     
-    for K in strikes:
+    total_strikes = len(strikes)
+    if status_container:
+        status_container.write(f"⚡ Fetching live ticks & computing Implied Volatility / Greeks for {total_strikes} strike levels...")
+    
+    for idx, K in enumerate(strikes):
         ce_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('CE'))]
         pe_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('PE'))]
 
@@ -199,15 +213,20 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
             continue
             
     df_quant = pd.DataFrame(records)
+    if status_container:
+        status_container.write(f"✅ Quant Engine Complete: Successfully processed {len(df_quant)} liquid strike rows.")
     return df_quant, T
 
 # ==============================================================================
 # OPTIMIZER WITH STRICT RISK CONTROLS & SELECTION AUDIT LOGGING
 # ==============================================================================
-def find_optimal_iron_condor(df, spot, T):
+def find_optimal_iron_condor(df, spot, T, status_container=None):
     if df is None or df.empty:
         return None, pd.DataFrame()
         
+    if status_container:
+        status_container.write("🎯 Running Iron Condor Combinatorial Optimizer & Risk Filters...")
+
     best_score = -np.inf
     optimal_condor = None
     strikes = np.sort(df['strike'].unique())
@@ -346,6 +365,8 @@ def find_optimal_iron_condor(df, spot, T):
                     })
 
     df_audit = pd.DataFrame(audit_logs)
+    if status_container:
+        status_container.write(f"📊 Evaluated {len(df_audit)} total option leg combinations.")
     return optimal_condor, df_audit
 
 # ==============================================================================
@@ -356,18 +377,28 @@ st.title("⚡ Dynamic Risk-Managed Iron Condor Engine")
 live_mode = st.sidebar.checkbox("Enable Live Refresh (5s)", value=False)
 
 try:
-    smartApi = authenticate()
-    chain, expiry_dt = get_nifty_option_chain()
-    
-    spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
-    if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
-        st.warning("⚠️ Spot Price Fetch Warning: Market closed or feed delayed. Using fallback benchmark.")
-        spot_price = 24383.60
-    else:
-        spot_price = float(spot_res['data']['ltp'])
-    
-    df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt)
-    result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T)
+    # --- Live Background Process Display ---
+    with st.status("⚙️ Processing Quant Calculations & Market Data...", expanded=True) as status:
+        status.write("🔌 Connecting to Angel One SmartAPI...")
+        smartApi = authenticate(status_container=status)
+        
+        status.write("📋 Fetching NIFTY Option Chain Scrip Master...")
+        chain, expiry_dt = get_nifty_option_chain()
+        status.write(f"✅ Option chain retrieved. Target Expiry: {expiry_dt.strftime('%d-%b-%Y')}")
+        
+        status.write("📈 Fetching NIFTY 50 Spot Price...")
+        spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
+        if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
+            status.write("⚠️ Spot price feed warning. Utilizing benchmark spot price fallback.")
+            spot_price = 24383.60
+        else:
+            spot_price = float(spot_res['data']['ltp'])
+        status.write(f"✅ NIFTY Spot Price: ₹{spot_price:,.2f}")
+        
+        df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt, status_container=status)
+        result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T, status_container=status)
+        
+        status.update(label="✅ All Background Calculations Complete!", state="complete", expanded=False)
 
     st.subheader("📌 Live Market Dashboard")
     m1, m2, m3, m4 = st.columns(4)
