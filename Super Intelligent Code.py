@@ -132,28 +132,41 @@ def get_nifty_option_chain(_log_placeholder):
 
 
 def extract_oi_and_price(market_data_res):
-    """Safely extract price and Open Interest from various SmartAPI payload structures."""
+    """Safely extract price and Open Interest from SmartAPI FULL market data payload structures."""
     if not isinstance(market_data_res, dict) or not market_data_res.get('status'):
         return 0.0, 0.0
     
     data = market_data_res.get('data', {})
     
-    # Check if data contains 'fetched' array or direct dict
-    if isinstance(data, dict) and 'fetched' in data and len(data['fetched']) > 0:
-        item = data['fetched'][0]
+    # Locate target item dictionary in data or fetched list
+    if isinstance(data, dict):
+        if 'fetched' in data and isinstance(data['fetched'], list) and len(data['fetched']) > 0:
+            item = data['fetched'][0]
+        else:
+            item = data
     elif isinstance(data, list) and len(data) > 0:
         item = data[0]
-    elif isinstance(data, dict):
-        item = data
     else:
         return 0.0, 0.0
 
-    # Extract Price (ltp)
-    price = float(item.get('ltp', item.get('lastPrice', 0)))
+    # Extract Price (ltp / lastPrice)
+    price = float(item.get('ltp', item.get('lastPrice', 0.0)))
     
-    # Extract Open Interest across potential keys
-    oi = float(item.get('op', item.get('openInterest', item.get('openinterest', item.get('oi', 0)))))
+    # Extract Open Interest using all potential key variants returned by SmartAPI FULL mode
+    raw_oi = (
+        item.get('op') or 
+        item.get('openInterest') or 
+        item.get('opnInterest') or 
+        item.get('openinterest') or 
+        item.get('oi') or 
+        0
+    )
     
+    try:
+        oi = float(str(raw_oi).replace(',', '').strip())
+    except (ValueError, TypeError):
+        oi = 0.0
+
     return price, oi
 
 
@@ -186,9 +199,9 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
         pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], str(pe_row.iloc[0]['token'])
         
         try:
-            # SWITCHED TO getMarketData("FULL", ...) TO RETRIEVE VALID OPEN INTEREST
-            ce_res = smartApi.getMarketData("FULL", {"NFO": [ce_token]})
-            pe_res = smartApi.getMarketData("FULL", {"NFO": [pe_token]})
+            # PROPER API PARAMETER KEYS REQUIRED BY SMARTCONNECT
+            ce_res = smartApi.getMarketData(mode="FULL", exchangeTokens={"NFO": [ce_token]})
+            pe_res = smartApi.getMarketData(mode="FULL", exchangeTokens={"NFO": [pe_token]})
 
             ce_price, ce_oi = extract_oi_and_price(ce_res)
             pe_price, pe_oi = extract_oi_and_price(pe_res)
