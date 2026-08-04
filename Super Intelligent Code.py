@@ -94,14 +94,13 @@ def authenticate():
 
 
 @st.cache_data(ttl=1800)
-def get_nifty_option_chain(_log_placeholder):
-    _log_placeholder.info("⏳ Step 1/4: Fetching master NIFTY option chain file...")
+def get_nifty_option_chain():
+    """Pure data fetching function without Streamlit UI elements to allow clean caching."""
     url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
     headers = {'User-Agent': 'Mozilla/5.0'}
     
     response = requests.get(url, headers=headers, timeout=15)
     if response.status_code != 200:
-        _log_placeholder.warning("⚠️ Primary master URL failed, retrying fallback URL...")
         url = "https://margincalculator.angelbroking.com/OpenAPI_Data/files/OpenAPIScripMaster.json"
         response = requests.get(url, headers=headers, timeout=15)
         
@@ -127,7 +126,6 @@ def get_nifty_option_chain(_log_placeholder):
     nearest_expiry = upcoming_expiries.min()
     
     chain = nifty_opts[nifty_opts['expiry_dt'] == nearest_expiry].copy()
-    _log_placeholder.success(f"✅ Option chain received for expiry date: **{nearest_expiry.strftime('%d-%b-%Y')}**")
     return chain, nearest_expiry
 
 
@@ -421,7 +419,9 @@ try:
     st.success(f"🟢 **API Connection Status:** Successfully connected to SmartAPI (Client ID: `{CLIENT_CODE}`)")
     exec_status.write("✅ Authentication Successful.")
 
-    chain, expiry_dt = get_nifty_option_chain(exec_status)
+    exec_status.info("⏳ Step 1/4: Fetching master NIFTY option chain file...")
+    chain, expiry_dt = get_nifty_option_chain()
+    exec_status.success(f"✅ Option chain received for expiry date: **{expiry_dt.strftime('%d-%b-%Y')}**")
     
     exec_status.info("⏳ Step 2/4: Fetching live NIFTY index spot price...")
     spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
