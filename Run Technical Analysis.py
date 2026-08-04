@@ -5,16 +5,14 @@ import json
 import sqlite3
 import urllib.request
 import pyotp
-import pandas as pd
 import requests
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from dash import Dash, dcc, html, Input, Output, State
-import pandas as pd
-import pyotp
 import streamlit as st
 from scipy.stats import norm
 from vollib.black_scholes.greeks.analytical import gamma, vega, theta
@@ -32,16 +30,13 @@ def get_secret(key: str, default: str = "") -> str:
     if env_val:
         return env_val
     try:
-        import streamlit as st
         return st.secrets.get(key, default)
     except Exception:
         return default
-# ==================== CREDENTIALS & GLOBAL STATE ====================
 
-# Safely fetch credentials
+# ==================== CREDENTIALS & GLOBAL STATE ====================
 API_KEY = get_secret("API_KEY")
 CLIENT_CODE = get_secret("CLIENT_CODE")
-PIN = get_secret("PIN")  # Using PIN for SmartAPI session
 PIN = get_secret("PIN")
 TOTP_SECRET = get_secret("TOTP_SECRET")
 
@@ -49,9 +44,6 @@ smart_api = SmartConnect(api_key=API_KEY)
 session_active = False
 auth_status_msg = "NOT INITIALIZED"
 
-
-def login_smartapi():
-    global session_active, auth_status_msg
 # QUANT PARAMETERS
 RISK_FREE_RATE = 0.068       # Benchmark Repo rate (~6.8%)
 LOT_SIZE = 65                # NIFTY Lot Size
@@ -71,27 +63,16 @@ def authenticate():
         raise ConnectionError(f"SmartAPI Login Failed: {msg}")
     return smartApi
 
-
 @st.cache_data(ttl=1800)
 def get_nifty_option_chain():
     url = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
     headers = {'User-Agent': 'Mozilla/5.0'}
 
-    # Check for missing credentials
-    if not (CLIENT_CODE and PIN and TOTP_SECRET and API_KEY):
-        auth_status_msg = "AUTH FAILED: Missing API Credentials/Secrets"
-        print(auth_status_msg)
-        session_active = False
-        return False
     response = requests.get(url, headers=headers, timeout=15)
     if response.status_code != 200:
         url = "https://margincalculator.angelbroking.com/OpenAPI_Data/files/OpenAPIScripMaster.json"
         response = requests.get(url, headers=headers, timeout=15)
 
-    try:
-        totp_code = pyotp.TOTP(TOTP_SECRET).now()
-        # Fixed: Passed PIN instead of undefined PASSWORD
-        res = smart_api.generateSession(CLIENT_CODE, PIN, totp_code)
     df = pd.DataFrame(response.json())
     df.columns = [str(c).lower() for c in df.columns]
     
@@ -106,21 +87,36 @@ def get_nifty_option_chain():
     if 'tradingsymbol' not in nifty_opts.columns:
         nifty_opts['tradingsymbol'] = nifty_opts['symbol'] if 'symbol' in nifty_opts.columns else nifty_opts[symbol_col]
 
+    nifty_opts['strike'] = nifty_opts['strike'].astype(float) / 100.0
+    nifty_opts['expiry_dt'] = pd.to_datetime(nifty_opts['expiry'], format='%d%b%Y')
+
+    today = pd.Timestamp.now().normalize()
+    upcoming_expiries = nifty_opts[nifty_opts['expiry_dt'] >= today]['expiry_dt']
+    nearest_expiry = upcoming_expiries.min()
+    chain = nifty_opts[nifty_opts['expiry_dt'] == nearest_expiry].copy()
+
+    return chain, nearest_expiry
+
+def login_smartapi():
+    global session_active, auth_status_msg
+    if not (CLIENT_CODE and PIN and TOTP_SECRET and API_KEY):
+        auth_status_msg = "AUTH FAILED: Missing API Credentials/Secrets"
+        session_active = False
+        return False
+    try:
+        totp_code = pyotp.TOTP(TOTP_SECRET).now()
+        res = smart_api.generateSession(CLIENT_CODE, PIN, totp_code)
         if isinstance(res, dict) and res.get('status'):
             session_active = True
             auth_status_msg = "CONNECTED: SmartAPI Live Session Active"
-            print("SmartAPI session established.")
             return True
         else:
             msg = res.get('message', 'Unknown Error') if isinstance(res, dict) else str(res)
             auth_status_msg = f"AUTH FAILED: {msg}"
             session_active = False
-            print(auth_status_msg)
             return False
-
     except Exception as e:
         auth_status_msg = f"AUTH ERROR: {str(e)}"
-        print(auth_status_msg)
         session_active = False
         return False
 
@@ -179,22 +175,17 @@ def download_scrip_master():
         if file_date == now_ist().date():
             need_download = False
     if need_download:
-        print("Downloading Scrip Master...")
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         urllib.request.urlretrieve(url, SCRIP_MASTER_FILE)
-        print("Scrip Master saved.")
 
 def load_scrip_master_df():
     download_scrip_master()
     filtered_rows = []
-    nifty_opts['strike'] = nifty_opts['strike'].astype(float) / 100.0
-    nifty_opts['expiry_dt'] = pd.to_datetime(nifty_opts['expiry'], format='%d%b%Y')
 
     with open(SCRIP_MASTER_FILE, "r") as f:
         data = json.load(f)
         for row in data:
             name = str(row.get('name', '')).upper()
-            symbol = str(row.get('symbol', '')).upper()
             exch = str(row.get('exch_seg', '')).upper()
             
             if name in ["NIFTY 50", "INDIA VIX"] or (name == "NIFTY" and exch == "NFO"):
@@ -285,30 +276,6 @@ token, exchange = resolve_nifty_token(_df_master)
 vix_token, vix_exchange = resolve_india_vix_token(_df_master)
 nifty_options_df, current_expiry = build_nifty_option_chain(_df_master)
 
-# ==================== SMARTAPI SESSION ====================
-
-smart_api = SmartConnect(api_key=API_KEY)
-session_active = False
-
-def login_smartapi():
-    global session_active
-    if not (CLIENT_CODE and PIN and TOTP_SECRET and API_KEY):
-        print("Credentials missing -- set SMARTAPI_* environment variables on Render.")
-        session_active = False
-        return False
-    try:
-        totp_code = pyotp.TOTP(TOTP_SECRET).now()
-        smart_api.generateSession(CLIENT_CODE, PIN, totp_code)
-        session_active = True
-        print("SmartAPI session established.")
-        return True
-    except Exception as e:
-        print(f"Session generation failed: {e}")
-        session_active = False
-        return False
-
-login_smartapi()
-
 def api_call(fn, *args, retry_on_auth_fail=True, **kwargs):
     global session_active
     try:
@@ -392,46 +359,22 @@ def bs_greeks(S, K, T, r, sigma, opt_type, position="BUY"):
     """Calculates Delta, Gamma, and Vega for a given position type."""
     if T <= 0 or sigma <= 0 or S <= 0:
         return {"delta": 0.0, "gamma": 0.0, "vega": 0.0}
-    today = pd.Timestamp.now().normalize()
-    upcoming_expiries = nifty_opts[nifty_opts['expiry_dt'] >= today]['expiry_dt']
-    nearest_expiry = upcoming_expiries.min()
 
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    chain = nifty_opts[nifty_opts['expiry_dt'] == nearest_expiry].copy()
-    return chain, nearest_expiry
 
-
-# ==============================================================================
-# 2. QUANT ENGINE WITH REAL-TIME GREEKS & LIQUIDITY FILTERS
-# ==============================================================================
-def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
-    now = pd.Timestamp.now()
-    expiry_end = expiry_dt + pd.Timedelta(hours=15, minutes=30)
-    remaining_seconds = max((expiry_end - now).total_seconds(), 3600)
-    T = remaining_seconds / (365.0 * 86400.0)
-
-    # Raw option Greeks (Long Position)
     if opt_type == "CE":
         delta = _norm_cdf(d1)
     else:
         delta = _norm_cdf(d1) - 1.0
-    records = []
-    strikes = chain[(chain['strike'] >= spot_price * 0.92) & (chain['strike'] <= spot_price * 1.08)]['strike'].unique()
-    strikes.sort()
-    
-    for K in strikes:
-        ce_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('CE'))]
-        pe_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('PE'))]
 
-    gamma = _norm_pdf(d1) / (S * sigma * math.sqrt(T))
-    vega = (S * _norm_pdf(d1) * math.sqrt(T)) / 100.0  # Normalized for 1% change in IV
+    gamma_val = _norm_pdf(d1) / (S * sigma * math.sqrt(T))
+    vega_val = (S * _norm_pdf(d1) * math.sqrt(T)) / 100.0
 
-    # Adjust signs based on position side (BUY vs SELL)
     multiplier = 1.0 if position == "BUY" else -1.0
     return {
         "delta": round(delta * multiplier, 3),
-        "gamma": round(gamma * multiplier, 5),
-        "vega": round(vega * multiplier, 3)
+        "gamma": round(gamma_val * multiplier, 5),
+        "vega": round(vega_val * multiplier, 3)
     }
 
 def strike_for_target_delta(S, T, r, sigma, target_abs_delta, opt_type, step):
@@ -452,6 +395,70 @@ def strike_for_target_delta(S, T, r, sigma, target_abs_delta, opt_type, step):
                 lo = mid
     result = (lo + hi) / 2.0
     return round(result / step) * step
+
+# ==================== QUANT ENGINE ====================
+def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
+    now = pd.Timestamp.now()
+    expiry_end = expiry_dt + pd.Timedelta(hours=15, minutes=30)
+    remaining_seconds = max((expiry_end - now).total_seconds(), 3600)
+    T = remaining_seconds / (365.0 * 86400.0)
+
+    records = []
+    strikes = chain[(chain['strike'] >= spot_price * 0.92) & (chain['strike'] <= spot_price * 1.08)]['strike'].unique()
+    strikes.sort()
+    
+    for K in strikes:
+        ce_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('CE'))]
+        pe_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('PE'))]
+
+        if ce_row.empty or pe_row.empty:
+            continue
+
+        ce_symbol, ce_token = ce_row.iloc[0]['tradingsymbol'], ce_row.iloc[0]['token']
+        pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], pe_row.iloc[0]['token']
+        
+        try:
+            ce_res = smartApi.ltpData("NFO", ce_symbol, ce_token)
+            pe_res = smartApi.ltpData("NFO", pe_symbol, pe_token)
+            
+            if not isinstance(ce_res, dict) or not ce_res.get('status') or not isinstance(ce_res.get('data'), dict):
+                continue
+            if not isinstance(pe_res, dict) or not pe_res.get('status') or not isinstance(pe_res.get('data'), dict):
+                continue
+
+            ce_price = float(ce_res['data'].get('ltp', 0))
+            pe_price = float(pe_res['data'].get('ltp', 0))
+            ce_oi = float(ce_res['data'].get('openinterest', 0))
+            pe_oi = float(pe_res['data'].get('openinterest', 0))
+            
+            if ce_price <= 0 or pe_price <= 0 or ce_oi < MIN_OI_THRESHOLD or pe_oi < MIN_OI_THRESHOLD:
+                continue
+
+            ce_iv = implied_volatility(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
+            pe_iv = implied_volatility(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
+            
+            ce_g = gamma('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
+            pe_g = gamma('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
+            ce_v = vega('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
+            pe_v = vega('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
+            ce_t = theta('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
+            pe_t = theta('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
+            
+            net_gex = ((pe_oi * pe_g) - (ce_oi * ce_g)) * (spot_price ** 2) * 0.01 / 1e6
+            
+            records.append({
+                'strike': K, 'ce_price': ce_price, 'pe_price': pe_price,
+                'ce_iv': ce_iv, 'pe_iv': pe_iv, 'ce_oi': ce_oi, 'pe_oi': pe_oi,
+                'ce_gamma': ce_g, 'pe_gamma': pe_g,
+                'ce_vega': ce_v, 'pe_vega': pe_v,
+                'ce_theta': ce_t, 'pe_theta': pe_t,
+                'gex': net_gex
+            })
+        except Exception:
+            continue
+
+    df_quant = pd.DataFrame(records)
+    return df_quant, T
 
 # ==================== INDICATORS ====================
 
@@ -535,7 +542,6 @@ def generate_individual_signals(df):
         vwap_val = df.loc[i, 'VWAP']
 
         if pd.isna(rsi_curr) or pd.isna(adx_val):
-        if ce_row.empty or pe_row.empty:
             continue
 
         if adx_val > 22 and close_curr > vwap_val:
@@ -643,14 +649,6 @@ def fetch_recent_days_raw(n_days, sym_token=None, seg=None):
     frames.reverse()
     return frames
 
-def fetch_recent_days(n_days=5):
-    frames = fetch_recent_days_raw(n_days)
-    if not frames:
-        return pd.DataFrame()
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.sort_values('Timestamp').reset_index(drop=True)
-    return generate_individual_signals(combined)
-
 # ==================== VOLATILITY-BASED EXPECTED MOVE ====================
 
 def get_days_to_expiry(as_of=None):
@@ -733,7 +731,7 @@ def close_position(pos_id, exit_premiums, pnl_points, pnl_rupees, reason):
     conn.commit()
     conn.close()
 
-# ==================== IRON CONDOR: DELTA/SKEW STRIKE SELECTION & GREEKS ====================
+# ==================== IRON CONDOR SETUP & GREEKS ====================
 
 def round_to_step(value, step):
     return round(value / step) * step
@@ -793,20 +791,10 @@ def build_iron_condor(spot, df_recent, vix_val=None):
         for wing, hedge_strike, tok_h, _ in candidates:
             hedge_prem = ltp_map.get(str(tok_h))
             if hedge_prem is None:
-            
-        ce_symbol, ce_token = ce_row.iloc[0]['tradingsymbol'], ce_row.iloc[0]['token']
-        pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], pe_row.iloc[0]['token']
-        
-        try:
-            ce_res = smartApi.ltpData("NFO", ce_symbol, ce_token)
-            pe_res = smartApi.ltpData("NFO", pe_symbol, pe_token)
-            
-            if not isinstance(ce_res, dict) or not ce_res.get('status') or not isinstance(ce_res.get('data'), dict):
                 continue
             credit = short_prem - hedge_prem
             max_loss = wing - credit
             if max_loss <= 0:
-            if not isinstance(pe_res, dict) or not pe_res.get('status') or not isinstance(pe_res.get('data'), dict):
                 continue
             if credit / max_loss >= STD_PARAMS['IC_MIN_CREDIT_TO_MAXLOSS']:
                 return wing, hedge_strike, hedge_prem, True
@@ -826,8 +814,8 @@ def build_iron_condor(spot, df_recent, vix_val=None):
 
     # ---- CALCULATE GREEKS FOR THE 4 LEGS ----
     greeks = {
-        "buy_put": bs_greeks(spot, put_hedge_strike, T, r, put_iv, "PE", "BUY"),
-        "buy_call": bs_greeks(spot, call_hedge_strike, T, r, call_iv, "CE", "BUY"),
+        "buy_put": bs_greeks(spot, put_hedge_strike if put_hedge_strike else spot, T, r, put_iv, "PE", "BUY"),
+        "buy_call": bs_greeks(spot, call_hedge_strike if call_hedge_strike else spot, T, r, call_iv, "CE", "BUY"),
         "sell_put": bs_greeks(spot, put_short_strike, T, r, put_iv, "PE", "SELL"),
         "sell_call": bs_greeks(spot, call_short_strike, T, r, call_iv, "CE", "SELL"),
     }
@@ -973,39 +961,10 @@ def backtest_iron_condor(n_days=None, day_frames=None, vix_frames=None):
     r = STD_PARAMS['IC_RISK_FREE_RATE']
     target_delta = STD_PARAMS['IC_TARGET_DELTA']
     cost_pts = estimated_round_trip_cost_points()
-            ce_price = float(ce_res['data'].get('ltp', 0))
-            pe_price = float(pe_res['data'].get('ltp', 0))
-            ce_oi = float(ce_res['data'].get('openinterest', 0))
-            pe_oi = float(pe_res['data'].get('openinterest', 0))
-            
-            # Liquidity Filter
-            if ce_price <= 0 or pe_price <= 0 or ce_oi < MIN_OI_THRESHOLD or pe_oi < MIN_OI_THRESHOLD:
-                continue
 
     trades = []
     for day_df in day_frames:
         if day_df.empty or len(day_df) < 5:
-            ce_iv = implied_volatility(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
-            pe_iv = implied_volatility(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
-            
-            ce_g = gamma('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
-            pe_g = gamma('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
-            ce_v = vega('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
-            pe_v = vega('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
-            ce_t = theta('c', spot_price, K, T, RISK_FREE_RATE, ce_iv)
-            pe_t = theta('p', spot_price, K, T, RISK_FREE_RATE, pe_iv)
-            
-            net_gex = ((pe_oi * pe_g) - (ce_oi * ce_g)) * (spot_price ** 2) * 0.01 / 1e6
-            
-            records.append({
-                'strike': K, 'ce_price': ce_price, 'pe_price': pe_price,
-                'ce_iv': ce_iv, 'pe_iv': pe_iv, 'ce_oi': ce_oi, 'pe_oi': pe_oi,
-                'ce_gamma': ce_g, 'pe_gamma': pe_g,
-                'ce_vega': ce_v, 'pe_vega': pe_v,
-                'ce_theta': ce_t, 'pe_theta': pe_t,
-                'gex': net_gex
-            })
-        except Exception:
             continue
         day_date = day_df['Timestamp'].dt.date.iloc[0]
         spot_open = float(day_df['Close'].iloc[0])
@@ -1322,9 +1281,6 @@ def generate_options_dashboard_cards(df, vix_val=None):
             pnl_color = '#ff1744'
 
     greeks = ic['greeks']
-            
-    df_quant = pd.DataFrame(records)
-    return df_quant, T
 
     return html.Div(style={'backgroundColor': '#1e1e1e', 'border': '1px solid #ffd700', 'borderRadius': '8px', 'padding': '12px', 'marginBottom': '15px'}, children=[
         html.H4("LIVE OPTIONS TRADING SUGGESTIONS & STOP-LOSS TRACKER", style={'color': '#ffd700', 'marginTop': '0', 'textAlign': 'center', 'fontSize': '16px'}),
@@ -1335,43 +1291,10 @@ def generate_options_dashboard_cards(df, vix_val=None):
         gate_block, rr_warn,
 
         html.Div(style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px'}, children=[
-# ==============================================================================
-# 3. OPTIMIZER WITH STRICT RISK CONTROLS & SELECTION AUDIT LOGGING
-# ==============================================================================
-def find_optimal_iron_condor(df, spot, T):
-    if df is None or df.empty:
-        return None, pd.DataFrame()
-        
-    best_score = -np.inf
-    optimal_condor = None
-    strikes = np.sort(df['strike'].unique())
-    
-    avg_chain_iv = np.mean(df['ce_iv'].tolist() + df['pe_iv'].tolist()) if not df.empty else 0.12
-    expected_1d_move = spot * (avg_chain_iv * np.sqrt(1 / 365.0))
-    MIN_OTM_BUFFER = max(spot * 0.004, expected_1d_move * 0.5)
-    
-    audit_logs = []
-
             html.Div(style={'flex': '1 1 320px', 'backgroundColor': '#2a2a2a', 'padding': '12px', 'borderRadius': '6px'}, children=[
                 html.H5("Iron Condor -- Delta/Skew-Sized Strikes & Greeks", style={'color': '#00e676', 'marginTop': '0', 'fontSize': '14px'}),
                 html.Div(f"Spot: {curr_spot:.2f}  |  Call wing: {ic['call_wing']} pts  |  Put wing: {ic['put_wing']} pts", style={'color': '#fff', 'fontSize': '12px'}),
                 html.Hr(style={'borderColor': '#444'}),
-    for i in range(len(strikes)):
-        long_put_k = strikes[i]
-        
-        for j in range(i + 1, len(strikes)):
-            short_put_k = strikes[j]
-            wing_width = short_put_k - long_put_k
-            
-            if short_put_k >= spot or (spot - short_put_k) < MIN_OTM_BUFFER:
-                audit_logs.append({
-                    'combo': f"{long_put_k}/{short_put_k}/X/X",
-                    'status': 'Rejected',
-                    'reason': f"Short Put ({short_put_k}) too close to spot (Min Buffer: {MIN_OTM_BUFFER:.1f} pts)"
-                })
-                continue
-
-                # Legs with output Delta, Gamma & Vega
                 html.Ul(style={'color': '#ccc', 'fontSize': '11px', 'paddingLeft': '16px'}, children=[
                     html.Li([
                         f"BUY PUT: ", html.B(f"{ic['put_hedge_strike']:.0f} PE" if ic['put_hedge_strike'] else "N/A"), 
@@ -1394,8 +1317,6 @@ def find_optimal_iron_condor(df, spot, T):
                         html.Div(f"   -> Δ: {greeks['sell_call']['delta']}, Γ: {greeks['sell_call']['gamma']}, ν: {greeks['sell_call']['vega']}", style={'color': '#29b6f6'})
                     ]),
                 ]),
-            for k in range(j + 1, len(strikes)):
-                short_call_k = strikes[k]
 
                 html.Div(style={'backgroundColor': '#121212', 'padding': '8px', 'borderRadius': '4px', 'marginTop': '8px'}, children=[
                     html.Div(f"Call credit: {fmt(ic['call_credit'])} pts | Max loss: {fmt(ic['call_max_loss'])} pts | Breakeven: {fmt(ic['call_breakeven'])}", style={'color': '#ccc', 'fontSize': '11px'}),
@@ -1451,16 +1372,40 @@ def generate_condor_backtest_card(bt):
         html.Div(bt['note'], style={'color': '#666', 'fontSize': '9px', 'marginTop': '4px'}),
     ])
 
-# ==================== DASH APP LAYOUT & CALLBACK ====================
+# ==================== OPTIMIZER ====================
 
-app = Dash(__name__, meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
-server = app.server
+def find_optimal_iron_condor(df, spot, T):
+    if df is None or df.empty:
+        return None, pd.DataFrame()
+        
+    best_score = -np.inf
+    optimal_condor = None
+    strikes = np.sort(df['strike'].unique())
+    
+    avg_chain_iv = np.mean(df['ce_iv'].tolist() + df['pe_iv'].tolist()) if not df.empty else 0.12
+    expected_1d_move = spot * (avg_chain_iv * np.sqrt(1 / 365.0))
+    MIN_OTM_BUFFER = max(spot * 0.004, expected_1d_move * 0.5)
+    
+    audit_logs = []
 
-# Helper function to generate styled Auth Badge
-def get_auth_badge():
-    if session_active:
-        status_color = "#00e676"  # Vibrant Green
-        status_text = f"SUCCESS -- {auth_status_msg}"
+    for i in range(len(strikes)):
+        long_put_k = strikes[i]
+        
+        for j in range(i + 1, len(strikes)):
+            short_put_k = strikes[j]
+            wing_width = short_put_k - long_put_k
+            
+            if short_put_k >= spot or (spot - short_put_k) < MIN_OTM_BUFFER:
+                audit_logs.append({
+                    'combo': f"{long_put_k}/{short_put_k}/X/X",
+                    'status': 'Rejected',
+                    'reason': f"Short Put ({short_put_k}) too close to spot (Min Buffer: {MIN_OTM_BUFFER:.1f} pts)"
+                })
+                continue
+
+            for k in range(j + 1, len(strikes)):
+                short_call_k = strikes[k]
+
                 if short_call_k <= spot or (short_call_k - spot) < MIN_OTM_BUFFER:
                     audit_logs.append({
                         'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/X",
@@ -1469,7 +1414,7 @@ def get_auth_badge():
                     })
                     continue
                     
-                long_call_k = short_call_k + wing_width  # Symmetric Wings
+                long_call_k = short_call_k + wing_width
                 if long_call_k not in strikes:
                     audit_logs.append({
                         'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
@@ -1551,7 +1496,6 @@ def get_auth_badge():
 
                 if utility_score > best_score:
                     if optimal_condor is not None:
-                        # Log replacement of previous best
                         audit_logs.append({
                             'combo': f"{optimal_condor['long_put']:.0f}/{optimal_condor['short_put']:.0f}/{optimal_condor['short_call']:.0f}/{optimal_condor['long_call']:.0f}",
                             'status': 'Outranked',
@@ -1574,24 +1518,17 @@ def get_auth_badge():
     df_audit = pd.DataFrame(audit_logs)
     return optimal_condor, df_audit
 
+# ==================== DASH APP LAYOUT & CALLBACK ====================
 
-# ==============================================================================
-# 4. STREAMLIT DASHBOARD UI
-# ==============================================================================
-st.title("⚡ Dynamic Risk-Managed Iron Condor Engine")
+app = Dash(__name__, meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
+server = app.server
 
-live_mode = st.sidebar.checkbox("Enable Live Refresh (5s)", value=False)
-
-try:
-    smartApi = authenticate()
-    chain, expiry_dt = get_nifty_option_chain()
-    
-    spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
-    if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
-        st.warning("⚠️ Spot Price Fetch Warning: Market closed or feed delayed. Using fallback benchmark.")
-        spot_price = 24383.60
+def get_auth_badge():
+    if session_active:
+        status_color = "#00e676"
+        status_text = f"SUCCESS -- {auth_status_msg}"
     else:
-        status_color = "#ff1744"  # Alert Red
+        status_color = "#ff1744"
         status_text = f"FAILED -- {auth_status_msg}"
 
     return html.Div([
@@ -1599,34 +1536,12 @@ try:
         html.Span(status_text, style={'color': status_color, 'fontWeight': 'bold'})
     ], style={'marginTop': '4px', 'fontSize': '12px'})
 
-        spot_price = float(spot_res['data']['ltp'])
-    
-    df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt)
-    result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T)
-
 app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'fontFamily': 'Segoe UI, sans-serif'}, children=[
-    st.subheader("📌 Live Market Dashboard")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("NIFTY Spot Price", f"₹{spot_price:,.2f}")
-    m2.metric("Target Expiry", expiry_dt.strftime('%d-%b-%Y'))
-
-    # Top Section with Title, Auth Status, and Basketing Order
     html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'flex-start', 'marginBottom': '15px'}, children=[
-        
-        # Title and Authentication Status Section
         html.Div(children=[
             html.H3("Dynamic Regime Strategy Engine: NIFTY 50", style={'color': '#ffffff', 'margin': '0'}),
-            # Auth Status directly below title
             html.Div(id='top-auth-status-container', children=[get_auth_badge()])
         ]),
-    if result:
-        m3.metric("Model PoP", f"{result['pop']:.1f}%")
-        m4.metric("Buffered RoM", f"{result['return_on_margin']:.2f}%")
-
-        st.markdown("---")
-        st.subheader("🎯 Liquidity-Filtered Option Legs")
-
-        # Top-Right Requested Order & Checks Info Box
         html.Div(style={
             'backgroundColor': '#1e1e1e', 
             'border': '1px solid #ff9800', 
@@ -1644,14 +1559,8 @@ app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'f
             html.Hr(style={'borderColor': '#444', 'margin': '6px 0'}),
             html.Div(html.B("Option Selling Check"), style={'color': '#ffea00', 'marginBottom': '2px'}),
             html.Div("BUY CALL > SELL CALL > SELL PUT > BUY PUT", style={'color': '#00e676', 'fontWeight': 'bold'})
-        trade_df = pd.DataFrame([
-            {"Leg": "[1] BUY PUT (Outer Wing)", "Strike": f"{result['long_put']:.0f} PE", "Distance": f"-{spot_price - result['long_put']:.0f} pts"},
-            {"Leg": "[2] SELL PUT (Inner Strike)", "Strike": f"{result['short_put']:.0f} PE", "Distance": f"-{spot_price - result['short_put']:.0f} pts"},
-            {"Leg": "[3] SELL CALL (Inner Strike)", "Strike": f"{result['short_call']:.0f} CE", "Distance": f"+{result['short_call'] - spot_price:.0f} pts"},
-            {"Leg": "[4] BUY CALL (Outer Wing)", "Strike": f"{result['long_call']:.0f} CE", "Distance": f"+{result['long_call'] - spot_price:.0f} pts"},
         ])
     ]),
-    
     html.Div(id='session-warning'),
     html.Div(id='market-insights-panel'),
     html.Div(id='options-trading-banner'),
@@ -1670,7 +1579,6 @@ app.layout = html.Div(style={'backgroundColor': '#121212', 'padding': '10px', 'f
     Input('interval-component', 'n_intervals'),
 )
 def update_dashboard(n):
-    # Ensure active session attempt on dynamic refresh if currently failed
     if not session_active:
         login_smartapi()
 
@@ -1716,22 +1624,6 @@ def update_dashboard(n):
     fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['VWAP'], line=dict(color='#ffea00', width=1.5), name='VWAP'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['BB_Upper'], line=dict(color='#29b6f6', width=1, dash='dot'), name='BB Upper'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['BB_Lower'], line=dict(color='#29b6f6', width=1, dash='dot'), name='BB Lower'), row=1, col=1)
-        st.table(trade_df)
-
-        st.subheader("📊 Financials & Risk Buffers")
-        f1, f2, f3, f4 = st.columns(4)
-        f1.metric("Net Credit (Post-Slippage)", f"₹{result['net_credit_rupees']:,.2f}", f"{result['net_credit_pts']:.2f} pts")
-        f2.metric("Max Loss Limit", f"₹{result['max_loss_rupees']:,.2f}")
-        f3.metric("Required Margin (+30% Cushion)", f"₹{result['buffered_margin']:,.2f}")
-        f4.metric("Net EV per Trade", f"₹{result['expected_value']:,.2f}")
-
-        st.markdown("---")
-        st.subheader("🛡️ Dynamic Risk & Sensitivity Metrics")
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Hard Stop-Loss Threshold", f"₹{result['stop_loss_level']:,.2f}", "2x Credit Limit", delta_color="inverse")
-        r2.metric("Daily Theta Decay (+)", f"₹{abs(result['net_theta_daily']):,.2f}/day")
-        r3.metric("Vega Risk (+5% IV Shock)", f"₹{result['net_vega_shock_5pct']:,.2f}", delta_color="inverse")
-        r4.metric("Net Position Gamma", f"{result['net_gamma']:.4f}")
 
     comb_buy = df[df['Combined_Sig'] == 1]
     comb_sell = df[df['Combined_Sig'] == -1]
@@ -1747,24 +1639,6 @@ def update_dashboard(n):
     fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['MACD_Signal'], line=dict(color='#ff9800', width=1.5), name='Signal'), row=3, col=1)
     colors = ['#00e676' if v >= 0 else '#ff1744' for v in df['MACD_Hist']]
     fig.add_trace(go.Bar(x=df['Timestamp'], y=df['MACD_Hist'], marker_color=colors, name='Hist'), row=3, col=1)
-    else:
-        st.warning("No valid Iron Condor setup met the minimum PoP, EV, and safety criteria for this tick.")
-
-    # ==========================================================================
-    # AUDIT TRAIL DISPLAY (SELECTION / REJECTION REASONS)
-    # ==========================================================================
-    st.markdown("---")
-    st.subheader("🔍 Iron Condor Selection Audit Trail")
-    if not df_audit.empty:
-        status_filter = st.multiselect(
-            "Filter Evaluation Status", 
-            options=df_audit['status'].unique(), 
-            default=df_audit['status'].unique()
-        )
-        filtered_audit = df_audit[df_audit['status'].isin(status_filter)]
-        st.dataframe(filtered_audit, use_container_width=True)
-    else:
-        st.info("No strike combinations evaluated.")
 
     fig.update_layout(
         title=f"NIFTY 50 Engine (Regime: {current_regime}){' [fallback: previous session]' if is_fallback else ''}",
@@ -1773,8 +1647,82 @@ def update_dashboard(n):
     )
     
     return fig, card_elements, options_banner, warning, insights_panel, get_auth_badge()
-except Exception as e:
-    st.error(f"Execution Error: {str(e)}")
+
+# ==================== STREAMLIT PAGE RUNNER ====================
+def render_streamlit_dashboard():
+    st.title("⚡ Dynamic Risk-Managed Iron Condor Engine")
+    live_mode = st.sidebar.checkbox("Enable Live Refresh (5s)", value=False)
+
+    try:
+        smartApi = authenticate()
+        chain, expiry_dt = get_nifty_option_chain()
+        
+        spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
+        if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
+            st.warning("⚠️ Spot Price Fetch Warning: Market closed or feed delayed. Using fallback benchmark.")
+            spot_price = 24383.60
+        else:
+            spot_price = float(spot_res['data']['ltp'])
+        
+        df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt)
+        result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T)
+
+        st.subheader("📌 Live Market Dashboard")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("NIFTY Spot Price", f"₹{spot_price:,.2f}")
+        m2.metric("Target Expiry", expiry_dt.strftime('%d-%b-%Y'))
+
+        if result:
+            m3.metric("Model PoP", f"{result['pop']:.1f}%")
+            m4.metric("Buffered RoM", f"{result['return_on_margin']:.2f}%")
+
+            st.markdown("---")
+            st.subheader("🎯 Liquidity-Filtered Option Legs")
+
+            trade_df = pd.DataFrame([
+                {"Leg": "[1] BUY PUT (Outer Wing)", "Strike": f"{result['long_put']:.0f} PE", "Distance": f"-{spot_price - result['long_put']:.0f} pts"},
+                {"Leg": "[2] SELL PUT (Inner Strike)", "Strike": f"{result['short_put']:.0f} PE", "Distance": f"-{spot_price - result['short_put']:.0f} pts"},
+                {"Leg": "[3] SELL CALL (Inner Strike)", "Strike": f"{result['short_call']:.0f} CE", "Distance": f"+{result['short_call'] - spot_price:.0f} pts"},
+                {"Leg": "[4] BUY CALL (Outer Wing)", "Strike": f"{result['long_call']:.0f} CE", "Distance": f"+{result['long_call'] - spot_price:.0f} pts"},
+            ])
+            st.table(trade_df)
+
+            st.subheader("📊 Financials & Risk Buffers")
+            f1, f2, f3, f4 = st.columns(4)
+            f1.metric("Net Credit (Post-Slippage)", f"₹{result['net_credit_rupees']:,.2f}", f"{result['net_credit_pts']:.2f} pts")
+            f2.metric("Max Loss Limit", f"₹{result['max_loss_rupees']:,.2f}")
+            f3.metric("Required Margin (+30% Cushion)", f"₹{result['buffered_margin']:,.2f}")
+            f4.metric("Net EV per Trade", f"₹{result['expected_value']:,.2f}")
+
+            st.markdown("---")
+            st.subheader("🛡️ Dynamic Risk & Sensitivity Metrics")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Hard Stop-Loss Threshold", f"₹{result['stop_loss_level']:,.2f}", "2x Credit Limit", delta_color="inverse")
+            r2.metric("Daily Theta Decay (+)", f"₹{abs(result['net_theta_daily']):,.2f}/day")
+            r3.metric("Vega Risk (+5% IV Shock)", f"₹{result['net_vega_shock_5pct']:,.2f}", delta_color="inverse")
+            r4.metric("Net Position Gamma", f"{result['net_gamma']:.4f}")
+        else:
+            st.warning("No valid Iron Condor setup met the minimum PoP, EV, and safety criteria for this tick.")
+
+        st.markdown("---")
+        st.subheader("🔍 Iron Condor Selection Audit Trail")
+        if not df_audit.empty:
+            status_filter = st.multiselect(
+                "Filter Evaluation Status", 
+                options=df_audit['status'].unique(), 
+                default=df_audit['status'].unique()
+            )
+            filtered_audit = df_audit[df_audit['status'].isin(status_filter)]
+            st.dataframe(filtered_audit, use_container_width=True)
+        else:
+            st.info("No strike combinations evaluated.")
+
+    except Exception as e:
+        st.error(f"Execution Error: {str(e)}")
+
+    if live_mode:
+        time.sleep(5.0)
+        st.rerun()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8050))
@@ -1782,6 +1730,3 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port, debug=False)
     except AttributeError:
         app.run_server(host='0.0.0.0', port=port, debug=False)
-if live_mode:
-    time.sleep(5.0)
-    st.rerun()
