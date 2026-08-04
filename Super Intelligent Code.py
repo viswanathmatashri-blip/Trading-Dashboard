@@ -136,7 +136,6 @@ def extract_oi_and_price(market_data_res):
     
     data = market_data_res.get('data', {})
     
-    # Locate target item dictionary in data or fetched list
     if isinstance(data, dict):
         if 'fetched' in data and isinstance(data['fetched'], list) and len(data['fetched']) > 0:
             item = data['fetched'][0]
@@ -147,10 +146,8 @@ def extract_oi_and_price(market_data_res):
     else:
         return 0.0, 0.0
 
-    # Extract Price (ltp / lastPrice)
     price = float(item.get('ltp', item.get('lastPrice', 0.0)))
     
-    # Extract Open Interest using all potential key variants returned by SmartAPI FULL mode
     raw_oi = (
         item.get('op') or 
         item.get('openInterest') or 
@@ -197,7 +194,6 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
         pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], str(pe_row.iloc[0]['token'])
         
         try:
-            # PROPER API PARAMETER KEYS REQUIRED BY SMARTCONNECT
             ce_res = smartApi.getMarketData(mode="FULL", exchangeTokens={"NFO": [ce_token]})
             pe_res = smartApi.getMarketData(mode="FULL", exchangeTokens={"NFO": [pe_token]})
 
@@ -206,7 +202,6 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
 
             log_placeholder.write(f"📊 Strike {K:.0f} Metrics -> CE Price: ₹{ce_price:.2f}, PE Price: ₹{pe_price:.2f} | CE OI: {ce_oi:.0f}, PE OI: {pe_oi:.0f}")
 
-            # Inequality Filters
             reasons = []
             if ce_price <= 0:
                 reasons.append(f"CE Price ({ce_price:.2f}) <= 0.00")
@@ -255,7 +250,7 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt, log_placeholder):
 def find_optimal_iron_condor(df, spot, T, log_placeholder):
     log_placeholder.info("⏳ Step 4/4: Evaluating Iron Condor combinations...")
     if df is None or df.empty:
-        return None, pd.DataFrame()
+        return None, pd.DataFrame(), 0.0, 0.0, 0.0
         
     best_score = -np.inf
     optimal_condor = None
@@ -371,7 +366,9 @@ def find_optimal_iron_condor(df, spot, T, log_placeholder):
                     'net_vega_shock_5pct': net_vega * 0.05 * LOT_SIZE,
                     'net_theta_daily': (net_theta / TRADING_DAYS_PER_YEAR) * LOT_SIZE,
                     'return_on_margin': (net_credit * LOT_SIZE / buffered_margin) * 100,
-                    'utility_score': utility_score
+                    'utility_score': utility_score,
+                    'put_distance': spot - short_put_k,
+                    'call_distance': short_call_k - spot
                 }
 
                 if utility_score > best_score:
@@ -398,7 +395,7 @@ def find_optimal_iron_condor(df, spot, T, log_placeholder):
 
     df_audit = pd.DataFrame(audit_logs)
     log_placeholder.success(f"✅ Evaluated {combo_count} valid Iron Condor structures.")
-    return optimal_condor, df_audit
+    return optimal_condor, df_audit, avg_chain_iv, expected_1d_move, MIN_OTM_BUFFER
 
 
 # ==============================================================================
@@ -423,28 +420,51 @@ try:
     chain, expiry_dt = get_nifty_option_chain()
     exec_status.success(f"✅ Option chain received for expiry date: **{expiry_dt.strftime('%d-%b-%Y')}**")
     
+    # CORRECTION 1: NO FALLBACK BENCHMARK - EXPLICIT API FAILURE HANDLING
     exec_status.info("⏳ Step 2/4: Fetching live NIFTY index spot price...")
     spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
     if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
-        exec_status.warning("⚠️ Spot Price Fetch Warning: Market closed or feed delayed. Using fallback benchmark.")
-        spot_price = 24383.60
-    else:
-        spot_price = float(spot_res['data']['ltp'])
-        exec_status.success(f"✅ NIFTY Spot Price Received: **₹{spot_price:,.2f}**")
+        raise ConnectionError("Fetching spot price failed! Unable to fetch live NIFTY price from SmartAPI. Check connectivity and credentials.")
+    
+    spot_price = float(spot_res['data']['ltp'])
+    if spot_price <= 0:
+        raise ValueError(f"Invalid NIFTY Spot Price received ({spot_price}). Check API data feed connectivity.")
+    exec_status.success(f"✅ NIFTY Spot Price Received: **₹{spot_price:,.2f}**")
     
     df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt, exec_status)
-    result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T, exec_status)
+    result, df_audit, avg_chain_iv, expected_1d_move, min_otm_buffer = find_optimal_iron_condor(df_quant, spot_price, T, exec_status)
 
     exec_status.update(label="🚀 Execution Complete!", state="complete", expanded=False)
 
     st.subheader("📌 Live Market Dashboard")
+    
+    # CORRECTION 2: DASHBOARD DISPLAY WITH AVG IV AND EXPECTED 1-DAY MOVE
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("NIFTY Spot Price", f"₹{spot_price:,.2f}")
     m2.metric("Target Expiry", expiry_dt.strftime('%d-%b-%Y'))
+    m3.metric("Current Avg IV", f"{avg_chain_iv * 100:.2f}%")
+    m4.metric("Expected 1-Day Move", f"±₹{expected_1d_move:.2f}", f"{(expected_1d_move / spot_price) * 100:.2f}%")
+
+    st.markdown("---")
     
+    # CORRECTION 3: STRATEGY SELECTION CRITERIA
+    st.subheader("⚙️ Strategy Selection Criteria (Filter Baselines)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Min Prob. of Profit (PoP)", "≥ 52.0%")
+    c2.metric("Min Expected Value (EV)", "> ₹0.00")
+    c3.metric("Min Safety Buffer", f"≥ {min_otm_buffer:.1f} pts", f"Max(0.4% Spot, 50% 1D Move)")
+    c4.metric("Min Liquidity (OI)", f"≥ {MIN_OI_THRESHOLD:,} contracts")
+
+    st.markdown("---")
+
+    # CORRECTION 4: SHOW CANDIDATE TRADE METRICS WHEN SELECTED
     if result:
-        m3.metric("Model PoP", f"{result['pop']:.1f}%")
-        m4.metric("Buffered RoM", f"{result['return_on_margin']:.2f}%")
+        st.subheader("🎯 Selected Iron Condor Criteria & Safety Metrics")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Strategy PoP", f"{result['pop']:.1f}%", f"Δ +{result['pop'] - 52.0:.1f}% vs Threshold")
+        s2.metric("Net EV per Trade", f"₹{result['expected_value']:,.2f}", "Positive Expectancy")
+        s3.metric("Put/Call Safety Buffers", f"-{result['put_distance']:.0f} / +{result['call_distance']:.0f} pts", f"Min Required: {min_otm_buffer:.0f} pts")
+        s4.metric("Utility Optimization Score", f"{result['utility_score']:.4f}", "Rank 1 Condor")
 
         st.markdown("---")
         st.subheader("🎯 Liquidity-Filtered Option Legs")
@@ -462,7 +482,7 @@ try:
         f1.metric("Net Credit (Post-Slippage)", f"₹{result['net_credit_rupees']:,.2f}", f"{result['net_credit_pts']:.2f} pts")
         f2.metric("Max Loss Limit", f"₹{result['max_loss_rupees']:,.2f}")
         f3.metric("Required Margin (+30% Cushion)", f"₹{result['buffered_margin']:,.2f}")
-        f4.metric("Net EV per Trade", f"₹{result['expected_value']:,.2f}")
+        f4.metric("Return on Margin (RoM)", f"{result['return_on_margin']:.2f}%")
 
         st.markdown("---")
         st.subheader("🛡️ Dynamic Risk & Sensitivity Metrics")
