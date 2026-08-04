@@ -25,7 +25,7 @@ def get_secret(key: str, default: str = "") -> str:
     except Exception:
         return default
 
-# Safely fetch credentials
+# SAFELY FETCH CREDENTIALS
 API_KEY = get_secret("API_KEY")
 CLIENT_CODE = get_secret("CLIENT_CODE")
 PIN = get_secret("PIN")
@@ -87,9 +87,10 @@ def get_nifty_option_chain():
 
 
 # ==============================================================================
-# 2. QUANT ENGINE WITH REAL-TIME GREEKS & LIQUIDITY FILTERS
+# 2. OPTIMIZED QUANT ENGINE WITH BATCH MARKET DATA & CACHING
 # ==============================================================================
-def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
+@st.cache_data(ttl=15, show_spinner=False)
+def run_quant_engine(_smartApi, chain, spot_price, expiry_dt):
     now = pd.Timestamp.now()
     expiry_end = expiry_dt + pd.Timedelta(hours=15, minutes=30)
     remaining_seconds = max((expiry_end - now).total_seconds(), 3600)
@@ -99,34 +100,78 @@ def run_quant_engine(smartApi, chain, spot_price, expiry_dt):
     strikes = chain[(chain['strike'] >= spot_price * 0.92) & (chain['strike'] <= spot_price * 1.08)]['strike'].unique()
     strikes.sort()
     
+    # Pre-build lookup mappings to avoid search overhead
+    tokens = []
+    symbol_map = {}
+    
     for K in strikes:
         ce_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('CE'))]
         pe_row = chain[(chain['strike'] == K) & (chain['tradingsymbol'].str.endswith('PE'))]
         
-        if ce_row.empty or pe_row.empty:
+        if not ce_row.empty and not pe_row.empty:
+            ce_symbol, ce_token = ce_row.iloc[0]['tradingsymbol'], str(ce_row.iloc[0]['token'])
+            pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], str(pe_row.iloc[0]['token'])
+            
+            tokens.extend([ce_token, pe_token])
+            symbol_map[K] = {
+                'ce_symbol': ce_symbol, 'ce_token': ce_token,
+                'pe_symbol': pe_symbol, 'pe_token': pe_token
+            }
+
+    if not tokens:
+        return pd.DataFrame(), T
+
+    # BATCH FETCH MARKET DATA (Prevents page freeze from multiple sequential calls)
+    market_data_map = {}
+    try:
+        # Process token chunks to respect API limits if needed
+        chunk_size = 50
+        for i in range(0, len(tokens), chunk_size):
+            chunk = tokens[i:i + chunk_size]
+            payload = {"mode": "FULL", "exchangeTokens": {"NFO": chunk}}
+            res = _smartApi.getMarketData("FULL", payload)
+            if isinstance(res, dict) and res.get('status') and 'fetched' in res.get('data', {}):
+                for item in res['data']['fetched']:
+                    market_data_map[str(item.get('symbolToken'))] = item
+    except Exception:
+        # Fallback to individual calls if bulk endpoint fails
+        pass
+
+    for K in strikes:
+        if K not in symbol_map:
             continue
             
-        ce_symbol, ce_token = ce_row.iloc[0]['tradingsymbol'], ce_row.iloc[0]['token']
-        pe_symbol, pe_token = pe_row.iloc[0]['tradingsymbol'], pe_row.iloc[0]['token']
+        ce_token = symbol_map[K]['ce_token']
+        pe_token = symbol_map[K]['pe_token']
+        ce_symbol = symbol_map[K]['ce_symbol']
+        pe_symbol = symbol_map[K]['pe_symbol']
         
+        ce_data = market_data_map.get(ce_token)
+        pe_data = market_data_map.get(pe_token)
+        
+        # Fallback fetch if missing from batch
+        if not ce_data:
+            ce_res = _smartApi.ltpData("NFO", ce_symbol, ce_token)
+            if isinstance(ce_res, dict) and ce_res.get('status'):
+                ce_data = ce_res.get('data', {})
+        if not pe_data:
+            pe_res = _smartApi.ltpData("NFO", pe_symbol, pe_token)
+            if isinstance(pe_res, dict) and pe_res.get('status'):
+                pe_data = pe_res.get('data', {})
+                
+        if not ce_data or not pe_data:
+            continue
+
+        ce_price = float(ce_data.get('ltp', ce_data.get('lastPrice', 0)))
+        pe_price = float(pe_data.get('ltp', pe_data.get('lastPrice', 0)))
+        ce_oi = float(ce_data.get('openInterest', ce_data.get('openinterest', 0)))
+        pe_oi = float(pe_data.get('openInterest', pe_data.get('openinterest', 0)))
+        
+        # Liquidity Filter
+        if ce_price <= 0 or pe_price <= 0 or ce_oi < MIN_OI_THRESHOLD or pe_oi < MIN_OI_THRESHOLD:
+            continue
+
         try:
-            ce_res = smartApi.ltpData("NFO", ce_symbol, ce_token)
-            pe_res = smartApi.ltpData("NFO", pe_symbol, pe_token)
-            
-            if not isinstance(ce_res, dict) or not ce_res.get('status') or not isinstance(ce_res.get('data'), dict):
-                continue
-            if not isinstance(pe_res, dict) or not pe_res.get('status') or not isinstance(pe_res.get('data'), dict):
-                continue
-
-            ce_price = float(ce_res['data'].get('ltp', 0))
-            pe_price = float(pe_res['data'].get('ltp', 0))
-            ce_oi = float(ce_res['data'].get('openinterest', 0))
-            pe_oi = float(pe_res['data'].get('openinterest', 0))
-            
-            # Liquidity Filter
-            if ce_price <= 0 or pe_price <= 0 or ce_oi < MIN_OI_THRESHOLD or pe_oi < MIN_OI_THRESHOLD:
-                continue
-
             ce_iv = implied_volatility(ce_price, spot_price, K, T, RISK_FREE_RATE, 'c')
             pe_iv = implied_volatility(pe_price, spot_price, K, T, RISK_FREE_RATE, 'p')
             
@@ -180,9 +225,9 @@ def find_optimal_iron_condor(df, spot, T):
             
             if short_put_k >= spot or (spot - short_put_k) < MIN_OTM_BUFFER:
                 audit_logs.append({
-                    'combo': f"{long_put_k}/{short_put_k}/X/X",
+                    'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/X/X",
                     'status': 'Rejected',
-                    'reason': f"Short Put ({short_put_k}) too close to spot (Min Buffer: {MIN_OTM_BUFFER:.1f} pts)"
+                    'reason': f"Short Put ({short_put_k:.0f}) too close to spot (Min Buffer: {MIN_OTM_BUFFER:.1f} pts)"
                 })
                 continue
                 
@@ -191,18 +236,18 @@ def find_optimal_iron_condor(df, spot, T):
                 
                 if short_call_k <= spot or (short_call_k - spot) < MIN_OTM_BUFFER:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/X",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/X",
                         'status': 'Rejected',
-                        'reason': f"Short Call ({short_call_k}) too close to spot (Min Buffer: {MIN_OTM_BUFFER:.1f} pts)"
+                        'reason': f"Short Call ({short_call_k:.0f}) too close to spot (Min Buffer: {MIN_OTM_BUFFER:.1f} pts)"
                     })
                     continue
                     
                 long_call_k = short_call_k + wing_width  # Symmetric Wings
                 if long_call_k not in strikes:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Rejected',
-                        'reason': f"Symmetric Long Call Strike ({long_call_k}) not present in liquid chain"
+                        'reason': f"Symmetric Long Call Strike ({long_call_k:.0f}) not present in liquid chain"
                     })
                     continue
                     
@@ -218,7 +263,7 @@ def find_optimal_iron_condor(df, spot, T):
                 
                 if net_credit <= 1.0 or max_loss <= 0:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Rejected',
                         'reason': f"Insufficient Credit ({net_credit:.2f} pts) or Invalid Max Loss ({max_loss:.2f})"
                     })
@@ -235,7 +280,7 @@ def find_optimal_iron_condor(df, spot, T):
                 
                 if pop < 0.52:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Rejected',
                         'reason': f"PoP ({pop*100:.1f}%) below minimum required threshold (52.0%)"
                     })
@@ -247,7 +292,7 @@ def find_optimal_iron_condor(df, spot, T):
                 
                 if expected_value <= 0:
                     audit_logs.append({
-                        'combo': f"{long_put_k}/{short_put_k}/{short_call_k}/{long_call_k}",
+                        'combo': f"{long_put_k:.0f}/{short_put_k:.0f}/{short_call_k:.0f}/{long_call_k:.0f}",
                         'status': 'Rejected',
                         'reason': f"Negative or Zero Expected Value (EV: ₹{expected_value * LOT_SIZE:.2f})"
                     })
@@ -279,7 +324,6 @@ def find_optimal_iron_condor(df, spot, T):
 
                 if utility_score > best_score:
                     if optimal_condor is not None:
-                        # Log replacement of previous best
                         audit_logs.append({
                             'combo': f"{optimal_condor['long_put']:.0f}/{optimal_condor['short_put']:.0f}/{optimal_condor['short_call']:.0f}/{optimal_condor['long_call']:.0f}",
                             'status': 'Outranked',
@@ -308,21 +352,23 @@ def find_optimal_iron_condor(df, spot, T):
 # ==============================================================================
 st.title("⚡ Dynamic Risk-Managed Iron Condor Engine")
 
+# Non-blocking Live Refresh via Sidebar Control
 live_mode = st.sidebar.checkbox("Enable Live Refresh (5s)", value=False)
 
 try:
-    smartApi = authenticate()
-    chain, expiry_dt = get_nifty_option_chain()
-    
-    spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
-    if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
-        st.warning("⚠️ Spot Price Fetch Warning: Market closed or feed delayed. Using fallback benchmark.")
-        spot_price = 24383.60
-    else:
-        spot_price = float(spot_res['data']['ltp'])
-    
-    df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt)
-    result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T)
+    with st.spinner("Connecting to SmartAPI and Fetching Chain..."):
+        smartApi = authenticate()
+        chain, expiry_dt = get_nifty_option_chain()
+        
+        spot_res = smartApi.ltpData("NSE", "NIFTY", "99926000")
+        if not isinstance(spot_res, dict) or not spot_res.get('status') or not isinstance(spot_res.get('data'), dict):
+            st.warning("⚠️ Spot Price Fetch Warning: Market closed or feed delayed. Using fallback benchmark.")
+            spot_price = 24383.60
+        else:
+            spot_price = float(spot_res['data']['ltp'])
+        
+        df_quant, T = run_quant_engine(smartApi, chain, spot_price, expiry_dt)
+        result, df_audit = find_optimal_iron_condor(df_quant, spot_price, T)
 
     st.subheader("📌 Live Market Dashboard")
     m1, m2, m3, m4 = st.columns(4)
@@ -381,6 +427,7 @@ try:
 except Exception as e:
     st.error(f"Execution Error: {str(e)}")
 
+# NON-BLOCKING LIVE REFRESH HANDLER
 if live_mode:
     time.sleep(5.0)
     st.rerun()
