@@ -89,15 +89,15 @@ MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 
 @st.cache_resource(ttl=3600)
-def authenticate(status_container=None):
-    if status_container:
-        status_container.write("🔑 Checking SmartAPI credentials...")
+def authenticate(_status_container=None):
+    if _status_container:
+        _status_container.write("🔑 Checking SmartAPI credentials...")
     if not API_KEY or not CLIENT_CODE:
         st.error("🔑 Credentials missing! Configure Streamlit secrets or environment variables.")
         st.stop()
     
-    if status_container:
-        status_container.write("🌐 Generating TOTP & Initializing SmartConnect API session...")
+    if _status_container:
+        _status_container.write("🌐 Generating TOTP & Initializing SmartConnect API session...")
     smartApi = SmartConnect(api_key=API_KEY)
     totp = pyotp.TOTP(TOTP_SECRET).now()
     session = smartApi.generateSession(CLIENT_CODE, PIN, totp)
@@ -105,8 +105,8 @@ def authenticate(status_container=None):
         msg = session.get('message', 'Authentication Failed') if isinstance(session, dict) else 'Invalid Auth Response'
         raise ConnectionError(f"SmartAPI Login Failed: {msg}")
         
-    if status_container:
-        status_container.write("✅ SmartAPI Connected successfully.")
+    if _status_container:
+        _status_container.write("✅ SmartAPI Connected successfully.")
     return smartApi
 
 @st.cache_data(ttl=1800)
@@ -380,7 +380,7 @@ try:
     # --- Live Background Process Display ---
     with st.status("⚙️ Processing Quant Calculations & Market Data...", expanded=True) as status:
         status.write("🔌 Connecting to Angel One SmartAPI...")
-        smartApi = authenticate(status_container=status)
+        smartApi = authenticate(_status_container=status)
         
         status.write("📋 Fetching NIFTY Option Chain Scrip Master...")
         chain, expiry_dt = get_nifty_option_chain()
