@@ -58,10 +58,18 @@ def calculate_greeks(flag, S, K, T, r, sigma):
         "vega": round(vega, 4)
     }
 
+from flask import render_template_string
+
+HTML_CODE = """
+<!DOCTYPE html>
+<html>
+... paste full HTML content here ...
+</html>
+"""
+
 @app.route('/')
 def home():
-    return render_template('index.html')
-
+    return render_template_string(HTML_CODE)
 @app.route('/api/fetch-chain', methods=['POST'])
 def fetch_chain():
     """Generates available strikes near the ATM price for selection."""
