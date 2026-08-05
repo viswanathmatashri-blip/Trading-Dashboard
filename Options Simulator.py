@@ -118,7 +118,6 @@ def is_market_open():
     return time(9, 15) <= now.time() <= time(15, 30)
 
 def bs_price(flag, S, K, T, r, sigma):
-    """Black-Scholes theoretical price calculation."""
     if T <= 0.00001 or sigma <= 0 or S <= 0 or K <= 0:
         return max(0.0, S - K) if flag.upper() in ['CE', 'C'] else max(0.0, K - S)
 
@@ -131,7 +130,6 @@ def bs_price(flag, S, K, T, r, sigma):
         return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 def calculate_greeks(flag, S, K, T, r, sigma):
-    """Individual leg display Greeks."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
 
@@ -160,7 +158,6 @@ def calculate_greeks(flag, S, K, T, r, sigma):
     }
 
 def calculate_basket_portfolio_value(legs, S, T, r=0.07, sigma=0.145):
-    """Calculates total basket portfolio market value given index price S."""
     total_val = 0.0
     for leg in legs:
         flag = leg['option_type']
@@ -173,33 +170,24 @@ def calculate_basket_portfolio_value(legs, S, T, r=0.07, sigma=0.145):
     return total_val
 
 def calculate_basket_greeks_from_price_diff(legs, S, T=7/365, r=0.07, sigma=0.145):
-    """
-    Computes Net Basket Greeks by bumping underlying index price (dS), time (dT), and IV (dSigma).
-    Measures portfolio P&L / premium changes w.r.t index movements.
-    """
     if not legs or S <= 0:
         return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
 
-    dS = 1.0          # 1 point shift in spot price
-    dt = 1.0 / 365.0  # 1 day time decay shift
-    dSigma = 0.01     # 1% IV shift
+    dS = 1.0
+    dt = 1.0 / 365.0
+    dSigma = 0.01
 
-    # Base Portfolio Premium Value
     V0 = calculate_basket_portfolio_value(legs, S, T, r, sigma)
 
-    # 1. Delta (Change in portfolio value per +1 point move in Spot)
     V_up = calculate_basket_portfolio_value(legs, S + dS, T, r, sigma)
     V_dn = calculate_basket_portfolio_value(legs, S - dS, T, r, sigma)
     net_delta = (V_up - V_dn) / (2 * dS)
 
-    # 2. Gamma (Rate of change of Delta per +1 point move in Spot)
     net_gamma = (V_up - 2 * V0 + V_dn) / (dS ** 2)
 
-    # 3. Theta (Change in portfolio value per 1 day passage of time)
     V_time = calculate_basket_portfolio_value(legs, S, max(T - dt, 0.00001), r, sigma)
     net_theta = V_time - V0
 
-    # 4. Vega (Change in portfolio value per 1% rise in IV)
     V_vol = calculate_basket_portfolio_value(legs, S, T, r, sigma + dSigma)
     net_vega = V_vol - V0
 
@@ -213,6 +201,34 @@ def calculate_basket_greeks_from_price_diff(legs, S, T=7/365, r=0.07, sigma=0.14
         "vega": round(net_vega, 2),
         "expected_day_theta": round(net_expected_day_theta, 2)
     }
+
+def calculate_max_profit_loss(legs):
+    has_unhedged_short_call = False
+    has_unhedged_short_put = False
+    max_profit = 0.0
+
+    for leg in legs:
+        qty = int(leg.get('qty', 65))
+        entry_price = float(leg.get('entry_price', 0.0) or 0.0)
+        action = leg.get('action', 'BUY')
+        opt_type = leg.get('option_type', 'CE')
+
+        if action == 'BUY':
+            max_profit = float('inf')
+        elif action == 'SELL':
+            max_profit += (entry_price * qty)
+            if opt_type in ['CE', 'C']:
+                has_unhedged_short_call = True
+            elif opt_type in ['PE', 'P']:
+                has_unhedged_short_put = True
+
+    if has_unhedged_short_call or has_unhedged_short_put:
+        max_loss_str = "Uncapped"
+    else:
+        max_loss_str = "Defined"
+
+    max_profit_str = "Uncapped" if max_profit == float('inf') else f"₹{round(max_profit, 2)}"
+    return max_profit_str, max_loss_str
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -230,6 +246,14 @@ HTML_TEMPLATE = """
             color: #00ff88; padding: 6px 14px; border-radius: 20px;
             font-size: 11px; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
             max-width: 90vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+
+        #refreshToggleOverlay {
+            position: fixed; top: 10px; right: 15px; z-index: 9999;
+            background: rgba(20, 20, 20, 0.95); border: 1px solid #444;
+            color: #fff; padding: 6px 12px; border-radius: 20px;
+            font-size: 11px; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+            display: flex; align-items: center; gap: 6px; cursor: pointer;
         }
 
         .pill-err { border-color: #ff5252 !important; color: #ff5252 !important; }
@@ -266,6 +290,11 @@ HTML_TEMPLATE = """
 <body>
 
     <div id="apiStatusPill">Status: Logging in API...</div>
+
+    <div id="refreshToggleOverlay">
+        <input type="checkbox" id="chkAutoRefresh" checked onchange="toggleRefreshInterval()">
+        <label for="chkAutoRefresh" style="margin:0; cursor:pointer; color:#fff;">Enable Refresh 5 sec</label>
+    </div>
 
     <h2>Real-Market Options Strategy Tracker (SmartAPI Live)</h2>
     <div class="grid">
@@ -321,6 +350,8 @@ HTML_TEMPLATE = """
         <div>
             <div class="status-bar">
                 <div class="status-item">Index LTP: <span id="stIndex" class="status-value">-</span></div>
+                <div class="status-item">Current IV: <span id="stIv" class="status-value">-</span></div>
+                <div class="status-item">Expected 1-Day Move: <span id="stMove" class="status-value">-</span></div>
                 <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
             </div>
 
@@ -346,7 +377,7 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="card">
-                <h3>Basket Legs Real-Time Premium Chart (1-Day Scale)</h3>
+                <h3>Basket Legs Real-Time Premium Chart (1-Day Historical Scale)</h3>
                 <canvas id="legsPremiumChart" height="120"></canvas>
             </div>
         </div>
@@ -356,7 +387,7 @@ HTML_TEMPLATE = """
         let pendingLegs = [];
         let activeBaskets = [];
         let mainChart, legsChart;
-        let legHistory = {};
+        let refreshTimer = null;
 
         function updateStatus(text, type='info') {
             const pill = document.getElementById('apiStatusPill');
@@ -387,6 +418,15 @@ HTML_TEMPLATE = """
                 }
             }
         });
+
+        function toggleRefreshInterval() {
+            const isChecked = document.getElementById('chkAutoRefresh').checked;
+            if (refreshTimer) clearInterval(refreshTimer);
+
+            if (isChecked) {
+                refreshTimer = setInterval(updateDashboard, 5000);
+            }
+        }
 
         async function loadExpiries() {
             updateStatus("Initializing...", "warn");
@@ -513,6 +553,8 @@ HTML_TEMPLATE = """
                 if (data.error) { document.getElementById('stIndex').innerText = data.error; return; }
 
                 document.getElementById('stIndex').innerText = data.underlying_price;
+                document.getElementById('stIv').innerText = data.current_iv + "%";
+                document.getElementById('stMove').innerText = "±" + data.expected_1day_move + " pts";
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED";
 
                 if (data.chart_labels && data.chart_labels.length > 0) {
@@ -523,8 +565,6 @@ HTML_TEMPLATE = """
 
                 const container = document.getElementById('basketsContainer');
                 container.innerHTML = '';
-
-                let nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
                 data.baskets.forEach(b => {
                     let pnlDisplay = typeof b.basket_pnl === 'number' ? `₹${b.basket_pnl}` : b.basket_pnl;
@@ -544,6 +584,11 @@ HTML_TEMPLATE = """
                                 <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ₹${b.net_greeks.expected_day_theta}</span>
                             </div>
                             <button class="btn-delete" onclick="deleteBasket(${b.id})" style="padding: 4px 8px; margin-top:4px;">🗑️ Delete Basket</button>
+                        </div>
+                        
+                        <div style="margin-top: 6px; font-size: 12px; color: #aaa;">
+                            <strong>Max Profit:</strong> <span style="color:#00ff88; margin-right:15px;">${b.max_profit}</span>
+                            <strong>Max Loss:</strong> <span style="color:#ff5252;">${b.max_loss}</span>
                         </div>`;
 
                     b.legs.forEach((leg, idx) => {
@@ -568,49 +613,50 @@ HTML_TEMPLATE = """
                     container.innerHTML += html;
                 });
 
-                updateLegsChart(data.baskets, nowTime);
+                if (data.baskets && data.baskets.length > 0) {
+                    updateLegsHistoricalChart(data.baskets[0]);
+                }
 
             } catch(e) { updateStatus("Couldnt fetch live price from API", "error"); }
         }
 
-        function updateLegsChart(baskets, nowTime) {
-            if (baskets.length === 0 || baskets[0].legs.length === 0) return;
+        function updateLegsHistoricalChart(firstBasket) {
+            if (!firstBasket || !firstBasket.legs_historical) return;
 
-            let basket = baskets[0];
-            if (!legsChart.data.labels.includes(nowTime)) {
-                legsChart.data.labels.push(nowTime);
+            const hist = firstBasket.legs_historical;
+            if (hist.labels && hist.labels.length > 0) {
+                legsChart.data.labels = hist.labels;
+                
+                let datasets = [];
+                if (hist.leg1_prices && hist.leg1_prices.length > 0) {
+                    datasets.push({
+                        label: `${firstBasket.legs[0].strike} ${firstBasket.legs[0].option_type} (${firstBasket.legs[0].action})`,
+                        data: hist.leg1_prices,
+                        borderColor: '#00bcd4',
+                        backgroundColor: 'transparent',
+                        yAxisID: 'y1',
+                        tension: 0.1
+                    });
+                }
+
+                if (hist.leg2_prices && hist.leg2_prices.length > 0) {
+                    datasets.push({
+                        label: `${firstBasket.legs[1].strike} ${firstBasket.legs[1].option_type} (${firstBasket.legs[1].action})`,
+                        data: hist.leg2_prices,
+                        borderColor: '#ff9800',
+                        backgroundColor: 'transparent',
+                        yAxisID: 'y2',
+                        tension: 0.1
+                    });
+                }
+
+                legsChart.data.datasets = datasets;
+                legsChart.update();
             }
-
-            if (legsChart.data.labels.length > 40) legsChart.data.labels.shift();
-
-            let datasets = [];
-
-            basket.legs.forEach((leg, idx) => {
-                let legKey = `leg_${idx}`;
-                if (!legHistory[legKey]) legHistory[legKey] = [];
-                if (typeof leg.current_premium === 'number') legHistory[legKey].push(leg.current_premium);
-                if (legHistory[legKey].length > 40) legHistory[legKey].shift();
-
-                let color = idx === 0 ? '#00bcd4' : '#ff9800';
-                let axis = idx === 0 ? 'y1' : 'y2';
-
-                datasets.push({
-                    label: `${leg.strike} ${leg.option_type} (${leg.action})`,
-                    data: [...legHistory[legKey]],
-                    borderColor: color,
-                    backgroundColor: idx === 1 ? 'rgba(0, 255, 136, 0.15)' : 'transparent',
-                    fill: idx === 1 ? '-1' : false,
-                    yAxisID: axis,
-                    tension: 0.2
-                });
-            });
-
-            legsChart.data.datasets = datasets;
-            legsChart.update();
         }
 
         loadExpiries();
-        setInterval(updateDashboard, 3000);
+        toggleRefreshInterval();
     </script>
 </body>
 </html>
@@ -709,6 +755,10 @@ def live_data():
     if underlying_price is None:
         return jsonify({"status": "Couldnt fetch live price from API", "error": "couldnt fetch live price from API"})
 
+    # Current IV and Expected 1-Day Move Calculations
+    current_iv = 14.5  # Standard default benchmark IV
+    expected_1day_move = round(underlying_price * (current_iv / 100.0) / math.sqrt(365), 2)
+
     chart_labels, chart_prices = [], []
     try:
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -737,7 +787,9 @@ def live_data():
 
         raw_legs = basket.get('legs', [])
 
-        for leg in raw_legs:
+        leg_historical_data = {"labels": [], "leg1_prices": [], "leg2_prices": []}
+
+        for idx, leg in enumerate(raw_legs):
             strike = float(leg['strike'])
             expiry = leg.get('expiry', '').upper()
             opt_type = leg['option_type']
@@ -765,6 +817,27 @@ def live_data():
                 except Exception as e:
                     print(f"Error querying option LTP for {trading_symbol}:", str(e))
 
+                # Fetch Historical Option Candle Data for Leg Premium Chart
+                try:
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    leg_candle_param = {
+                        "exchange": exchange,
+                        "symboltoken": scrip_token,
+                        "interval": "FIFTEEN_MINUTE",
+                        "fromdate": f"{today_str} 09:15",
+                        "todate": f"{today_str} 15:30"
+                    }
+                    leg_candles = api.getCandleData(leg_candle_param)
+                    if leg_candles and leg_candles.get('status') and leg_candles.get('data'):
+                        prices = [float(c[4]) for c in leg_candles['data']]
+                        if idx == 0:
+                            leg_historical_data["labels"] = [c[0].split('T')[1][:5] for c in leg_candles['data']]
+                            leg_historical_data["leg1_prices"] = prices
+                        elif idx == 1:
+                            leg_historical_data["leg2_prices"] = prices
+                except Exception as e:
+                    print(f"Error fetching leg candle data for {trading_symbol}:", str(e))
+
             if current_premium is None:
                 current_premium = "couldnt fetch live price from API"
                 leg_pnl = "N/A"
@@ -780,7 +853,7 @@ def live_data():
                     basket_pnl += leg_pnl
                     total_decay_till_date += theta_decay_till_date
 
-            greeks = calculate_greeks(opt_type, underlying_price, strike, T=7/365, r=0.07, sigma=0.145)
+            greeks = calculate_greeks(opt_type, underlying_price, strike, T=7/365, r=0.07, sigma=current_iv / 100.0)
 
             legs_data.append({
                 "strike": strike,
@@ -795,8 +868,8 @@ def live_data():
                 "greeks": greeks
             })
 
-        # Calculate Net Basket Greeks using Price Differences (Bump & Revalue method)
-        net_greeks = calculate_basket_greeks_from_price_diff(raw_legs, underlying_price)
+        net_greeks = calculate_basket_greeks_from_price_diff(raw_legs, underlying_price, sigma=current_iv / 100.0)
+        max_profit, max_loss = calculate_max_profit_loss(raw_legs)
 
         processed_baskets.append({
             "id": basket.get('id'),
@@ -804,12 +877,17 @@ def live_data():
             "legs": legs_data,
             "basket_pnl": round(basket_pnl, 2) if not has_leg_error else "couldnt fetch live price from API",
             "total_decay_till_date": round(total_decay_till_date, 2) if not has_leg_error else "N/A",
-            "net_greeks": net_greeks
+            "net_greeks": net_greeks,
+            "max_profit": max_profit,
+            "max_loss": max_loss,
+            "legs_historical": leg_historical_data
         })
 
     return jsonify({
         "status": status_msg,
         "underlying_price": underlying_price,
+        "current_iv": current_iv,
+        "expected_1day_move": expected_1day_move,
         "is_market_open": is_market_open(),
         "chart_labels": chart_labels,
         "chart_prices": chart_prices,
