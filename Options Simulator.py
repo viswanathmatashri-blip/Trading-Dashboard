@@ -191,6 +191,7 @@ HTML_TEMPLATE = """
         .pnl-neg { color: #ff5252; font-weight: bold; }
         .pnl-err { color: #ff9800; font-weight: bold; }
         .greek-tag { font-family: monospace; background: #2d2d2d; padding: 3px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; display: inline-block; margin-top: 4px; }
+        .basket-summary-tag { font-family: monospace; background: #1a3835; border: 1px solid #00bcd4; padding: 3px 7px; border-radius: 4px; font-size: 11px; color: #00e5ff; margin-left: 6px; display: inline-block; }
     </style>
 </head>
 <body>
@@ -461,9 +462,19 @@ HTML_TEMPLATE = """
                     let pnlClass = typeof b.basket_pnl === 'number' ? (b.basket_pnl >= 0 ? 'pnl-pos' : 'pnl-neg') : 'pnl-err';
 
                     let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <div><strong>${b.name}</strong> <span class="${pnlClass}" style="margin-left: 15px;">Live P&L: ${pnlDisplay}</span></div>
-                            <button class="btn-delete" onclick="deleteBasket(${b.id})" style="padding: 4px 8px;">🗑️ Delete Basket</button>
+                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
+                            <div style="display:flex; align-items:center; flex-wrap:wrap; gap:4px;">
+                                <strong>${b.name}</strong>
+                                <span class="${pnlClass}" style="margin-left: 10px; margin-right: 10px;">Live P&L: ${pnlDisplay}</span>
+                                
+                                <span class="basket-summary-tag">Net &Delta;: ${b.net_greeks.delta}</span>
+                                <span class="basket-summary-tag">Net &Gamma;: ${b.net_greeks.gamma}</span>
+                                <span class="basket-summary-tag">Net &Theta;: ${b.net_greeks.theta}</span>
+                                <span class="basket-summary-tag">Net &Nu;: ${b.net_greeks.vega}</span>
+                                <span class="basket-summary-tag" style="color:#00ff88; border-color:#00ff88; background:#1b3821;">Tot Decay: ₹${b.total_decay_till_date}</span>
+                                <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ${b.net_greeks.expected_day_theta}</span>
+                            </div>
+                            <button class="btn-delete" onclick="deleteBasket(${b.id})" style="padding: 4px 8px; margin-top:4px;">🗑️ Delete Basket</button>
                         </div>`;
 
                     b.legs.forEach((leg, idx) => {
@@ -504,7 +515,6 @@ HTML_TEMPLATE = """
             if (legsChart.data.labels.length > 40) legsChart.data.labels.shift();
 
             let datasets = [];
-            let leg1Data = [], leg2Data = [];
 
             basket.legs.forEach((leg, idx) => {
                 let legKey = `leg_${idx}`;
@@ -655,12 +665,20 @@ def live_data():
         legs_data = []
         has_leg_error = False
 
+        net_delta = 0.0
+        net_gamma = 0.0
+        net_theta = 0.0
+        net_vega = 0.0
+        total_decay_till_date = 0.0
+        net_expected_day_theta = 0.0
+
         for leg in basket.get('legs', []):
             strike = float(leg['strike'])
             expiry = leg.get('expiry', '').upper()
             opt_type = leg['option_type']
             action = leg['action']
             qty = int(leg.get('qty', 65))
+            direction = 1 if action == 'BUY' else -1
 
             current_premium, scrip_token, trading_symbol = None, None, None
 
@@ -693,10 +711,19 @@ def live_data():
                 entry_price = float(leg.get('entry_price')) if leg.get('entry_price') is not None and float(leg.get('entry_price')) > 0 else current_premium
                 leg_pnl = (current_premium - entry_price) * qty if action == 'BUY' else (entry_price - current_premium) * qty
                 theta_decay_till_date = round(entry_price - current_premium, 2)
+                
                 if not has_leg_error:
                     basket_pnl += leg_pnl
+                    total_decay_till_date += (entry_price - current_premium) * qty
 
             greeks = calculate_greeks(opt_type, underlying_price, strike, T=7/365, r=0.07, sigma=0.145)
+
+            # Accumulate Net Basket Greeks
+            net_delta += greeks['delta'] * qty * direction
+            net_gamma += greeks['gamma'] * qty * direction
+            net_theta += greeks['theta'] * qty * direction
+            net_vega += greeks['vega'] * qty * direction
+            net_expected_day_theta += greeks['expected_day_theta'] * qty * direction
 
             legs_data.append({
                 "strike": strike,
@@ -714,7 +741,15 @@ def live_data():
             "id": basket.get('id'),
             "name": basket.get('name', 'Basket'),
             "legs": legs_data,
-            "basket_pnl": round(basket_pnl, 2) if not has_leg_error else "couldnt fetch live price from API"
+            "basket_pnl": round(basket_pnl, 2) if not has_leg_error else "couldnt fetch live price from API",
+            "total_decay_till_date": round(total_decay_till_date, 2) if not has_leg_error else "N/A",
+            "net_greeks": {
+                "delta": round(net_delta, 2),
+                "gamma": round(net_gamma, 6),
+                "theta": round(net_theta, 2),
+                "vega": round(net_vega, 2),
+                "expected_day_theta": round(net_expected_day_theta, 2)
+            }
         })
 
     return jsonify({
