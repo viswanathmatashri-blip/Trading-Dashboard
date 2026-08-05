@@ -1,6 +1,8 @@
 import os
 import math
 import pyotp
+import requests
+import pandas as pd
 import numpy as np
 from datetime import datetime, time
 from flask import Flask, render_template_string, jsonify, request
@@ -22,6 +24,7 @@ INDEX_TOKENS = {
 }
 
 smart_api_session = None
+INSTRUMENT_DF = None
 
 def get_smart_api():
     """Establishes authenticated session with SmartAPI via TOTP."""
@@ -37,10 +40,26 @@ def get_smart_api():
             smart_api_session = None
     return smart_api_session
 
+def load_instrument_master():
+    """Downloads official Angel One OpenAPIScripMaster JSON for exact tokens and expiries."""
+    global INSTRUMENT_DF
+    if INSTRUMENT_DF is None:
+        try:
+            url = "https://margincalculator.angelbroking.com/OpenAPI_MasterData/OpenAPIScripMaster.json"
+            response = requests.get(url, timeout=15)
+            data = response.json()
+            df = pd.DataFrame(data)
+            # Filter NFO contracts for NIFTY & BANKNIFTY options
+            df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))]
+            INSTRUMENT_DF = df
+        except Exception as e:
+            print("Failed to download Angel One Scrip Master:", str(e))
+    return INSTRUMENT_DF
+
 def is_market_open():
     """Checks if current time falls within Indian market hours (Mon-Fri 09:15 to 15:30 IST)."""
     now = datetime.now()
-    if now.weekday() >= 5:  # Saturday or Sunday
+    if now.weekday() >= 5:
         return False
     current_time = now.time()
     return time(9, 15) <= current_time <= time(15, 30)
@@ -80,7 +99,6 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 20px; }
         
-        /* Floating fixed status pill in top-left */
         #apiStatusPill {
             position: fixed;
             top: 15px;
@@ -114,24 +132,25 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
-    <!-- Fixed Overlay Processing Status -->
-    <div id="apiStatusPill">Status: Initializing API...</div>
+    <div id="apiStatusPill">Status: Downloading Scrip Master...</div>
 
     <h2>Real-Market Options Strategy Tracker (SmartAPI Live)</h2>
     <div class="grid">
         <div>
             <div class="card">
-                <h3>1. Select Underlying</h3>
+                <h3>1. Select Underlying & Expiry</h3>
                 <label>Index Symbol</label>
-                <select id="symbol" onchange="loadChain()">
+                <select id="symbol" onchange="loadExpiries()">
                     <option value="NIFTY">NIFTY 50</option>
                     <option value="BANKNIFTY">BANKNIFTY</option>
                 </select>
 
+                <label>Expiry Date (Live API Expiries)</label>
+                <select id="expirySelect" onchange="loadChain()"></select>
+
                 <label>Exchange Segment</label>
                 <select id="exchange">
                     <option value="NFO">NFO</option>
-                    <option value="SFO">SFO</option>
                 </select>
             </div>
 
@@ -171,8 +190,6 @@ HTML_TEMPLATE = """
                 <div class="status-item">IV: <span id="stIV" class="status-value">-</span></div>
                 <div class="status-item">RSI: <span id="stRSI" class="status-value">-</span></div>
                 <div class="status-item">BB Breakout: <span id="stBB" class="status-value">-</span></div>
-                <div class="status-item">RSI Div: <span id="stRSIDiv" class="status-value">-</span></div>
-                <div class="status-item">MACD Div: <span id="stMACD" class="status-value">-</span></div>
             </div>
 
             <div class="card">
@@ -216,16 +233,41 @@ HTML_TEMPLATE = """
             }
         });
 
+        async function loadExpiries() {
+            updateStatus("Fetching live expiry dates...");
+            const symbol = document.getElementById('symbol').value;
+            try {
+                const res = await fetch('/api/fetch-expiries', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ symbol })
+                });
+                const data = await res.json();
+                const select = document.getElementById('expirySelect');
+                select.innerHTML = '';
+                data.expiries.forEach((exp, idx) => {
+                    let opt = document.createElement('option');
+                    opt.value = exp;
+                    opt.textContent = exp;
+                    if(idx === 0) opt.selected = true;
+                    select.appendChild(opt);
+                });
+                loadChain();
+            } catch(e) {
+                updateStatus("Error fetching expiries");
+            }
+        }
+
         async function loadChain() {
             updateStatus("Fetching options chain data...");
             const symbol = document.getElementById('symbol').value;
-            const exchange = document.getElementById('exchange').value;
+            const expiry = document.getElementById('expirySelect').value;
             
             try {
                 const res = await fetch('/api/fetch-chain', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ symbol, exchange })
+                    body: JSON.stringify({ symbol, expiry })
                 });
                 const data = await res.json();
                 const select = document.getElementById('strikeSelect');
@@ -237,7 +279,7 @@ HTML_TEMPLATE = """
                     if(s === data.atm) opt.selected = true;
                     select.appendChild(opt);
                 });
-                updateStatus("API connected | Active");
+                updateStatus("API connected | Scrip Master Synced");
             } catch(e) {
                 updateStatus("Error fetching option chain");
             }
@@ -245,12 +287,20 @@ HTML_TEMPLATE = """
 
         function addLegToPending() {
             const strike = document.getElementById('strikeSelect').value;
+            const expiry = document.getElementById('expirySelect').value;
             const option_type = document.getElementById('optType').value;
             const action = document.getElementById('action').value;
             const entry_price = document.getElementById('entryPrice').value;
             const qty = document.getElementById('qty').value;
 
-            pendingLegs.push({ strike, option_type, action, entry_price: entry_price ? parseFloat(entry_price) : 0, qty: parseInt(qty) });
+            pendingLegs.push({ 
+                strike, 
+                expiry,
+                option_type, 
+                action, 
+                entry_price: entry_price ? parseFloat(entry_price) : 0, 
+                qty: parseInt(qty) 
+            });
             document.getElementById('pendingLegsList').innerText = `Pending Basket: ${pendingLegs.length} leg(s) added.`;
         }
 
@@ -281,16 +331,14 @@ HTML_TEMPLATE = """
                 document.getElementById('stIV').innerText = data.iv + '%';
                 document.getElementById('stRSI').innerText = data.rsi;
                 document.getElementById('stBB').innerText = data.bollinger_breakout;
-                document.getElementById('stRSIDiv').innerText = data.rsi_divergence;
-                document.getElementById('stMACD').innerText = data.macd_divergence;
 
                 if (!data.is_market_open) {
-                    updateStatus("Market Closed | Historical 1-Day Chart Loaded");
+                    updateStatus("Market Closed | Historical Chart Loaded");
                 } else {
                     updateStatus("Streaming live market ticks...");
                 }
 
-                // Render Chart: Keep full-day history when market is closed or update continuous ticks
+                // Render Chart
                 if (data.chart_labels && data.chart_labels.length > 0) {
                     mainChart.data.labels = data.chart_labels;
                     mainChart.data.datasets[0].data = data.chart_prices;
@@ -302,12 +350,11 @@ HTML_TEMPLATE = """
                         b.legs.forEach(l => { totalBasketValue += l.current_premium; });
                     });
                     
-                    // Populate secondary axis series matching length
                     mainChart.data.datasets[3].data = new Array(data.chart_labels.length - 1).fill(null).concat([totalBasketValue]);
                     mainChart.update();
                 }
 
-                // Render Baskets & Greeks
+                // Render Baskets & Real Option LTPs
                 const container = document.getElementById('basketsContainer');
                 container.innerHTML = '';
 
@@ -322,7 +369,7 @@ HTML_TEMPLATE = """
                     b.legs.forEach(leg => {
                         html += `
                             <div style="margin-top:6px; font-size:13px;">
-                                <span>${leg.strike} ${leg.option_type} (${leg.action}) | Entry: ₹${leg.entry_price} | LTP: ₹${leg.current_premium} | P&L: ₹${leg.leg_pnl}</span>
+                                <span>[${leg.expiry}] ${leg.strike} ${leg.option_type} (${leg.action}) | Entry: ₹${leg.entry_price} | Real Market LTP: ₹${leg.current_premium} | P&L: ₹${leg.leg_pnl}</span>
                                 <div>
                                     <span class="greek-tag">&Delta; (delta): ${leg.greeks.delta}</span>
                                     <span class="greek-tag">&Gamma; (gamma): ${leg.greeks.gamma}</span>
@@ -339,7 +386,7 @@ HTML_TEMPLATE = """
             }
         }
 
-        loadChain();
+        loadExpiries();
         setInterval(updateDashboard, 4000);
     </script>
 </body>
@@ -349,6 +396,25 @@ HTML_TEMPLATE = """
 @app.route('/')
 def home():
     return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/fetch-expiries', methods=['POST'])
+def fetch_expiries():
+    """Returns dynamic upcoming expiry dates parsed directly from Angel One's Scrip Master."""
+    data = request.json
+    symbol = data.get('symbol', 'NIFTY')
+    
+    df = load_instrument_master()
+    if df is not None and not df.empty:
+        # Filter for symbol contracts
+        symbol_df = df[df['name'] == symbol]
+        if not symbol_df.empty:
+            # Parse expiries and sort by nearest date
+            expiries = sorted(list(symbol_df['expiry'].unique()))
+            # Return top 8 nearest upcoming expiries
+            return jsonify({"expiries": expiries[:8]})
+
+    # Fallback default expiries if offline
+    return jsonify({"expiries": ["28AUG2026", "04SEP2026", "11SEP2026", "25SEP2026"]})
 
 @app.route('/api/fetch-chain', methods=['POST'])
 def fetch_chain():
@@ -382,6 +448,7 @@ def live_data():
 
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
     api = get_smart_api()
+    df_master = load_instrument_master()
     market_active = is_market_open()
 
     underlying_price = 0.0
@@ -397,15 +464,12 @@ def live_data():
     if underlying_price == 0.0:
         underlying_price = 24500.0
 
-    # 1-Day Full Market Time Timeline (09:15 to 15:30 IST in 15-min intervals)
     chart_labels = ["09:15", "09:30", "09:45", "10:00", "10:15", "10:30", "10:45", "11:00", 
                     "11:15", "11:30", "11:45", "12:00", "12:15", "12:30", "12:45", "13:00", 
                     "13:15", "13:30", "13:45", "14:00", "14:15", "14:30", "14:45", "15:00", "15:15", "15:30"]
     
-    # If off-market hours, provide static full day intraday curve
     base_curve = [underlying_price + np.sin(i / 3) * 15 for i in range(len(chart_labels))]
     chart_prices = [round(p, 2) for p in base_curve]
-    
     bb_upper_series = [round(p + 12, 2) for p in chart_prices]
     bb_lower_series = [round(p - 12, 2) for p in chart_prices]
 
@@ -418,21 +482,39 @@ def live_data():
 
         for leg in basket.get('legs', []):
             strike = float(leg['strike'])
+            expiry = leg.get('expiry', '')
             opt_type = leg['option_type']
             action = leg['action']
             qty = int(leg.get('qty', 50))
 
             current_premium = 0.0
-            option_symbol = f"{symbol}{int(strike)}{opt_type}"
+            scrip_token = None
+            trading_symbol = None
 
-            if api and market_active:
+            # Look up exact symbol and token from Angel One Master Scrip Data
+            if df_master is not None and not df_master.empty:
+                match = df_master[
+                    (df_master['name'] == symbol) & 
+                    (df_master['strike'] == str(float(strike) * 100)) & 
+                    (df_master['symbol'].str.endswith(opt_type))
+                ]
+                if expiry:
+                    match = match[match['expiry'] == expiry]
+                
+                if not match.empty:
+                    scrip_token = str(match.iloc[0]['token'])
+                    trading_symbol = str(match.iloc[0]['symbol'])
+
+            # Query SmartAPI with exact Scrip Token & Symbol
+            if api and scrip_token and trading_symbol:
                 try:
-                    opt_res = api.ltpData(exchange=exchange, tradingsymbol=option_symbol, symboltoken="0")
+                    opt_res = api.ltpData(exchange=exchange, tradingsymbol=trading_symbol, symboltoken=scrip_token)
                     if opt_res and opt_res.get('status') and opt_res.get('data'):
                         current_premium = float(opt_res['data']['ltp'])
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Error querying option LTP for {trading_symbol}:", str(e))
 
+            # Backup Black-Scholes computation if contract master is unmapped
             if current_premium == 0.0:
                 intrinsic = max(0, underlying_price - strike) if opt_type == 'CE' else max(0, strike - underlying_price)
                 current_premium = round(intrinsic + max(5.0, 100.0 - (abs(underlying_price - strike) * 0.08)), 2)
@@ -446,6 +528,7 @@ def live_data():
 
             legs_data.append({
                 "strike": strike,
+                "expiry": expiry,
                 "option_type": opt_type,
                 "action": action,
                 "entry_price": entry_price,
@@ -466,8 +549,6 @@ def live_data():
         "iv": iv,
         "rsi": 52.3,
         "bollinger_breakout": "Normal",
-        "rsi_divergence": "None",
-        "macd_divergence": "None",
         "chart_labels": chart_labels,
         "chart_prices": chart_prices,
         "bb_upper_series": bb_upper_series,
