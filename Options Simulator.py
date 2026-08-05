@@ -285,7 +285,6 @@ HTML_TEMPLATE = """
             max-width: 90vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
 
-        /* Fix 3: Expanded ribbon to enforce single-line text without wrapping */
         #refreshToggleOverlay {
             position: fixed; top: 10px; right: 15px; z-index: 9999;
             background: rgba(20, 20, 20, 0.95); border: 1px solid #444;
@@ -455,7 +454,6 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="card">
-                <!-- Fix 4: Added Timeframe Dropdown selector for Basket Legs Chart -->
                 <div class="header-flex">
                     <h3>Basket Legs Real-Time Premium Chart</h3>
                     <div>
@@ -491,11 +489,16 @@ HTML_TEMPLATE = """
             if (type === 'warn') pill.classList.add('pill-warn');
         }
 
+        // Professional Chart Options (Disables rise-up entrance animations & sets clean lines)
         const ctx = document.getElementById('mainChart').getContext('2d');
         mainChart = new Chart(ctx, {
             type: 'line',
-            data: { labels: [], datasets: [{ label: 'Index Spot Price', data: [], borderColor: '#00bcd4', yAxisID: 'y', tension: 0.1 }] },
-            options: { scales: { y: { display: true, position: 'left', grid: { color: '#2a2a2a' } } } }
+            data: { labels: [], datasets: [{ label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 4, yAxisID: 'y', tension: 0.1 }] },
+            options: { 
+                animation: false,
+                responsive: true,
+                scales: { y: { display: true, position: 'left', grid: { color: '#2a2a2a' } } } 
+            }
         });
 
         const ctxLegs = document.getElementById('legsPremiumChart').getContext('2d');
@@ -503,6 +506,7 @@ HTML_TEMPLATE = """
             type: 'line',
             data: { labels: [], datasets: [] },
             options: {
+                animation: false,
                 responsive: true,
                 interaction: { mode: 'index', intersect: false },
                 scales: {
@@ -621,7 +625,6 @@ HTML_TEMPLATE = """
             const basketId = Date.now();
             const newBasketName = `Basket #${activeBaskets.length + 1}`;
             
-            // Auto-select chart for newly created basket if none selected
             if (!selectedChartBasketId) selectedChartBasketId = basketId;
 
             activeBaskets.push({ id: basketId, name: newBasketName, legs: [...pendingLegs] });
@@ -636,7 +639,6 @@ HTML_TEMPLATE = """
             });
         }
 
-        // Fix 1: Instant & Permanent Basket Deletion
         function deleteBasket(basketId) {
             deletedBasketIds.add(basketId);
             activeBaskets = activeBaskets.filter(b => b.id !== basketId);
@@ -645,11 +647,9 @@ HTML_TEMPLATE = """
                 selectedChartBasketId = activeBaskets.length > 0 ? activeBaskets[0].id : null;
             }
             
-            // Instantly remove DOM element or re-render UI state
             updateDashboard();
         }
 
-        // Fix 2: Dynamic Basket Selection for Chart
         function toggleBasketChart(basketId) {
             selectedChartBasketId = selectedChartBasketId === basketId ? null : basketId;
             updateDashboard();
@@ -661,7 +661,6 @@ HTML_TEMPLATE = """
             const interval = document.getElementById('timeframeSelect').value;
             const basketInterval = document.getElementById('basketTimeframeSelect').value;
 
-            // Enforce client-side deletion filter
             activeBaskets = activeBaskets.filter(b => !deletedBasketIds.has(b.id));
 
             try {
@@ -686,10 +685,9 @@ HTML_TEMPLATE = """
                 if (data.chart_labels && data.chart_labels.length > 0) {
                     mainChart.data.labels = data.chart_labels;
                     mainChart.data.datasets[0].data = data.chart_prices;
-                    mainChart.update();
+                    mainChart.update('none'); // Update without vertical entry animation
                 }
 
-                // Filter backend data against client-side blacklisted/deleted IDs
                 const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
 
                 const container = document.getElementById('basketsContainer');
@@ -750,20 +748,19 @@ HTML_TEMPLATE = """
                     container.innerHTML += html;
                 });
 
-                // Load Basket Chart according to checked option
                 const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
                 if (targetBasket) {
                     updateLegsHistoricalChart(targetBasket);
                 } else {
                     legsChart.data.labels = [];
                     legsChart.data.datasets = [];
-                    legsChart.update();
+                    legsChart.update('none');
                 }
 
             } catch(e) { updateStatus("Couldnt fetch live price from API", "error"); }
         }
 
-        // Renders all legs of selected basket dynamically
+        // Professional, Static Horizontal Sliding Chart Renderer
         function updateLegsHistoricalChart(basket) {
             if (!basket || !basket.legs_historical) return;
 
@@ -778,6 +775,9 @@ HTML_TEMPLATE = """
                             label: series.label,
                             data: series.prices,
                             borderColor: CHART_COLORS[idx % CHART_COLORS.length],
+                            borderWidth: 1.5,
+                            pointRadius: 0,            // Eliminates heavy dot overlays
+                            pointHoverRadius: 4,       // Clean hover feedback
                             backgroundColor: 'transparent',
                             tension: 0.1
                         });
@@ -785,7 +785,7 @@ HTML_TEMPLATE = """
                 }
 
                 legsChart.data.datasets = datasets;
-                legsChart.update();
+                legsChart.update('none'); // Prevents vertical entry bounce effect
             }
         }
 
@@ -794,241 +794,3 @@ HTML_TEMPLATE = """
     </script>
 </body>
 </html>
-"""
-
-@app.route('/')
-def home():
-    ensure_scrip_master_loading()
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/fetch-expiries', methods=['POST'])
-def fetch_expiries():
-    ensure_scrip_master_loading()
-    api, api_status = get_smart_api()
-    data = request.json
-    symbol = data.get('symbol', 'NIFTY')
-    
-    status_msg = SCRIP_MASTER_STATUS if INSTRUMENT_DF is None else api_status
-
-    if INSTRUMENT_DF is not None and not INSTRUMENT_DF.empty:
-        symbol_df = INSTRUMENT_DF[INSTRUMENT_DF['name'] == symbol]
-        if not symbol_df.empty:
-            raw_expiries = symbol_df['expiry'].dropna().unique()
-            parsed_dates = []
-            
-            for exp in raw_expiries:
-                try:
-                    dt = datetime.strptime(str(exp).upper(), "%d%b%Y")
-                    if dt.date() >= datetime.today().date():
-                        parsed_dates.append((dt, str(exp).upper()))
-                except Exception:
-                    pass
-
-            parsed_dates.sort(key=lambda x: x[0])
-            sorted_expiries = [x[1] for x in parsed_dates]
-
-            return jsonify({"status": status_msg, "expiries": sorted_expiries})
-
-    return jsonify({"status": status_msg, "expiries": []})
-
-@app.route('/api/fetch-chain', methods=['POST'])
-def fetch_chain():
-    ensure_scrip_master_loading()
-    api, api_status = get_smart_api()
-    data = request.json
-    symbol = data.get('symbol', 'NIFTY')
-    config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
-
-    status_msg = SCRIP_MASTER_STATUS if INSTRUMENT_DF is None else api_status
-
-    if not api:
-        return jsonify({"status": status_msg, "strikes": []})
-
-    try:
-        res = api.ltpData(exchange=config['exchange'], tradingsymbol=config['tradingsymbol'], symboltoken=config['token'])
-        if res and res.get('status') and res.get('data'):
-            spot_price = float(res['data']['ltp'])
-            step = config['step']
-            atm = round(spot_price / step) * step
-            strikes = [int(atm + (step * i)) for i in range(-10, 11)]
-            return jsonify({"status": status_msg, "spot": spot_price, "atm": atm, "strikes": strikes})
-        else:
-            return jsonify({"status": "Couldnt fetch live price", "strikes": []})
-    except Exception as e:
-        return jsonify({"status": f"Couldnt fetch live price: {str(e)}", "strikes": []})
-
-@app.route('/api/live-data', methods=['POST'])
-def live_data():
-    ensure_scrip_master_loading()
-    api, api_status = get_smart_api()
-    req_data = request.json
-    symbol = req_data.get('symbol', 'NIFTY')
-    exchange = req_data.get('exchange', 'NFO')
-    interval_key = req_data.get('interval', '15')
-    basket_interval_key = req_data.get('basket_interval', '15')
-    baskets = req_data.get('baskets', [])
-
-    candle_interval = INTERVAL_MAP.get(interval_key, "FIFTEEN_MINUTE")
-    basket_candle_interval = INTERVAL_MAP.get(basket_interval_key, "FIFTEEN_MINUTE")
-    config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
-
-    if INSTRUMENT_DF is None:
-        return jsonify({"status": SCRIP_MASTER_STATUS, "error": SCRIP_MASTER_STATUS})
-
-    status_msg = api_status
-
-    if not api:
-        return jsonify({"status": status_msg, "error": status_msg})
-
-    underlying_price = None
-    try:
-        res = api.ltpData(exchange=config['exchange'], tradingsymbol=config['tradingsymbol'], symboltoken=config['token'])
-        if res and res.get('status') and res.get('data'):
-            underlying_price = float(res['data']['ltp'])
-    except Exception as e:
-        print("Error querying SmartAPI LTP:", str(e))
-
-    if underlying_price is None:
-        return jsonify({"status": "Couldnt fetch live price from API", "error": "couldnt fetch live price from API"})
-
-    current_iv = 14.5
-    expected_1day_move = round(underlying_price * (current_iv / 100.0) / math.sqrt(365), 2)
-
-    chart_labels, chart_prices = [], []
-    try:
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        candle_param = {
-            "exchange": config['exchange'],
-            "symboltoken": config['token'],
-            "interval": candle_interval,
-            "fromdate": f"{today_str} 09:15",
-            "todate": f"{today_str} 15:30"
-        }
-        candle_data = api.getCandleData(candle_param)
-        if candle_data and candle_data.get('status') and candle_data.get('data'):
-            for candle in candle_data['data']:
-                chart_labels.append(candle[0].split('T')[1][:5])
-                chart_prices.append(float(candle[4]))
-    except Exception as e:
-        print("Error fetching candle data:", str(e))
-
-    processed_baskets = []
-
-    for basket in baskets:
-        basket_pnl = 0.0
-        legs_data = []
-        has_leg_error = False
-        total_decay_till_date = 0.0
-
-        raw_legs = basket.get('legs', [])
-        leg_historical_data = {"labels": [], "leg_series": []}
-
-        for idx, leg in enumerate(raw_legs):
-            strike = float(leg['strike'])
-            expiry = leg.get('expiry', '').upper()
-            opt_type = leg['option_type']
-            action = leg['action']
-            qty = int(leg.get('qty', 65))
-
-            current_premium, scrip_token, trading_symbol = None, None, None
-
-            match = INSTRUMENT_DF[
-                (INSTRUMENT_DF['name'] == symbol) & 
-                (abs(INSTRUMENT_DF['strike_price'] - strike) < 0.01) & 
-                (INSTRUMENT_DF['symbol'].str.endswith(opt_type)) &
-                (INSTRUMENT_DF['expiry'].str.upper() == expiry)
-            ]
-
-            if not match.empty:
-                scrip_token = str(match.iloc[0]['token'])
-                trading_symbol = str(match.iloc[0]['symbol'])
-
-            if scrip_token and trading_symbol:
-                try:
-                    opt_res = api.ltpData(exchange=exchange, tradingsymbol=trading_symbol, symboltoken=scrip_token)
-                    if opt_res and opt_res.get('status') and opt_res.get('data'):
-                        current_premium = float(opt_res['data']['ltp'])
-                except Exception as e:
-                    print(f"Error querying option LTP for {trading_symbol}:", str(e))
-
-                try:
-                    today_str = datetime.now().strftime("%Y-%m-%d")
-                    leg_candle_param = {
-                        "exchange": exchange,
-                        "symboltoken": scrip_token,
-                        "interval": basket_candle_interval,
-                        "fromdate": f"{today_str} 09:15",
-                        "todate": f"{today_str} 15:30"
-                    }
-                    leg_candles = api.getCandleData(leg_candle_param)
-                    if leg_candles and leg_candles.get('status') and leg_candles.get('data'):
-                        prices = [float(c[4]) for c in leg_candles['data']]
-                        if not leg_historical_data["labels"]:
-                            leg_historical_data["labels"] = [c[0].split('T')[1][:5] for c in leg_candles['data']]
-                        
-                        leg_historical_data["leg_series"].append({
-                            "label": f"{strike} {opt_type} ({action})",
-                            "prices": prices
-                        })
-                except Exception as e:
-                    print(f"Error fetching leg candle data for {trading_symbol}:", str(e))
-
-            if current_premium is None:
-                current_premium = "couldnt fetch live price from API"
-                leg_pnl = "N/A"
-                theta_decay_till_date = "N/A"
-                has_leg_error = True
-                entry_price = leg.get('entry_price') if leg.get('entry_price') is not None else "N/A"
-            else:
-                entry_price = float(leg.get('entry_price')) if leg.get('entry_price') is not None and float(leg.get('entry_price')) > 0 else current_premium
-                leg_pnl = (current_premium - entry_price) * qty if action == 'BUY' else (entry_price - current_premium) * qty
-                theta_decay_till_date = round((entry_price - current_premium) * qty, 2) if action == 'SELL' else round((current_premium - entry_price) * qty, 2)
-                
-                if not has_leg_error:
-                    basket_pnl += leg_pnl
-                    total_decay_till_date += theta_decay_till_date
-
-            greeks = calculate_greeks(opt_type, underlying_price, strike, T=7/365, r=0.07, sigma=current_iv / 100.0)
-
-            legs_data.append({
-                "strike": strike,
-                "expiry": expiry,
-                "option_type": opt_type,
-                "action": action,
-                "qty": qty,
-                "entry_price": round(entry_price, 2) if isinstance(entry_price, float) else entry_price,
-                "current_premium": round(current_premium, 2) if isinstance(current_premium, float) else current_premium,
-                "leg_pnl": round(leg_pnl, 2) if isinstance(leg_pnl, float) else leg_pnl,
-                "theta_decay_till_date": theta_decay_till_date,
-                "greeks": greeks
-            })
-
-        net_greeks = calculate_basket_greeks_from_price_diff(raw_legs, underlying_price, sigma=current_iv / 100.0)
-        max_profit, max_loss = calculate_max_profit_loss(raw_legs)
-
-        processed_baskets.append({
-            "id": basket.get('id'),
-            "name": basket.get('name', 'Basket'),
-            "legs": legs_data,
-            "basket_pnl": round(basket_pnl, 2) if not has_leg_error else "couldnt fetch live price from API",
-            "total_decay_till_date": round(total_decay_till_date, 2) if not has_leg_error else "N/A",
-            "net_greeks": net_greeks,
-            "max_profit": max_profit,
-            "max_loss": max_loss,
-            "legs_historical": leg_historical_data
-        })
-
-    return jsonify({
-        "status": status_msg,
-        "underlying_price": underlying_price,
-        "current_iv": current_iv,
-        "expected_1day_move": expected_1day_move,
-        "is_market_open": is_market_open(),
-        "chart_labels": chart_labels,
-        "chart_prices": chart_prices,
-        "baskets": processed_baskets
-    })
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
