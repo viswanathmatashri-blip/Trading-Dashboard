@@ -207,10 +207,8 @@ def calculate_max_profit_loss(legs):
         return "₹0", "₹0"
 
     total_net_credit = 0.0
-    short_calls = []
-    long_calls = []
-    short_puts = []
-    long_puts = []
+    short_calls, long_calls = [], []
+    short_puts, long_puts = [], []
 
     for leg in legs:
         qty = int(leg.get('qty', 65))
@@ -232,7 +230,6 @@ def calculate_max_profit_loss(legs):
             else:
                 long_puts.append(strike)
 
-    # Check Call Spread Hedging
     call_hedged = False
     call_width = 0
     if short_calls:
@@ -240,7 +237,6 @@ def calculate_max_profit_loss(legs):
             call_hedged = True
             call_width = min(long_calls) - max(short_calls)
 
-    # Check Put Spread Hedging
     put_hedged = False
     put_width = 0
     if short_puts:
@@ -248,28 +244,24 @@ def calculate_max_profit_loss(legs):
             put_hedged = True
             put_width = min(short_puts) - max(long_puts)
 
-    # Iron Condor / Fully Hedged Strategy
     if short_calls and short_puts and call_hedged and put_hedged:
         max_width = max(call_width, put_width) * qty
         max_profit = total_net_credit
         max_loss = max_width - total_net_credit
         return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
 
-    # Vertical Call Spread (Bear Call Spread / Bull Call Spread)
     if short_calls and call_hedged and not short_puts:
         max_width = call_width * qty
         max_profit = total_net_credit
         max_loss = max_width - total_net_credit
         return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
 
-    # Vertical Put Spread (Bull Put Spread / Bear Put Spread)
     if short_puts and put_hedged and not short_calls:
         max_width = put_width * qty
         max_profit = total_net_credit
         max_loss = max_width - total_net_credit
         return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
 
-    # Unhedged Strategy Logic
     max_profit_str = "Uncapped" if (long_calls or long_puts) and not (short_calls or short_puts) else f"₹{round(total_net_credit, 2)}"
     max_loss_str = "Uncapped" if (short_calls and not call_hedged) or (short_puts and not put_hedged) else "Defined"
 
@@ -317,7 +309,7 @@ HTML_TEMPLATE = """
         button { background: #00bcd4; color: black; font-weight: bold; cursor: pointer; border: none; margin-top: 15px; }
         button:hover { background: #008ba3; }
         
-        .btn-delete { background: #ff5252; color: white; border: none; padding: 2px 6px; border-radius: 4px; cursor: pointer; font-size: 11px; width: auto; margin: 0; }
+        .btn-delete { background: #ff5252; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; width: auto; margin: 0; display: inline-flex; align-items: center; gap: 4px; }
         .btn-delete:hover { background: #d32f2f; }
         
         .pending-leg-item { display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 6px; border-radius: 4px; margin-top: 5px; font-size: 12px; }
@@ -330,6 +322,42 @@ HTML_TEMPLATE = """
         .pnl-err { color: #ff9800; font-weight: bold; }
         .greek-tag { font-family: monospace; background: #2d2d2d; padding: 3px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; display: inline-block; margin-top: 4px; }
         .basket-summary-tag { font-family: monospace; background: #1a3835; border: 1px solid #00bcd4; padding: 3px 7px; border-radius: 4px; font-size: 11px; color: #00e5ff; margin-left: 6px; display: inline-block; }
+
+        /* Loader Animation */
+        .spinner {
+            width: 12px;
+            height: 12px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 0.8s linear infinite;
+            display: inline-block;
+        }
+
+        .header-spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(0, 188, 212, 0.3);
+            border-radius: 50%;
+            border-top-color: #00bcd4;
+            animation: spin 0.8s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+            margin-left: 8px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .basket-status-msg {
+            font-size: 11px;
+            color: #00bcd4;
+            font-weight: normal;
+            margin-left: 8px;
+            display: inline-flex;
+            align-items: center;
+        }
     </style>
 </head>
 <body>
@@ -417,8 +445,11 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="card">
-                <h3>Active Basket Positions & Real-Time Option LTP</h3>
-                <div id="basketsContainer"></div>
+                <div style="display: flex; align-items: center;">
+                    <h3 style="margin: 0;">Active Basket Positions & Real-Time Option LTP</h3>
+                    <span id="basketHeaderStatus"></span>
+                </div>
+                <div id="basketsContainer" style="margin-top: 15px;"></div>
             </div>
 
             <div class="card">
@@ -570,14 +601,30 @@ HTML_TEMPLATE = """
 
         function deployBasket() {
             if (pendingLegs.length === 0) return alert("Add position legs first.");
-            activeBaskets.push({ id: Date.now(), name: `Basket #${activeBaskets.length + 1}`, legs: [...pendingLegs] });
+            const newBasketName = `Basket #${activeBaskets.length + 1}`;
+            activeBaskets.push({ id: Date.now(), name: newBasketName, legs: [...pendingLegs] });
             pendingLegs = [];
             renderPendingLegs();
-            updateDashboard();
+
+            // Show Loading Indicator in Section Title
+            const statusElem = document.getElementById('basketHeaderStatus');
+            statusElem.innerHTML = `<span class="basket-status-msg"><span class="header-spinner"></span> Adding ${newBasketName}...</span>`;
+
+            updateDashboard().then(() => {
+                statusElem.innerHTML = '';
+            });
         }
 
-        function deleteBasket(basketId) {
+        function deleteBasket(basketId, btnElement) {
+            if (btnElement) {
+                btnElement.disabled = true;
+                btnElement.innerHTML = `<span class="spinner"></span>`;
+            }
+
+            // Immediately mutate state locally for 0ms delay
             activeBaskets = activeBaskets.filter(b => b.id !== basketId);
+            
+            // Re-render immediately locally
             updateDashboard();
         }
 
@@ -628,7 +675,7 @@ HTML_TEMPLATE = """
                                 <span class="basket-summary-tag" style="color:#00ff88; border-color:#00ff88; background:#1b3821;">Tot Decay: ₹${b.total_decay_till_date}</span>
                                 <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ₹${b.net_greeks.expected_day_theta}</span>
                             </div>
-                            <button class="btn-delete" onclick="deleteBasket(${b.id})" style="padding: 4px 8px; margin-top:4px;">🗑️ Delete Basket</button>
+                            <button class="btn-delete" onclick="deleteBasket(${b.id}, this)">🗑️ Delete Basket</button>
                         </div>
                         
                         <div style="margin-top: 6px; font-size: 12px; color: #aaa;">
