@@ -117,7 +117,21 @@ def is_market_open():
         return False
     return time(9, 15) <= now.time() <= time(15, 30)
 
+def bs_price(flag, S, K, T, r, sigma):
+    """Black-Scholes theoretical price calculation."""
+    if T <= 0.00001 or sigma <= 0 or S <= 0 or K <= 0:
+        return max(0.0, S - K) if flag.upper() in ['CE', 'C'] else max(0.0, K - S)
+
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+
+    if flag.upper() in ['CE', 'C']:
+        return S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+    else:
+        return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
 def calculate_greeks(flag, S, K, T, r, sigma):
+    """Individual leg display Greeks."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
 
@@ -125,16 +139,16 @@ def calculate_greeks(flag, S, K, T, r, sigma):
     d2 = d1 - sigma * math.sqrt(T)
 
     gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
-    vega = (S * norm.pdf(d1) * math.sqrt(T)) / 100
+    vega = (S * norm.pdf(d1) * math.sqrt(T)) / 100.0
 
     if flag.upper() in ['CE', 'C']:
         delta = norm.cdf(d1)
-        theta = (- (S * norm.pdf(d1) * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * norm.cdf(d2)) / 365
+        theta = (- (S * norm.pdf(d1) * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * norm.cdf(d2)) / 365.0
     else:
         delta = norm.cdf(d1) - 1
-        theta = (- (S * norm.pdf(d1) * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365
+        theta = (- (S * norm.pdf(d1) * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365.0
 
-    days_left = max(T * 365, 0.5)
+    days_left = max(T * 365.0, 0.5)
     expected_day_theta = theta * (1.0 / days_left)
 
     return {
@@ -143,6 +157,61 @@ def calculate_greeks(flag, S, K, T, r, sigma):
         "theta": round(theta, 4),
         "vega": round(vega, 4),
         "expected_day_theta": round(expected_day_theta, 4)
+    }
+
+def calculate_basket_portfolio_value(legs, S, T, r=0.07, sigma=0.145):
+    """Calculates total basket portfolio market value given index price S."""
+    total_val = 0.0
+    for leg in legs:
+        flag = leg['option_type']
+        strike = float(leg['strike'])
+        qty = int(leg.get('qty', 65))
+        direction = 1 if leg['action'] == 'BUY' else -1
+        
+        p = bs_price(flag, S, strike, T, r, sigma)
+        total_val += (p * qty * direction)
+    return total_val
+
+def calculate_basket_greeks_from_price_diff(legs, S, T=7/365, r=0.07, sigma=0.145):
+    """
+    Computes Net Basket Greeks by bumping underlying index price (dS), time (dT), and IV (dSigma).
+    Measures portfolio P&L / premium changes w.r.t index movements.
+    """
+    if not legs or S <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
+
+    dS = 1.0          # 1 point shift in spot price
+    dt = 1.0 / 365.0  # 1 day time decay shift
+    dSigma = 0.01     # 1% IV shift
+
+    # Base Portfolio Premium Value
+    V0 = calculate_basket_portfolio_value(legs, S, T, r, sigma)
+
+    # 1. Delta (Change in portfolio value per +1 point move in Spot)
+    V_up = calculate_basket_portfolio_value(legs, S + dS, T, r, sigma)
+    V_dn = calculate_basket_portfolio_value(legs, S - dS, T, r, sigma)
+    net_delta = (V_up - V_dn) / (2 * dS)
+
+    # 2. Gamma (Rate of change of Delta per +1 point move in Spot)
+    net_gamma = (V_up - 2 * V0 + V_dn) / (dS ** 2)
+
+    # 3. Theta (Change in portfolio value per 1 day passage of time)
+    V_time = calculate_basket_portfolio_value(legs, S, max(T - dt, 0.00001), r, sigma)
+    net_theta = V_time - V0
+
+    # 4. Vega (Change in portfolio value per 1% rise in IV)
+    V_vol = calculate_basket_portfolio_value(legs, S, T, r, sigma + dSigma)
+    net_vega = V_vol - V0
+
+    days_left = max(T * 365.0, 0.5)
+    net_expected_day_theta = net_theta * (1.0 / days_left)
+
+    return {
+        "delta": round(net_delta, 2),
+        "gamma": round(net_gamma, 4),
+        "theta": round(net_theta, 2),
+        "vega": round(net_vega, 2),
+        "expected_day_theta": round(net_expected_day_theta, 2)
     }
 
 HTML_TEMPLATE = """
@@ -467,12 +536,12 @@ HTML_TEMPLATE = """
                                 <strong>${b.name}</strong>
                                 <span class="${pnlClass}" style="margin-left: 10px; margin-right: 10px;">Live P&L: ${pnlDisplay}</span>
                                 
-                                <span class="basket-summary-tag">Net &Delta;: ${b.net_greeks.delta}</span>
-                                <span class="basket-summary-tag">Net &Gamma;: ${b.net_greeks.gamma}</span>
-                                <span class="basket-summary-tag">Net &Theta;: ${b.net_greeks.theta}</span>
-                                <span class="basket-summary-tag">Net &Nu;: ${b.net_greeks.vega}</span>
+                                <span class="basket-summary-tag">Net &Delta;: ₹${b.net_greeks.delta} /pt</span>
+                                <span class="basket-summary-tag">Net &Gamma;: ₹${b.net_greeks.gamma} /pt&sup2;</span>
+                                <span class="basket-summary-tag">Net &Theta;: ₹${b.net_greeks.theta} /day</span>
+                                <span class="basket-summary-tag">Net &Nu;: ₹${b.net_greeks.vega} /1% IV</span>
                                 <span class="basket-summary-tag" style="color:#00ff88; border-color:#00ff88; background:#1b3821;">Tot Decay: ₹${b.total_decay_till_date}</span>
-                                <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ${b.net_greeks.expected_day_theta}</span>
+                                <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ₹${b.net_greeks.expected_day_theta}</span>
                             </div>
                             <button class="btn-delete" onclick="deleteBasket(${b.id})" style="padding: 4px 8px; margin-top:4px;">🗑️ Delete Basket</button>
                         </div>`;
@@ -664,21 +733,16 @@ def live_data():
         basket_pnl = 0.0
         legs_data = []
         has_leg_error = False
-
-        net_delta = 0.0
-        net_gamma = 0.0
-        net_theta = 0.0
-        net_vega = 0.0
         total_decay_till_date = 0.0
-        net_expected_day_theta = 0.0
 
-        for leg in basket.get('legs', []):
+        raw_legs = basket.get('legs', [])
+
+        for leg in raw_legs:
             strike = float(leg['strike'])
             expiry = leg.get('expiry', '').upper()
             opt_type = leg['option_type']
             action = leg['action']
             qty = int(leg.get('qty', 65))
-            direction = 1 if action == 'BUY' else -1
 
             current_premium, scrip_token, trading_symbol = None, None, None
 
@@ -710,26 +774,20 @@ def live_data():
             else:
                 entry_price = float(leg.get('entry_price')) if leg.get('entry_price') is not None and float(leg.get('entry_price')) > 0 else current_premium
                 leg_pnl = (current_premium - entry_price) * qty if action == 'BUY' else (entry_price - current_premium) * qty
-                theta_decay_till_date = round(entry_price - current_premium, 2)
+                theta_decay_till_date = round((entry_price - current_premium) * qty, 2) if action == 'SELL' else round((current_premium - entry_price) * qty, 2)
                 
                 if not has_leg_error:
                     basket_pnl += leg_pnl
-                    total_decay_till_date += (entry_price - current_premium) * qty
+                    total_decay_till_date += theta_decay_till_date
 
             greeks = calculate_greeks(opt_type, underlying_price, strike, T=7/365, r=0.07, sigma=0.145)
-
-            # Accumulate Net Basket Greeks
-            net_delta += greeks['delta'] * qty * direction
-            net_gamma += greeks['gamma'] * qty * direction
-            net_theta += greeks['theta'] * qty * direction
-            net_vega += greeks['vega'] * qty * direction
-            net_expected_day_theta += greeks['expected_day_theta'] * qty * direction
 
             legs_data.append({
                 "strike": strike,
                 "expiry": expiry,
                 "option_type": opt_type,
                 "action": action,
+                "qty": qty,
                 "entry_price": round(entry_price, 2) if isinstance(entry_price, float) else entry_price,
                 "current_premium": round(current_premium, 2) if isinstance(current_premium, float) else current_premium,
                 "leg_pnl": round(leg_pnl, 2) if isinstance(leg_pnl, float) else leg_pnl,
@@ -737,19 +795,16 @@ def live_data():
                 "greeks": greeks
             })
 
+        # Calculate Net Basket Greeks using Price Differences (Bump & Revalue method)
+        net_greeks = calculate_basket_greeks_from_price_diff(raw_legs, underlying_price)
+
         processed_baskets.append({
             "id": basket.get('id'),
             "name": basket.get('name', 'Basket'),
             "legs": legs_data,
             "basket_pnl": round(basket_pnl, 2) if not has_leg_error else "couldnt fetch live price from API",
             "total_decay_till_date": round(total_decay_till_date, 2) if not has_leg_error else "N/A",
-            "net_greeks": {
-                "delta": round(net_delta, 2),
-                "gamma": round(net_gamma, 6),
-                "theta": round(net_theta, 2),
-                "vega": round(net_vega, 2),
-                "expected_day_theta": round(net_expected_day_theta, 2)
-            }
+            "net_greeks": net_greeks
         })
 
     return jsonify({
