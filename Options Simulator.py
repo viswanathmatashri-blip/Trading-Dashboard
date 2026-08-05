@@ -794,8 +794,6 @@ HTML_TEMPLATE = r"""
 </html>
 """
 
-# ==================== BACKEND API ROUTES ====================
-
 @app.route('/')
 def index():
     ensure_scrip_master_loading()
@@ -866,13 +864,13 @@ def live_data():
     except Exception as e:
         return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
 
-    # Candle History for Spot Chart
+    now = datetime.now()
+    from_date = now.strftime("%Y-%m-%d 09:15")
+    to_date = now.strftime("%Y-%m-%d %H:%M")
+
+    # Fetch Index Candle History
     chart_labels, chart_prices = [], []
     try:
-        now = datetime.now()
-        from_date = now.strftime("%Y-%m-%d 09:15")
-        to_date = now.strftime("%Y-%m-%d %H:%M")
-        
         hist_params = {
             "exchange": idx_info["exchange"],
             "symboltoken": idx_info["token"],
@@ -895,6 +893,8 @@ def live_data():
     for basket in baskets:
         basket_pnl = 0.0
         processed_legs = []
+        leg_series_data = []
+        basket_chart_labels = []
 
         for leg in basket.get('legs', []):
             strike = float(leg['strike'])
@@ -906,6 +906,7 @@ def live_data():
 
             current_ltp = "N/A"
             token = None
+            symbol_name = None
             
             if INSTRUMENT_DF is not None:
                 match = INSTRUMENT_DF[
@@ -916,12 +917,36 @@ def live_data():
                 ]
                 if not match.empty:
                     token = str(match.iloc[0]['token'])
+                    symbol_name = match.iloc[0]['symbol']
 
-            if token:
+            if token and symbol_name:
                 try:
-                    opt_ltp_resp = smart_api.ltpData("NFO", match.iloc[0]['symbol'], token)
+                    opt_ltp_resp = smart_api.ltpData("NFO", symbol_name, token)
                     if opt_ltp_resp and opt_ltp_resp.get('status') and opt_ltp_resp.get('data'):
                         current_ltp = float(opt_ltp_resp['data']['ltp'])
+                except Exception:
+                    pass
+
+                # Fetch Option Leg Candle History
+                try:
+                    leg_hist_params = {
+                        "exchange": "NFO",
+                        "symboltoken": token,
+                        "interval": INTERVAL_MAP.get(basket_interval, "FIFTEEN_MINUTE"),
+                        "fromdate": from_date,
+                        "todate": to_date
+                    }
+                    leg_hist_resp = smart_api.getCandleData(leg_hist_params)
+                    if leg_hist_resp and leg_hist_resp.get('status') and leg_hist_resp.get('data'):
+                        leg_candles = leg_hist_resp['data']
+                        if not basket_chart_labels:
+                            basket_chart_labels = [c[0].split('T')[1][:5] for c in leg_candles]
+                        
+                        leg_prices = [float(c[4]) for c in leg_candles]
+                        leg_series_data.append({
+                            "label": f"{strike} {opt_type} ({action})",
+                            "prices": leg_prices
+                        })
                 except Exception:
                     pass
 
@@ -936,7 +961,6 @@ def live_data():
                     leg_pnl = (entry_price - current_ltp) * qty
                 basket_pnl += leg_pnl
 
-            # Calculate Greeks
             try:
                 exp_dt = datetime.strptime(exp_date, "%d%b%Y")
                 days_to_exp = max((exp_dt - datetime.now()).days, 0.5)
@@ -945,7 +969,6 @@ def live_data():
 
             T = days_to_exp / 365.0
             greeks = calculate_greeks(opt_type, spot_price, strike, T, 0.07, iv_estimate / 100.0)
-
             decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
 
             processed_legs.append({
@@ -972,7 +995,11 @@ def live_data():
             "max_loss": max_lss,
             "net_greeks": net_greeks,
             "total_decay_till_date": round(basket_pnl, 2),
-            "legs": processed_legs
+            "legs": processed_legs,
+            "legs_historical": {
+                "labels": basket_chart_labels,
+                "leg_series": leg_series_data
+            }
         })
 
     return jsonify({
