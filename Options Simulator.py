@@ -29,7 +29,6 @@ def get_smart_api():
     """Authenticates with SmartAPI, renewing expired tokens automatically."""
     global smart_api_session
     
-    # Check if credentials exist
     if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
         return None, "Missing Render Env Variables (API_KEY/CLIENT_CODE/PIN/TOTP_SECRET)"
 
@@ -53,19 +52,35 @@ def get_smart_api():
         return None, f"Couldnt log in: {str(e)}"
 
 def load_instrument_master():
-    """Downloads Angel One OpenAPIScripMaster JSON and processes numeric strikes."""
+    """Downloads Angel One OpenAPIScripMaster JSON with browser headers and handles retries."""
     global INSTRUMENT_DF
     if INSTRUMENT_DF is None:
-        try:
-            url = "https://margincalculator.angelbroking.com/OpenAPI_MasterData/OpenAPIScripMaster.json"
-            response = requests.get(url, timeout=15)
-            data = response.json()
-            df = pd.DataFrame(data)
-            df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))].copy()
-            df['strike_price'] = df['strike'].astype(float) / 100.0
-            INSTRUMENT_DF = df
-        except Exception as e:
-            print("Failed to download Angel One Scrip Master:", str(e))
+        url = "https://margincalculator.angelbroking.com/OpenAPI_MasterData/OpenAPIScripMaster.json"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*"
+        }
+        
+        for attempt in range(1, 4):
+            try:
+                print(f"[Scrip Master] Downloading JSON (Attempt {attempt}/3)...")
+                response = requests.get(url, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    df = pd.DataFrame(data)
+                    
+                    # Keep only NFO options to save memory
+                    df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))].copy()
+                    df['strike_price'] = df['strike'].astype(float) / 100.0
+                    
+                    INSTRUMENT_DF = df
+                    print(f"[Scrip Master] Successfully loaded {len(INSTRUMENT_DF)} option contracts.")
+                    break
+                else:
+                    print(f"[Scrip Master] HTTP Error {response.status_code}")
+            except Exception as e:
+                print(f"[Scrip Master] Download error on attempt {attempt}: {str(e)}")
+
     return INSTRUMENT_DF
 
 def is_market_open():
@@ -483,7 +498,7 @@ def live_data():
         return jsonify({"status": status_msg, "error": status_msg})
 
     if df_master is None or df_master.empty:
-        return jsonify({"status": "Downloading Scrip Master...", "error": "Scrip Master Not Loaded"})
+        return jsonify({"status": "Scrip Master Not Loaded", "error": "Scrip Master Not Loaded"})
 
     underlying_price = None
     try:
