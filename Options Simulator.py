@@ -13,7 +13,6 @@ from SmartApi import SmartConnect
 
 app = Flask(__name__)
 
-# Fetch environment variables from Render
 API_KEY = os.environ.get("API_KEY")
 CLIENT_CODE = os.environ.get("CLIENT_CODE")
 PIN = os.environ.get("PIN")
@@ -37,11 +36,9 @@ SCRIP_MASTER_STATUS = "Initializing Scrip Master..."
 IS_DOWNLOADING_MASTER = False
 
 def get_smart_api():
-    """Authenticates with SmartAPI, renewing expired tokens automatically."""
     global smart_api_session
-    
     if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-        return None, "Missing Render Env Variables (API_KEY/CLIENT_CODE/PIN/TOTP_SECRET)"
+        return None, "Missing Render Env Variables"
 
     try:
         if smart_api_session is None:
@@ -63,17 +60,13 @@ def get_smart_api():
         return None, f"Couldnt log in: {str(e)}"
 
 def download_scrip_master_thread():
-    """Chunked background downloader to stream JSON and report MB / % progress."""
     global INSTRUMENT_DF, SCRIP_MASTER_STATUS, IS_DOWNLOADING_MASTER
     if INSTRUMENT_DF is not None or IS_DOWNLOADING_MASTER:
         return
 
     IS_DOWNLOADING_MASTER = True
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*"
-    }
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
     try:
         SCRIP_MASTER_STATUS = "Downloading Scrip Master: 0%"
@@ -122,12 +115,11 @@ def is_market_open():
     now = datetime.now()
     if now.weekday() >= 5:
         return False
-    current_time = now.time()
-    return time(9, 15) <= current_time <= time(15, 30)
+    return time(9, 15) <= now.time() <= time(15, 30)
 
 def calculate_greeks(flag, S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
 
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
@@ -142,11 +134,15 @@ def calculate_greeks(flag, S, K, T, r, sigma):
         delta = norm.cdf(d1) - 1
         theta = (- (S * norm.pdf(d1) * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * norm.cdf(-d2)) / 365
 
+    days_left = max(T * 365, 0.5)
+    expected_day_theta = theta * (1.0 / days_left)
+
     return {
         "delta": round(delta, 4),
         "gamma": round(gamma, 6),
         "theta": round(theta, 4),
-        "vega": round(vega, 4)
+        "vega": round(vega, 4),
+        "expected_day_theta": round(expected_day_theta, 4)
     }
 
 HTML_TEMPLATE = """
@@ -160,22 +156,11 @@ HTML_TEMPLATE = """
         body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 20px; padding-top: 35px; }
         
         #apiStatusPill {
-            position: fixed;
-            top: 10px;
-            left: 15px;
-            z-index: 9999;
-            background: rgba(20, 20, 20, 0.95);
-            border: 1px solid #00bcd4;
-            color: #00ff88;
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-size: 11px;
-            font-weight: bold;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-            max-width: 90vw;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            position: fixed; top: 10px; left: 15px; z-index: 9999;
+            background: rgba(20, 20, 20, 0.95); border: 1px solid #00bcd4;
+            color: #00ff88; padding: 6px 14px; border-radius: 20px;
+            font-size: 11px; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+            max-width: 90vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
 
         .pill-err { border-color: #ff5252 !important; color: #ff5252 !important; }
@@ -223,7 +208,7 @@ HTML_TEMPLATE = """
                     <option value="BANKNIFTY">BANKNIFTY</option>
                 </select>
 
-                <label>Expiry Date (All Live Weekly Expiries)</label>
+                <label>Expiry Date</label>
                 <select id="expirySelect" onchange="loadChain()"></select>
 
                 <label>Exchange Segment</label>
@@ -246,14 +231,14 @@ HTML_TEMPLATE = """
                 <label>Trade Action</label>
                 <select id="action">
                     <option value="BUY">BUY</option>
-                    <option value="SELL">SELL</option>
+                    <option value="SELL" selected>SELL</option>
                 </select>
 
                 <label>Entry Price (₹)</label>
                 <input type="number" id="entryPrice" placeholder="Auto-fetches LTP if blank" step="0.05">
 
                 <label>Quantity / Lots</label>
-                <input type="number" id="qty" value="50">
+                <input type="number" id="qty" value="65">
 
                 <button onclick="addLegToPending()">+ Add Position Leg</button>
                 
@@ -282,12 +267,17 @@ HTML_TEMPLATE = """
                         </select>
                     </div>
                 </div>
-                <canvas id="mainChart" height="110"></canvas>
+                <canvas id="mainChart" height="100"></canvas>
             </div>
 
             <div class="card">
                 <h3>Active Basket Positions & Real-Time Option LTP</h3>
                 <div id="basketsContainer"></div>
+            </div>
+
+            <div class="card">
+                <h3>Basket Legs Real-Time Premium Chart (1-Day Scale)</h3>
+                <canvas id="legsPremiumChart" height="120"></canvas>
             </div>
         </div>
     </div>
@@ -295,7 +285,8 @@ HTML_TEMPLATE = """
     <script>
         let pendingLegs = [];
         let activeBaskets = [];
-        let mainChart;
+        let mainChart, legsChart;
+        let legHistory = {};
 
         function updateStatus(text, type='info') {
             const pill = document.getElementById('apiStatusPill');
@@ -308,15 +299,21 @@ HTML_TEMPLATE = """
         const ctx = document.getElementById('mainChart').getContext('2d');
         mainChart = new Chart(ctx, {
             type: 'line',
-            data: {
-                labels: [],
-                datasets: [
-                    { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', yAxisID: 'y', tension: 0.1 }
-                ]
-            },
+            data: { labels: [], datasets: [{ label: 'Index Spot Price', data: [], borderColor: '#00bcd4', yAxisID: 'y', tension: 0.1 }] },
+            options: { scales: { y: { display: true, position: 'left', grid: { color: '#2a2a2a' } } } }
+        });
+
+        const ctxLegs = document.getElementById('legsPremiumChart').getContext('2d');
+        legsChart = new Chart(ctxLegs, {
+            type: 'line',
+            data: { labels: [], datasets: [] },
             options: {
+                responsive: true,
+                interaction: { mode: 'index', intersect: false },
                 scales: {
-                    y: { type: 'linear', display: true, position: 'left', grid: { color: '#2a2a2a' } }
+                    x: { grid: { color: '#2a2a2a' } },
+                    y1: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Leg 1 Premium (₹)', color: '#00bcd4' }, grid: { color: '#2a2a2a' } },
+                    y2: { type: 'linear', display: true, position: 'right', title: { display: true, text: 'Leg 2 Premium (₹)', color: '#ff9800' }, grid: { drawOnChartArea: false } }
                 }
             }
         });
@@ -332,20 +329,14 @@ HTML_TEMPLATE = """
                 });
                 const data = await res.json();
                 
-                if (data.status) {
-                    let type = "info";
-                    if (data.status.includes("Downloading") || data.status.includes("Processing")) type = "warn";
-                    if (data.status.includes("Failed") || data.status.includes("Couldnt")) type = "error";
-                    updateStatus(data.status, type);
-                }
+                if (data.status) updateStatus(data.status, data.status.includes("Downloading") ? "warn" : "info");
 
                 const select = document.getElementById('expirySelect');
                 select.innerHTML = '';
                 if(data.expiries && data.expiries.length > 0) {
                     data.expiries.forEach((exp, idx) => {
                         let opt = document.createElement('option');
-                        opt.value = exp;
-                        opt.textContent = exp;
+                        opt.value = exp; opt.textContent = exp;
                         if(idx === 0) opt.selected = true;
                         select.appendChild(opt);
                     });
@@ -353,9 +344,7 @@ HTML_TEMPLATE = """
                 } else if (data.status && data.status.includes("Downloading")) {
                     setTimeout(loadExpiries, 2000);
                 }
-            } catch(e) {
-                updateStatus("Couldnt log in: Network Error", "error");
-            }
+            } catch(e) { updateStatus("Couldnt log in: Network Error", "error"); }
         }
 
         async function loadChain() {
@@ -376,15 +365,12 @@ HTML_TEMPLATE = """
                 if(data.strikes && data.strikes.length > 0) {
                     data.strikes.forEach(s => {
                         let opt = document.createElement('option');
-                        opt.value = s;
-                        opt.textContent = s;
+                        opt.value = s; opt.textContent = s;
                         if(s === data.atm) opt.selected = true;
                         select.appendChild(opt);
                     });
                 }
-            } catch(e) {
-                updateStatus("Couldnt fetch live price from API", "error");
-            }
+            } catch(e) { updateStatus("Couldnt fetch live price from API", "error"); }
         }
 
         function addLegToPending() {
@@ -396,10 +382,7 @@ HTML_TEMPLATE = """
             const qty = document.getElementById('qty').value;
 
             pendingLegs.push({ 
-                strike, 
-                expiry,
-                option_type, 
-                action, 
+                strike, expiry, option_type, action, 
                 entry_price: entry_price ? parseFloat(entry_price) : null, 
                 qty: parseInt(qty) 
             });
@@ -413,10 +396,7 @@ HTML_TEMPLATE = """
 
         function renderPendingLegs() {
             const container = document.getElementById('pendingContainer');
-            if (pendingLegs.length === 0) {
-                container.innerHTML = '';
-                return;
-            }
+            if (pendingLegs.length === 0) { container.innerHTML = ''; return; }
 
             let html = `<div style="font-size: 12px; color: #ffca28; margin-bottom: 5px; font-weight: bold;">
                 Pending Basket (${pendingLegs.length} leg(s)):
@@ -428,10 +408,8 @@ HTML_TEMPLATE = """
                     <div class="pending-leg-item">
                         <span>${leg.strike} ${leg.option_type} (${leg.action}) | ${leg.qty} Qty | ${entryText}</span>
                         <button class="btn-delete" onclick="removePendingLeg(${idx})" title="Remove Leg">❌</button>
-                    </div>
-                `;
+                    </div>`;
             });
-
             container.innerHTML = html;
         }
 
@@ -461,17 +439,8 @@ HTML_TEMPLATE = """
                 });
                 const data = await res.json();
 
-                if (data.status) {
-                    let type = "info";
-                    if (data.status.includes("Downloading") || data.status.includes("Processing")) type = "warn";
-                    if (data.status.includes("Failed") || data.status.includes("Couldnt")) type = "error";
-                    updateStatus(data.status, type);
-                }
-
-                if (data.error) {
-                    document.getElementById('stIndex').innerText = data.error;
-                    return;
-                }
+                if (data.status) updateStatus(data.status, "info");
+                if (data.error) { document.getElementById('stIndex').innerText = data.error; return; }
 
                 document.getElementById('stIndex').innerText = data.underlying_price;
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED";
@@ -485,20 +454,19 @@ HTML_TEMPLATE = """
                 const container = document.getElementById('basketsContainer');
                 container.innerHTML = '';
 
+                let nowTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
                 data.baskets.forEach(b => {
                     let pnlDisplay = typeof b.basket_pnl === 'number' ? `₹${b.basket_pnl}` : b.basket_pnl;
                     let pnlClass = typeof b.basket_pnl === 'number' ? (b.basket_pnl >= 0 ? 'pnl-pos' : 'pnl-neg') : 'pnl-err';
 
                     let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <div>
-                                <strong>${b.name}</strong>
-                                <span class="${pnlClass}" style="margin-left: 15px;">Live P&L: ${pnlDisplay}</span>
-                            </div>
+                            <div><strong>${b.name}</strong> <span class="${pnlClass}" style="margin-left: 15px;">Live P&L: ${pnlDisplay}</span></div>
                             <button class="btn-delete" onclick="deleteBasket(${b.id})" style="padding: 4px 8px;">🗑️ Delete Basket</button>
                         </div>`;
 
-                    b.legs.forEach(leg => {
+                    b.legs.forEach((leg, idx) => {
                         let ltpText = typeof leg.current_premium === 'number' ? `₹${leg.current_premium}` : leg.current_premium;
                         let entryText = typeof leg.entry_price === 'number' ? `₹${leg.entry_price}` : leg.entry_price;
                         let legPnlText = typeof leg.leg_pnl === 'number' ? `₹${leg.leg_pnl}` : leg.leg_pnl;
@@ -511,15 +479,55 @@ HTML_TEMPLATE = """
                                     <span class="greek-tag">&Gamma;: ${leg.greeks.gamma}</span>
                                     <span class="greek-tag">&Theta;: ${leg.greeks.theta}</span>
                                     <span class="greek-tag">&Nu;: ${leg.greeks.vega}</span>
+                                    <span class="greek-tag" style="color:#00ff88;">Decay Till Date: ₹${leg.theta_decay_till_date}</span>
+                                    <span class="greek-tag" style="color:#00bcd4;">Exp Day Theta: ${leg.greeks.expected_day_theta}</span>
                                 </div>
                             </div>`;
                     });
                     html += `</div>`;
                     container.innerHTML += html;
                 });
-            } catch(e) {
-                updateStatus("Couldnt fetch live price from API", "error");
+
+                updateLegsChart(data.baskets, nowTime);
+
+            } catch(e) { updateStatus("Couldnt fetch live price from API", "error"); }
+        }
+
+        function updateLegsChart(baskets, nowTime) {
+            if (baskets.length === 0 || baskets[0].legs.length === 0) return;
+
+            let basket = baskets[0];
+            if (!legsChart.data.labels.includes(nowTime)) {
+                legsChart.data.labels.push(nowTime);
             }
+
+            if (legsChart.data.labels.length > 40) legsChart.data.labels.shift();
+
+            let datasets = [];
+            let leg1Data = [], leg2Data = [];
+
+            basket.legs.forEach((leg, idx) => {
+                let legKey = `leg_${idx}`;
+                if (!legHistory[legKey]) legHistory[legKey] = [];
+                if (typeof leg.current_premium === 'number') legHistory[legKey].push(leg.current_premium);
+                if (legHistory[legKey].length > 40) legHistory[legKey].shift();
+
+                let color = idx === 0 ? '#00bcd4' : '#ff9800';
+                let axis = idx === 0 ? 'y1' : 'y2';
+
+                datasets.push({
+                    label: `${leg.strike} ${leg.option_type} (${leg.action})`,
+                    data: [...legHistory[legKey]],
+                    borderColor: color,
+                    backgroundColor: idx === 1 ? 'rgba(0, 255, 136, 0.15)' : 'transparent',
+                    fill: idx === 1 ? '-1' : false,
+                    yAxisID: axis,
+                    tension: 0.2
+                });
+            });
+
+            legsChart.data.datasets = datasets;
+            legsChart.update();
         }
 
         loadExpiries();
@@ -586,8 +594,7 @@ def fetch_chain():
             strikes = [int(atm + (step * i)) for i in range(-10, 11)]
             return jsonify({"status": status_msg, "spot": spot_price, "atm": atm, "strikes": strikes})
         else:
-            msg = res.get('message', 'Failed to fetch LTP') if res else 'No response'
-            return jsonify({"status": f"Couldnt fetch live price: {msg}", "strikes": []})
+            return jsonify({"status": "Couldnt fetch live price", "strikes": []})
     except Exception as e:
         return jsonify({"status": f"Couldnt fetch live price: {str(e)}", "strikes": []})
 
@@ -623,8 +630,7 @@ def live_data():
     if underlying_price is None:
         return jsonify({"status": "Couldnt fetch live price from API", "error": "couldnt fetch live price from API"})
 
-    chart_labels = []
-    chart_prices = []
+    chart_labels, chart_prices = [], []
     try:
         today_str = datetime.now().strftime("%Y-%m-%d")
         candle_param = {
@@ -637,10 +643,8 @@ def live_data():
         candle_data = api.getCandleData(candle_param)
         if candle_data and candle_data.get('status') and candle_data.get('data'):
             for candle in candle_data['data']:
-                time_label = candle[0].split('T')[1][:5]
-                close_p = float(candle[4])
-                chart_labels.append(time_label)
-                chart_prices.append(close_p)
+                chart_labels.append(candle[0].split('T')[1][:5])
+                chart_prices.append(float(candle[4]))
     except Exception as e:
         print("Error fetching candle data:", str(e))
 
@@ -656,11 +660,9 @@ def live_data():
             expiry = leg.get('expiry', '').upper()
             opt_type = leg['option_type']
             action = leg['action']
-            qty = int(leg.get('qty', 50))
+            qty = int(leg.get('qty', 65))
 
-            current_premium = None
-            scrip_token = None
-            trading_symbol = None
+            current_premium, scrip_token, trading_symbol = None, None, None
 
             match = INSTRUMENT_DF[
                 (INSTRUMENT_DF['name'] == symbol) & 
@@ -684,11 +686,13 @@ def live_data():
             if current_premium is None:
                 current_premium = "couldnt fetch live price from API"
                 leg_pnl = "N/A"
+                theta_decay_till_date = "N/A"
                 has_leg_error = True
                 entry_price = leg.get('entry_price') if leg.get('entry_price') is not None else "N/A"
             else:
                 entry_price = float(leg.get('entry_price')) if leg.get('entry_price') is not None and float(leg.get('entry_price')) > 0 else current_premium
                 leg_pnl = (current_premium - entry_price) * qty if action == 'BUY' else (entry_price - current_premium) * qty
+                theta_decay_till_date = round(entry_price - current_premium, 2)
                 if not has_leg_error:
                     basket_pnl += leg_pnl
 
@@ -702,6 +706,7 @@ def live_data():
                 "entry_price": round(entry_price, 2) if isinstance(entry_price, float) else entry_price,
                 "current_premium": round(current_premium, 2) if isinstance(current_premium, float) else current_premium,
                 "leg_pnl": round(leg_pnl, 2) if isinstance(leg_pnl, float) else leg_pnl,
+                "theta_decay_till_date": theta_decay_till_date,
                 "greeks": greeks
             })
 
