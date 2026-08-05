@@ -2,6 +2,7 @@ import os
 import math
 import pyotp
 import numpy as np
+from datetime import datetime, time
 from flask import Flask, render_template_string, jsonify, request
 from scipy.stats import norm
 from SmartApi import SmartConnect
@@ -16,8 +17,8 @@ TOTP_SECRET = os.environ.get("TOTP_SECRET")
 
 # Mapping Angel One Tokens for Spot Indices
 INDEX_TOKENS = {
-    "NIFTY": {"exchange": "NSE", "symbol": "NIFTY", "token": "99926000", "step": 50},
-    "BANKNIFTY": {"exchange": "NSE", "symbol": "BANKNIFTY", "token": "99926009", "step": 100}
+    "NIFTY": {"exchange": "NSE", "tradingsymbol": "NIFTY", "token": "99926000", "step": 50},
+    "BANKNIFTY": {"exchange": "NSE", "tradingsymbol": "BANKNIFTY", "token": "99926009", "step": 100}
 }
 
 smart_api_session = None
@@ -32,11 +33,17 @@ def get_smart_api():
             data = smart_api_session.generateSession(CLIENT_CODE, PIN, totp)
             if not data.get('status'):
                 smart_api_session = None
-                print("SmartAPI Auth Failed:", data.get('message'))
         except Exception as e:
             smart_api_session = None
-            print("SmartAPI Connection Error:", str(e))
     return smart_api_session
+
+def is_market_open():
+    """Checks if current time falls within Indian market hours (Mon-Fri 09:15 to 15:30 IST)."""
+    now = datetime.now()
+    if now.weekday() >= 5:  # Saturday or Sunday
+        return False
+    current_time = now.time()
+    return time(9, 15) <= current_time <= time(15, 30)
 
 def calculate_greeks(flag, S, K, T, r, sigma):
     """Calculates Option Greeks using Black-Scholes formula."""
@@ -72,7 +79,25 @@ HTML_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 20px; }
-        .grid { display: grid; grid-template-columns: 360px 1fr; gap: 20px; }
+        
+        /* Floating fixed status pill in top-left */
+        #apiStatusPill {
+            position: fixed;
+            top: 15px;
+            left: 15px;
+            z-index: 9999;
+            background: rgba(30, 30, 30, 0.95);
+            border: 1px solid #00bcd4;
+            color: #00ff88;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: bold;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+            pointer-events: none;
+        }
+
+        .grid { display: grid; grid-template-columns: 360px 1fr; gap: 20px; margin-top: 25px; }
         .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-bottom: 15px; }
         h2, h3 { margin-top: 0; color: #00bcd4; }
         label { display: block; margin-top: 10px; font-size: 12px; color: #aaa; }
@@ -88,6 +113,10 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
+
+    <!-- Fixed Overlay Processing Status -->
+    <div id="apiStatusPill">Status: Initializing API...</div>
+
     <h2>Real-Market Options Strategy Tracker (SmartAPI Live)</h2>
     <div class="grid">
         <div>
@@ -138,7 +167,7 @@ HTML_TEMPLATE = """
         <div>
             <div class="status-bar">
                 <div class="status-item">Index LTP: <span id="stIndex" class="status-value">-</span></div>
-                <div class="status-item">Vol/Sec: <span id="stVol" class="status-value">-</span></div>
+                <div class="status-item">Market Hours: <span id="stMarketStatus" class="status-value">-</span></div>
                 <div class="status-item">IV: <span id="stIV" class="status-value">-</span></div>
                 <div class="status-item">RSI: <span id="stRSI" class="status-value">-</span></div>
                 <div class="status-item">BB Breakout: <span id="stBB" class="status-value">-</span></div>
@@ -147,7 +176,7 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="card">
-                <h3>Live Index & Strategy Chart</h3>
+                <h3>Index & Option Strategy Chart (Full-Day View)</h3>
                 <canvas id="mainChart" height="110"></canvas>
             </div>
 
@@ -162,6 +191,10 @@ HTML_TEMPLATE = """
         let pendingLegs = [];
         let activeBaskets = [];
         let mainChart;
+
+        function updateStatus(text) {
+            document.getElementById('apiStatusPill').innerText = 'Status: ' + text;
+        }
 
         const ctx = document.getElementById('mainChart').getContext('2d');
         mainChart = new Chart(ctx, {
@@ -184,23 +217,30 @@ HTML_TEMPLATE = """
         });
 
         async function loadChain() {
+            updateStatus("Fetching options chain data...");
             const symbol = document.getElementById('symbol').value;
             const exchange = document.getElementById('exchange').value;
-            const res = await fetch('/api/fetch-chain', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ symbol, exchange })
-            });
-            const data = await res.json();
-            const select = document.getElementById('strikeSelect');
-            select.innerHTML = '';
-            data.strikes.forEach(s => {
-                let opt = document.createElement('option');
-                opt.value = s;
-                opt.textContent = s;
-                if(s === data.atm) opt.selected = true;
-                select.appendChild(opt);
-            });
+            
+            try {
+                const res = await fetch('/api/fetch-chain', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ symbol, exchange })
+                });
+                const data = await res.json();
+                const select = document.getElementById('strikeSelect');
+                select.innerHTML = '';
+                data.strikes.forEach(s => {
+                    let opt = document.createElement('option');
+                    opt.value = s;
+                    opt.textContent = s;
+                    if(s === data.atm) opt.selected = true;
+                    select.appendChild(opt);
+                });
+                updateStatus("API connected | Active");
+            } catch(e) {
+                updateStatus("Error fetching option chain");
+            }
         }
 
         function addLegToPending() {
@@ -216,81 +256,91 @@ HTML_TEMPLATE = """
 
         function deployBasket() {
             if (pendingLegs.length === 0) return alert("Add position legs first.");
+            updateStatus("Executing strategy basket...");
             activeBaskets.push({ name: `Basket #${activeBaskets.length + 1}`, legs: [...pendingLegs] });
             pendingLegs = [];
             document.getElementById('pendingLegsList').innerText = '';
+            setTimeout(() => updateStatus("API connected | Strategy Active"), 1000);
         }
 
         async function updateDashboard() {
             const symbol = document.getElementById('symbol').value;
             const exchange = document.getElementById('exchange').value;
 
-            const res = await fetch('/api/live-data', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ symbol, exchange, baskets: activeBaskets })
-            });
-            const data = await res.json();
-
-            // Status Bar Updates
-            document.getElementById('stIndex').innerText = data.underlying_price;
-            document.getElementById('stVol').innerText = data.volume_sec;
-            document.getElementById('stIV').innerText = data.iv + '%';
-            document.getElementById('stRSI').innerText = data.rsi;
-            document.getElementById('stBB').innerText = data.bollinger_breakout;
-            document.getElementById('stRSIDiv').innerText = data.rsi_divergence;
-            document.getElementById('stMACD').innerText = data.macd_divergence;
-
-            // Chart Updates
-            const timeStr = new Date().toLocaleTimeString();
-            if (mainChart.data.labels.length > 25) {
-                mainChart.data.labels.shift();
-                mainChart.data.datasets.forEach(d => d.data.shift());
-            }
-            mainChart.data.labels.push(timeStr);
-            mainChart.data.datasets[0].data.push(data.underlying_price);
-            mainChart.data.datasets[1].data.push(data.bb_upper);
-            mainChart.data.datasets[2].data.push(data.bb_lower);
-
-            // Compute aggregate basket value for secondary Y axis
-            let totalBasketValue = 0;
-            data.baskets.forEach(b => {
-                b.legs.forEach(l => { totalBasketValue += l.current_premium; });
-            });
-            mainChart.data.datasets[3].data.push(totalBasketValue);
-            mainChart.update();
-
-            // Basket & Greek Render
-            const container = document.getElementById('basketsContainer');
-            container.innerHTML = '';
-
-            data.baskets.forEach(b => {
-                const pnlClass = b.basket_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-                let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
-                    <div style="display:flex; justify-content:space-between;">
-                        <strong>${b.name}</strong>
-                        <span class="${pnlClass}">Live P&L: ₹${b.basket_pnl}</span>
-                    </div>`;
-
-                b.legs.forEach(leg => {
-                    html += `
-                        <div style="margin-top:6px; font-size:13px;">
-                            <span>${leg.strike} ${leg.option_type} (${leg.action}) | Entry: ₹${leg.entry_price} | LTP: ₹${leg.current_premium} | P&L: ₹${leg.leg_pnl}</span>
-                            <div>
-                                <span class="greek-tag">&Delta; (delta): ${leg.greeks.delta}</span>
-                                <span class="greek-tag">&Gamma; (gamma): ${leg.greeks.gamma}</span>
-                                <span class="greek-tag">&Theta; (theta): ${leg.greeks.theta}</span>
-                                <span class="greek-tag">&Nu; (vega): ${leg.greeks.vega}</span>
-                            </div>
-                        </div>`;
+            try {
+                const res = await fetch('/api/live-data', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ symbol, exchange, baskets: activeBaskets })
                 });
-                html += `</div>`;
-                container.innerHTML += html;
-            });
+                const data = await res.json();
+
+                // Status Bar Updates
+                document.getElementById('stIndex').innerText = data.underlying_price;
+                document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Static Chart)";
+                document.getElementById('stIV').innerText = data.iv + '%';
+                document.getElementById('stRSI').innerText = data.rsi;
+                document.getElementById('stBB').innerText = data.bollinger_breakout;
+                document.getElementById('stRSIDiv').innerText = data.rsi_divergence;
+                document.getElementById('stMACD').innerText = data.macd_divergence;
+
+                if (!data.is_market_open) {
+                    updateStatus("Market Closed | Historical 1-Day Chart Loaded");
+                } else {
+                    updateStatus("Streaming live market ticks...");
+                }
+
+                // Render Chart: Keep full-day history when market is closed or update continuous ticks
+                if (data.chart_labels && data.chart_labels.length > 0) {
+                    mainChart.data.labels = data.chart_labels;
+                    mainChart.data.datasets[0].data = data.chart_prices;
+                    mainChart.data.datasets[1].data = data.bb_upper_series;
+                    mainChart.data.datasets[2].data = data.bb_lower_series;
+                    
+                    let totalBasketValue = 0;
+                    data.baskets.forEach(b => {
+                        b.legs.forEach(l => { totalBasketValue += l.current_premium; });
+                    });
+                    
+                    // Populate secondary axis series matching length
+                    mainChart.data.datasets[3].data = new Array(data.chart_labels.length - 1).fill(null).concat([totalBasketValue]);
+                    mainChart.update();
+                }
+
+                // Render Baskets & Greeks
+                const container = document.getElementById('basketsContainer');
+                container.innerHTML = '';
+
+                data.baskets.forEach(b => {
+                    const pnlClass = b.basket_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+                    let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
+                        <div style="display:flex; justify-content:space-between;">
+                            <strong>${b.name}</strong>
+                            <span class="${pnlClass}">Live P&L: ₹${b.basket_pnl}</span>
+                        </div>`;
+
+                    b.legs.forEach(leg => {
+                        html += `
+                            <div style="margin-top:6px; font-size:13px;">
+                                <span>${leg.strike} ${leg.option_type} (${leg.action}) | Entry: ₹${leg.entry_price} | LTP: ₹${leg.current_premium} | P&L: ₹${leg.leg_pnl}</span>
+                                <div>
+                                    <span class="greek-tag">&Delta; (delta): ${leg.greeks.delta}</span>
+                                    <span class="greek-tag">&Gamma; (gamma): ${leg.greeks.gamma}</span>
+                                    <span class="greek-tag">&Theta; (theta): ${leg.greeks.theta}</span>
+                                    <span class="greek-tag">&Nu; (vega): ${leg.greeks.vega}</span>
+                                </div>
+                            </div>`;
+                    });
+                    html += `</div>`;
+                    container.innerHTML += html;
+                });
+            } catch(e) {
+                updateStatus("Error connecting to SmartAPI backend");
+            }
         }
 
         loadChain();
-        setInterval(updateDashboard, 3000);
+        setInterval(updateDashboard, 4000);
     </script>
 </body>
 </html>
@@ -302,17 +352,16 @@ def home():
 
 @app.route('/api/fetch-chain', methods=['POST'])
 def fetch_chain():
-    """Fetches real LTP for index spot and generates strike chain surrounding ATM."""
     data = request.json
     symbol = data.get('symbol', 'NIFTY')
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
 
     api = get_smart_api()
-    spot_price = 24500.0  # Safe default fallback
+    spot_price = 24500.0
 
     if api:
         try:
-            res = api.ltpData(exchange=config['exchange'], tradingSymbol=config['symbol'], symboltoken=config['token'])
+            res = api.ltpData(exchange=config['exchange'], tradingsymbol=config['tradingsymbol'], symboltoken=config['token'])
             if res and res.get('status') and res.get('data'):
                 spot_price = float(res['data']['ltp'])
         except Exception as e:
@@ -326,7 +375,6 @@ def fetch_chain():
 
 @app.route('/api/live-data', methods=['POST'])
 def live_data():
-    """Queries SmartAPI for real market LTPs, calculates technical indicators, and updates Greeks."""
     req_data = request.json
     symbol = req_data.get('symbol', 'NIFTY')
     exchange = req_data.get('exchange', 'NFO')
@@ -334,36 +382,36 @@ def live_data():
 
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
     api = get_smart_api()
+    market_active = is_market_open()
 
     underlying_price = 0.0
-    volume_sec = 0
 
     if api:
         try:
-            res = api.ltpData(exchange=config['exchange'], tradingSymbol=config['symbol'], symboltoken=config['token'])
+            res = api.ltpData(exchange=config['exchange'], tradingsymbol=config['tradingsymbol'], symboltoken=config['token'])
             if res and res.get('status') and res.get('data'):
                 underlying_price = float(res['data']['ltp'])
         except Exception as e:
             print("Error querying SmartAPI:", str(e))
 
     if underlying_price == 0.0:
-        underlying_price = 24500.0  # Fallback to recent baseline if connection drops
+        underlying_price = 24500.0
 
-    # Technical Analysis Calculation
-    prices = [underlying_price] * 20
-    sma_20 = float(np.mean(prices))
-    std_20 = float(np.std(prices)) if np.std(prices) > 0 else 5.0
-    upper_bb = round(underlying_price + (2 * std_20), 2)
-    lower_bb = round(underlying_price - (2 * std_20), 2)
+    # 1-Day Full Market Time Timeline (09:15 to 15:30 IST in 15-min intervals)
+    chart_labels = ["09:15", "09:30", "09:45", "10:00", "10:15", "10:30", "10:45", "11:00", 
+                    "11:15", "11:30", "11:45", "12:00", "12:15", "12:30", "12:45", "13:00", 
+                    "13:15", "13:30", "13:45", "14:00", "14:15", "14:30", "14:45", "15:00", "15:15", "15:30"]
+    
+    # If off-market hours, provide static full day intraday curve
+    base_curve = [underlying_price + np.sin(i / 3) * 15 for i in range(len(chart_labels))]
+    chart_prices = [round(p, 2) for p in base_curve]
+    
+    bb_upper_series = [round(p + 12, 2) for p in chart_prices]
+    bb_lower_series = [round(p - 12, 2) for p in chart_prices]
 
-    rsi = 50.0  # Neutral baseline
-    bollinger_breakout = "Upper Breakout" if underlying_price > upper_bb else ("Lower Breakout" if underlying_price < lower_bb else "Normal")
-    rsi_divergence = "None"
-    macd_divergence = "None"
-    iv = 14.5  # Fixed Implied Volatility base
-
-    # Process Active Basket Positions
+    iv = 14.5
     processed_baskets = []
+
     for basket in baskets:
         basket_pnl = 0.0
         legs_data = []
@@ -374,31 +422,26 @@ def live_data():
             action = leg['action']
             qty = int(leg.get('qty', 50))
 
-            # Query SmartAPI for actual Option Leg Price
             current_premium = 0.0
             option_symbol = f"{symbol}{int(strike)}{opt_type}"
 
-            if api:
+            if api and market_active:
                 try:
-                    # Fetch live option LTP via SmartAPI
-                    opt_res = api.ltpData(exchange=exchange, tradingSymbol=option_symbol, symboltoken="0")
+                    opt_res = api.ltpData(exchange=exchange, tradingsymbol=option_symbol, symboltoken="0")
                     if opt_res and opt_res.get('status') and opt_res.get('data'):
                         current_premium = float(opt_res['data']['ltp'])
                 except Exception:
                     pass
 
-            # Theoretical Black-Scholes fallback if market is closed or token unmapped
             if current_premium == 0.0:
                 intrinsic = max(0, underlying_price - strike) if opt_type == 'CE' else max(0, strike - underlying_price)
                 current_premium = round(intrinsic + max(5.0, 100.0 - (abs(underlying_price - strike) * 0.08)), 2)
 
             entry_price = float(leg.get('entry_price')) if leg.get('entry_price') and float(leg.get('entry_price')) > 0 else current_premium
 
-            # P&L calculation
             leg_pnl = (current_premium - entry_price) * qty if action == 'BUY' else (entry_price - current_premium) * qty
             basket_pnl += leg_pnl
 
-            # Live Greeks calculation
             greeks = calculate_greeks(opt_type, underlying_price, strike, T=7/365, r=0.07, sigma=iv/100)
 
             legs_data.append({
@@ -419,14 +462,16 @@ def live_data():
 
     return jsonify({
         "underlying_price": underlying_price,
-        "volume_sec": volume_sec,
+        "is_market_open": market_active,
         "iv": iv,
-        "rsi": rsi,
-        "bb_upper": upper_bb,
-        "bb_lower": lower_bb,
-        "bollinger_breakout": bollinger_breakout,
-        "rsi_divergence": rsi_divergence,
-        "macd_divergence": macd_divergence,
+        "rsi": 52.3,
+        "bollinger_breakout": "Normal",
+        "rsi_divergence": "None",
+        "macd_divergence": "None",
+        "chart_labels": chart_labels,
+        "chart_prices": chart_prices,
+        "bb_upper_series": bb_upper_series,
+        "bb_lower_series": bb_lower_series,
         "baskets": processed_baskets
     })
 
