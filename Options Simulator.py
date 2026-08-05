@@ -267,7 +267,7 @@ def calculate_max_profit_loss(legs):
 
     return max_profit_str, max_loss_str
 
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -489,7 +489,6 @@ HTML_TEMPLATE = """
             if (type === 'warn') pill.classList.add('pill-warn');
         }
 
-        // Professional Chart Options (Disables rise-up entrance animations & sets clean lines)
         const ctx = document.getElementById('mainChart').getContext('2d');
         mainChart = new Chart(ctx, {
             type: 'line',
@@ -685,7 +684,7 @@ HTML_TEMPLATE = """
                 if (data.chart_labels && data.chart_labels.length > 0) {
                     mainChart.data.labels = data.chart_labels;
                     mainChart.data.datasets[0].data = data.chart_prices;
-                    mainChart.update('none'); // Update without vertical entry animation
+                    mainChart.update('none');
                 }
 
                 const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
@@ -760,7 +759,6 @@ HTML_TEMPLATE = """
             } catch(e) { updateStatus("Couldnt fetch live price from API", "error"); }
         }
 
-        // Professional, Static Horizontal Sliding Chart Renderer
         function updateLegsHistoricalChart(basket) {
             if (!basket || !basket.legs_historical) return;
 
@@ -776,8 +774,8 @@ HTML_TEMPLATE = """
                             data: series.prices,
                             borderColor: CHART_COLORS[idx % CHART_COLORS.length],
                             borderWidth: 1.5,
-                            pointRadius: 0,            // Eliminates heavy dot overlays
-                            pointHoverRadius: 4,       // Clean hover feedback
+                            pointRadius: 0,
+                            pointHoverRadius: 4,
                             backgroundColor: 'transparent',
                             tension: 0.1
                         });
@@ -785,7 +783,7 @@ HTML_TEMPLATE = """
                 }
 
                 legsChart.data.datasets = datasets;
-                legsChart.update('none'); // Prevents vertical entry bounce effect
+                legsChart.update('none');
             }
         }
 
@@ -794,3 +792,12 @@ HTML_TEMPLATE = """
     </script>
 </body>
 </html>
+"""
+
+@app.route('/')
+def index():
+    ensure_scrip_master_loading()
+    return render_template_string(HTML_TEMPLATE)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
