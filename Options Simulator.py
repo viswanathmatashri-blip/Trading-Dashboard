@@ -267,6 +267,41 @@ def calculate_max_profit_loss(legs):
 
     return max_profit_str, max_loss_str
 
+def identify_strategy(legs):
+    if not legs:
+        return "Custom Strategy"
+    
+    n_legs = len(legs)
+    buys = [l for l in legs if l['action'] == 'BUY']
+    sells = [l for l in legs if l['action'] == 'SELL']
+
+    if n_legs == 1:
+        leg = legs[0]
+        return f"Long {leg['option_type']}" if leg['action'] == 'BUY' else f"Short {leg['option_type']}"
+
+    if n_legs == 2:
+        if len(buys) == 1 and len(sells) == 1:
+            b_leg, s_leg = buys[0], sells[0]
+            if b_leg['option_type'] == 'CE' and s_leg['option_type'] == 'CE':
+                return "Bull Call Spread" if b_leg['strike'] < s_leg['strike'] else "Bear Call Spread"
+            if b_leg['option_type'] == 'PE' and s_leg['option_type'] == 'PE':
+                return "Bear Put Spread" if b_leg['strike'] > s_leg['strike'] else "Bull Put Spread"
+        elif len(buys) == 2:
+            if set(l['option_type'] for l in buys) == {'CE', 'PE'}:
+                strikes = set(l['strike'] for l in buys)
+                return "Long Straddle" if len(strikes) == 1 else "Long Strangle"
+        elif len(sells) == 2:
+            if set(l['option_type'] for l in sells) == {'CE', 'PE'}:
+                strikes = set(l['strike'] for l in sells)
+                return "Short Straddle" if len(strikes) == 1 else "Short Strangle"
+
+    if n_legs == 4 and len(buys) == 2 and len(sells) == 2:
+        types = set(l['option_type'] for l in legs)
+        if types == {'CE', 'PE'}:
+            return "Iron Condor" or "Iron Butterfly"
+
+    return "Custom Multi-Leg"
+
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
@@ -323,6 +358,7 @@ HTML_TEMPLATE = r"""
         .pnl-err { color: #ff9800; font-weight: bold; }
         .greek-tag { font-family: monospace; background: #2d2d2d; padding: 3px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; display: inline-block; margin-top: 4px; }
         .basket-summary-tag { font-family: monospace; background: #1a3835; border: 1px solid #00bcd4; padding: 3px 7px; border-radius: 4px; font-size: 11px; color: #00e5ff; margin-left: 6px; display: inline-block; }
+        .strategy-badge { background: #00bcd4; color: #000; font-weight: bold; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 8px; }
 
         .chart-checkbox-container {
             display: inline-flex;
@@ -455,7 +491,7 @@ HTML_TEMPLATE = r"""
 
             <div class="card">
                 <div class="header-flex">
-                    <h3>Basket Legs Real-Time Premium Chart</h3>
+                    <h3>Basket Legs Real-Time Premium Chart & P&L Zones</h3>
                     <div>
                         <label style="display:inline; color:#aaa; font-size:12px; margin-right:5px;">Basket Candle Timeframe:</label>
                         <select id="basketTimeframeSelect" class="chart-select" onchange="updateDashboard()">
@@ -701,6 +737,7 @@ HTML_TEMPLATE = r"""
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
                             <div style="display:flex; align-items:center; flex-wrap:wrap; gap:4px;">
                                 <strong>${b.name}</strong>
+                                <span class="strategy-badge">${b.strategy_type}</span>
                                 <span class="${pnlClass}" style="margin-left: 10px; margin-right: 10px;">Live P&L: ${pnlDisplay}</span>
                                 
                                 <span class="basket-summary-tag">Net &Delta;: ₹${b.net_greeks.delta} /pt</span>
@@ -769,14 +806,15 @@ HTML_TEMPLATE = r"""
 
                 if (hist.leg_series) {
                     hist.leg_series.forEach((series, idx) => {
+                        let isPositivePnl = basket.basket_pnl >= 0;
                         datasets.push({
                             label: series.label,
                             data: series.prices,
                             borderColor: CHART_COLORS[idx % CHART_COLORS.length],
-                            borderWidth: 1.5,
+                            borderWidth: 2,
                             pointRadius: 0,
                             pointHoverRadius: 4,
-                            backgroundColor: 'transparent',
+                            fill: { target: 'origin', above: 'rgba(0,255,136,0.08)', below: 'rgba(255,82,82,0.08)' },
                             tension: 0.1
                         });
                     });
@@ -802,7 +840,6 @@ def index():
 @app.route('/api/fetch-expiries', methods=['POST'])
 def fetch_expiries():
     ensure_scrip_master_loading()
-    
     if INSTRUMENT_DF is None:
         return jsonify({"expiries": [], "status": SCRIP_MASTER_STATUS})
 
@@ -868,7 +905,6 @@ def live_data():
     from_date = now.strftime("%Y-%m-%d 09:15")
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
-    # Fetch Index Candle History
     chart_labels, chart_prices = [], []
     try:
         hist_params = {
@@ -894,7 +930,7 @@ def live_data():
         basket_pnl = 0.0
         processed_legs = []
         leg_series_data = []
-        basket_chart_labels = []
+        master_timestamps = chart_labels or []
 
         for leg in basket.get('legs', []):
             strike = float(leg['strike'])
@@ -919,6 +955,7 @@ def live_data():
                     token = str(match.iloc[0]['token'])
                     symbol_name = match.iloc[0]['symbol']
 
+            leg_prices_map = {}
             if token and symbol_name:
                 try:
                     opt_ltp_resp = smart_api.ltpData("NFO", symbol_name, token)
@@ -927,7 +964,6 @@ def live_data():
                 except Exception:
                     pass
 
-                # Fetch Option Leg Candle History
                 try:
                     leg_hist_params = {
                         "exchange": "NFO",
@@ -938,15 +974,9 @@ def live_data():
                     }
                     leg_hist_resp = smart_api.getCandleData(leg_hist_params)
                     if leg_hist_resp and leg_hist_resp.get('status') and leg_hist_resp.get('data'):
-                        leg_candles = leg_hist_resp['data']
-                        if not basket_chart_labels:
-                            basket_chart_labels = [c[0].split('T')[1][:5] for c in leg_candles]
-                        
-                        leg_prices = [float(c[4]) for c in leg_candles]
-                        leg_series_data.append({
-                            "label": f"{strike} {opt_type} ({action})",
-                            "prices": leg_prices
-                        })
+                        for c in leg_hist_resp['data']:
+                            ts = c[0].split('T')[1][:5]
+                            leg_prices_map[ts] = float(c[4])
                 except Exception:
                     pass
 
@@ -984,12 +1014,20 @@ def live_data():
                 "theta_decay_till_date": decay_till_date
             })
 
+            aligned_series = [leg_prices_map.get(ts, current_ltp if isinstance(current_ltp, (int, float)) else entry_price) for ts in master_timestamps]
+            leg_series_data.append({
+                "label": f"{strike} {opt_type} ({action})",
+                "prices": aligned_series
+            })
+
+        strategy_type = identify_strategy(basket.get('legs', []))
         net_greeks = calculate_basket_greeks_from_price_diff(basket.get('legs', []), spot_price)
         max_prof, max_lss = calculate_max_profit_loss(basket.get('legs', []))
 
         processed_baskets.append({
             "id": basket['id'],
             "name": basket['name'],
+            "strategy_type": strategy_type,
             "basket_pnl": round(basket_pnl, 2),
             "max_profit": max_prof,
             "max_loss": max_lss,
@@ -997,7 +1035,7 @@ def live_data():
             "total_decay_till_date": round(basket_pnl, 2),
             "legs": processed_legs,
             "legs_historical": {
-                "labels": basket_chart_labels,
+                "labels": master_timestamps,
                 "leg_series": leg_series_data
             }
         })
