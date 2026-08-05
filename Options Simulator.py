@@ -794,10 +794,197 @@ HTML_TEMPLATE = r"""
 </html>
 """
 
+# ==================== BACKEND API ROUTES ====================
+
 @app.route('/')
 def index():
     ensure_scrip_master_loading()
     return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/fetch-expiries', methods=['POST'])
+def fetch_expiries():
+    ensure_scrip_master_loading()
+    
+    if INSTRUMENT_DF is None:
+        return jsonify({"expiries": [], "status": SCRIP_MASTER_STATUS})
+
+    data = request.json or {}
+    symbol = data.get('symbol', 'NIFTY')
+
+    filtered = INSTRUMENT_DF[INSTRUMENT_DF['name'] == symbol]
+    expiries = sorted(filtered['expiry'].unique().tolist())
+    
+    return jsonify({"expiries": expiries, "status": "API connection success"})
+
+@app.route('/api/fetch-chain', methods=['POST'])
+def fetch_chain():
+    if INSTRUMENT_DF is None:
+        return jsonify({"strikes": [], "atm": None})
+
+    data = request.json or {}
+    symbol = data.get('symbol', 'NIFTY')
+    expiry = data.get('expiry')
+
+    filtered = INSTRUMENT_DF[(INSTRUMENT_DF['name'] == symbol) & (INSTRUMENT_DF['expiry'] == expiry)]
+    strikes = sorted(filtered['strike_price'].unique().tolist())
+
+    smart_api, _ = get_smart_api()
+    atm = None
+    if smart_api and symbol in INDEX_TOKENS:
+        try:
+            tok_info = INDEX_TOKENS[symbol]
+            ltp_resp = smart_api.ltpData(tok_info["exchange"], tok_info["tradingsymbol"], tok_info["token"])
+            if ltp_resp and ltp_resp.get('status') and ltp_resp.get('data'):
+                spot = float(ltp_resp['data']['ltp'])
+                step = tok_info['step']
+                atm = round(spot / step) * step
+        except Exception:
+            pass
+
+    return jsonify({"strikes": strikes, "atm": atm})
+
+@app.route('/api/live-data', methods=['POST'])
+def live_data():
+    smart_api, conn_msg = get_smart_api()
+    if not smart_api:
+        return jsonify({"error": conn_msg, "status": conn_msg})
+
+    req_data = request.json or {}
+    symbol = req_data.get('symbol', 'NIFTY')
+    baskets = req_data.get('baskets', [])
+    interval = req_data.get('interval', '15')
+    basket_interval = req_data.get('basket_interval', '15')
+
+    idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
+    
+    try:
+        ltp_resp = smart_api.ltpData(idx_info["exchange"], idx_info["tradingsymbol"], idx_info["token"])
+        if not (ltp_resp and ltp_resp.get('status') and ltp_resp.get('data')):
+            return jsonify({"error": "Failed to fetch Index LTP", "status": "LTP Fetch Failed"})
+        
+        spot_price = float(ltp_resp['data']['ltp'])
+    except Exception as e:
+        return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
+
+    # Candle History for Spot Chart
+    chart_labels, chart_prices = [], []
+    try:
+        now = datetime.now()
+        from_date = now.strftime("%Y-%m-%d 09:15")
+        to_date = now.strftime("%Y-%m-%d %H:%M")
+        
+        hist_params = {
+            "exchange": idx_info["exchange"],
+            "symboltoken": idx_info["token"],
+            "interval": INTERVAL_MAP.get(interval, "FIFTEEN_MINUTE"),
+            "fromdate": from_date,
+            "todate": to_date
+        }
+        hist_resp = smart_api.getCandleData(hist_params)
+        if hist_resp and hist_resp.get('status') and hist_resp.get('data'):
+            candles = hist_resp['data']
+            chart_labels = [c[0].split('T')[1][:5] for c in candles]
+            chart_prices = [float(c[4]) for c in candles]
+    except Exception:
+        pass
+
+    iv_estimate = 14.5
+    expected_1day_move = round(spot_price * (iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
+
+    processed_baskets = []
+    for basket in baskets:
+        basket_pnl = 0.0
+        processed_legs = []
+
+        for leg in basket.get('legs', []):
+            strike = float(leg['strike'])
+            exp_date = leg['expiry']
+            opt_type = leg['option_type']
+            action = leg['action']
+            qty = int(leg.get('qty', 65))
+            entry_price = leg.get('entry_price')
+
+            current_ltp = "N/A"
+            token = None
+            
+            if INSTRUMENT_DF is not None:
+                match = INSTRUMENT_DF[
+                    (INSTRUMENT_DF['name'] == symbol) & 
+                    (INSTRUMENT_DF['expiry'] == exp_date) & 
+                    (INSTRUMENT_DF['strike_price'] == strike) & 
+                    (INSTRUMENT_DF['symbol'].str.endswith(opt_type))
+                ]
+                if not match.empty:
+                    token = str(match.iloc[0]['token'])
+
+            if token:
+                try:
+                    opt_ltp_resp = smart_api.ltpData("NFO", match.iloc[0]['symbol'], token)
+                    if opt_ltp_resp and opt_ltp_resp.get('status') and opt_ltp_resp.get('data'):
+                        current_ltp = float(opt_ltp_resp['data']['ltp'])
+                except Exception:
+                    pass
+
+            if entry_price is None or entry_price == 0:
+                entry_price = current_ltp if isinstance(current_ltp, (int, float)) else 0.0
+
+            leg_pnl = 0.0
+            if isinstance(current_ltp, (int, float)) and isinstance(entry_price, (int, float)):
+                if action == 'BUY':
+                    leg_pnl = (current_ltp - entry_price) * qty
+                else:
+                    leg_pnl = (entry_price - current_ltp) * qty
+                basket_pnl += leg_pnl
+
+            # Calculate Greeks
+            try:
+                exp_dt = datetime.strptime(exp_date, "%d%b%Y")
+                days_to_exp = max((exp_dt - datetime.now()).days, 0.5)
+            except Exception:
+                days_to_exp = 7.0
+
+            T = days_to_exp / 365.0
+            greeks = calculate_greeks(opt_type, spot_price, strike, T, 0.07, iv_estimate / 100.0)
+
+            decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
+
+            processed_legs.append({
+                "strike": strike,
+                "expiry": exp_date,
+                "option_type": opt_type,
+                "action": action,
+                "qty": qty,
+                "entry_price": entry_price,
+                "current_premium": current_ltp,
+                "leg_pnl": round(leg_pnl, 2) if isinstance(leg_pnl, float) else leg_pnl,
+                "greeks": greeks,
+                "theta_decay_till_date": decay_till_date
+            })
+
+        net_greeks = calculate_basket_greeks_from_price_diff(basket.get('legs', []), spot_price)
+        max_prof, max_lss = calculate_max_profit_loss(basket.get('legs', []))
+
+        processed_baskets.append({
+            "id": basket['id'],
+            "name": basket['name'],
+            "basket_pnl": round(basket_pnl, 2),
+            "max_profit": max_prof,
+            "max_loss": max_lss,
+            "net_greeks": net_greeks,
+            "total_decay_till_date": round(basket_pnl, 2),
+            "legs": processed_legs
+        })
+
+    return jsonify({
+        "status": conn_msg,
+        "underlying_price": spot_price,
+        "current_iv": iv_estimate,
+        "expected_1day_move": expected_1day_move,
+        "is_market_open": is_market_open(),
+        "chart_labels": chart_labels,
+        "chart_prices": chart_prices,
+        "baskets": processed_baskets
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
