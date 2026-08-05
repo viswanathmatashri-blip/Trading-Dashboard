@@ -285,12 +285,14 @@ HTML_TEMPLATE = """
             max-width: 90vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
 
+        /* Fix 3: Expanded ribbon to enforce single-line text without wrapping */
         #refreshToggleOverlay {
             position: fixed; top: 10px; right: 15px; z-index: 9999;
             background: rgba(20, 20, 20, 0.95); border: 1px solid #444;
-            color: #fff; padding: 6px 12px; border-radius: 20px;
+            color: #fff; padding: 8px 16px; border-radius: 20px;
             font-size: 11px; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-            display: flex; align-items: center; gap: 6px; cursor: pointer;
+            display: flex; align-items: center; gap: 8px; cursor: pointer;
+            white-space: nowrap; width: auto; max-width: none;
         }
 
         .pill-err { border-color: #ff5252 !important; color: #ff5252 !important; }
@@ -323,15 +325,15 @@ HTML_TEMPLATE = """
         .greek-tag { font-family: monospace; background: #2d2d2d; padding: 3px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; display: inline-block; margin-top: 4px; }
         .basket-summary-tag { font-family: monospace; background: #1a3835; border: 1px solid #00bcd4; padding: 3px 7px; border-radius: 4px; font-size: 11px; color: #00e5ff; margin-left: 6px; display: inline-block; }
 
-        /* Loader Animation */
-        .spinner {
-            width: 12px;
-            height: 12px;
-            border: 2px solid rgba(255,255,255,0.3);
-            border-radius: 50%;
-            border-top-color: #fff;
-            animation: spin 0.8s linear infinite;
-            display: inline-block;
+        .chart-checkbox-container {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            color: #00ff88;
+            margin-right: 12px;
+            cursor: pointer;
+            user-select: none;
         }
 
         .header-spinner {
@@ -365,8 +367,8 @@ HTML_TEMPLATE = """
     <div id="apiStatusPill">Status: Logging in API...</div>
 
     <div id="refreshToggleOverlay">
-        <input type="checkbox" id="chkAutoRefresh" checked onchange="toggleRefreshInterval()">
-        <label for="chkAutoRefresh" style="margin:0; cursor:pointer; color:#fff;">Enable Refresh 5 sec</label>
+        <input type="checkbox" id="chkAutoRefresh" checked onchange="toggleRefreshInterval()" style="margin:0; width:auto;">
+        <label for="chkAutoRefresh" style="margin:0; cursor:pointer; color:#fff; white-space:nowrap; display:inline;">Enable Refresh 5 sec</label>
     </div>
 
     <h2>Real-Market Options Strategy Tracker (SmartAPI Live)</h2>
@@ -453,7 +455,19 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="card">
-                <h3>Basket Legs Real-Time Premium Chart (1-Day Historical Scale)</h3>
+                <!-- Fix 4: Added Timeframe Dropdown selector for Basket Legs Chart -->
+                <div class="header-flex">
+                    <h3>Basket Legs Real-Time Premium Chart</h3>
+                    <div>
+                        <label style="display:inline; color:#aaa; font-size:12px; margin-right:5px;">Basket Candle Timeframe:</label>
+                        <select id="basketTimeframeSelect" class="chart-select" onchange="updateDashboard()">
+                            <option value="1">1 min</option>
+                            <option value="3">3 mins</option>
+                            <option value="5">5 mins</option>
+                            <option value="15" selected>15 mins</option>
+                        </select>
+                    </div>
+                </div>
                 <canvas id="legsPremiumChart" height="120"></canvas>
             </div>
         </div>
@@ -462,8 +476,12 @@ HTML_TEMPLATE = """
     <script>
         let pendingLegs = [];
         let activeBaskets = [];
+        let selectedChartBasketId = null;
+        let deletedBasketIds = new Set();
         let mainChart, legsChart;
         let refreshTimer = null;
+
+        const CHART_COLORS = ['#00bcd4', '#ff9800', '#e91e63', '#4caf50', '#9c27b0', '#ffeb3b'];
 
         function updateStatus(text, type='info') {
             const pill = document.getElementById('apiStatusPill');
@@ -489,8 +507,7 @@ HTML_TEMPLATE = """
                 interaction: { mode: 'index', intersect: false },
                 scales: {
                     x: { grid: { color: '#2a2a2a' } },
-                    y1: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Leg 1 Premium (₹)', color: '#00bcd4' }, grid: { color: '#2a2a2a' } },
-                    y2: { type: 'linear', display: true, position: 'right', title: { display: true, text: 'Leg 2 Premium (₹)', color: '#ff9800' }, grid: { drawOnChartArea: false } }
+                    y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Option Premium (₹)', color: '#00bcd4' }, grid: { color: '#2a2a2a' } }
                 }
             }
         });
@@ -601,12 +618,16 @@ HTML_TEMPLATE = """
 
         function deployBasket() {
             if (pendingLegs.length === 0) return alert("Add position legs first.");
+            const basketId = Date.now();
             const newBasketName = `Basket #${activeBaskets.length + 1}`;
-            activeBaskets.push({ id: Date.now(), name: newBasketName, legs: [...pendingLegs] });
+            
+            // Auto-select chart for newly created basket if none selected
+            if (!selectedChartBasketId) selectedChartBasketId = basketId;
+
+            activeBaskets.push({ id: basketId, name: newBasketName, legs: [...pendingLegs] });
             pendingLegs = [];
             renderPendingLegs();
 
-            // Show Loading Indicator in Section Title
             const statusElem = document.getElementById('basketHeaderStatus');
             statusElem.innerHTML = `<span class="basket-status-msg"><span class="header-spinner"></span> Adding ${newBasketName}...</span>`;
 
@@ -615,16 +636,22 @@ HTML_TEMPLATE = """
             });
         }
 
-        function deleteBasket(basketId, btnElement) {
-            if (btnElement) {
-                btnElement.disabled = true;
-                btnElement.innerHTML = `<span class="spinner"></span>`;
-            }
-
-            // Immediately mutate state locally for 0ms delay
+        // Fix 1: Instant & Permanent Basket Deletion
+        function deleteBasket(basketId) {
+            deletedBasketIds.add(basketId);
             activeBaskets = activeBaskets.filter(b => b.id !== basketId);
             
-            // Re-render immediately locally
+            if (selectedChartBasketId === basketId) {
+                selectedChartBasketId = activeBaskets.length > 0 ? activeBaskets[0].id : null;
+            }
+            
+            // Instantly remove DOM element or re-render UI state
+            updateDashboard();
+        }
+
+        // Fix 2: Dynamic Basket Selection for Chart
+        function toggleBasketChart(basketId) {
+            selectedChartBasketId = selectedChartBasketId === basketId ? null : basketId;
             updateDashboard();
         }
 
@@ -632,12 +659,19 @@ HTML_TEMPLATE = """
             const symbol = document.getElementById('symbol').value;
             const exchange = document.getElementById('exchange').value;
             const interval = document.getElementById('timeframeSelect').value;
+            const basketInterval = document.getElementById('basketTimeframeSelect').value;
+
+            // Enforce client-side deletion filter
+            activeBaskets = activeBaskets.filter(b => !deletedBasketIds.has(b.id));
 
             try {
                 const res = await fetch('/api/live-data', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ symbol, exchange, interval, baskets: activeBaskets })
+                    body: JSON.stringify({ 
+                        symbol, exchange, interval, basket_interval: basketInterval, 
+                        baskets: activeBaskets 
+                    })
                 });
                 const data = await res.json();
 
@@ -655,12 +689,16 @@ HTML_TEMPLATE = """
                     mainChart.update();
                 }
 
+                // Filter backend data against client-side blacklisted/deleted IDs
+                const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
+
                 const container = document.getElementById('basketsContainer');
                 container.innerHTML = '';
 
-                data.baskets.forEach(b => {
+                validBaskets.forEach(b => {
                     let pnlDisplay = typeof b.basket_pnl === 'number' ? `₹${b.basket_pnl}` : b.basket_pnl;
                     let pnlClass = typeof b.basket_pnl === 'number' ? (b.basket_pnl >= 0 ? 'pnl-pos' : 'pnl-neg') : 'pnl-err';
+                    let isChecked = selectedChartBasketId === b.id;
 
                     let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
@@ -675,7 +713,14 @@ HTML_TEMPLATE = """
                                 <span class="basket-summary-tag" style="color:#00ff88; border-color:#00ff88; background:#1b3821;">Tot Decay: ₹${b.total_decay_till_date}</span>
                                 <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ₹${b.net_greeks.expected_day_theta}</span>
                             </div>
-                            <button class="btn-delete" onclick="deleteBasket(${b.id}, this)">🗑️ Delete Basket</button>
+                            
+                            <div style="display:flex; align-items:center;">
+                                <label class="chart-checkbox-container">
+                                    <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleBasketChart(${b.id})" style="width:auto; margin:0;">
+                                    <span>Load Chart</span>
+                                </label>
+                                <button class="btn-delete" onclick="deleteBasket(${b.id})">🗑️ Delete Basket</button>
+                            </div>
                         </div>
                         
                         <div style="margin-top: 6px; font-size: 12px; color: #aaa;">
@@ -683,7 +728,7 @@ HTML_TEMPLATE = """
                             <strong>Max Loss:</strong> <span style="color:#ff5252;">${b.max_loss}</span>
                         </div>`;
 
-                    b.legs.forEach((leg, idx) => {
+                    b.legs.forEach((leg) => {
                         let ltpText = typeof leg.current_premium === 'number' ? `₹${leg.current_premium}` : leg.current_premium;
                         let entryText = typeof leg.entry_price === 'number' ? `₹${leg.entry_price}` : leg.entry_price;
                         let legPnlText = typeof leg.leg_pnl === 'number' ? `₹${leg.leg_pnl}` : leg.leg_pnl;
@@ -705,40 +750,37 @@ HTML_TEMPLATE = """
                     container.innerHTML += html;
                 });
 
-                if (data.baskets && data.baskets.length > 0) {
-                    updateLegsHistoricalChart(data.baskets[0]);
+                // Load Basket Chart according to checked option
+                const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
+                if (targetBasket) {
+                    updateLegsHistoricalChart(targetBasket);
+                } else {
+                    legsChart.data.labels = [];
+                    legsChart.data.datasets = [];
+                    legsChart.update();
                 }
 
             } catch(e) { updateStatus("Couldnt fetch live price from API", "error"); }
         }
 
-        function updateLegsHistoricalChart(firstBasket) {
-            if (!firstBasket || !firstBasket.legs_historical) return;
+        // Renders all legs of selected basket dynamically
+        function updateLegsHistoricalChart(basket) {
+            if (!basket || !basket.legs_historical) return;
 
-            const hist = firstBasket.legs_historical;
+            const hist = basket.legs_historical;
             if (hist.labels && hist.labels.length > 0) {
                 legsChart.data.labels = hist.labels;
-                
                 let datasets = [];
-                if (hist.leg1_prices && hist.leg1_prices.length > 0) {
-                    datasets.push({
-                        label: `${firstBasket.legs[0].strike} ${firstBasket.legs[0].option_type} (${firstBasket.legs[0].action})`,
-                        data: hist.leg1_prices,
-                        borderColor: '#00bcd4',
-                        backgroundColor: 'transparent',
-                        yAxisID: 'y1',
-                        tension: 0.1
-                    });
-                }
 
-                if (hist.leg2_prices && hist.leg2_prices.length > 0) {
-                    datasets.push({
-                        label: `${firstBasket.legs[1].strike} ${firstBasket.legs[1].option_type} (${firstBasket.legs[1].action})`,
-                        data: hist.leg2_prices,
-                        borderColor: '#ff9800',
-                        backgroundColor: 'transparent',
-                        yAxisID: 'y2',
-                        tension: 0.1
+                if (hist.leg_series) {
+                    hist.leg_series.forEach((series, idx) => {
+                        datasets.push({
+                            label: series.label,
+                            data: series.prices,
+                            borderColor: CHART_COLORS[idx % CHART_COLORS.length],
+                            backgroundColor: 'transparent',
+                            tension: 0.1
+                        });
                     });
                 }
 
@@ -823,9 +865,11 @@ def live_data():
     symbol = req_data.get('symbol', 'NIFTY')
     exchange = req_data.get('exchange', 'NFO')
     interval_key = req_data.get('interval', '15')
+    basket_interval_key = req_data.get('basket_interval', '15')
     baskets = req_data.get('baskets', [])
 
     candle_interval = INTERVAL_MAP.get(interval_key, "FIFTEEN_MINUTE")
+    basket_candle_interval = INTERVAL_MAP.get(basket_interval_key, "FIFTEEN_MINUTE")
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
 
     if INSTRUMENT_DF is None:
@@ -877,8 +921,7 @@ def live_data():
         total_decay_till_date = 0.0
 
         raw_legs = basket.get('legs', [])
-
-        leg_historical_data = {"labels": [], "leg1_prices": [], "leg2_prices": []}
+        leg_historical_data = {"labels": [], "leg_series": []}
 
         for idx, leg in enumerate(raw_legs):
             strike = float(leg['strike'])
@@ -913,18 +956,20 @@ def live_data():
                     leg_candle_param = {
                         "exchange": exchange,
                         "symboltoken": scrip_token,
-                        "interval": "FIFTEEN_MINUTE",
+                        "interval": basket_candle_interval,
                         "fromdate": f"{today_str} 09:15",
                         "todate": f"{today_str} 15:30"
                     }
                     leg_candles = api.getCandleData(leg_candle_param)
                     if leg_candles and leg_candles.get('status') and leg_candles.get('data'):
                         prices = [float(c[4]) for c in leg_candles['data']]
-                        if idx == 0:
+                        if not leg_historical_data["labels"]:
                             leg_historical_data["labels"] = [c[0].split('T')[1][:5] for c in leg_candles['data']]
-                            leg_historical_data["leg1_prices"] = prices
-                        elif idx == 1:
-                            leg_historical_data["leg2_prices"] = prices
+                        
+                        leg_historical_data["leg_series"].append({
+                            "label": f"{strike} {opt_type} ({action})",
+                            "prices": prices
+                        })
                 except Exception as e:
                     print(f"Error fetching leg candle data for {trading_symbol}:", str(e))
 
