@@ -203,31 +203,76 @@ def calculate_basket_greeks_from_price_diff(legs, S, T=7/365, r=0.07, sigma=0.14
     }
 
 def calculate_max_profit_loss(legs):
-    has_unhedged_short_call = False
-    has_unhedged_short_put = False
-    max_profit = 0.0
+    if not legs:
+        return "₹0", "₹0"
+
+    total_net_credit = 0.0
+    short_calls = []
+    long_calls = []
+    short_puts = []
+    long_puts = []
 
     for leg in legs:
         qty = int(leg.get('qty', 65))
         entry_price = float(leg.get('entry_price', 0.0) or 0.0)
         action = leg.get('action', 'BUY')
         opt_type = leg.get('option_type', 'CE')
+        strike = float(leg.get('strike', 0))
 
-        if action == 'BUY':
-            max_profit = float('inf')
-        elif action == 'SELL':
-            max_profit += (entry_price * qty)
+        if action == 'SELL':
+            total_net_credit += (entry_price * qty)
             if opt_type in ['CE', 'C']:
-                has_unhedged_short_call = True
-            elif opt_type in ['PE', 'P']:
-                has_unhedged_short_put = True
+                short_calls.append(strike)
+            else:
+                short_puts.append(strike)
+        elif action == 'BUY':
+            total_net_credit -= (entry_price * qty)
+            if opt_type in ['CE', 'C']:
+                long_calls.append(strike)
+            else:
+                long_puts.append(strike)
 
-    if has_unhedged_short_call or has_unhedged_short_put:
-        max_loss_str = "Uncapped"
-    else:
-        max_loss_str = "Defined"
+    # Check Call Spread Hedging
+    call_hedged = False
+    call_width = 0
+    if short_calls:
+        if long_calls and min(long_calls) > max(short_calls):
+            call_hedged = True
+            call_width = min(long_calls) - max(short_calls)
 
-    max_profit_str = "Uncapped" if max_profit == float('inf') else f"₹{round(max_profit, 2)}"
+    # Check Put Spread Hedging
+    put_hedged = False
+    put_width = 0
+    if short_puts:
+        if long_puts and max(long_puts) < min(short_puts):
+            put_hedged = True
+            put_width = min(short_puts) - max(long_puts)
+
+    # Iron Condor / Fully Hedged Strategy
+    if short_calls and short_puts and call_hedged and put_hedged:
+        max_width = max(call_width, put_width) * qty
+        max_profit = total_net_credit
+        max_loss = max_width - total_net_credit
+        return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
+
+    # Vertical Call Spread (Bear Call Spread / Bull Call Spread)
+    if short_calls and call_hedged and not short_puts:
+        max_width = call_width * qty
+        max_profit = total_net_credit
+        max_loss = max_width - total_net_credit
+        return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
+
+    # Vertical Put Spread (Bull Put Spread / Bear Put Spread)
+    if short_puts and put_hedged and not short_calls:
+        max_width = put_width * qty
+        max_profit = total_net_credit
+        max_loss = max_width - total_net_credit
+        return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
+
+    # Unhedged Strategy Logic
+    max_profit_str = "Uncapped" if (long_calls or long_puts) and not (short_calls or short_puts) else f"₹{round(total_net_credit, 2)}"
+    max_loss_str = "Uncapped" if (short_calls and not call_hedged) or (short_puts and not put_hedged) else "Defined"
+
     return max_profit_str, max_loss_str
 
 HTML_TEMPLATE = """
@@ -755,8 +800,7 @@ def live_data():
     if underlying_price is None:
         return jsonify({"status": "Couldnt fetch live price from API", "error": "couldnt fetch live price from API"})
 
-    # Current IV and Expected 1-Day Move Calculations
-    current_iv = 14.5  # Standard default benchmark IV
+    current_iv = 14.5
     expected_1day_move = round(underlying_price * (current_iv / 100.0) / math.sqrt(365), 2)
 
     chart_labels, chart_prices = [], []
@@ -817,7 +861,6 @@ def live_data():
                 except Exception as e:
                     print(f"Error querying option LTP for {trading_symbol}:", str(e))
 
-                # Fetch Historical Option Candle Data for Leg Premium Chart
                 try:
                     today_str = datetime.now().strftime("%Y-%m-%d")
                     leg_candle_param = {
