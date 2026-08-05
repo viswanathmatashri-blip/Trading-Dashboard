@@ -4,7 +4,7 @@ import pyotp
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from flask import Flask, render_template_string, jsonify, request
 from scipy.stats import norm
 from SmartApi import SmartConnect
@@ -41,7 +41,7 @@ def get_smart_api():
     return smart_api_session
 
 def load_instrument_master():
-    """Downloads official Angel One OpenAPIScripMaster JSON for exact tokens and expiries."""
+    """Downloads and caches Angel One OpenAPIScripMaster JSON."""
     global INSTRUMENT_DF
     if INSTRUMENT_DF is None:
         try:
@@ -49,7 +49,7 @@ def load_instrument_master():
             response = requests.get(url, timeout=15)
             data = response.json()
             df = pd.DataFrame(data)
-            # Filter NFO contracts for NIFTY & BANKNIFTY options
+            # Filter NFO option contracts
             df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))]
             INSTRUMENT_DF = df
         except Exception as e:
@@ -132,7 +132,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
-    <div id="apiStatusPill">Status: Downloading Scrip Master...</div>
+    <div id="apiStatusPill">Status: Syncing SmartAPI Data...</div>
 
     <h2>Real-Market Options Strategy Tracker (SmartAPI Live)</h2>
     <div class="grid">
@@ -145,7 +145,7 @@ HTML_TEMPLATE = """
                     <option value="BANKNIFTY">BANKNIFTY</option>
                 </select>
 
-                <label>Expiry Date (Live API Expiries)</label>
+                <label>Expiry Date (All Live Weekly Expiries)</label>
                 <select id="expirySelect" onchange="loadChain()"></select>
 
                 <label>Exchange Segment</label>
@@ -186,14 +186,14 @@ HTML_TEMPLATE = """
         <div>
             <div class="status-bar">
                 <div class="status-item">Index LTP: <span id="stIndex" class="status-value">-</span></div>
-                <div class="status-item">Market Hours: <span id="stMarketStatus" class="status-value">-</span></div>
+                <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
                 <div class="status-item">IV: <span id="stIV" class="status-value">-</span></div>
                 <div class="status-item">RSI: <span id="stRSI" class="status-value">-</span></div>
                 <div class="status-item">BB Breakout: <span id="stBB" class="status-value">-</span></div>
             </div>
 
             <div class="card">
-                <h3>Index & Option Strategy Chart (Full-Day View)</h3>
+                <h3>Index & Option Strategy Chart (API Candle Data)</h3>
                 <canvas id="mainChart" height="110"></canvas>
             </div>
 
@@ -219,10 +219,10 @@ HTML_TEMPLATE = """
             data: {
                 labels: [],
                 datasets: [
-                    { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', yAxisID: 'y' },
-                    { label: 'Bollinger Upper', data: [], borderColor: '#ff9800', borderDash: [4, 4], yAxisID: 'y' },
-                    { label: 'Bollinger Lower', data: [], borderColor: '#ff9800', borderDash: [4, 4], yAxisID: 'y' },
-                    { label: 'Basket Premium Value', data: [], borderColor: '#e91e63', yAxisID: 'y1' }
+                    { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', yAxisID: 'y', tension: 0.1 },
+                    { label: 'Bollinger Upper', data: [], borderColor: '#ff9800', borderDash: [4, 4], yAxisID: 'y', tension: 0.1 },
+                    { label: 'Bollinger Lower', data: [], borderColor: '#ff9800', borderDash: [4, 4], yAxisID: 'y', tension: 0.1 },
+                    { label: 'Basket Premium Value', data: [], borderColor: '#e91e63', yAxisID: 'y1', tension: 0.1 }
                 ]
             },
             options: {
@@ -234,7 +234,7 @@ HTML_TEMPLATE = """
         });
 
         async function loadExpiries() {
-            updateStatus("Fetching live expiry dates...");
+            updateStatus("Fetching all weekly expiry dates...");
             const symbol = document.getElementById('symbol').value;
             try {
                 const res = await fetch('/api/fetch-expiries', {
@@ -279,7 +279,7 @@ HTML_TEMPLATE = """
                     if(s === data.atm) opt.selected = true;
                     select.appendChild(opt);
                 });
-                updateStatus("API connected | Scrip Master Synced");
+                updateStatus("SmartAPI Connected | Live Expiries Loaded");
             } catch(e) {
                 updateStatus("Error fetching option chain");
             }
@@ -310,7 +310,7 @@ HTML_TEMPLATE = """
             activeBaskets.push({ name: `Basket #${activeBaskets.length + 1}`, legs: [...pendingLegs] });
             pendingLegs = [];
             document.getElementById('pendingLegsList').innerText = '';
-            setTimeout(() => updateStatus("API connected | Strategy Active"), 1000);
+            setTimeout(() => updateStatus("SmartAPI Connected | Strategy Active"), 1000);
         }
 
         async function updateDashboard() {
@@ -327,18 +327,18 @@ HTML_TEMPLATE = """
 
                 // Status Bar Updates
                 document.getElementById('stIndex').innerText = data.underlying_price;
-                document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Static Chart)";
+                document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (SmartAPI Candle Chart)";
                 document.getElementById('stIV').innerText = data.iv + '%';
                 document.getElementById('stRSI').innerText = data.rsi;
                 document.getElementById('stBB').innerText = data.bollinger_breakout;
 
                 if (!data.is_market_open) {
-                    updateStatus("Market Closed | Historical Chart Loaded");
+                    updateStatus("Market Closed | SmartAPI Intraday Candles Loaded");
                 } else {
                     updateStatus("Streaming live market ticks...");
                 }
 
-                // Render Chart
+                // Render Chart with API Candles
                 if (data.chart_labels && data.chart_labels.length > 0) {
                     mainChart.data.labels = data.chart_labels;
                     mainChart.data.datasets[0].data = data.chart_prices;
@@ -387,7 +387,7 @@ HTML_TEMPLATE = """
         }
 
         loadExpiries();
-        setInterval(updateDashboard, 4000);
+        setInterval(updateDashboard, 5000);
     </script>
 </body>
 </html>
@@ -399,22 +399,36 @@ def home():
 
 @app.route('/api/fetch-expiries', methods=['POST'])
 def fetch_expiries():
-    """Returns dynamic upcoming expiry dates parsed directly from Angel One's Scrip Master."""
+    """Parses, normalizes, and chronologically sorts ALL weekly expiries from SmartAPI Scrip Master."""
     data = request.json
     symbol = data.get('symbol', 'NIFTY')
     
     df = load_instrument_master()
     if df is not None and not df.empty:
-        # Filter for symbol contracts
         symbol_df = df[df['name'] == symbol]
         if not symbol_df.empty:
-            # Parse expiries and sort by nearest date
-            expiries = sorted(list(symbol_df['expiry'].unique()))
-            # Return top 8 nearest upcoming expiries
-            return jsonify({"expiries": expiries[:8]})
+            raw_expiries = symbol_df['expiry'].dropna().unique()
+            parsed_dates = []
+            
+            for exp in raw_expiries:
+                try:
+                    # Parse standard Angel formats (e.g. 11AUG2026 / 11Aug2026)
+                    dt = datetime.strptime(str(exp).upper(), "%d%b%Y")
+                    # Filter out past expiries
+                    if dt.date() >= datetime.today().date():
+                        parsed_dates.append((dt, str(exp).upper()))
+                except Exception:
+                    pass
 
-    # Fallback default expiries if offline
-    return jsonify({"expiries": ["28AUG2026", "04SEP2026", "11SEP2026", "25SEP2026"]})
+            # Sort chronologically by date
+            parsed_dates.sort(key=lambda x: x[0])
+            sorted_expiries = [x[1] for x in parsed_dates]
+
+            if sorted_expiries:
+                return jsonify({"expiries": sorted_expiries})
+
+    # Default fallback
+    return jsonify({"expiries": ["11AUG2026", "18AUG2026", "25AUG2026", "01SEP2026", "08SEP2026"]})
 
 @app.route('/api/fetch-chain', methods=['POST'])
 def fetch_chain():
@@ -459,19 +473,46 @@ def live_data():
             if res and res.get('status') and res.get('data'):
                 underlying_price = float(res['data']['ltp'])
         except Exception as e:
-            print("Error querying SmartAPI:", str(e))
+            print("Error querying SmartAPI LTP:", str(e))
 
     if underlying_price == 0.0:
         underlying_price = 24500.0
 
-    chart_labels = ["09:15", "09:30", "09:45", "10:00", "10:15", "10:30", "10:45", "11:00", 
-                    "11:15", "11:30", "11:45", "12:00", "12:15", "12:30", "12:45", "13:00", 
-                    "13:15", "13:30", "13:45", "14:00", "14:15", "14:30", "14:45", "15:00", "15:15", "15:30"]
-    
-    base_curve = [underlying_price + np.sin(i / 3) * 15 for i in range(len(chart_labels))]
-    chart_prices = [round(p, 2) for p in base_curve]
-    bb_upper_series = [round(p + 12, 2) for p in chart_prices]
-    bb_lower_series = [round(p - 12, 2) for p in chart_prices]
+    # Retrieve Official Historical Intraday Candle Data from SmartAPI
+    chart_labels = []
+    chart_prices = []
+
+    if api:
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            # Fetch 15-minute intraday candles for the current trading day
+            candle_param = {
+                "exchange": config['exchange'],
+                "symboltoken": config['token'],
+                "interval": "FIFTEEN_MINUTE",
+                "fromdate": f"{today_str} 09:15",
+                "todate": f"{today_str} 15:30"
+            }
+            candle_data = api.getCandleData(candle_param)
+            if candle_data and candle_data.get('status') and candle_data.get('data'):
+                for candle in candle_data['data']:
+                    # Format timestamp HH:MM
+                    time_label = candle[0].split('T')[1][:5]
+                    close_p = float(candle[4])
+                    chart_labels.append(time_label)
+                    chart_prices.append(close_p)
+        except Exception as e:
+            print("Error fetching candle data:", str(e))
+
+    # Fallback to current LTP line if historical candle feed is quiet
+    if not chart_prices:
+        chart_labels = ["09:15", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"]
+        chart_prices = [underlying_price] * len(chart_labels)
+
+    # Compute technical indicator bands from candle prices
+    std_dev = float(np.std(chart_prices)) if len(chart_prices) > 1 and np.std(chart_prices) > 0 else 15.0
+    bb_upper_series = [round(p + (2 * std_dev), 2) for p in chart_prices]
+    bb_lower_series = [round(p - (2 * std_dev), 2) for p in chart_prices]
 
     iv = 14.5
     processed_baskets = []
@@ -491,7 +532,6 @@ def live_data():
             scrip_token = None
             trading_symbol = None
 
-            # Look up exact symbol and token from Angel One Master Scrip Data
             if df_master is not None and not df_master.empty:
                 match = df_master[
                     (df_master['name'] == symbol) & 
@@ -499,13 +539,12 @@ def live_data():
                     (df_master['symbol'].str.endswith(opt_type))
                 ]
                 if expiry:
-                    match = match[match['expiry'] == expiry]
+                    match = match[match['expiry'].str.upper() == expiry.upper()]
                 
                 if not match.empty:
                     scrip_token = str(match.iloc[0]['token'])
                     trading_symbol = str(match.iloc[0]['symbol'])
 
-            # Query SmartAPI with exact Scrip Token & Symbol
             if api and scrip_token and trading_symbol:
                 try:
                     opt_res = api.ltpData(exchange=exchange, tradingsymbol=trading_symbol, symboltoken=scrip_token)
@@ -514,7 +553,6 @@ def live_data():
                 except Exception as e:
                     print(f"Error querying option LTP for {trading_symbol}:", str(e))
 
-            # Backup Black-Scholes computation if contract master is unmapped
             if current_premium == 0.0:
                 intrinsic = max(0, underlying_price - strike) if opt_type == 'CE' else max(0, strike - underlying_price)
                 current_premium = round(intrinsic + max(5.0, 100.0 - (abs(underlying_price - strike) * 0.08)), 2)
