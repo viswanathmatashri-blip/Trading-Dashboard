@@ -24,6 +24,13 @@ INDEX_TOKENS = {
     "BANKNIFTY": {"exchange": "NSE", "tradingsymbol": "BANKNIFTY", "token": "99926009", "step": 100}
 }
 
+INTERVAL_MAP = {
+    "1": "ONE_MINUTE",
+    "3": "THREE_MINUTE",
+    "5": "FIVE_MINUTE",
+    "15": "FIFTEEN_MINUTE"
+}
+
 smart_api_session = None
 INSTRUMENT_DF = None
 SCRIP_MASTER_STATUS = "Initializing Scrip Master..."
@@ -62,7 +69,6 @@ def download_scrip_master_thread():
         return
 
     IS_DOWNLOADING_MASTER = True
-    # Official Angel One OpenAPI Scrip Master URL
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -78,7 +84,7 @@ def download_scrip_master_thread():
             downloaded = 0
             chunks = []
             
-            for chunk in response.iter_content(chunk_size=1024 * 512):  # 512 KB chunks
+            for chunk in response.iter_content(chunk_size=1024 * 512):
                 if chunk:
                     chunks.append(chunk)
                     downloaded += len(chunk)
@@ -95,7 +101,6 @@ def download_scrip_master_thread():
             data = json.loads(content.decode('utf-8'))
             
             df = pd.DataFrame(data)
-            # Filter NFO Option instruments to reduce RAM consumption
             df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))].copy()
             df['strike_price'] = df['strike'].astype(float) / 100.0
             
@@ -109,13 +114,11 @@ def download_scrip_master_thread():
         IS_DOWNLOADING_MASTER = False
 
 def ensure_scrip_master_loading():
-    """Starts background thread if Scrip Master is not yet loaded."""
     if INSTRUMENT_DF is None and not IS_DOWNLOADING_MASTER:
         t = threading.Thread(target=download_scrip_master_thread, daemon=True)
         t.start()
 
 def is_market_open():
-    """Checks if current time falls within Indian market hours (Mon-Fri 09:15 to 15:30 IST)."""
     now = datetime.now()
     if now.weekday() >= 5:
         return False
@@ -181,10 +184,21 @@ HTML_TEMPLATE = """
         .grid { display: grid; grid-template-columns: 360px 1fr; gap: 20px; margin-top: 15px; }
         .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-bottom: 15px; }
         h2, h3 { margin-top: 0; color: #00bcd4; }
+        
+        .header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .header-flex h3 { margin: 0; }
+        .chart-select { width: auto !important; padding: 4px 8px !important; margin: 0 !important; font-size: 12px; }
+
         label { display: block; margin-top: 10px; font-size: 12px; color: #aaa; }
         select, input, button { width: 100%; padding: 8px; margin-top: 5px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
         button { background: #00bcd4; color: black; font-weight: bold; cursor: pointer; border: none; margin-top: 15px; }
         button:hover { background: #008ba3; }
+        
+        .btn-delete { background: #ff5252; color: white; border: none; padding: 2px 6px; border-radius: 4px; cursor: pointer; font-size: 11px; width: auto; margin: 0; }
+        .btn-delete:hover { background: #d32f2f; }
+        
+        .pending-leg-item { display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 6px; border-radius: 4px; margin-top: 5px; font-size: 12px; }
+
         .status-bar { display: flex; gap: 12px; background: #262626; padding: 10px; border-radius: 6px; font-weight: bold; margin-bottom: 15px; flex-wrap: wrap; }
         .status-item { font-size: 12px; }
         .status-value { color: #00ff88; }
@@ -242,7 +256,9 @@ HTML_TEMPLATE = """
                 <input type="number" id="qty" value="50">
 
                 <button onclick="addLegToPending()">+ Add Position Leg</button>
-                <div id="pendingLegsList" style="margin-top: 10px; font-size: 12px; color: #ffca28;"></div>
+                
+                <div id="pendingContainer" style="margin-top: 12px;"></div>
+                
                 <button onclick="deployBasket()" style="background: #4caf50; color: white;">Execute Strategy Basket</button>
             </div>
         </div>
@@ -254,7 +270,18 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="card">
-                <h3>Index Strategy Chart (SmartAPI 15-Min Candles)</h3>
+                <div class="header-flex">
+                    <h3>Index Strategy Chart</h3>
+                    <div>
+                        <label style="display:inline; color:#aaa; font-size:12px; margin-right:5px;">Candle Timeframe:</label>
+                        <select id="timeframeSelect" class="chart-select" onchange="updateDashboard()">
+                            <option value="1">1 min</option>
+                            <option value="3">3 mins</option>
+                            <option value="5">5 mins</option>
+                            <option value="15" selected>15 mins</option>
+                        </select>
+                    </div>
+                </div>
                 <canvas id="mainChart" height="110"></canvas>
             </div>
 
@@ -376,25 +403,61 @@ HTML_TEMPLATE = """
                 entry_price: entry_price ? parseFloat(entry_price) : null, 
                 qty: parseInt(qty) 
             });
-            document.getElementById('pendingLegsList').innerText = `Pending Basket: ${pendingLegs.length} leg(s) added.`;
+            renderPendingLegs();
+        }
+
+        function removePendingLeg(index) {
+            pendingLegs.splice(index, 1);
+            renderPendingLegs();
+        }
+
+        function renderPendingLegs() {
+            const container = document.getElementById('pendingContainer');
+            if (pendingLegs.length === 0) {
+                container.innerHTML = '';
+                return;
+            }
+
+            let html = `<div style="font-size: 12px; color: #ffca28; margin-bottom: 5px; font-weight: bold;">
+                Pending Basket (${pendingLegs.length} leg(s)):
+            </div>`;
+
+            pendingLegs.forEach((leg, idx) => {
+                let entryText = leg.entry_price ? `₹${leg.entry_price}` : 'Auto LTP';
+                html += `
+                    <div class="pending-leg-item">
+                        <span>${leg.strike} ${leg.option_type} (${leg.action}) | ${leg.qty} Qty | ${entryText}</span>
+                        <button class="btn-delete" onclick="removePendingLeg(${idx})" title="Remove Leg">❌</button>
+                    </div>
+                `;
+            });
+
+            container.innerHTML = html;
         }
 
         function deployBasket() {
             if (pendingLegs.length === 0) return alert("Add position legs first.");
-            activeBaskets.push({ name: `Basket #${activeBaskets.length + 1}`, legs: [...pendingLegs] });
+            activeBaskets.push({ id: Date.now(), name: `Basket #${activeBaskets.length + 1}`, legs: [...pendingLegs] });
             pendingLegs = [];
-            document.getElementById('pendingLegsList').innerText = '';
+            renderPendingLegs();
+            updateDashboard();
+        }
+
+        function deleteBasket(basketId) {
+            activeBaskets = activeBaskets.filter(b => b.id !== basketId);
+            updateDashboard();
         }
 
         async function updateDashboard() {
             const symbol = document.getElementById('symbol').value;
             const exchange = document.getElementById('exchange').value;
+            const interval = document.getElementById('timeframeSelect').value;
 
             try {
                 const res = await fetch('/api/live-data', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ symbol, exchange, baskets: activeBaskets })
+                    body: JSON.stringify({ symbol, exchange, interval, baskets: activeBaskets })
                 });
                 const data = await res.json();
 
@@ -427,9 +490,12 @@ HTML_TEMPLATE = """
                     let pnlClass = typeof b.basket_pnl === 'number' ? (b.basket_pnl >= 0 ? 'pnl-pos' : 'pnl-neg') : 'pnl-err';
 
                     let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
-                        <div style="display:flex; justify-content:space-between;">
-                            <strong>${b.name}</strong>
-                            <span class="${pnlClass}">Live P&L: ${pnlDisplay}</span>
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <strong>${b.name}</strong>
+                                <span class="${pnlClass}" style="margin-left: 15px;">Live P&L: ${pnlDisplay}</span>
+                            </div>
+                            <button class="btn-delete" onclick="deleteBasket(${b.id})" style="padding: 4px 8px;">🗑️ Delete Basket</button>
                         </div>`;
 
                     b.legs.forEach(leg => {
@@ -475,7 +541,6 @@ def fetch_expiries():
     data = request.json
     symbol = data.get('symbol', 'NIFTY')
     
-    # Priority for status overlay
     status_msg = SCRIP_MASTER_STATUS if INSTRUMENT_DF is None else api_status
 
     if INSTRUMENT_DF is not None and not INSTRUMENT_DF.empty:
@@ -533,8 +598,10 @@ def live_data():
     req_data = request.json
     symbol = req_data.get('symbol', 'NIFTY')
     exchange = req_data.get('exchange', 'NFO')
+    interval_key = req_data.get('interval', '15')
     baskets = req_data.get('baskets', [])
 
+    candle_interval = INTERVAL_MAP.get(interval_key, "FIFTEEN_MINUTE")
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
 
     if INSTRUMENT_DF is None:
@@ -563,7 +630,7 @@ def live_data():
         candle_param = {
             "exchange": config['exchange'],
             "symboltoken": config['token'],
-            "interval": "FIFTEEN_MINUTE",
+            "interval": candle_interval,
             "fromdate": f"{today_str} 09:15",
             "todate": f"{today_str} 15:30"
         }
@@ -639,6 +706,7 @@ def live_data():
             })
 
         processed_baskets.append({
+            "id": basket.get('id'),
             "name": basket.get('name', 'Basket'),
             "legs": legs_data,
             "basket_pnl": round(basket_pnl, 2) if not has_leg_error else "couldnt fetch live price from API"
