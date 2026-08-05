@@ -17,7 +17,6 @@ CLIENT_CODE = os.environ.get("CLIENT_CODE")
 PIN = os.environ.get("PIN")
 TOTP_SECRET = os.environ.get("TOTP_SECRET")
 
-# Mapping Angel One Tokens for Spot Indices
 INDEX_TOKENS = {
     "NIFTY": {"exchange": "NSE", "tradingsymbol": "NIFTY", "token": "99926000", "step": 50},
     "BANKNIFTY": {"exchange": "NSE", "tradingsymbol": "BANKNIFTY", "token": "99926009", "step": 100}
@@ -27,18 +26,31 @@ smart_api_session = None
 INSTRUMENT_DF = None
 
 def get_smart_api():
-    """Establishes authenticated session with SmartAPI via TOTP."""
+    """Authenticates with SmartAPI, renewing expired tokens automatically."""
     global smart_api_session
-    if smart_api_session is None:
-        try:
-            smart_api_session = SmartConnect(api_key=API_KEY)
+    
+    # Check if credentials exist
+    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
+        return None, "Missing Render Env Variables (API_KEY/CLIENT_CODE/PIN/TOTP_SECRET)"
+
+    try:
+        if smart_api_session is None:
+            obj = SmartConnect(api_key=API_KEY)
             totp = pyotp.TOTP(TOTP_SECRET).now()
-            data = smart_api_session.generateSession(CLIENT_CODE, PIN, totp)
-            if not data.get('status'):
-                smart_api_session = None
-        except Exception as e:
-            smart_api_session = None
-    return smart_api_session
+            data = obj.generateSession(CLIENT_CODE, PIN, totp)
+            
+            if data and data.get('status') and data.get('data') and data['data'].get('jwtToken'):
+                smart_api_session = obj
+                return smart_api_session, "API connection success"
+            else:
+                msg = data.get('message', 'Authentication Failed') if data else 'No response from SmartAPI'
+                return None, f"Couldnt log in: {msg}"
+        else:
+            return smart_api_session, "API connection success"
+            
+    except Exception as e:
+        smart_api_session = None
+        return None, f"Couldnt log in: {str(e)}"
 
 def load_instrument_master():
     """Downloads Angel One OpenAPIScripMaster JSON and processes numeric strikes."""
@@ -49,9 +61,7 @@ def load_instrument_master():
             response = requests.get(url, timeout=15)
             data = response.json()
             df = pd.DataFrame(data)
-            # Filter NFO option contracts
             df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))].copy()
-            # Convert paise strike strings (e.g. "2425000.000000") to actual float strike values
             df['strike_price'] = df['strike'].astype(float) / 100.0
             INSTRUMENT_DF = df
         except Exception as e:
@@ -67,7 +77,6 @@ def is_market_open():
     return time(9, 15) <= current_time <= time(15, 30)
 
 def calculate_greeks(flag, S, K, T, r, sigma):
-    """Calculates Option Greeks using Black-Scholes formula."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
 
@@ -99,14 +108,14 @@ HTML_TEMPLATE = """
     <title>Live SmartAPI Options Position Tracker</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 20px; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 20px; padding-top: 35px; }
         
         #apiStatusPill {
             position: fixed;
-            top: 15px;
+            top: 10px;
             left: 15px;
             z-index: 9999;
-            background: rgba(30, 30, 30, 0.95);
+            background: rgba(20, 20, 20, 0.95);
             border: 1px solid #00bcd4;
             color: #00ff88;
             padding: 6px 14px;
@@ -114,10 +123,16 @@ HTML_TEMPLATE = """
             font-size: 11px;
             font-weight: bold;
             box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-            pointer-events: none;
+            max-width: 90vw;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
-        .grid { display: grid; grid-template-columns: 360px 1fr; gap: 20px; margin-top: 25px; }
+        .pill-err { border-color: #ff5252 !important; color: #ff5252 !important; }
+        .pill-warn { border-color: #ffca28 !important; color: #ffca28 !important; }
+
+        .grid { display: grid; grid-template-columns: 360px 1fr; gap: 20px; margin-top: 15px; }
         .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-bottom: 15px; }
         h2, h3 { margin-top: 0; color: #00bcd4; }
         label { display: block; margin-top: 10px; font-size: 12px; color: #aaa; }
@@ -135,7 +150,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
-    <div id="apiStatusPill">Status: Connecting SmartAPI...</div>
+    <div id="apiStatusPill">Status: Logging in API...</div>
 
     <h2>Real-Market Options Strategy Tracker (SmartAPI Live)</h2>
     <div class="grid">
@@ -209,8 +224,12 @@ HTML_TEMPLATE = """
         let activeBaskets = [];
         let mainChart;
 
-        function updateStatus(text) {
-            document.getElementById('apiStatusPill').innerText = 'Status: ' + text;
+        function updateStatus(text, type='info') {
+            const pill = document.getElementById('apiStatusPill');
+            pill.innerText = 'Status: ' + text;
+            pill.className = '';
+            if (type === 'error') pill.classList.add('pill-err');
+            if (type === 'warn') pill.classList.add('pill-warn');
         }
 
         const ctx = document.getElementById('mainChart').getContext('2d');
@@ -230,7 +249,7 @@ HTML_TEMPLATE = """
         });
 
         async function loadExpiries() {
-            updateStatus("Fetching expiries from SmartAPI...");
+            updateStatus("Logging in API...", "warn");
             const symbol = document.getElementById('symbol').value;
             try {
                 const res = await fetch('/api/fetch-expiries', {
@@ -239,6 +258,11 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ symbol })
                 });
                 const data = await res.json();
+                
+                if (data.status) {
+                    updateStatus(data.status, data.status === "API connection success" ? "info" : "error");
+                }
+
                 const select = document.getElementById('expirySelect');
                 select.innerHTML = '';
                 if(data.expiries && data.expiries.length > 0) {
@@ -250,16 +274,13 @@ HTML_TEMPLATE = """
                         select.appendChild(opt);
                     });
                     loadChain();
-                } else {
-                    updateStatus("Could not fetch live price from API");
                 }
             } catch(e) {
-                updateStatus("Could not fetch live price from API");
+                updateStatus("Couldnt log in: Network Error", "error");
             }
         }
 
         async function loadChain() {
-            updateStatus("Fetching strike prices...");
             const symbol = document.getElementById('symbol').value;
             const expiry = document.getElementById('expirySelect').value;
             
@@ -270,6 +291,11 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ symbol, expiry })
                 });
                 const data = await res.json();
+                
+                if (data.status) {
+                    updateStatus(data.status, data.status === "API connection success" ? "info" : "error");
+                }
+
                 const select = document.getElementById('strikeSelect');
                 select.innerHTML = '';
                 if(data.strikes && data.strikes.length > 0) {
@@ -280,12 +306,9 @@ HTML_TEMPLATE = """
                         if(s === data.atm) opt.selected = true;
                         select.appendChild(opt);
                     });
-                    updateStatus("SmartAPI Connected");
-                } else {
-                    updateStatus("Could not fetch live price from API");
                 }
             } catch(e) {
-                updateStatus("Could not fetch live price from API");
+                updateStatus("Couldnt fetch live price from API", "error");
             }
         }
 
@@ -310,11 +333,9 @@ HTML_TEMPLATE = """
 
         function deployBasket() {
             if (pendingLegs.length === 0) return alert("Add position legs first.");
-            updateStatus("Executing strategy basket...");
             activeBaskets.push({ name: `Basket #${activeBaskets.length + 1}`, legs: [...pendingLegs] });
             pendingLegs = [];
             document.getElementById('pendingLegsList').innerText = '';
-            setTimeout(() => updateStatus("SmartAPI Connected | Active"), 1000);
         }
 
         async function updateDashboard() {
@@ -329,9 +350,12 @@ HTML_TEMPLATE = """
                 });
                 const data = await res.json();
 
+                if (data.status) {
+                    updateStatus(data.status, data.status === "API connection success" ? "info" : "error");
+                }
+
                 if (data.error) {
                     document.getElementById('stIndex').innerText = data.error;
-                    updateStatus(data.error);
                     return;
                 }
 
@@ -377,7 +401,7 @@ HTML_TEMPLATE = """
                     container.innerHTML += html;
                 });
             } catch(e) {
-                updateStatus("Could not fetch live price from API");
+                updateStatus("Couldnt fetch live price from API", "error");
             }
         }
 
@@ -394,6 +418,7 @@ def home():
 
 @app.route('/api/fetch-expiries', methods=['POST'])
 def fetch_expiries():
+    api, status_msg = get_smart_api()
     data = request.json
     symbol = data.get('symbol', 'NIFTY')
     
@@ -415,20 +440,19 @@ def fetch_expiries():
             parsed_dates.sort(key=lambda x: x[0])
             sorted_expiries = [x[1] for x in parsed_dates]
 
-            if sorted_expiries:
-                return jsonify({"expiries": sorted_expiries})
+            return jsonify({"status": status_msg, "expiries": sorted_expiries})
 
-    return jsonify({"error": "couldnt fetch live price from API", "expiries": []})
+    return jsonify({"status": status_msg, "expiries": []})
 
 @app.route('/api/fetch-chain', methods=['POST'])
 def fetch_chain():
+    api, status_msg = get_smart_api()
     data = request.json
     symbol = data.get('symbol', 'NIFTY')
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
 
-    api = get_smart_api()
     if not api:
-        return jsonify({"error": "couldnt fetch live price from API", "strikes": []})
+        return jsonify({"status": status_msg, "strikes": []})
 
     try:
         res = api.ltpData(exchange=config['exchange'], tradingsymbol=config['tradingsymbol'], symboltoken=config['token'])
@@ -437,25 +461,29 @@ def fetch_chain():
             step = config['step']
             atm = round(spot_price / step) * step
             strikes = [int(atm + (step * i)) for i in range(-10, 11)]
-            return jsonify({"spot": spot_price, "atm": atm, "strikes": strikes})
+            return jsonify({"status": status_msg, "spot": spot_price, "atm": atm, "strikes": strikes})
+        else:
+            msg = res.get('message', 'Failed to fetch LTP') if res else 'No response'
+            return jsonify({"status": f"Couldnt fetch live price: {msg}", "strikes": []})
     except Exception as e:
-        print("Error fetching spot LTP:", str(e))
-
-    return jsonify({"error": "couldnt fetch live price from API", "strikes": []})
+        return jsonify({"status": f"Couldnt fetch live price: {str(e)}", "strikes": []})
 
 @app.route('/api/live-data', methods=['POST'])
 def live_data():
+    api, status_msg = get_smart_api()
     req_data = request.json
     symbol = req_data.get('symbol', 'NIFTY')
     exchange = req_data.get('exchange', 'NFO')
     baskets = req_data.get('baskets', [])
 
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
-    api = get_smart_api()
     df_master = load_instrument_master()
 
-    if not api or df_master is None or df_master.empty:
-        return jsonify({"error": "couldnt fetch live price from API"})
+    if not api:
+        return jsonify({"status": status_msg, "error": status_msg})
+
+    if df_master is None or df_master.empty:
+        return jsonify({"status": "Downloading Scrip Master...", "error": "Scrip Master Not Loaded"})
 
     underlying_price = None
     try:
@@ -466,7 +494,7 @@ def live_data():
         print("Error querying SmartAPI LTP:", str(e))
 
     if underlying_price is None:
-        return jsonify({"error": "couldnt fetch live price from API"})
+        return jsonify({"status": "Couldnt fetch live price from API", "error": "couldnt fetch live price from API"})
 
     chart_labels = []
     chart_prices = []
@@ -507,7 +535,6 @@ def live_data():
             scrip_token = None
             trading_symbol = None
 
-            # Precise lookup against numeric strike_price and expiry in Scrip Master
             match = df_master[
                 (df_master['name'] == symbol) & 
                 (abs(df_master['strike_price'] - strike) < 0.01) & 
@@ -558,6 +585,7 @@ def live_data():
         })
 
     return jsonify({
+        "status": status_msg,
         "underlying_price": underlying_price,
         "is_market_open": is_market_open(),
         "chart_labels": chart_labels,
