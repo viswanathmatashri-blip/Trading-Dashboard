@@ -1,6 +1,8 @@
 import os
+import json
 import math
 import pyotp
+import threading
 import requests
 import pandas as pd
 import numpy as np
@@ -24,6 +26,8 @@ INDEX_TOKENS = {
 
 smart_api_session = None
 INSTRUMENT_DF = None
+SCRIP_MASTER_STATUS = "Initializing Scrip Master..."
+IS_DOWNLOADING_MASTER = False
 
 def get_smart_api():
     """Authenticates with SmartAPI, renewing expired tokens automatically."""
@@ -51,37 +55,64 @@ def get_smart_api():
         smart_api_session = None
         return None, f"Couldnt log in: {str(e)}"
 
-def load_instrument_master():
-    """Downloads Angel One OpenAPIScripMaster JSON with browser headers and handles retries."""
-    global INSTRUMENT_DF
-    if INSTRUMENT_DF is None:
-        url = "https://margincalculator.angelbroking.com/OpenAPI_MasterData/OpenAPIScripMaster.json"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*"
-        }
-        
-        for attempt in range(1, 4):
-            try:
-                print(f"[Scrip Master] Downloading JSON (Attempt {attempt}/3)...")
-                response = requests.get(url, headers=headers, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    df = pd.DataFrame(data)
-                    
-                    # Keep only NFO options to save memory
-                    df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))].copy()
-                    df['strike_price'] = df['strike'].astype(float) / 100.0
-                    
-                    INSTRUMENT_DF = df
-                    print(f"[Scrip Master] Successfully loaded {len(INSTRUMENT_DF)} option contracts.")
-                    break
-                else:
-                    print(f"[Scrip Master] HTTP Error {response.status_code}")
-            except Exception as e:
-                print(f"[Scrip Master] Download error on attempt {attempt}: {str(e)}")
+def download_scrip_master_thread():
+    """Chunked background downloader to stream JSON and report MB / % progress."""
+    global INSTRUMENT_DF, SCRIP_MASTER_STATUS, IS_DOWNLOADING_MASTER
+    if INSTRUMENT_DF is not None or IS_DOWNLOADING_MASTER:
+        return
 
-    return INSTRUMENT_DF
+    IS_DOWNLOADING_MASTER = True
+    # Official Angel One OpenAPI Scrip Master URL
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*"
+    }
+
+    try:
+        SCRIP_MASTER_STATUS = "Downloading Scrip Master: 0%"
+        response = requests.get(url, headers=headers, stream=True, timeout=60)
+        
+        if response.status_code == 200:
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            chunks = []
+            
+            for chunk in response.iter_content(chunk_size=1024 * 512):  # 512 KB chunks
+                if chunk:
+                    chunks.append(chunk)
+                    downloaded += len(chunk)
+                    mb_dl = round(downloaded / (1024 * 1024), 1)
+                    if total_size > 0:
+                        mb_tot = round(total_size / (1024 * 1024), 1)
+                        pct = int((downloaded / total_size) * 100)
+                        SCRIP_MASTER_STATUS = f"Downloading Scrip Master: {mb_dl} MB / {mb_tot} MB ({pct}%)"
+                    else:
+                        SCRIP_MASTER_STATUS = f"Downloading Scrip Master: {mb_dl} MB"
+
+            SCRIP_MASTER_STATUS = "Processing Scrip Master JSON..."
+            content = b"".join(chunks)
+            data = json.loads(content.decode('utf-8'))
+            
+            df = pd.DataFrame(data)
+            # Filter NFO Option instruments to reduce RAM consumption
+            df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))].copy()
+            df['strike_price'] = df['strike'].astype(float) / 100.0
+            
+            INSTRUMENT_DF = df
+            SCRIP_MASTER_STATUS = "Scrip Master Loaded"
+        else:
+            SCRIP_MASTER_STATUS = f"Scrip Master HTTP Error {response.status_code}"
+    except Exception as e:
+        SCRIP_MASTER_STATUS = f"Scrip Master Download Failed: {str(e)}"
+    finally:
+        IS_DOWNLOADING_MASTER = False
+
+def ensure_scrip_master_loading():
+    """Starts background thread if Scrip Master is not yet loaded."""
+    if INSTRUMENT_DF is None and not IS_DOWNLOADING_MASTER:
+        t = threading.Thread(target=download_scrip_master_thread, daemon=True)
+        t.start()
 
 def is_market_open():
     """Checks if current time falls within Indian market hours (Mon-Fri 09:15 to 15:30 IST)."""
@@ -264,7 +295,7 @@ HTML_TEMPLATE = """
         });
 
         async function loadExpiries() {
-            updateStatus("Logging in API...", "warn");
+            updateStatus("Initializing...", "warn");
             const symbol = document.getElementById('symbol').value;
             try {
                 const res = await fetch('/api/fetch-expiries', {
@@ -275,7 +306,10 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 
                 if (data.status) {
-                    updateStatus(data.status, data.status === "API connection success" ? "info" : "error");
+                    let type = "info";
+                    if (data.status.includes("Downloading") || data.status.includes("Processing")) type = "warn";
+                    if (data.status.includes("Failed") || data.status.includes("Couldnt")) type = "error";
+                    updateStatus(data.status, type);
                 }
 
                 const select = document.getElementById('expirySelect');
@@ -289,6 +323,8 @@ HTML_TEMPLATE = """
                         select.appendChild(opt);
                     });
                     loadChain();
+                } else if (data.status && data.status.includes("Downloading")) {
+                    setTimeout(loadExpiries, 2000);
                 }
             } catch(e) {
                 updateStatus("Couldnt log in: Network Error", "error");
@@ -298,7 +334,8 @@ HTML_TEMPLATE = """
         async function loadChain() {
             const symbol = document.getElementById('symbol').value;
             const expiry = document.getElementById('expirySelect').value;
-            
+            if (!expiry) return;
+
             try {
                 const res = await fetch('/api/fetch-chain', {
                     method: 'POST',
@@ -306,10 +343,6 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ symbol, expiry })
                 });
                 const data = await res.json();
-                
-                if (data.status) {
-                    updateStatus(data.status, data.status === "API connection success" ? "info" : "error");
-                }
 
                 const select = document.getElementById('strikeSelect');
                 select.innerHTML = '';
@@ -366,7 +399,10 @@ HTML_TEMPLATE = """
                 const data = await res.json();
 
                 if (data.status) {
-                    updateStatus(data.status, data.status === "API connection success" ? "info" : "error");
+                    let type = "info";
+                    if (data.status.includes("Downloading") || data.status.includes("Processing")) type = "warn";
+                    if (data.status.includes("Failed") || data.status.includes("Couldnt")) type = "error";
+                    updateStatus(data.status, type);
                 }
 
                 if (data.error) {
@@ -421,7 +457,7 @@ HTML_TEMPLATE = """
         }
 
         loadExpiries();
-        setInterval(updateDashboard, 5000);
+        setInterval(updateDashboard, 3000);
     </script>
 </body>
 </html>
@@ -429,17 +465,21 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def home():
+    ensure_scrip_master_loading()
     return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/fetch-expiries', methods=['POST'])
 def fetch_expiries():
-    api, status_msg = get_smart_api()
+    ensure_scrip_master_loading()
+    api, api_status = get_smart_api()
     data = request.json
     symbol = data.get('symbol', 'NIFTY')
     
-    df = load_instrument_master()
-    if df is not None and not df.empty:
-        symbol_df = df[df['name'] == symbol]
+    # Priority for status overlay
+    status_msg = SCRIP_MASTER_STATUS if INSTRUMENT_DF is None else api_status
+
+    if INSTRUMENT_DF is not None and not INSTRUMENT_DF.empty:
+        symbol_df = INSTRUMENT_DF[INSTRUMENT_DF['name'] == symbol]
         if not symbol_df.empty:
             raw_expiries = symbol_df['expiry'].dropna().unique()
             parsed_dates = []
@@ -461,10 +501,13 @@ def fetch_expiries():
 
 @app.route('/api/fetch-chain', methods=['POST'])
 def fetch_chain():
-    api, status_msg = get_smart_api()
+    ensure_scrip_master_loading()
+    api, api_status = get_smart_api()
     data = request.json
     symbol = data.get('symbol', 'NIFTY')
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
+
+    status_msg = SCRIP_MASTER_STATUS if INSTRUMENT_DF is None else api_status
 
     if not api:
         return jsonify({"status": status_msg, "strikes": []})
@@ -485,20 +528,22 @@ def fetch_chain():
 
 @app.route('/api/live-data', methods=['POST'])
 def live_data():
-    api, status_msg = get_smart_api()
+    ensure_scrip_master_loading()
+    api, api_status = get_smart_api()
     req_data = request.json
     symbol = req_data.get('symbol', 'NIFTY')
     exchange = req_data.get('exchange', 'NFO')
     baskets = req_data.get('baskets', [])
 
     config = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
-    df_master = load_instrument_master()
+
+    if INSTRUMENT_DF is None:
+        return jsonify({"status": SCRIP_MASTER_STATUS, "error": SCRIP_MASTER_STATUS})
+
+    status_msg = api_status
 
     if not api:
         return jsonify({"status": status_msg, "error": status_msg})
-
-    if df_master is None or df_master.empty:
-        return jsonify({"status": "Scrip Master Not Loaded", "error": "Scrip Master Not Loaded"})
 
     underlying_price = None
     try:
@@ -550,11 +595,11 @@ def live_data():
             scrip_token = None
             trading_symbol = None
 
-            match = df_master[
-                (df_master['name'] == symbol) & 
-                (abs(df_master['strike_price'] - strike) < 0.01) & 
-                (df_master['symbol'].str.endswith(opt_type)) &
-                (df_master['expiry'].str.upper() == expiry)
+            match = INSTRUMENT_DF[
+                (INSTRUMENT_DF['name'] == symbol) & 
+                (abs(INSTRUMENT_DF['strike_price'] - strike) < 0.01) & 
+                (INSTRUMENT_DF['symbol'].str.endswith(opt_type)) &
+                (INSTRUMENT_DF['expiry'].str.upper() == expiry)
             ]
 
             if not match.empty:
