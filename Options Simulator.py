@@ -985,18 +985,18 @@ def fetch_chain():
 
 @app.route('/api/gemini-analysis', methods=['POST'])
 def gemini_analysis():
-    req = request.json or {}
-    basket_id = req.get('basket_id')
-    baskets = req.get('baskets', [])
-
-    target_basket = next((b for b in baskets if str(b.get('id')) == str(basket_id)), None)
-    if not target_basket:
-        return jsonify({"analysis": "Error: Basket not found."})
-
-    if not GEMINI_API_KEY:
-        return jsonify({"analysis": "Gemini API key not configured. Set GEMINI_API_KEY in environment variables."})
-
     try:
+        req = request.json or {}
+        basket_id = req.get('basket_id')
+        baskets = req.get('baskets', [])
+
+        target_basket = next((b for b in baskets if str(b.get('id')) == str(basket_id)), None)
+        if not target_basket:
+            return jsonify({"analysis": "Error: Basket not found."})
+
+        if not GEMINI_API_KEY:
+            return jsonify({"analysis": "Gemini API key not configured. Set GEMINI_API_KEY in environment variables."})
+
         client = genai.Client(api_key=GEMINI_API_KEY)
         
         prompt = f"""
@@ -1016,8 +1016,7 @@ def gemini_analysis():
         )
         return jsonify({"analysis": response.text})
     except Exception as e:
-        return jsonify({"analysis": f"Failed to fetch Gemini analysis: {str(e)}"})
-
+        return jsonify({"analysis": f"Gemini API Error: {str(e)}"})
 @app.route('/api/live-data', methods=['POST'])
 def live_data():
     smart_api, conn_msg = get_smart_api()
