@@ -464,6 +464,7 @@ HTML_TEMPLATE = r"""
                 <div class="status-item">Index LTP: <span id="stIndex" class="status-value">-</span></div>
                 <div class="status-item">Current IV: <span id="stIv" class="status-value">-</span></div>
                 <div class="status-item">Expected 1-Day Move: <span id="stMove" class="status-value">-</span></div>
+                <div class="status-item">Expected Expiry Move: <span id="stExpiryMove" class="status-value">-</span></div>
                 <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
             </div>
 
@@ -513,6 +514,7 @@ HTML_TEMPLATE = r"""
         let pendingLegs = [];
         let activeBaskets = [];
         let selectedChartBasketId = null;
+        let showStrikesPerBasket = {}; // Tracks strike line toggle state per basket
         let deletedBasketIds = new Set();
         let mainChart, legsChart;
         let refreshTimer = null;
@@ -530,11 +532,14 @@ HTML_TEMPLATE = r"""
         const ctx = document.getElementById('mainChart').getContext('2d');
         mainChart = new Chart(ctx, {
             type: 'line',
-            data: { labels: [], datasets: [{ label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 4, yAxisID: 'y', tension: 0.1 }] },
+            data: { labels: [], datasets: [{ label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 4, yAxisID: 'y', tension: 0.1, fill: { target: 'origin', above: 'rgba(0,255,136,0.08)', below: 'rgba(255,82,82,0.08)' } }] },
             options: { 
                 animation: false,
                 responsive: true,
-                scales: { y: { display: true, position: 'left', grid: { color: '#2a2a2a' } } } 
+                scales: { y: { display: true, position: 'left', grid: { color: '#2a2a2a' } } },
+                plugins: {
+                    annotation: { annotations: {} }
+                }
             }
         });
 
@@ -663,6 +668,7 @@ HTML_TEMPLATE = r"""
             const newBasketName = `Basket #${activeBaskets.length + 1}`;
             
             if (!selectedChartBasketId) selectedChartBasketId = basketId;
+            showStrikesPerBasket[basketId] = false; // Default off
 
             activeBaskets.push({ id: basketId, name: newBasketName, legs: [...pendingLegs] });
             pendingLegs = [];
@@ -679,6 +685,7 @@ HTML_TEMPLATE = r"""
         function deleteBasket(basketId) {
             deletedBasketIds.add(basketId);
             activeBaskets = activeBaskets.filter(b => b.id !== basketId);
+            delete showStrikesPerBasket[basketId];
             
             if (selectedChartBasketId === basketId) {
                 selectedChartBasketId = activeBaskets.length > 0 ? activeBaskets[0].id : null;
@@ -692,11 +699,17 @@ HTML_TEMPLATE = r"""
             updateDashboard();
         }
 
+        function toggleShowStrikes(basketId, checkbox) {
+            showStrikesPerBasket[basketId] = checkbox.checked;
+            updateDashboard();
+        }
+
         async function updateDashboard() {
             const symbol = document.getElementById('symbol').value;
             const exchange = document.getElementById('exchange').value;
             const interval = document.getElementById('timeframeSelect').value;
             const basketInterval = document.getElementById('basketTimeframeSelect').value;
+            const selectedExpiry = document.getElementById('expirySelect').value;
 
             activeBaskets = activeBaskets.filter(b => !deletedBasketIds.has(b.id));
 
@@ -706,7 +719,7 @@ HTML_TEMPLATE = r"""
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ 
                         symbol, exchange, interval, basket_interval: basketInterval, 
-                        baskets: activeBaskets 
+                        expiry: selectedExpiry, baskets: activeBaskets 
                     })
                 });
                 const data = await res.json();
@@ -717,15 +730,45 @@ HTML_TEMPLATE = r"""
                 document.getElementById('stIndex').innerText = data.underlying_price;
                 document.getElementById('stIv').innerText = data.current_iv + "%";
                 document.getElementById('stMove').innerText = "±" + data.expected_1day_move + " pts";
+                document.getElementById('stExpiryMove').innerText = "±" + data.expected_expiry_move + " pts";
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED";
+
+                const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
 
                 if (data.chart_labels && data.chart_labels.length > 0) {
                     mainChart.data.labels = data.chart_labels;
                     mainChart.data.datasets[0].data = data.chart_prices;
+
+                    // Dynamic P&L coloring for main chart background region
+                    const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
+                    const isProfitable = targetBasket ? targetBasket.basket_pnl >= 0 : true;
+                    
+                    mainChart.data.datasets[0].fill = {
+                        target: 'origin',
+                        above: isProfitable ? 'rgba(0,255,136,0.12)' : 'rgba(0,255,136,0.03)',
+                        below: !isProfitable ? 'rgba(255,82,82,0.12)' : 'rgba(255,82,82,0.03)'
+                    };
+
+                    // Handle light horizontal lines for leg strike prices if enabled
+                    let extraDatasets = [mainChart.data.datasets[0]];
+                    if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
+                        targetBasket.legs.forEach((leg, lIdx) => {
+                            let strikeVal = parseFloat(leg.strike);
+                            let strikeDataset = {
+                                label: `Strike: ${strikeVal} ${leg.option_type}`,
+                                data: new Array(data.chart_labels.length).fill(strikeVal),
+                                borderColor: CHART_COLORS[lIdx % CHART_COLORS.length],
+                                borderDash: [4, 4],
+                                borderWidth: 1.2,
+                                pointRadius: 0,
+                                fill: false
+                            };
+                            extraDatasets.push(strikeDataset);
+                        });
+                    }
+                    mainChart.data.datasets = extraDatasets;
                     mainChart.update('none');
                 }
-
-                const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
 
                 const container = document.getElementById('basketsContainer');
                 container.innerHTML = '';
@@ -734,6 +777,7 @@ HTML_TEMPLATE = r"""
                     let pnlDisplay = typeof b.basket_pnl === 'number' ? `₹${b.basket_pnl}` : b.basket_pnl;
                     let pnlClass = typeof b.basket_pnl === 'number' ? (b.basket_pnl >= 0 ? 'pnl-pos' : 'pnl-neg') : 'pnl-err';
                     let isChecked = selectedChartBasketId === b.id;
+                    let strikesChecked = showStrikesPerBasket[b.id] ? 'checked' : '';
 
                     let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
@@ -750,7 +794,11 @@ HTML_TEMPLATE = r"""
                                 <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ₹${b.net_greeks.expected_day_theta}</span>
                             </div>
                             
-                            <div style="display:flex; align-items:center;">
+                            <div style="display:flex; align-items:center; gap: 8px;">
+                                <label class="chart-checkbox-container" title="Show leg strike lines on underlying index chart">
+                                    <input type="checkbox" ${strikesChecked} onchange="toggleShowStrikes(${b.id}, this)" style="width:auto; margin:0;">
+                                    <span>Show Strikes on Chart</span>
+                                </label>
                                 <label class="chart-checkbox-container">
                                     <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleBasketChart(${b.id})" style="width:auto; margin:0;">
                                     <span>Load Chart</span>
@@ -816,7 +864,7 @@ HTML_TEMPLATE = r"""
                             borderWidth: 2,
                             pointRadius: 0,
                             pointHoverRadius: 4,
-                            fill: { target: 'origin', above: 'rgba(0,255,136,0.08)', below: 'rgba(255,82,82,0.08)' },
+                            fill: { target: 'origin', above: isPositivePnl ? 'rgba(0,255,136,0.1)' : 'rgba(0,255,136,0.03)', below: !isPositivePnl ? 'rgba(255,82,82,0.1)' : 'rgba(255,82,82,0.03)' },
                             tension: 0.1
                         });
                     });
@@ -891,6 +939,7 @@ def live_data():
     baskets = req_data.get('baskets', [])
     interval = req_data.get('interval', '15')
     basket_interval = req_data.get('basket_interval', '15')
+    selected_expiry = req_data.get('expiry')
 
     idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
     
@@ -926,6 +975,16 @@ def live_data():
 
     iv_estimate = 14.5
     expected_1day_move = round(spot_price * (iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
+    
+    # Calculate days left till expiry for expected expiry move
+    days_to_expiry = 7.0
+    if selected_expiry:
+        try:
+            exp_dt = datetime.strptime(selected_expiry, "%d%b%Y").date()
+            days_to_expiry = max((exp_dt - now.date()).days, 0.5)
+        except Exception:
+            pass
+    expected_expiry_move = round(spot_price * (iv_estimate / 100.0) * math.sqrt(days_to_expiry / 365.0), 2)
 
     processed_baskets = []
     for basket in baskets:
@@ -995,7 +1054,7 @@ def live_data():
 
             try:
                 exp_dt = datetime.strptime(exp_date, "%d%b%Y").date()
-                days_to_exp = max((exp_dt - datetime.now(IST).date()).days, 0.5)
+                days_to_exp = max((exp_dt - now.date()).days, 0.5)
             except Exception:
                 days_to_exp = 7.0
 
@@ -1047,6 +1106,7 @@ def live_data():
         "underlying_price": spot_price,
         "current_iv": iv_estimate,
         "expected_1day_move": expected_1day_move,
+        "expected_expiry_move": expected_expiry_move,
         "is_market_open": is_market_open(),
         "chart_labels": chart_labels,
         "chart_prices": chart_prices,
