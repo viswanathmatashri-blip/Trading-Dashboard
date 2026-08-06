@@ -9,15 +9,18 @@ import numpy as np
 from datetime import datetime, time, timezone, timedelta
 from flask import Flask, render_template_string, jsonify, request
 from SmartApi import SmartConnect
+from scipy.stats import norm
 
 app = Flask(__name__)
 
+# Environment Configuration
 API_KEY = os.environ.get("API_KEY")
 CLIENT_CODE = os.environ.get("CLIENT_CODE")
 PIN = os.environ.get("PIN")
 TOTP_SECRET = os.environ.get("TOTP_SECRET")
 
 IST = timezone(timedelta(hours=5, minutes=30))
+RISK_FREE_RATE = 0.065  # Standard Risk-Free Rate (~6.5%)
 
 INDEX_TOKENS = {
     "NIFTY": {"exchange": "NSE", "tradingsymbol": "NIFTY", "token": "99926000", "step": 50},
@@ -119,12 +122,7 @@ def is_market_open():
     return time(9, 15) <= now.time() <= time(15, 30)
 
 def get_last_trading_day_dates():
-    """Returns (from_date_str, to_date_str) formatted for SmartAPI.
-    If market is currently open, returns today's 09:15 to now.
-    If market is closed/weekend/before 09:15, returns last valid trading day (09:15 to 15:30).
-    """
     now = datetime.now(IST)
-    
     if is_market_open():
         return now.strftime("%Y-%m-%d 09:15"), now.strftime("%Y-%m-%d %H:%M")
     
@@ -132,7 +130,7 @@ def get_last_trading_day_dates():
     if now.time() < time(9, 15):
         target_date -= timedelta(days=1)
         
-    while target_date.weekday() >= 5:  # Skip Saturday (5) and Sunday (6)
+    while target_date.weekday() >= 5:
         target_date -= timedelta(days=1)
 
     from_str = target_date.strftime("%Y-%m-%d 09:15")
@@ -140,12 +138,8 @@ def get_last_trading_day_dates():
     return from_str, to_str
 
 def fetch_option_chain_data(smart_api, symbol, expiry):
-    """Fetches option chain data from SmartAPI to extract real-time Greeks and ATM IV."""
     try:
-        chain_params = {
-            "name": symbol,
-            "expirydate": expiry
-        }
+        chain_params = {"name": symbol, "expirydate": expiry}
         res = smart_api.optionChain(chain_params)
         if res and res.get('status') and res.get('data'):
             return res['data']
@@ -153,45 +147,68 @@ def fetch_option_chain_data(smart_api, symbol, expiry):
         pass
     return []
 
-def get_atm_iv_and_leg_greeks(option_chain, spot_price, step, strike, opt_type):
-    """Extracts ATM IV and specific Leg Greeks directly from SmartAPI option chain."""
+# --- BLACK-SCHOLES GREEKS ENGINE ---
+def calculate_black_scholes_greeks(spot, strike, t_years, iv_pct, opt_type='CE'):
+    greeks = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
+    sigma = max(iv_pct, 1.0) / 100.0
+    t = max(t_years, 0.0001)
+    r = RISK_FREE_RATE
+
+    if spot <= 0 or strike <= 0:
+        return greeks
+
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
+    d2 = d1 - sigma * math.sqrt(t)
+
+    pdf_d1 = norm.pdf(d1)
+    
+    gamma = pdf_d1 / (spot * sigma * math.sqrt(t))
+    vega = (spot * pdf_d1 * math.sqrt(t)) / 100.0
+
+    if opt_type.upper() in ['CE', 'CALL']:
+        delta = norm.cdf(d1)
+        theta_annual = - (spot * pdf_d1 * sigma) / (2 * math.sqrt(t)) - r * strike * math.exp(-r * t) * norm.cdf(d2)
+    else:
+        delta = norm.cdf(d1) - 1.0
+        theta_annual = - (spot * pdf_d1 * sigma) / (2 * math.sqrt(t)) + r * strike * math.exp(-r * t) * norm.cdf(-d2)
+
+    theta_day = theta_annual / 365.0
+
+    return {
+        "delta": round(delta, 4),
+        "gamma": round(gamma, 6),
+        "theta": round(theta_day, 4),
+        "vega": round(vega, 4),
+        "expected_day_theta": round(theta_day, 4)
+    }
+
+def get_atm_iv_and_leg_greeks(option_chain, spot_price, step, strike, opt_type, expiry_str):
     atm_strike = round(spot_price / step) * step
-    atm_iv = 14.5  # Fallback default
-    leg_greeks = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
+    atm_iv = 14.5
 
-    if not option_chain:
-        return atm_iv, leg_greeks
+    if option_chain:
+        for item in option_chain:
+            item_strike = float(item.get('strikePrice', 0) or 0)
+            if abs(item_strike - atm_strike) < 0.01:
+                iv_val = float(item.get('impliedVolatility', 0) or 0)
+                if iv_val > 0:
+                    atm_iv = iv_val
+                    break
 
-    # Search chain for ATM IV and exact strike Greeks
-    for item in option_chain:
-        item_strike = float(item.get('strikePrice', 0) or 0)
-        item_type = item.get('optionType', '')
+    now = datetime.now(IST)
+    try:
+        exp_dt = datetime.strptime(expiry_str, "%d%b%Y").replace(hour=15, minute=30, tzinfo=IST)
+        time_diff = exp_dt - now
+        days_remaining = max(time_diff.total_seconds() / (24 * 3600), 0.01)
+    except Exception:
+        days_remaining = 1.0
         
-        # Capture ATM IV
-        if abs(item_strike - atm_strike) < 0.01:
-            iv_val = float(item.get('impliedVolatility', 0) or 0)
-            if iv_val > 0:
-                atm_iv = iv_val
-
-        # Capture matching leg Greeks from SmartAPI
-        if abs(item_strike - strike) < 0.01 and item_type.upper() == opt_type.upper():
-            d = float(item.get('delta', 0) or 0)
-            g = float(item.get('gamma', 0) or 0)
-            t = float(item.get('theta', 0) or 0)
-            v = float(item.get('vega', 0) or 0)
-            
-            leg_greeks = {
-                "delta": round(d, 4),
-                "gamma": round(g, 6),
-                "theta": round(t, 4),
-                "vega": round(v, 4),
-                "expected_day_theta": round(t, 4)
-            }
+    t_years = days_remaining / 365.0
+    leg_greeks = calculate_black_scholes_greeks(spot_price, strike, t_years, atm_iv, opt_type)
 
     return atm_iv, leg_greeks
 
 def get_past_price_within_market_hours(candles, duration_mins):
-    """Filters candles strictly within market hours (09:15 to 15:30 IST) and finds last traded price duration_mins ago."""
     if not candles:
         return None, None
 
@@ -204,7 +221,7 @@ def get_past_price_within_market_hours(candles, duration_mins):
             dt_str = c[0].split('T')[1][:5]
             c_time = datetime.strptime(dt_str, "%H:%M").time()
             if market_open_time <= c_time <= market_close_time:
-                valid_candles.append((dt_str, float(c[4]))) # Last traded price (Close of candle)
+                valid_candles.append((dt_str, float(c[4])))
         except Exception:
             continue
 
@@ -232,7 +249,6 @@ def get_past_price_within_market_hours(candles, duration_mins):
     return latest_price, best_price
 
 def calculate_basket_net_greeks(legs):
-    """Aggregates SmartAPI leg greeks across all legs in a basket."""
     net_delta, net_gamma, net_theta, net_vega = 0.0, 0.0, 0.0, 0.0
     for leg in legs:
         qty = int(leg.get('qty', 65))
@@ -1001,7 +1017,6 @@ def live_data():
 
     idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
     
-    # 3. All values correspond to the last traded value (LTP)
     try:
         ltp_resp = smart_api.ltpData(idx_info["exchange"], idx_info["tradingsymbol"], idx_info["token"])
         if not (ltp_resp and ltp_resp.get('status') and ltp_resp.get('data')):
@@ -1011,7 +1026,6 @@ def live_data():
     except Exception as e:
         return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
 
-    # 4. Ongoing trading day chart (1-day period). If outside market hours - show last trading day data.
     from_date, to_date = get_last_trading_day_dates()
 
     chart_labels, chart_prices = [], []
@@ -1028,16 +1042,16 @@ def live_data():
         if hist_resp and hist_resp.get('status') and hist_resp.get('data'):
             index_candles = hist_resp['data']
             chart_labels = [c[0].split('T')[1][:5] for c in index_candles]
-            chart_prices = [float(c[4]) for c in index_candles] # Candle close = Last traded value
+            chart_prices = [float(c[4]) for c in index_candles]
     except Exception:
         pass
 
-    # 1. & 2. Fetch Option Chain to extract dynamic ATM IV & SmartAPI Greeks
     option_chain_data = []
     if selected_expiry:
         option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
 
-    atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(option_chain_data, spot_price, idx_info['step'], spot_price, 'CE')
+    # Dummy initial call just to extract overall ATM IV estimate
+    atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(option_chain_data, spot_price, idx_info['step'], spot_price, 'CE', selected_expiry or "31DEC2026")
     
     expected_1day_move = round(spot_price * (atm_iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
     
@@ -1097,7 +1111,6 @@ def live_data():
             leg_prices_map = {}
             leg_candles = []
             if token and symbol_name:
-                # 3. All values correspond to the last traded value (LTP)
                 try:
                     opt_ltp_resp = smart_api.ltpData("NFO", symbol_name, token)
                     if opt_ltp_resp and opt_ltp_resp.get('status') and opt_ltp_resp.get('data'):
@@ -1118,7 +1131,7 @@ def live_data():
                         leg_candles = leg_hist_resp['data']
                         for c in leg_candles:
                             ts = c[0].split('T')[1][:5]
-                            leg_prices_map[ts] = float(c[4]) # Last traded value
+                            leg_prices_map[ts] = float(c[4])
                 except Exception:
                     pass
 
@@ -1133,8 +1146,16 @@ def live_data():
                     leg_pnl = (entry_price - current_ltp) * qty
                 basket_pnl += leg_pnl
 
-            # 2. Greeks of individual legs taken strictly from SmartAPI
-            _, greeks = get_atm_iv_and_leg_greeks(option_chain_data, spot_price, idx_info['step'], strike, opt_type)
+            # Calculate precise Black-Scholes greeks per individual basket leg
+            _, greeks = get_atm_iv_and_leg_greeks(
+                option_chain_data, 
+                spot_price, 
+                idx_info['step'], 
+                strike, 
+                opt_type, 
+                exp_date
+            )
+            
             decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
 
             latest_lp, past_lp = get_past_price_within_market_hours(leg_candles, basket_impact_duration)
