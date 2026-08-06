@@ -120,7 +120,6 @@ def is_market_open():
     return time(9, 15) <= now.time() <= time(15, 30)
 
 def get_past_price_within_market_hours(candles, now_ist, duration_mins):
-    """Filters candles strictly within market hours (09:15 to 15:30 IST) and finds the price duration_mins ago[cite: 1]."""
     if not candles:
         return None, None
 
@@ -172,9 +171,9 @@ def bs_price(flag, S, K, T, r, sigma):
     else:
         return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
-def calculate_greeks(flag, S, K, T, r, sigma):
+def calculate_greeks_fallback(flag, S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0, "iv": 0.0}
 
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
@@ -197,8 +196,47 @@ def calculate_greeks(flag, S, K, T, r, sigma):
         "gamma": round(gamma, 6),
         "theta": round(theta, 4),
         "vega": round(vega, 4),
-        "expected_day_theta": round(expected_day_theta, 4)
+        "expected_day_theta": round(expected_day_theta, 4),
+        "iv": round(sigma * 100.0, 2)
     }
+
+def get_angelone_option_greeks(smart_api, name, expiry_date):
+    """
+    Fetches live Option Greeks directly from Angel One OpenAPI Endpoint.
+    `expiry_date` should be in standard uppercase format e.g. '27FEB2026'.
+    """
+    url = "https://apiconnect.angelone.in/rest/secure/angelbroking/marketData/v1/optionGreek"
+    
+    jwt_token = getattr(smart_api, 'jwtToken', None)
+    if not jwt_token and hasattr(smart_api, 'session_data'):
+        jwt_token = smart_api.session_data.get('jwtToken')
+        
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "MAC_ADDRESS",
+        "X-PrivateKey": API_KEY
+    }
+    
+    payload = {
+        "name": name,
+        "expirydate": expiry_date.upper()
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        data = response.json()
+        if data and data.get("status") and data.get("data"):
+            return data["data"]
+    except Exception as e:
+        print(f"Error fetching Greeks from SmartAPI: {e}")
+        
+    return None
 
 def calculate_basket_portfolio_value(legs, S, T, r=0.07, sigma=0.145):
     total_val = 0.0
@@ -879,6 +917,7 @@ HTML_TEMPLATE = r"""
                                     <span class="greek-tag">&Gamma;: ${leg.greeks.gamma}</span>
                                     <span class="greek-tag">&Theta;: ${leg.greeks.theta} <small style="color:#00bcd4;">(${leg.impact.theta_pct}%)</small></span>
                                     <span class="greek-tag">&Nu;: ${leg.greeks.vega} <small style="color:#00bcd4;">(${leg.impact.vega_pct}%)</small></span>
+                                    <span class="greek-tag" style="color:#e91e63;">IV: ${leg.greeks.iv}%</span>
                                     <span class="greek-tag" style="color:#00ff88;">Decay Till Date: ₹${leg.theta_decay_till_date}</span>
                                     <span class="greek-tag" style="color:#00bcd4;">Exp Day Theta: ${leg.greeks.expected_day_theta}</span>
                                 </div>
@@ -1028,7 +1067,31 @@ def live_data():
     except Exception:
         pass
 
-    iv_estimate = 14.5
+    # Fetch live Greeks directly from Angel One OpenAPI
+    greeks_lookup = {}
+    if selected_expiry:
+        raw_greeks = get_angelone_option_greeks(smart_api, symbol, selected_expiry)
+        if raw_greeks:
+            for item in raw_greeks:
+                try:
+                    s_price = float(item.get('strikePrice', 0))
+                    o_type = item.get('optionType', '')
+                    greeks_lookup[(s_price, o_type)] = {
+                        "delta": round(float(item.get('delta', 0)), 4),
+                        "gamma": round(float(item.get('gamma', 0)), 6),
+                        "theta": round(float(item.get('theta', 0)), 4),
+                        "vega": round(float(item.get('vega', 0)), 4),
+                        "iv": round(float(item.get('impliedVolatility', 0)), 2)
+                    }
+                except (ValueError, TypeError):
+                    continue
+
+    # Estimate IV dynamically from ATM Option Greek response if available
+    atm_step = idx_info.get('step', 50)
+    atm_strike = round(spot_price / atm_step) * atm_step
+    atm_greek = greeks_lookup.get((float(atm_strike), "CE")) or greeks_lookup.get((float(atm_strike), "PE"))
+    iv_estimate = atm_greek["iv"] if atm_greek and atm_greek.get("iv", 0) > 0 else 14.5
+
     expected_1day_move = round(spot_price * (iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
     
     days_to_expiry = 7.0
@@ -1044,7 +1107,6 @@ def live_data():
     for basket in baskets:
         basket_impact_duration = int(basket.get('impact_duration', 15))
         
-        # Spot price change over this basket's impact duration strictly within market hours
         _, past_spot = get_past_price_within_market_hours(index_candles, now, basket_impact_duration)
         if past_spot is None:
             past_spot = spot_price
@@ -1129,10 +1191,17 @@ def live_data():
                 days_to_exp = 7.0
 
             T = days_to_exp / 365.0
-            greeks = calculate_greeks(opt_type, spot_price, strike, T, 0.07, iv_estimate / 100.0)
+
+            # Match Angel One OpenAPI Greek data for this leg; fallback to Black-Scholes if offline
+            if (strike, opt_type) in greeks_lookup:
+                greeks = greeks_lookup[(strike, opt_type)]
+                days_left = max(T * 365.0, 0.5)
+                greeks["expected_day_theta"] = round(greeks["theta"] * (1.0 / days_left), 4)
+            else:
+                greeks = calculate_greeks_fallback(opt_type, spot_price, strike, T, 0.07, iv_estimate / 100.0)
+
             decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
 
-            # Leg past price within market hours
             latest_lp, past_lp = get_past_price_within_market_hours(leg_candles, now, basket_impact_duration)
             if latest_lp is not None and past_lp is not None:
                 current_ltp = latest_lp
@@ -1145,7 +1214,6 @@ def live_data():
             if isinstance(current_ltp, (int, float)) and isinstance(past_leg_price, (int, float)):
                 actual_leg_val_change = (current_ltp - past_leg_price) * qty * direction_mult
 
-            # Greek contributions
             c_delta = greeks['delta'] * delta_spot * qty * direction_mult
             c_theta = greeks['theta'] * dt_days * qty * direction_mult
             c_vega = actual_leg_val_change - (c_delta + c_theta)
@@ -1187,7 +1255,7 @@ def live_data():
             })
 
         strategy_type = identify_strategy(basket.get('legs', []))
-        net_greeks = calculate_basket_greeks_from_price_diff(basket.get('legs', []), spot_price)
+        net_greeks = calculate_basket_greeks_from_price_diff(basket.get('legs', []), spot_price, T=T, sigma=iv_estimate/100.0)
         max_prof, max_lss = calculate_max_profit_loss(basket.get('legs', []))
 
         if abs(total_basket_val_change) > 1e-5:
