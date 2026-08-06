@@ -14,3 +14,4 @@ requests
 vollib
 Flask==3.0.2
 pyotp==2.9.0
+google-genai
