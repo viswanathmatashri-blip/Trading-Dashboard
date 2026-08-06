@@ -359,7 +359,7 @@ HTML_TEMPLATE = r"""
         .pnl-neg { color: #ff5252; font-weight: bold; }
         .pnl-err { color: #ff9800; font-weight: bold; }
         .greek-tag { font-family: monospace; background: #2d2d2d; padding: 3px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; display: inline-block; margin-top: 4px; }
-        .basket-summary-tag { font-family: monospace; background: #1a3835; border: 1px solid #00bcd4; padding: 3px 7px; border-radius: 4px; font-size: 11px; color: #00e5ff; margin-left: 6px; display: inline-block; }
+        .basket-summary-tag { font-family: monospace; background: #1a3835; border: 1px solid #00bcd4; padding: 3px 7px; border-radius: 4px; font-size: 11px; color: #00e5ff; margin-left: 6px; display: inline-block; margin-top: 4px; }
         .strategy-badge { background: #00bcd4; color: #000; font-weight: bold; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 8px; }
 
         .chart-checkbox-container {
@@ -470,15 +470,25 @@ HTML_TEMPLATE = r"""
 
             <div class="card">
                 <div class="header-flex">
-                    <h3>Index Strategy Chart</h3>
-                    <div>
-                        <label style="display:inline; color:#aaa; font-size:12px; margin-right:5px;">Candle Timeframe:</label>
-                        <select id="timeframeSelect" class="chart-select" onchange="updateDashboard()">
-                            <option value="1">1 min</option>
-                            <option value="3">3 mins</option>
-                            <option value="5">5 mins</option>
-                            <option value="15" selected>15 mins</option>
-                        </select>
+                    <h3>Index Strategy Chart & Analytics Controls</h3>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <div>
+                            <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Impact Duration:</label>
+                            <select id="impactDurationSelect" class="chart-select" onchange="updateDashboard()">
+                                <option value="3">3 mins</option>
+                                <option value="5">5 mins</option>
+                                <option value="15" selected>15 mins</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Candle Timeframe:</label>
+                            <select id="timeframeSelect" class="chart-select" onchange="updateDashboard()">
+                                <option value="1">1 min</option>
+                                <option value="3">3 mins</option>
+                                <option value="5">5 mins</option>
+                                <option value="15" selected>15 mins</option>
+                            </select>
+                        </div>
                     </div>
                 </div>
                 <canvas id="mainChart" height="100"></canvas>
@@ -514,7 +524,7 @@ HTML_TEMPLATE = r"""
         let pendingLegs = [];
         let activeBaskets = [];
         let selectedChartBasketId = null;
-        let showStrikesPerBasket = {}; // Tracks strike line toggle state per basket
+        let showStrikesPerBasket = {};
         let deletedBasketIds = new Set();
         let mainChart, legsChart;
         let refreshTimer = null;
@@ -668,7 +678,7 @@ HTML_TEMPLATE = r"""
             const newBasketName = `Basket #${activeBaskets.length + 1}`;
             
             if (!selectedChartBasketId) selectedChartBasketId = basketId;
-            showStrikesPerBasket[basketId] = false; // Default off
+            showStrikesPerBasket[basketId] = false;
 
             activeBaskets.push({ id: basketId, name: newBasketName, legs: [...pendingLegs] });
             pendingLegs = [];
@@ -709,6 +719,7 @@ HTML_TEMPLATE = r"""
             const exchange = document.getElementById('exchange').value;
             const interval = document.getElementById('timeframeSelect').value;
             const basketInterval = document.getElementById('basketTimeframeSelect').value;
+            const impactDuration = document.getElementById('impactDurationSelect').value;
             const selectedExpiry = document.getElementById('expirySelect').value;
 
             activeBaskets = activeBaskets.filter(b => !deletedBasketIds.has(b.id));
@@ -719,6 +730,7 @@ HTML_TEMPLATE = r"""
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ 
                         symbol, exchange, interval, basket_interval: basketInterval, 
+                        impact_duration: impactDuration,
                         expiry: selectedExpiry, baskets: activeBaskets 
                     })
                 });
@@ -739,7 +751,6 @@ HTML_TEMPLATE = r"""
                     mainChart.data.labels = data.chart_labels;
                     mainChart.data.datasets[0].data = data.chart_prices;
 
-                    // Dynamic P&L coloring for main chart background region
                     const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
                     const isProfitable = targetBasket ? targetBasket.basket_pnl >= 0 : true;
                     
@@ -749,7 +760,6 @@ HTML_TEMPLATE = r"""
                         below: !isProfitable ? 'rgba(255,82,82,0.12)' : 'rgba(255,82,82,0.03)'
                     };
 
-                    // Handle light horizontal lines for leg strike prices if enabled
                     let extraDatasets = [mainChart.data.datasets[0]];
                     if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
                         targetBasket.legs.forEach((leg, lIdx) => {
@@ -786,10 +796,10 @@ HTML_TEMPLATE = r"""
                                 <span class="strategy-badge">${b.strategy_type}</span>
                                 <span class="${pnlClass}" style="margin-left: 10px; margin-right: 10px;">Live P&L: ${pnlDisplay}</span>
                                 
-                                <span class="basket-summary-tag">Net &Delta;: ₹${b.net_greeks.delta} /pt</span>
+                                <span class="basket-summary-tag">Net &Delta;: ₹${b.net_greeks.delta} /pt <small>(${b.basket_impact.delta_pct}%)</small></span>
                                 <span class="basket-summary-tag">Net &Gamma;: ₹${b.net_greeks.gamma} /pt&sup2;</span>
-                                <span class="basket-summary-tag">Net &Theta;: ₹${b.net_greeks.theta} /day</span>
-                                <span class="basket-summary-tag">Net &Nu;: ₹${b.net_greeks.vega} /1% IV</span>
+                                <span class="basket-summary-tag">Net &Theta;: ₹${b.net_greeks.theta} /day <small>(${b.basket_impact.theta_pct}%)</small></span>
+                                <span class="basket-summary-tag">Net &Nu;: ₹${b.net_greeks.vega} /1% IV <small>(${b.basket_impact.vega_pct}%)</small></span>
                                 <span class="basket-summary-tag" style="color:#00ff88; border-color:#00ff88; background:#1b3821;">Tot Decay: ₹${b.total_decay_till_date}</span>
                                 <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ₹${b.net_greeks.expected_day_theta}</span>
                             </div>
@@ -821,10 +831,10 @@ HTML_TEMPLATE = r"""
                             <div style="margin-top:6px; font-size:13px;">
                                 <span>[${leg.expiry}] ${leg.strike} ${leg.option_type} (${leg.action}) | Entry: ${entryText} | Real LTP: ${ltpText} | P&L: ${legPnlText}</span>
                                 <div>
-                                    <span class="greek-tag">&Delta;: ${leg.greeks.delta}</span>
+                                    <span class="greek-tag">&Delta;: ${leg.greeks.delta} <small style="color:#00bcd4;">(${leg.impact.delta_pct}%)</small></span>
                                     <span class="greek-tag">&Gamma;: ${leg.greeks.gamma}</span>
-                                    <span class="greek-tag">&Theta;: ${leg.greeks.theta}</span>
-                                    <span class="greek-tag">&Nu;: ${leg.greeks.vega}</span>
+                                    <span class="greek-tag">&Theta;: ${leg.greeks.theta} <small style="color:#00bcd4;">(${leg.impact.theta_pct}%)</small></span>
+                                    <span class="greek-tag">&Nu;: ${leg.greeks.vega} <small style="color:#00bcd4;">(${leg.impact.vega_pct}%)</small></span>
                                     <span class="greek-tag" style="color:#00ff88;">Decay Till Date: ₹${leg.theta_decay_till_date}</span>
                                     <span class="greek-tag" style="color:#00bcd4;">Exp Day Theta: ${leg.greeks.expected_day_theta}</span>
                                 </div>
@@ -939,6 +949,7 @@ def live_data():
     baskets = req_data.get('baskets', [])
     interval = req_data.get('interval', '15')
     basket_interval = req_data.get('basket_interval', '15')
+    impact_duration = int(req_data.get('impact_duration', 15))
     selected_expiry = req_data.get('expiry')
 
     idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
@@ -973,10 +984,23 @@ def live_data():
     except Exception:
         pass
 
+    # Spot price change over the selected impact duration
+    past_spot = spot_price
+    if chart_labels and chart_prices:
+        target_dt = now - timedelta(minutes=impact_duration)
+        target_str = target_dt.strftime("%H:%M")
+        best_idx = 0
+        for i in range(len(chart_labels)-1, -1, -1):
+            if chart_labels[i] <= target_str:
+                best_idx = i
+                break
+        past_spot = chart_prices[best_idx]
+    delta_spot = spot_price - past_spot
+    dt_days = impact_duration / 1440.0
+
     iv_estimate = 14.5
     expected_1day_move = round(spot_price * (iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
     
-    # Calculate days left till expiry for expected expiry move
     days_to_expiry = 7.0
     if selected_expiry:
         try:
@@ -992,6 +1016,11 @@ def live_data():
         processed_legs = []
         leg_series_data = []
         master_timestamps = chart_labels or []
+
+        basket_delta_contrib = 0.0
+        basket_theta_contrib = 0.0
+        basket_vega_contrib = 0.0
+        total_basket_val_change = 0.0
 
         for leg in basket.get('legs', []):
             strike = float(leg['strike'])
@@ -1062,6 +1091,41 @@ def live_data():
             greeks = calculate_greeks(opt_type, spot_price, strike, T, 0.07, iv_estimate / 100.0)
             decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
 
+            # Calculate past leg price for impact duration
+            past_leg_price = current_ltp if isinstance(current_ltp, (int, float)) else entry_price
+            if leg_prices_map and isinstance(current_ltp, (int, float)):
+                target_dt = now - timedelta(minutes=impact_duration)
+                target_str = target_dt.strftime("%H:%M")
+                best_leg_price = past_leg_price
+                for ts_key, p_val in sorted(leg_prices_map.items(), key=lambda x: x[0]):
+                    if ts_key <= target_str:
+                        best_leg_price = p_val
+                    else:
+                        break
+                past_leg_price = best_leg_price
+
+            direction_mult = 1 if action == 'BUY' else -1
+            actual_leg_val_change = 0.0
+            if isinstance(current_ltp, (int, float)) and isinstance(past_leg_price, (int, float)):
+                actual_leg_val_change = (current_ltp - past_leg_price) * qty * direction_mult
+
+            # Greek contributions
+            c_delta = greeks['delta'] * delta_spot * qty * direction_mult
+            c_theta = greeks['theta'] * dt_days * qty * direction_mult
+            c_vega = actual_leg_val_change - (c_delta + c_theta) # Residual attribution for volatility/higher-order terms
+
+            if abs(actual_leg_val_change) > 1e-5:
+                leg_delta_pct = round((c_delta / actual_leg_val_change) * 100.0, 1)
+                leg_theta_pct = round((c_theta / actual_leg_val_change) * 100.0, 1)
+                leg_vega_pct = round((c_vega / actual_leg_val_change) * 100.0, 1)
+            else:
+                leg_delta_pct, leg_theta_pct, leg_vega_pct = 0.0, 0.0, 0.0
+
+            basket_delta_contrib += c_delta
+            basket_theta_contrib += c_theta
+            basket_vega_contrib += c_vega
+            total_basket_val_change += actual_leg_val_change
+
             processed_legs.append({
                 "strike": strike,
                 "expiry": exp_date,
@@ -1072,7 +1136,12 @@ def live_data():
                 "current_premium": current_ltp,
                 "leg_pnl": round(leg_pnl, 2) if isinstance(leg_pnl, float) else leg_pnl,
                 "greeks": greeks,
-                "theta_decay_till_date": decay_till_date
+                "theta_decay_till_date": decay_till_date,
+                "impact": {
+                    "delta_pct": leg_delta_pct,
+                    "theta_pct": leg_theta_pct,
+                    "vega_pct": leg_vega_pct
+                }
             })
 
             aligned_series = [leg_prices_map.get(ts, current_ltp if isinstance(current_ltp, (int, float)) else entry_price) for ts in master_timestamps]
@@ -1085,6 +1154,19 @@ def live_data():
         net_greeks = calculate_basket_greeks_from_price_diff(basket.get('legs', []), spot_price)
         max_prof, max_lss = calculate_max_profit_loss(basket.get('legs', []))
 
+        if abs(total_basket_val_change) > 1e-5:
+            b_delta_pct = round((basket_delta_contrib / total_basket_val_change) * 100.0, 1)
+            b_theta_pct = round((basket_theta_contrib / total_basket_val_change) * 100.0, 1)
+            b_vega_pct = round((basket_vega_contrib / total_basket_val_change) * 100.0, 1)
+        else:
+            b_delta_pct, b_theta_pct, b_vega_pct = 0.0, 0.0, 0.0
+
+        basket_impact_metrics = {
+            "delta_pct": b_delta_pct,
+            "theta_pct": b_theta_pct,
+            "vega_pct": b_vega_pct
+        }
+
         processed_baskets.append({
             "id": basket['id'],
             "name": basket['name'],
@@ -1093,6 +1175,7 @@ def live_data():
             "max_profit": max_prof,
             "max_loss": max_lss,
             "net_greeks": net_greeks,
+            "basket_impact": basket_impact_metrics,
             "total_decay_till_date": round(basket_pnl, 2),
             "legs": processed_legs,
             "legs_historical": {
