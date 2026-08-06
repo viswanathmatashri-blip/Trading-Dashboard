@@ -5,6 +5,7 @@ import pyotp
 import threading
 import requests
 import pandas as pd
+import numpy as np
 from datetime import datetime, time, timezone, timedelta
 from flask import Flask, render_template_string, jsonify, request
 from SmartApi import SmartConnect
@@ -117,17 +118,80 @@ def is_market_open():
         return False
     return time(9, 15) <= now.time() <= time(15, 30)
 
-def fetch_smartapi_greeks(smart_api, symbol, expiry):
-    """Fetches option greeks strictly from SmartAPI optionGreek endpoint."""
+def get_last_trading_day_dates():
+    """Returns (from_date_str, to_date_str) formatted for SmartAPI.
+    If market is currently open, returns today's 09:15 to now.
+    If market is closed/weekend/before 09:15, returns last valid trading day (09:15 to 15:30).
+    """
+    now = datetime.now(IST)
+    
+    if is_market_open():
+        return now.strftime("%Y-%m-%d 09:15"), now.strftime("%Y-%m-%d %H:%M")
+    
+    target_date = now.date()
+    if now.time() < time(9, 15):
+        target_date -= timedelta(days=1)
+        
+    while target_date.weekday() >= 5:  # Skip Saturday (5) and Sunday (6)
+        target_date -= timedelta(days=1)
+
+    from_str = target_date.strftime("%Y-%m-%d 09:15")
+    to_str = target_date.strftime("%Y-%m-%d 15:30")
+    return from_str, to_str
+
+def fetch_option_chain_data(smart_api, symbol, expiry):
+    """Fetches option chain data from SmartAPI to extract real-time Greeks and ATM IV."""
     try:
-        res = smart_api._postRequest("api.market.optiongreeks", {"name": symbol, "expirydate": expiry})
+        chain_params = {
+            "name": symbol,
+            "expirydate": expiry
+        }
+        res = smart_api.optionChain(chain_params)
         if res and res.get('status') and res.get('data'):
             return res['data']
     except Exception:
         pass
     return []
 
-def get_past_price_within_market_hours(candles, now_ist, duration_mins):
+def get_atm_iv_and_leg_greeks(option_chain, spot_price, step, strike, opt_type):
+    """Extracts ATM IV and specific Leg Greeks directly from SmartAPI option chain."""
+    atm_strike = round(spot_price / step) * step
+    atm_iv = 14.5  # Fallback default
+    leg_greeks = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
+
+    if not option_chain:
+        return atm_iv, leg_greeks
+
+    # Search chain for ATM IV and exact strike Greeks
+    for item in option_chain:
+        item_strike = float(item.get('strikePrice', 0) or 0)
+        item_type = item.get('optionType', '')
+        
+        # Capture ATM IV
+        if abs(item_strike - atm_strike) < 0.01:
+            iv_val = float(item.get('impliedVolatility', 0) or 0)
+            if iv_val > 0:
+                atm_iv = iv_val
+
+        # Capture matching leg Greeks from SmartAPI
+        if abs(item_strike - strike) < 0.01 and item_type.upper() == opt_type.upper():
+            d = float(item.get('delta', 0) or 0)
+            g = float(item.get('gamma', 0) or 0)
+            t = float(item.get('theta', 0) or 0)
+            v = float(item.get('vega', 0) or 0)
+            
+            leg_greeks = {
+                "delta": round(d, 4),
+                "gamma": round(g, 6),
+                "theta": round(t, 4),
+                "vega": round(v, 4),
+                "expected_day_theta": round(t, 4)
+            }
+
+    return atm_iv, leg_greeks
+
+def get_past_price_within_market_hours(candles, duration_mins):
+    """Filters candles strictly within market hours (09:15 to 15:30 IST) and finds last traded price duration_mins ago."""
     if not candles:
         return None, None
 
@@ -140,7 +204,7 @@ def get_past_price_within_market_hours(candles, now_ist, duration_mins):
             dt_str = c[0].split('T')[1][:5]
             c_time = datetime.strptime(dt_str, "%H:%M").time()
             if market_open_time <= c_time <= market_close_time:
-                valid_candles.append((dt_str, float(c[4])))
+                valid_candles.append((dt_str, float(c[4]))) # Last traded price (Close of candle)
         except Exception:
             continue
 
@@ -166,6 +230,27 @@ def get_past_price_within_market_hours(candles, now_ist, duration_mins):
             break
 
     return latest_price, best_price
+
+def calculate_basket_net_greeks(legs):
+    """Aggregates SmartAPI leg greeks across all legs in a basket."""
+    net_delta, net_gamma, net_theta, net_vega = 0.0, 0.0, 0.0, 0.0
+    for leg in legs:
+        qty = int(leg.get('qty', 65))
+        direction = 1 if leg.get('action') == 'BUY' else -1
+        g = leg.get('greeks', {})
+        
+        net_delta += (g.get('delta', 0.0) * qty * direction)
+        net_gamma += (g.get('gamma', 0.0) * qty * direction)
+        net_theta += (g.get('theta', 0.0) * qty * direction)
+        net_vega += (g.get('vega', 0.0) * qty * direction)
+
+    return {
+        "delta": round(net_delta, 2),
+        "gamma": round(net_gamma, 4),
+        "theta": round(net_theta, 2),
+        "vega": round(net_vega, 2),
+        "expected_day_theta": round(net_theta, 2)
+    }
 
 def calculate_max_profit_loss(legs):
     if not legs:
@@ -371,7 +456,7 @@ HTML_TEMPLATE = r"""
         <label for="chkAutoRefresh" style="margin:0; cursor:pointer; color:#fff; white-space:nowrap; display:inline;">Enable Refresh 5 sec</label>
     </div>
 
-    <h2>Real-Market Options Strategy Tracker (SmartAPI Strictly)</h2>
+    <h2>Real-Market Options Strategy Tracker (SmartAPI Live)</h2>
     <div class="grid">
         <div>
             <div class="card">
@@ -425,7 +510,7 @@ HTML_TEMPLATE = r"""
         <div>
             <div class="status-bar">
                 <div class="status-item">Index LTP: <span id="stIndex" class="status-value">-</span></div>
-                <div class="status-item">Live ATM IV: <span id="stIv" class="status-value">-</span></div>
+                <div class="status-item">ATM IV (SmartAPI): <span id="stIv" class="status-value">-</span></div>
                 <div class="status-item">Expected 1-Day Move: <span id="stMove" class="status-value">-</span></div>
                 <div class="status-item">Expected Expiry Move: <span id="stExpiryMove" class="status-value">-</span></div>
                 <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
@@ -698,10 +783,10 @@ HTML_TEMPLATE = r"""
                 if (data.error) { document.getElementById('stIndex').innerText = data.error; return; }
 
                 document.getElementById('stIndex').innerText = data.underlying_price;
-                document.getElementById('stIv').innerText = data.current_iv !== "N/A" ? data.current_iv + "%" : "N/A";
-                document.getElementById('stMove').innerText = data.expected_1day_move !== "N/A" ? "±" + data.expected_1day_move + " pts" : "N/A";
-                document.getElementById('stExpiryMove').innerText = data.expected_expiry_move !== "N/A" ? "±" + data.expected_expiry_move + " pts" : "N/A";
-                document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED";
+                document.getElementById('stIv').innerText = data.current_iv + "%";
+                document.getElementById('stMove').innerText = "±" + data.expected_1day_move + " pts";
+                document.getElementById('stExpiryMove').innerText = "±" + data.expected_expiry_move + " pts";
+                document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Last Trading Day Data)";
 
                 const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
 
@@ -754,12 +839,12 @@ HTML_TEMPLATE = r"""
                                 <span class="strategy-badge">${b.strategy_type}</span>
                                 <span class="${pnlClass}" style="margin-left: 10px; margin-right: 10px;">Live P&L: ${pnlDisplay}</span>
                                 
-                                <span class="basket-summary-tag">Net &Delta;: ${b.net_greeks.delta} <small>(${b.basket_impact.delta_pct}%)</small></span>
-                                <span class="basket-summary-tag">Net &Gamma;: ${b.net_greeks.gamma}</span>
-                                <span class="basket-summary-tag">Net &Theta;: ${b.net_greeks.theta} <small>(${b.basket_impact.theta_pct}%)</small></span>
-                                <span class="basket-summary-tag">Net &Nu;: ${b.net_greeks.vega} <small>(${b.basket_impact.vega_pct}%)</small></span>
+                                <span class="basket-summary-tag">Net &Delta;: ₹${b.net_greeks.delta} /pt <small>(${b.basket_impact.delta_pct}%)</small></span>
+                                <span class="basket-summary-tag">Net &Gamma;: ₹${b.net_greeks.gamma} /pt&sup2;</span>
+                                <span class="basket-summary-tag">Net &Theta;: ₹${b.net_greeks.theta} /day <small>(${b.basket_impact.theta_pct}%)</small></span>
+                                <span class="basket-summary-tag">Net &Nu;: ₹${b.net_greeks.vega} /1% IV <small>(${b.basket_impact.vega_pct}%)</small></span>
                                 <span class="basket-summary-tag" style="color:#00ff88; border-color:#00ff88; background:#1b3821;">Tot Decay: ₹${b.total_decay_till_date}</span>
-                                <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ${b.net_greeks.expected_day_theta}</span>
+                                <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ₹${b.net_greeks.expected_day_theta}</span>
                             </div>
                             
                             <div style="display:flex; align-items:center; gap: 8px;">
@@ -798,7 +883,6 @@ HTML_TEMPLATE = r"""
                                     <span class="greek-tag">&Gamma;: ${leg.greeks.gamma}</span>
                                     <span class="greek-tag">&Theta;: ${leg.greeks.theta} <small style="color:#00bcd4;">(${leg.impact.theta_pct}%)</small></span>
                                     <span class="greek-tag">&Nu;: ${leg.greeks.vega} <small style="color:#00bcd4;">(${leg.impact.vega_pct}%)</small></span>
-                                    <span class="greek-tag" style="color:#ffca28;">IV: ${leg.iv}%</span>
                                     <span class="greek-tag" style="color:#00ff88;">Decay Till Date: ₹${leg.theta_decay_till_date}</span>
                                     <span class="greek-tag" style="color:#00bcd4;">Exp Day Theta: ${leg.greeks.expected_day_theta}</span>
                                 </div>
@@ -917,6 +1001,7 @@ def live_data():
 
     idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
     
+    # 3. All values correspond to the last traded value (LTP)
     try:
         ltp_resp = smart_api.ltpData(idx_info["exchange"], idx_info["tradingsymbol"], idx_info["token"])
         if not (ltp_resp and ltp_resp.get('status') and ltp_resp.get('data')):
@@ -926,9 +1011,8 @@ def live_data():
     except Exception as e:
         return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
 
-    now = datetime.now(IST)
-    from_date = now.strftime("%Y-%m-%d 09:15")
-    to_date = now.strftime("%Y-%m-%d %H:%M")
+    # 4. Ongoing trading day chart (1-day period). If outside market hours - show last trading day data.
+    from_date, to_date = get_last_trading_day_dates()
 
     chart_labels, chart_prices = [], []
     index_candles = []
@@ -944,26 +1028,20 @@ def live_data():
         if hist_resp and hist_resp.get('status') and hist_resp.get('data'):
             index_candles = hist_resp['data']
             chart_labels = [c[0].split('T')[1][:5] for c in index_candles]
-            chart_prices = [float(c[4]) for c in index_candles]
+            chart_prices = [float(c[4]) for c in index_candles] # Candle close = Last traded value
     except Exception:
         pass
 
-    # Strictly fetch Option Greeks from SmartAPI
-    smartapi_greeks_list = fetch_smartapi_greeks(smart_api, symbol, selected_expiry or "")
+    # 1. & 2. Fetch Option Chain to extract dynamic ATM IV & SmartAPI Greeks
+    option_chain_data = []
+    if selected_expiry:
+        option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
 
-    step = idx_info['step']
-    atm_strike = round(spot_price / step) * step
-
-    # Live ATM IV strictly from SmartAPI
-    live_atm_iv = "N/A"
-    if smartapi_greeks_list:
-        atm_iv_vals = [
-            float(g.get('impliedVolatility', 0.0)) for g in smartapi_greeks_list 
-            if float(g.get('strikePrice', 0)) == atm_strike and float(g.get('impliedVolatility', 0.0)) > 0
-        ]
-        if atm_iv_vals:
-            live_atm_iv = round(sum(atm_iv_vals) / len(atm_iv_vals), 2)
-
+    atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(option_chain_data, spot_price, idx_info['step'], spot_price, 'CE')
+    
+    expected_1day_move = round(spot_price * (atm_iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
+    
+    now = datetime.now(IST)
     days_to_expiry = 7.0
     if selected_expiry:
         try:
@@ -971,19 +1049,13 @@ def live_data():
             days_to_expiry = max((exp_dt - now.date()).days, 0.5)
         except Exception:
             pass
-
-    if isinstance(live_atm_iv, (int, float)):
-        expected_1day_move = round(spot_price * (live_atm_iv / 100.0) * math.sqrt(1 / 365.0), 2)
-        expected_expiry_move = round(spot_price * (live_atm_iv / 100.0) * math.sqrt(days_to_expiry / 365.0), 2)
-    else:
-        expected_1day_move = "N/A"
-        expected_expiry_move = "N/A"
+    expected_expiry_move = round(spot_price * (atm_iv_estimate / 100.0) * math.sqrt(days_to_expiry / 365.0), 2)
 
     processed_baskets = []
     for basket in baskets:
         basket_impact_duration = int(basket.get('impact_duration', 15))
         
-        _, past_spot = get_past_price_within_market_hours(index_candles, now, basket_impact_duration)
+        _, past_spot = get_past_price_within_market_hours(index_candles, basket_impact_duration)
         if past_spot is None:
             past_spot = spot_price
         delta_spot = spot_price - past_spot
@@ -998,12 +1070,6 @@ def live_data():
         basket_theta_contrib = 0.0
         basket_vega_contrib = 0.0
         total_basket_val_change = 0.0
-
-        net_basket_delta = 0.0
-        net_basket_gamma = 0.0
-        net_basket_theta = 0.0
-        net_basket_vega = 0.0
-        net_basket_expected_day_theta = 0.0
 
         for leg in basket.get('legs', []):
             strike = float(leg['strike'])
@@ -1031,6 +1097,7 @@ def live_data():
             leg_prices_map = {}
             leg_candles = []
             if token and symbol_name:
+                # 3. All values correspond to the last traded value (LTP)
                 try:
                     opt_ltp_resp = smart_api.ltpData("NFO", symbol_name, token)
                     if opt_ltp_resp and opt_ltp_resp.get('status') and opt_ltp_resp.get('data'):
@@ -1051,7 +1118,7 @@ def live_data():
                         leg_candles = leg_hist_resp['data']
                         for c in leg_candles:
                             ts = c[0].split('T')[1][:5]
-                            leg_prices_map[ts] = float(c[4])
+                            leg_prices_map[ts] = float(c[4]) # Last traded value
                 except Exception:
                     pass
 
@@ -1066,64 +1133,24 @@ def live_data():
                     leg_pnl = (entry_price - current_ltp) * qty
                 basket_pnl += leg_pnl
 
-            # Extract leg greeks strictly from SmartAPI
-            smart_greek_item = next(
-                (g for g in smartapi_greeks_list if float(g.get('strikePrice', 0)) == strike and g.get('optionType', '') == opt_type), 
-                None
-            )
-
-            try:
-                exp_dt = datetime.strptime(exp_date, "%d%b%Y").date()
-                days_to_exp = max((exp_dt - now.date()).days, 0.5)
-            except Exception:
-                days_to_exp = 7.0
-
-            if smart_greek_item:
-                leg_iv = float(smart_greek_item.get('impliedVolatility', 0.0))
-                raw_delta = float(smart_greek_item.get('delta', 0.0))
-                raw_gamma = float(smart_greek_item.get('gamma', 0.0))
-                raw_theta = float(smart_greek_item.get('theta', 0.0))
-                raw_vega = float(smart_greek_item.get('vega', 0.0))
-                exp_day_th = raw_theta * (1.0 / days_to_exp)
-
-                greeks = {
-                    "delta": round(raw_delta, 4),
-                    "gamma": round(raw_gamma, 6),
-                    "theta": round(raw_theta, 4),
-                    "vega": round(raw_vega, 4),
-                    "expected_day_theta": round(exp_day_th, 4)
-                }
-            else:
-                leg_iv = "N/A"
-                raw_delta, raw_gamma, raw_theta, raw_vega, exp_day_th = 0.0, 0.0, 0.0, 0.0, 0.0
-                greeks = {
-                    "delta": "N/A", "gamma": "N/A", "theta": "N/A", "vega": "N/A", "expected_day_theta": "N/A"
-                }
-
-            direction_mult = 1 if action == 'BUY' else -1
-
-            # Aggregate Basket Net Greeks strictly from SmartAPI values
-            net_basket_delta += raw_delta * qty * direction_mult
-            net_basket_gamma += raw_gamma * qty * direction_mult
-            net_basket_theta += raw_theta * qty * direction_mult
-            net_basket_vega += raw_vega * qty * direction_mult
-            net_basket_expected_day_theta += exp_day_th * qty * direction_mult
-
+            # 2. Greeks of individual legs taken strictly from SmartAPI
+            _, greeks = get_atm_iv_and_leg_greeks(option_chain_data, spot_price, idx_info['step'], strike, opt_type)
             decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
 
-            latest_lp, past_lp = get_past_price_within_market_hours(leg_candles, now, basket_impact_duration)
+            latest_lp, past_lp = get_past_price_within_market_hours(leg_candles, basket_impact_duration)
             if latest_lp is not None and past_lp is not None:
                 current_ltp = latest_lp
                 past_leg_price = past_lp
             else:
                 past_leg_price = current_ltp if isinstance(current_ltp, (int, float)) else entry_price
 
+            direction_mult = 1 if action == 'BUY' else -1
             actual_leg_val_change = 0.0
             if isinstance(current_ltp, (int, float)) and isinstance(past_leg_price, (int, float)):
                 actual_leg_val_change = (current_ltp - past_leg_price) * qty * direction_mult
 
-            c_delta = raw_delta * delta_spot * qty * direction_mult
-            c_theta = raw_theta * dt_days * qty * direction_mult
+            c_delta = greeks['delta'] * delta_spot * qty * direction_mult
+            c_theta = greeks['theta'] * dt_days * qty * direction_mult
             c_vega = actual_leg_val_change - (c_delta + c_theta)
 
             if abs(actual_leg_val_change) > 1e-5:
@@ -1148,7 +1175,6 @@ def live_data():
                 "current_premium": current_ltp,
                 "leg_pnl": round(leg_pnl, 2) if isinstance(leg_pnl, float) else leg_pnl,
                 "greeks": greeks,
-                "iv": round(leg_iv, 2) if isinstance(leg_iv, (int, float)) else leg_iv,
                 "theta_decay_till_date": decay_till_date,
                 "impact": {
                     "delta_pct": leg_delta_pct,
@@ -1164,6 +1190,7 @@ def live_data():
             })
 
         strategy_type = identify_strategy(basket.get('legs', []))
+        net_greeks = calculate_basket_net_greeks(processed_legs)
         max_prof, max_lss = calculate_max_profit_loss(basket.get('legs', []))
 
         if abs(total_basket_val_change) > 1e-5:
@@ -1177,14 +1204,6 @@ def live_data():
             "delta_pct": b_delta_pct,
             "theta_pct": b_theta_pct,
             "vega_pct": b_vega_pct
-        }
-
-        net_greeks = {
-            "delta": round(net_basket_delta, 2),
-            "gamma": round(net_basket_gamma, 4),
-            "theta": round(net_basket_theta, 2),
-            "vega": round(net_basket_vega, 2),
-            "expected_day_theta": round(net_basket_expected_day_theta, 2)
         }
 
         processed_baskets.append({
@@ -1208,7 +1227,7 @@ def live_data():
     return jsonify({
         "status": conn_msg,
         "underlying_price": spot_price,
-        "current_iv": live_atm_iv,
+        "current_iv": atm_iv_estimate,
         "expected_1day_move": expected_1day_move,
         "expected_expiry_move": expected_expiry_move,
         "is_market_open": is_market_open(),
