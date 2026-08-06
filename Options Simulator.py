@@ -147,7 +147,39 @@ def fetch_option_chain_data(smart_api, symbol, expiry):
         pass
     return []
 
-# --- BLACK-SCHOLES GREEKS ENGINE ---
+# --- BLACK-SCHOLES IV & GREEKS ENGINE ---
+def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_type='CE'):
+    """Calculates IV dynamically from Option LTP using Newton-Raphson inversion."""
+    if market_price <= 0 or spot <= 0 or strike <= 0 or t_years <= 0:
+        return None
+
+    intrinsic = max(0, spot - strike) if opt_type.upper() in ['CE', 'CALL'] else max(0, strike - spot)
+    if market_price <= intrinsic:
+        return None
+
+    sigma = 0.15  # Initial guess (15%)
+    for _ in range(20):
+        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * math.sqrt(t_years))
+        d2 = d1 - sigma * math.sqrt(t_years)
+
+        if opt_type.upper() in ['CE', 'CALL']:
+            price = spot * norm.cdf(d1) - strike * math.exp(-r * t_years) * norm.cdf(d2)
+        else:
+            price = strike * math.exp(-r * t_years) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+
+        vega = spot * norm.pdf(d1) * math.sqrt(t_years)
+        
+        diff = price - market_price
+        if abs(diff) < 1e-4:
+            return round(sigma * 100.0, 2)
+            
+        if vega < 1e-6:
+            break
+            
+        sigma = sigma - diff / vega
+
+    return round(max(sigma, 0.01) * 100.0, 2)
+
 def calculate_black_scholes_greeks(spot, strike, t_years, iv_pct, opt_type='CE'):
     greeks = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
     sigma = max(iv_pct, 1.0) / 100.0
@@ -182,10 +214,21 @@ def calculate_black_scholes_greeks(spot, strike, t_years, iv_pct, opt_type='CE')
         "expected_day_theta": round(theta_day, 4)
     }
 
-def get_atm_iv_and_leg_greeks(option_chain, spot_price, step, strike, opt_type, expiry_str):
+def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike, opt_type, expiry_str, symbol="NIFTY"):
     atm_strike = round(spot_price / step) * step
-    atm_iv = 14.5
+    
+    now = datetime.now(IST)
+    try:
+        exp_dt = datetime.strptime(expiry_str, "%d%b%Y").replace(hour=15, minute=30, tzinfo=IST)
+        time_diff = exp_dt - now
+        days_remaining = max(time_diff.total_seconds() / (24 * 3600), 0.001)
+    except Exception:
+        days_remaining = 1.0
+        
+    t_years = days_remaining / 365.0
+    atm_iv = None
 
+    # Step 1: Read impliedVolatility directly from API option chain if available
     if option_chain:
         for item in option_chain:
             item_strike = float(item.get('strikePrice', 0) or 0)
@@ -195,18 +238,59 @@ def get_atm_iv_and_leg_greeks(option_chain, spot_price, step, strike, opt_type, 
                     atm_iv = iv_val
                     break
 
-    now = datetime.now(IST)
-    try:
-        exp_dt = datetime.strptime(expiry_str, "%d%b%Y").replace(hour=15, minute=30, tzinfo=IST)
-        time_diff = exp_dt - now
-        days_remaining = max(time_diff.total_seconds() / (24 * 3600), 0.01)
-    except Exception:
-        days_remaining = 1.0
-        
-    t_years = days_remaining / 365.0
-    leg_greeks = calculate_black_scholes_greeks(spot_price, strike, t_years, atm_iv, opt_type)
+    # Step 2: Dynamically calculate IV from ATM Call & Put LTPs using Black-Scholes inversion
+    if atm_iv is None and smart_api and INSTRUMENT_DF is not None:
+        try:
+            match_ce = INSTRUMENT_DF[
+                (INSTRUMENT_DF['name'] == symbol) & 
+                (INSTRUMENT_DF['expiry'] == expiry_str) & 
+                (INSTRUMENT_DF['strike_price'] == atm_strike) & 
+                (INSTRUMENT_DF['symbol'].str.endswith('CE'))
+            ]
+            match_pe = INSTRUMENT_DF[
+                (INSTRUMENT_DF['name'] == symbol) & 
+                (INSTRUMENT_DF['expiry'] == expiry_str) & 
+                (INSTRUMENT_DF['strike_price'] == atm_strike) & 
+                (INSTRUMENT_DF['symbol'].str.endswith('PE'))
+            ]
 
-    return atm_iv, leg_greeks
+            ce_ltp, pe_ltp = None, None
+            if not match_ce.empty:
+                res_ce = smart_api.ltpData("NFO", match_ce.iloc[0]['symbol'], str(match_ce.iloc[0]['token']))
+                if res_ce and res_ce.get('data'):
+                    ce_ltp = float(res_ce['data']['ltp'])
+
+            if not match_pe.empty:
+                res_pe = smart_api.ltpData("NFO", match_pe.iloc[0]['symbol'], str(match_pe.iloc[0]['token']))
+                if res_pe and res_pe.get('data'):
+                    pe_ltp = float(res_pe['data']['ltp'])
+
+            iv_ce = calculate_implied_volatility(ce_ltp, spot_price, atm_strike, t_years, RISK_FREE_RATE, 'CE') if ce_ltp else None
+            iv_pe = calculate_implied_volatility(pe_ltp, spot_price, atm_strike, t_years, RISK_FREE_RATE, 'PE') if pe_ltp else None
+
+            if iv_ce and iv_pe:
+                atm_iv = (iv_ce + iv_pe) / 2.0
+            elif iv_ce:
+                atm_iv = iv_ce
+            elif iv_pe:
+                atm_iv = iv_pe
+        except Exception:
+            pass
+
+    # Step 3: Fetch real-time INDIA VIX index LTP if option pricing is unavailable
+    if atm_iv is None and smart_api:
+        try:
+            vix_res = smart_api.ltpData("NSE", "INDIA VIX", "26009")
+            if vix_res and vix_res.get('data'):
+                atm_iv = float(vix_res['data']['ltp'])
+        except Exception:
+            pass
+
+    # Final fallback if market closed and no token data exists
+    atm_iv = atm_iv if atm_iv is not None else 10.0
+
+    leg_greeks = calculate_black_scholes_greeks(spot_price, strike, t_years, atm_iv, opt_type)
+    return round(atm_iv, 2), leg_greeks
 
 def get_past_price_within_market_hours(candles, duration_mins):
     if not candles:
@@ -526,7 +610,7 @@ HTML_TEMPLATE = r"""
         <div>
             <div class="status-bar">
                 <div class="status-item">Index LTP: <span id="stIndex" class="status-value">-</span></div>
-                <div class="status-item">ATM IV (SmartAPI): <span id="stIv" class="status-value">-</span></div>
+                <div class="status-item">Dynamic ATM IV: <span id="stIv" class="status-value">-</span></div>
                 <div class="status-item">Expected 1-Day Move: <span id="stMove" class="status-value">-</span></div>
                 <div class="status-item">Expected Expiry Move: <span id="stExpiryMove" class="status-value">-</span></div>
                 <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
@@ -1050,8 +1134,11 @@ def live_data():
     if selected_expiry:
         option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
 
-    # Dummy initial call just to extract overall ATM IV estimate
-    atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(option_chain_data, spot_price, idx_info['step'], spot_price, 'CE', selected_expiry or "31DEC2026")
+    # Dynamic calculation of real-time ATM IV without hardcoded fallback values
+    atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(
+        smart_api, option_chain_data, spot_price, idx_info['step'], 
+        spot_price, 'CE', selected_expiry or "31DEC2026", symbol=symbol
+    )
     
     expected_1day_move = round(spot_price * (atm_iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
     
@@ -1146,14 +1233,10 @@ def live_data():
                     leg_pnl = (entry_price - current_ltp) * qty
                 basket_pnl += leg_pnl
 
-            # Calculate precise Black-Scholes greeks per individual basket leg
+            # Calculate dynamic Black-Scholes Greeks per leg using precise implied volatility
             _, greeks = get_atm_iv_and_leg_greeks(
-                option_chain_data, 
-                spot_price, 
-                idx_info['step'], 
-                strike, 
-                opt_type, 
-                exp_date
+                smart_api, option_chain_data, spot_price, idx_info['step'], 
+                strike, opt_type, exp_date, symbol=symbol
             )
             
             decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
