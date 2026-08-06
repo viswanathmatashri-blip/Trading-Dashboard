@@ -119,6 +119,47 @@ def is_market_open():
         return False
     return time(9, 15) <= now.time() <= time(15, 30)
 
+def get_past_price_within_market_hours(candles, now_ist, duration_mins):
+    """Filters candles strictly within market hours (09:15 to 15:30 IST) and finds the price duration_mins ago[cite: 1]."""
+    if not candles:
+        return None, None
+
+    market_open_time = time(9, 15)
+    market_close_time = time(15, 30)
+
+    valid_candles = []
+    for c in candles:
+        try:
+            dt_str = c[0].split('T')[1][:5]
+            c_time = datetime.strptime(dt_str, "%H:%M").time()
+            if market_open_time <= c_time <= market_close_time:
+                valid_candles.append((dt_str, float(c[4])))
+        except Exception:
+            continue
+
+    if not valid_candles:
+        return None, None
+
+    latest_ts, latest_price = valid_candles[-1]
+    try:
+        latest_dt = datetime.strptime(latest_ts, "%H:%M")
+        target_dt = latest_dt - timedelta(minutes=duration_mins)
+        market_open_dt = datetime.strptime("09:15", "%H:%M")
+        if target_dt < market_open_dt:
+            target_dt = market_open_dt
+        target_str = target_dt.strftime("%H:%M")
+    except Exception:
+        target_str = valid_candles[0][0]
+
+    best_price = valid_candles[0][1]
+    for ts, price in valid_candles:
+        if ts <= target_str:
+            best_price = price
+        else:
+            break
+
+    return latest_price, best_price
+
 def bs_price(flag, S, K, T, r, sigma):
     if T <= 0.00001 or sigma <= 0 or S <= 0 or K <= 0:
         return max(0.0, S - K) if flag.upper() in ['CE', 'C'] else max(0.0, K - S)
@@ -473,14 +514,6 @@ HTML_TEMPLATE = r"""
                     <h3>Index Strategy Chart & Analytics Controls</h3>
                     <div style="display: flex; gap: 10px; align-items: center;">
                         <div>
-                            <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Impact Duration:</label>
-                            <select id="impactDurationSelect" class="chart-select" onchange="updateDashboard()">
-                                <option value="3">3 mins</option>
-                                <option value="5">5 mins</option>
-                                <option value="15" selected>15 mins</option>
-                            </select>
-                        </div>
-                        <div>
                             <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Candle Timeframe:</label>
                             <select id="timeframeSelect" class="chart-select" onchange="updateDashboard()">
                                 <option value="1">1 min</option>
@@ -680,7 +713,7 @@ HTML_TEMPLATE = r"""
             if (!selectedChartBasketId) selectedChartBasketId = basketId;
             showStrikesPerBasket[basketId] = false;
 
-            activeBaskets.push({ id: basketId, name: newBasketName, legs: [...pendingLegs] });
+            activeBaskets.push({ id: basketId, name: newBasketName, impact_duration: 15, legs: [...pendingLegs] });
             pendingLegs = [];
             renderPendingLegs();
 
@@ -714,12 +747,19 @@ HTML_TEMPLATE = r"""
             updateDashboard();
         }
 
+        function updateBasketImpactDuration(basketId, val) {
+            const basket = activeBaskets.find(b => b.id === basketId);
+            if (basket) {
+                basket.impact_duration = parseInt(val);
+                updateDashboard();
+            }
+        }
+
         async function updateDashboard() {
             const symbol = document.getElementById('symbol').value;
             const exchange = document.getElementById('exchange').value;
             const interval = document.getElementById('timeframeSelect').value;
             const basketInterval = document.getElementById('basketTimeframeSelect').value;
-            const impactDuration = document.getElementById('impactDurationSelect').value;
             const selectedExpiry = document.getElementById('expirySelect').value;
 
             activeBaskets = activeBaskets.filter(b => !deletedBasketIds.has(b.id));
@@ -730,7 +770,6 @@ HTML_TEMPLATE = r"""
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ 
                         symbol, exchange, interval, basket_interval: basketInterval, 
-                        impact_duration: impactDuration,
                         expiry: selectedExpiry, baskets: activeBaskets 
                     })
                 });
@@ -813,6 +852,11 @@ HTML_TEMPLATE = r"""
                                     <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleBasketChart(${b.id})" style="width:auto; margin:0;">
                                     <span>Load Chart</span>
                                 </label>
+                                <select class="chart-select" onchange="updateBasketImpactDuration(${b.id}, this.value)" title="Duration of % Impact">
+                                    <option value="3" ${b.impact_duration === 3 ? 'selected' : ''}>3 mins</option>
+                                    <option value="5" ${b.impact_duration === 5 ? 'selected' : ''}>5 mins</option>
+                                    <option value="15" ${b.impact_duration === 15 ? 'selected' : ''}>15 mins</option>
+                                </select>
                                 <button class="btn-delete" onclick="deleteBasket(${b.id})">🗑️ Delete Basket</button>
                             </div>
                         </div>
@@ -949,7 +993,6 @@ def live_data():
     baskets = req_data.get('baskets', [])
     interval = req_data.get('interval', '15')
     basket_interval = req_data.get('basket_interval', '15')
-    impact_duration = int(req_data.get('impact_duration', 15))
     selected_expiry = req_data.get('expiry')
 
     idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
@@ -968,6 +1011,7 @@ def live_data():
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
     chart_labels, chart_prices = [], []
+    index_candles = []
     try:
         hist_params = {
             "exchange": idx_info["exchange"],
@@ -978,25 +1022,11 @@ def live_data():
         }
         hist_resp = smart_api.getCandleData(hist_params)
         if hist_resp and hist_resp.get('status') and hist_resp.get('data'):
-            candles = hist_resp['data']
-            chart_labels = [c[0].split('T')[1][:5] for c in candles]
-            chart_prices = [float(c[4]) for c in candles]
+            index_candles = hist_resp['data']
+            chart_labels = [c[0].split('T')[1][:5] for c in index_candles]
+            chart_prices = [float(c[4]) for c in index_candles]
     except Exception:
         pass
-
-    # Spot price change over the selected impact duration
-    past_spot = spot_price
-    if chart_labels and chart_prices:
-        target_dt = now - timedelta(minutes=impact_duration)
-        target_str = target_dt.strftime("%H:%M")
-        best_idx = 0
-        for i in range(len(chart_labels)-1, -1, -1):
-            if chart_labels[i] <= target_str:
-                best_idx = i
-                break
-        past_spot = chart_prices[best_idx]
-    delta_spot = spot_price - past_spot
-    dt_days = impact_duration / 1440.0
 
     iv_estimate = 14.5
     expected_1day_move = round(spot_price * (iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
@@ -1012,6 +1042,15 @@ def live_data():
 
     processed_baskets = []
     for basket in baskets:
+        basket_impact_duration = int(basket.get('impact_duration', 15))
+        
+        # Spot price change over this basket's impact duration strictly within market hours
+        _, past_spot = get_past_price_within_market_hours(index_candles, now, basket_impact_duration)
+        if past_spot is None:
+            past_spot = spot_price
+        delta_spot = spot_price - past_spot
+        dt_days = basket_impact_duration / 1440.0
+
         basket_pnl = 0.0
         processed_legs = []
         leg_series_data = []
@@ -1046,6 +1085,7 @@ def live_data():
                     symbol_name = match.iloc[0]['symbol']
 
             leg_prices_map = {}
+            leg_candles = []
             if token and symbol_name:
                 try:
                     opt_ltp_resp = smart_api.ltpData("NFO", symbol_name, token)
@@ -1064,7 +1104,8 @@ def live_data():
                     }
                     leg_hist_resp = smart_api.getCandleData(leg_hist_params)
                     if leg_hist_resp and leg_hist_resp.get('status') and leg_hist_resp.get('data'):
-                        for c in leg_hist_resp['data']:
+                        leg_candles = leg_hist_resp['data']
+                        for c in leg_candles:
                             ts = c[0].split('T')[1][:5]
                             leg_prices_map[ts] = float(c[4])
                 except Exception:
@@ -1091,18 +1132,13 @@ def live_data():
             greeks = calculate_greeks(opt_type, spot_price, strike, T, 0.07, iv_estimate / 100.0)
             decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
 
-            # Calculate past leg price for impact duration
-            past_leg_price = current_ltp if isinstance(current_ltp, (int, float)) else entry_price
-            if leg_prices_map and isinstance(current_ltp, (int, float)):
-                target_dt = now - timedelta(minutes=impact_duration)
-                target_str = target_dt.strftime("%H:%M")
-                best_leg_price = past_leg_price
-                for ts_key, p_val in sorted(leg_prices_map.items(), key=lambda x: x[0]):
-                    if ts_key <= target_str:
-                        best_leg_price = p_val
-                    else:
-                        break
-                past_leg_price = best_leg_price
+            # Leg past price within market hours
+            latest_lp, past_lp = get_past_price_within_market_hours(leg_candles, now, basket_impact_duration)
+            if latest_lp is not None and past_lp is not None:
+                current_ltp = latest_lp
+                past_leg_price = past_lp
+            else:
+                past_leg_price = current_ltp if isinstance(current_ltp, (int, float)) else entry_price
 
             direction_mult = 1 if action == 'BUY' else -1
             actual_leg_val_change = 0.0
@@ -1112,7 +1148,7 @@ def live_data():
             # Greek contributions
             c_delta = greeks['delta'] * delta_spot * qty * direction_mult
             c_theta = greeks['theta'] * dt_days * qty * direction_mult
-            c_vega = actual_leg_val_change - (c_delta + c_theta) # Residual attribution for volatility/higher-order terms
+            c_vega = actual_leg_val_change - (c_delta + c_theta)
 
             if abs(actual_leg_val_change) > 1e-5:
                 leg_delta_pct = round((c_delta / actual_leg_val_change) * 100.0, 1)
@@ -1171,6 +1207,7 @@ def live_data():
             "id": basket['id'],
             "name": basket['name'],
             "strategy_type": strategy_type,
+            "impact_duration": basket_impact_duration,
             "basket_pnl": round(basket_pnl, 2),
             "max_profit": max_prof,
             "max_loss": max_lss,
