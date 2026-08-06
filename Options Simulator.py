@@ -10,6 +10,7 @@ from datetime import datetime, time, timezone, timedelta
 from flask import Flask, render_template_string, jsonify, request
 from scipy.stats import norm
 from SmartApi import SmartConnect
+from google import genai
 
 app = Flask(__name__)
 
@@ -17,6 +18,7 @@ API_KEY = os.environ.get("API_KEY")
 CLIENT_CODE = os.environ.get("CLIENT_CODE")
 PIN = os.environ.get("PIN")
 TOTP_SECRET = os.environ.get("TOTP_SECRET")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -349,6 +351,9 @@ HTML_TEMPLATE = r"""
         
         .btn-delete { background: #ff5252; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; width: auto; margin: 0; display: inline-flex; align-items: center; gap: 4px; }
         .btn-delete:hover { background: #d32f2f; }
+
+        .btn-gemini { background: #6c5ce7; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold; width: auto; margin: 0; display: inline-flex; align-items: center; gap: 4px; }
+        .btn-gemini:hover { background: #5849be; }
         
         .pending-leg-item { display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 6px; border-radius: 4px; margin-top: 5px; font-size: 12px; }
 
@@ -396,6 +401,17 @@ HTML_TEMPLATE = r"""
             margin-left: 8px;
             display: inline-flex;
             align-items: center;
+        }
+
+        .gemini-panel {
+            background-color: #16213e;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            padding: 12px;
+            margin-top: 10px;
+            font-size: 13px;
+            line-height: 1.4;
+            color: #dcdde1;
         }
     </style>
 </head>
@@ -514,8 +530,9 @@ HTML_TEMPLATE = r"""
         let pendingLegs = [];
         let activeBaskets = [];
         let selectedChartBasketId = null;
-        let showStrikesPerBasket = {}; // Tracks strike line toggle state per basket
+        let showStrikesPerBasket = {}; 
         let deletedBasketIds = new Set();
+        let geminiAnalysisState = {}; // Tracks open state & responses per basket
         let mainChart, legsChart;
         let refreshTimer = null;
 
@@ -537,9 +554,7 @@ HTML_TEMPLATE = r"""
                 animation: false,
                 responsive: true,
                 scales: { y: { display: true, position: 'left', grid: { color: '#2a2a2a' } } },
-                plugins: {
-                    annotation: { annotations: {} }
-                }
+                plugins: { annotation: { annotations: {} } }
             }
         });
 
@@ -561,7 +576,6 @@ HTML_TEMPLATE = r"""
         function toggleRefreshInterval() {
             const isChecked = document.getElementById('chkAutoRefresh').checked;
             if (refreshTimer) clearInterval(refreshTimer);
-
             if (isChecked) {
                 refreshTimer = setInterval(updateDashboard, 5000);
             }
@@ -668,7 +682,7 @@ HTML_TEMPLATE = r"""
             const newBasketName = `Basket #${activeBaskets.length + 1}`;
             
             if (!selectedChartBasketId) selectedChartBasketId = basketId;
-            showStrikesPerBasket[basketId] = false; // Default off
+            showStrikesPerBasket[basketId] = false;
 
             activeBaskets.push({ id: basketId, name: newBasketName, legs: [...pendingLegs] });
             pendingLegs = [];
@@ -686,6 +700,7 @@ HTML_TEMPLATE = r"""
             deletedBasketIds.add(basketId);
             activeBaskets = activeBaskets.filter(b => b.id !== basketId);
             delete showStrikesPerBasket[basketId];
+            delete geminiAnalysisState[basketId];
             
             if (selectedChartBasketId === basketId) {
                 selectedChartBasketId = activeBaskets.length > 0 ? activeBaskets[0].id : null;
@@ -702,6 +717,32 @@ HTML_TEMPLATE = r"""
         function toggleShowStrikes(basketId, checkbox) {
             showStrikesPerBasket[basketId] = checkbox.checked;
             updateDashboard();
+        }
+
+        async function toggleGeminiAnalysis(basketId) {
+            if (!geminiAnalysisState[basketId]) {
+                geminiAnalysisState[basketId] = { isOpen: true, loading: true, text: "" };
+            } else {
+                geminiAnalysisState[basketId].isOpen = !geminiAnalysisState[basketId].isOpen;
+            }
+            updateDashboard();
+
+            if (geminiAnalysisState[basketId].isOpen && !geminiAnalysisState[basketId].text) {
+                try {
+                    const res = await fetch('/api/gemini-analysis', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ basket_id: basketId, baskets: activeBaskets })
+                    });
+                    const data = await res.json();
+                    geminiAnalysisState[basketId].loading = false;
+                    geminiAnalysisState[basketId].text = data.analysis || "No response received.";
+                } catch (e) {
+                    geminiAnalysisState[basketId].loading = false;
+                    geminiAnalysisState[basketId].text = "Error connecting to Gemini AI.";
+                }
+                updateDashboard();
+            }
         }
 
         async function updateDashboard() {
@@ -739,7 +780,6 @@ HTML_TEMPLATE = r"""
                     mainChart.data.labels = data.chart_labels;
                     mainChart.data.datasets[0].data = data.chart_prices;
 
-                    // Dynamic P&L coloring for main chart background region
                     const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
                     const isProfitable = targetBasket ? targetBasket.basket_pnl >= 0 : true;
                     
@@ -749,7 +789,6 @@ HTML_TEMPLATE = r"""
                         below: !isProfitable ? 'rgba(255,82,82,0.12)' : 'rgba(255,82,82,0.03)'
                     };
 
-                    // Handle light horizontal lines for leg strike prices if enabled
                     let extraDatasets = [mainChart.data.datasets[0]];
                     if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
                         targetBasket.legs.forEach((leg, lIdx) => {
@@ -779,6 +818,9 @@ HTML_TEMPLATE = r"""
                     let isChecked = selectedChartBasketId === b.id;
                     let strikesChecked = showStrikesPerBasket[b.id] ? 'checked' : '';
 
+                    let gemState = geminiAnalysisState[b.id];
+                    let geminiBtnText = gemState && gemState.isOpen ? "✨ Hide Analysis" : "✨ Gemini Analysis";
+
                     let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
                             <div style="display:flex; align-items:center; flex-wrap:wrap; gap:4px;">
@@ -803,6 +845,7 @@ HTML_TEMPLATE = r"""
                                     <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleBasketChart(${b.id})" style="width:auto; margin:0;">
                                     <span>Load Chart</span>
                                 </label>
+                                <button class="btn-gemini" onclick="toggleGeminiAnalysis(${b.id})">${geminiBtnText}</button>
                                 <button class="btn-delete" onclick="deleteBasket(${b.id})">🗑️ Delete Basket</button>
                             </div>
                         </div>
@@ -830,6 +873,18 @@ HTML_TEMPLATE = r"""
                                 </div>
                             </div>`;
                     });
+
+                    if (gemState && gemState.isOpen) {
+                        html += `<div class="gemini-panel">
+                            <h4 style="color: #00adb5; margin-top: 0; margin-bottom: 8px;">✨ Gemini AI Risk Assessment</h4>`;
+                        if (gemState.loading) {
+                            html += `<div><span class="header-spinner"></span> Connecting to Gemini AI...</div>`;
+                        } else {
+                            html += `<div>${gemState.text.replace(/\n/g, '<br>')}</div>`;
+                        }
+                        html += `</div>`;
+                    }
+
                     html += `</div>`;
                     container.innerHTML += html;
                 });
@@ -928,6 +983,41 @@ def fetch_chain():
 
     return jsonify({"strikes": strikes, "atm": atm})
 
+@app.route('/api/gemini-analysis', methods=['POST'])
+def gemini_analysis():
+    req = request.json or {}
+    basket_id = req.get('basket_id')
+    baskets = req.get('baskets', [])
+
+    target_basket = next((b for b in baskets if str(b.get('id')) == str(basket_id)), None)
+    if not target_basket:
+        return jsonify({"analysis": "Error: Basket not found."})
+
+    if not GEMINI_API_KEY:
+        return jsonify({"analysis": "Gemini API key not configured. Set GEMINI_API_KEY in environment variables."})
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        prompt = f"""
+        You are an expert options risk manager analyzing a live trading strategy basket:
+        {json.dumps(target_basket, indent=2)}
+        
+        Provide a concise, highly practical analysis covering:
+        1. Overall position standing and risk level.
+        2. Exposure to major greeks (Delta, Theta).
+        3. Actionable suggestions or risk-management recommendations.
+        Keep the response clear, structured, and professional.
+        """
+
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        return jsonify({"analysis": response.text})
+    except Exception as e:
+        return jsonify({"analysis": f"Failed to fetch Gemini analysis: {str(e)}"})
+
 @app.route('/api/live-data', methods=['POST'])
 def live_data():
     smart_api, conn_msg = get_smart_api()
@@ -976,7 +1066,6 @@ def live_data():
     iv_estimate = 14.5
     expected_1day_move = round(spot_price * (iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
     
-    # Calculate days left till expiry for expected expiry move
     days_to_expiry = 7.0
     if selected_expiry:
         try:
