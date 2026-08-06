@@ -6,7 +6,7 @@ import threading
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, time
+from datetime import datetime, time, timezone, timedelta
 from flask import Flask, render_template_string, jsonify, request
 from scipy.stats import norm
 from SmartApi import SmartConnect
@@ -17,6 +17,8 @@ API_KEY = os.environ.get("API_KEY")
 CLIENT_CODE = os.environ.get("CLIENT_CODE")
 PIN = os.environ.get("PIN")
 TOTP_SECRET = os.environ.get("TOTP_SECRET")
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 INDEX_TOKENS = {
     "NIFTY": {"exchange": "NSE", "tradingsymbol": "NIFTY", "token": "99926000", "step": 50},
@@ -112,7 +114,7 @@ def ensure_scrip_master_loading():
         t.start()
 
 def is_market_open():
-    now = datetime.now()
+    now = datetime.now(IST)
     if now.weekday() >= 5:
         return False
     return time(9, 15) <= now.time() <= time(15, 30)
@@ -901,7 +903,7 @@ def live_data():
     except Exception as e:
         return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
 
-    now = datetime.now()
+    now = datetime.now(IST)
     from_date = now.strftime("%Y-%m-%d 09:15")
     to_date = now.strftime("%Y-%m-%d %H:%M")
 
@@ -992,8 +994,8 @@ def live_data():
                 basket_pnl += leg_pnl
 
             try:
-                exp_dt = datetime.strptime(exp_date, "%d%b%Y")
-                days_to_exp = max((exp_dt - datetime.now()).days, 0.5)
+                exp_dt = datetime.strptime(exp_date, "%d%b%Y").date()
+                days_to_exp = max((exp_dt - datetime.now(IST).date()).days, 0.5)
             except Exception:
                 days_to_exp = 7.0
 
