@@ -122,7 +122,6 @@ def is_market_open():
     return time(9, 15) <= now.time() <= time(15, 30)
 
 def get_last_trading_day_dates(num_days=5):
-    """Fetches multi-day window (default 5 trading days) to gather enough candles for indicators."""
     now = datetime.now(IST)
     end_date = now.date()
     if not is_market_open() and now.time() < time(9, 15):
@@ -173,7 +172,6 @@ def calculate_pcr(option_chain_data, spot_price, step, strike_range_limit=None):
 
     for item in filtered_chain:
         opt_type = str(item.get('optionType', '')).upper()
-        # Flexibly extract Open Interest regardless of SmartAPI payload key casing
         oi = float(item.get('opennterest', 0) or item.get('openInterest', 0) or item.get('oi', 0) or 0)
         
         if opt_type in ['PE', 'PUT']:
@@ -187,7 +185,7 @@ def calculate_pcr(option_chain_data, spot_price, step, strike_range_limit=None):
     pcr_val = total_put_oi / total_call_oi
     return round(pcr_val, 2)
 
-# --- TECHNICAL INDICATORS & DIVERGENCE ENGINE ---
+# --- TECHNICAL INDICATORS & ACCURATE DIVERGENCE ENGINE ---
 def calculate_chart_indicators(candles):
     if not candles or len(candles) < 26:
         return {}, "BB (20,2) : N/A", "MACD (12,26,9) : N/A", "RSI (14) Divergence : N/A", [], [], []
@@ -245,38 +243,63 @@ def calculate_chart_indicators(candles):
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # Divergence Identification Algorithm
+    # --- REFINED DIVERGENCE DETECTION LOGIC ---
     price_divergence_points = [None] * len(df)
     macd_divergence_points = [None] * len(df)
     rsi_divergence_points = [None] * len(df)
     rsi_status = "RSI (14) Divergence : None"
 
-    window = 3
-    if len(df) >= 30:
-        for i in range(window + 10, len(df) - 1):
-            # Check for local price highs & RSI/MACD lower highs (Bearish Divergence)
-            if df['close'].iloc[i] > df['close'].iloc[i-window:i].max() and df['close'].iloc[i] > df['close'].iloc[i+1:i+window+1].max():
-                prev_high_idx = df['close'].iloc[i-15:i-window].idxmax()
-                if not pd.isna(prev_high_idx):
-                    if df['close'].iloc[i] > df['close'].loc[prev_high_idx]:
-                        if df['rsi'].iloc[i] < df['rsi'].loc[prev_high_idx]:
-                            rsi_status = "RSI (14) Divergence : Bearish Divergence"
-                            rsi_divergence_points[i] = round(df['rsi'].iloc[i], 2)
-                            price_divergence_points[i] = round(df['close'].iloc[i], 2)
-                        if df['macd'].iloc[i] < df['macd'].loc[prev_high_idx]:
-                            macd_divergence_points[i] = round(df['macd'].iloc[i], 2)
+    w = 3 # Swing window
+    peaks = []
+    troughs = []
 
-            # Check for local price lows & RSI/MACD higher lows (Bullish Divergence)
-            if df['close'].iloc[i] < df['close'].iloc[i-window:i].min() and df['close'].iloc[i] < df['close'].iloc[i+1:i+window+1].min():
-                prev_low_idx = df['close'].iloc[i-15:i-window].idxmin()
-                if not pd.isna(prev_low_idx):
-                    if df['close'].iloc[i] < df['close'].loc[prev_low_idx]:
-                        if df['rsi'].iloc[i] > df['rsi'].loc[prev_low_idx]:
-                            rsi_status = "RSI (14) Divergence : Bullish Divergence"
-                            rsi_divergence_points[i] = round(df['rsi'].iloc[i], 2)
-                            price_divergence_points[i] = round(df['close'].iloc[i], 2)
-                        if df['macd'].iloc[i] > df['macd'].loc[prev_low_idx]:
-                            macd_divergence_points[i] = round(df['macd'].iloc[i], 2)
+    # Find genuine swing highs (peaks) and swing lows (troughs)
+    for i in range(w, len(df) - w):
+        if df['close'].iloc[i] == df['close'].iloc[i-w:i+w+1].max():
+            peaks.append(i)
+        if df['close'].iloc[i] == df['close'].iloc[i-w:i+w+1].min():
+            troughs.append(i)
+
+    # Detect Bearish Divergence (Higher High in Price, Lower High in RSI/MACD)
+    for k in range(1, len(peaks)):
+        curr_p = peaks[k]
+        prev_p = peaks[k-1]
+
+        # Ensure peaks are reasonable distance apart (between 5 and 35 bars)
+        if 5 <= (curr_p - prev_p) <= 35:
+            price_hh = df['close'].iloc[curr_p] > df['close'].iloc[prev_p]
+            rsi_lh = df['rsi'].iloc[curr_p] < df['rsi'].iloc[prev_p]
+            macd_lh = df['macd'].iloc[curr_p] < df['macd'].iloc[prev_p]
+
+            if price_hh and rsi_lh:
+                rsi_divergence_points[curr_p] = round(df['rsi'].iloc[curr_p], 2)
+                price_divergence_points[curr_p] = round(df['close'].iloc[curr_p], 2)
+                rsi_status = "RSI (14) Divergence : Bearish Divergence"
+
+            if price_hh and macd_lh:
+                macd_divergence_points[curr_p] = round(df['macd'].iloc[curr_p], 2)
+                if price_divergence_points[curr_p] is None:
+                    price_divergence_points[curr_p] = round(df['close'].iloc[curr_p], 2)
+
+    # Detect Bullish Divergence (Lower Low in Price, Higher Low in RSI/MACD)
+    for k in range(1, len(troughs)):
+        curr_t = troughs[k]
+        prev_t = troughs[k-1]
+
+        if 5 <= (curr_t - prev_t) <= 35:
+            price_ll = df['close'].iloc[curr_t] < df['close'].iloc[prev_t]
+            rsi_hl = df['rsi'].iloc[curr_t] > df['rsi'].iloc[prev_t]
+            macd_hl = df['macd'].iloc[curr_t] > df['macd'].iloc[prev_t]
+
+            if price_ll and rsi_hl:
+                rsi_divergence_points[curr_t] = round(df['rsi'].iloc[curr_t], 2)
+                price_divergence_points[curr_t] = round(df['close'].iloc[curr_t], 2)
+                rsi_status = "RSI (14) Divergence : Bullish Divergence"
+
+            if price_ll and macd_hl:
+                macd_divergence_points[curr_t] = round(df['macd'].iloc[curr_t], 2)
+                if price_divergence_points[curr_t] is None:
+                    price_divergence_points[curr_t] = round(df['close'].iloc[curr_t], 2)
 
     def clean_series(series):
         return [None if np.isnan(val) else round(float(val), 2) for val in series]
@@ -744,7 +767,7 @@ HTML_TEMPLATE = r"""
         .subchart-title {
             font-size: 11px;
             color: #aaa;
-            margin: 8px 0 2px 0;
+            margin: 12px 0 2px 0;
             font-weight: bold;
         }
     </style>
@@ -852,10 +875,10 @@ HTML_TEMPLATE = r"""
 
                 <!-- Subcharts for MACD and RSI -->
                 <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator with Divergence Points</div>
-                <canvas id="macdChart" height="35"></canvas>
+                <canvas id="macdChart" height="40"></canvas>
 
                 <div class="subchart-title">RSI (14) Indicator with Divergence Points</div>
-                <canvas id="rsiChart" height="30"></canvas>
+                <canvas id="rsiChart" height="70"></canvas>
             </div>
 
             <div class="card">
@@ -927,7 +950,7 @@ HTML_TEMPLATE = r"""
             }
         });
 
-        // 2. Separate MACD Sub-Chart (12, 26, 9 EMA)
+        // 2. MACD Sub-Chart
         const ctxMACD = document.getElementById('macdChart').getContext('2d');
         macdChart = new Chart(ctxMACD, {
             type: 'bar',
@@ -937,7 +960,7 @@ HTML_TEMPLATE = r"""
                     { type: 'line', label: 'MACD (12, 26)', data: [], borderColor: '#2196f3', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
                     { type: 'line', label: 'Signal (9 EMA)', data: [], borderColor: '#ff9800', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
                     { type: 'bar', label: 'MACD Hist', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' },
-                    { type: 'line', label: 'MACD Divergence', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 4, showLine: false }
+                    { type: 'line', label: 'MACD Divergence', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 5, pointStyle: 'rectRot', showLine: false }
                 ]
             },
             options: {
@@ -950,23 +973,29 @@ HTML_TEMPLATE = r"""
             }
         });
 
-        // 3. Separate RSI Sub-Chart
+        // 3. RSI Sub-Chart (Taller Height & Better Scaling)
         const ctxRSI = document.getElementById('rsiChart').getContext('2d');
         rsiChart = new Chart(ctxRSI, {
             type: 'line',
             data: {
                 labels: [],
                 datasets: [
-                    { label: 'RSI (14)', data: [], borderColor: '#e91e63', borderWidth: 1.5, pointRadius: 0, spanGaps: true },
-                    { label: 'RSI Divergence', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 4, showLine: false }
+                    { label: 'RSI (14)', data: [], borderColor: '#e91e63', borderWidth: 1.8, pointRadius: 0, tension: 0.1, spanGaps: true },
+                    { label: 'RSI Divergence', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 5, pointStyle: 'rectRot', showLine: false }
                 ]
             },
             options: {
                 animation: false,
                 responsive: true,
+                maintainAspectRatio: false,
                 scales: {
-                    y: { min: 0, max: 100, grid: { color: '#2a2a2a' }, ticks: { stepSize: 30 } },
-                    x: { grid: { color: '#2a2a2a' } }
+                    y: { 
+                        suggestedMin: 10, 
+                        suggestedMax: 90, 
+                        grid: { color: '#2a2a2a' }, 
+                        ticks: { stepSize: 20, color: '#aaa' } 
+                    },
+                    x: { grid: { color: '#2a2a2a' }, ticks: { color: '#888' } }
                 }
             }
         });
@@ -1022,7 +1051,7 @@ HTML_TEMPLATE = r"""
                     data.expiries.forEach((exp, idx) => {
                         let opt = document.createElement('option');
                         opt.value = exp; opt.textContent = exp;
-                        if(idx === 0) opt.selected = true;
+                        if(idx === 0) opt.selected = true; // Auto Select Nearest Expiry
                         select.appendChild(opt);
                     });
                     loadChain();
@@ -1370,9 +1399,25 @@ def fetch_expiries():
     symbol = data.get('symbol', 'NIFTY')
 
     filtered = INSTRUMENT_DF[INSTRUMENT_DF['name'] == symbol]
-    expiries = sorted(filtered['expiry'].unique().tolist())
+    raw_expiries = filtered['expiry'].unique().tolist()
+
+    # --- CHRONOLOGICAL EXPIRY SORTING ENGINE ---
+    parsed_expiries = []
+    now_date = datetime.now(IST).date()
+
+    for exp in raw_expiries:
+        try:
+            exp_date = datetime.strptime(exp, "%d%b%Y").date()
+            if exp_date >= now_date:
+                parsed_expiries.append((exp_date, exp))
+        except Exception:
+            pass
+
+    # Sort strictly by calendar date ascending (nearest date first)
+    parsed_expiries.sort(key=lambda x: x[0])
+    sorted_expiries = [item[1] for item in parsed_expiries]
     
-    return jsonify({"expiries": expiries, "status": "API connection success"})
+    return jsonify({"expiries": sorted_expiries, "status": "API connection success"})
 
 @app.route('/api/fetch-chain', methods=['POST'])
 def fetch_chain():
@@ -1426,7 +1471,6 @@ def live_data():
     except Exception as e:
         return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
 
-    # Fetch 5 days worth of candles to satisfy Bollinger Bands, RSI, MACD requirements
     from_date, to_date = get_last_trading_day_dates(num_days=5)
 
     chart_labels, chart_prices = [], []
@@ -1453,7 +1497,6 @@ def live_data():
     if selected_expiry:
         option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
 
-    # Compute PCR
     pcr_value = calculate_pcr(option_chain_data, spot_price, idx_info['step'], pcr_strike_range)
 
     atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(
