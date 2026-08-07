@@ -185,10 +185,10 @@ def calculate_pcr(option_chain_data, spot_price, step, strike_range_limit=None):
     pcr_val = total_put_oi / total_call_oi
     return round(pcr_val, 2)
 
-# --- TECHNICAL INDICATORS & ACCURATE DIVERGENCE ENGINE ---
+# --- TECHNICAL INDICATORS ENGINE ---
 def calculate_chart_indicators(candles):
     if not candles or len(candles) < 26:
-        return {}, "BB (20,2) : N/A", "MACD (12,26,9) : N/A", "RSI (14) Divergence : N/A", [], [], []
+        return {}, "BB (20,2) : N/A", "MACD (12,26,9) : N/A", "RSI (14) : N/A"
 
     df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['close'] = df['close'].astype(float)
@@ -243,63 +243,13 @@ def calculate_chart_indicators(candles):
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # --- REFINED DIVERGENCE DETECTION LOGIC ---
-    price_divergence_points = [None] * len(df)
-    macd_divergence_points = [None] * len(df)
-    rsi_divergence_points = [None] * len(df)
-    rsi_status = "RSI (14) Divergence : None"
-
-    w = 3 # Swing window
-    peaks = []
-    troughs = []
-
-    # Find genuine swing highs (peaks) and swing lows (troughs)
-    for i in range(w, len(df) - w):
-        if df['close'].iloc[i] == df['close'].iloc[i-w:i+w+1].max():
-            peaks.append(i)
-        if df['close'].iloc[i] == df['close'].iloc[i-w:i+w+1].min():
-            troughs.append(i)
-
-    # Detect Bearish Divergence (Higher High in Price, Lower High in RSI/MACD)
-    for k in range(1, len(peaks)):
-        curr_p = peaks[k]
-        prev_p = peaks[k-1]
-
-        # Ensure peaks are reasonable distance apart (between 5 and 35 bars)
-        if 5 <= (curr_p - prev_p) <= 35:
-            price_hh = df['close'].iloc[curr_p] > df['close'].iloc[prev_p]
-            rsi_lh = df['rsi'].iloc[curr_p] < df['rsi'].iloc[prev_p]
-            macd_lh = df['macd'].iloc[curr_p] < df['macd'].iloc[prev_p]
-
-            if price_hh and rsi_lh:
-                rsi_divergence_points[curr_p] = round(df['rsi'].iloc[curr_p], 2)
-                price_divergence_points[curr_p] = round(df['close'].iloc[curr_p], 2)
-                rsi_status = "RSI (14) Divergence : Bearish Divergence"
-
-            if price_hh and macd_lh:
-                macd_divergence_points[curr_p] = round(df['macd'].iloc[curr_p], 2)
-                if price_divergence_points[curr_p] is None:
-                    price_divergence_points[curr_p] = round(df['close'].iloc[curr_p], 2)
-
-    # Detect Bullish Divergence (Lower Low in Price, Higher Low in RSI/MACD)
-    for k in range(1, len(troughs)):
-        curr_t = troughs[k]
-        prev_t = troughs[k-1]
-
-        if 5 <= (curr_t - prev_t) <= 35:
-            price_ll = df['close'].iloc[curr_t] < df['close'].iloc[prev_t]
-            rsi_hl = df['rsi'].iloc[curr_t] > df['rsi'].iloc[prev_t]
-            macd_hl = df['macd'].iloc[curr_t] > df['macd'].iloc[prev_t]
-
-            if price_ll and rsi_hl:
-                rsi_divergence_points[curr_t] = round(df['rsi'].iloc[curr_t], 2)
-                price_divergence_points[curr_t] = round(df['close'].iloc[curr_t], 2)
-                rsi_status = "RSI (14) Divergence : Bullish Divergence"
-
-            if price_ll and macd_hl:
-                macd_divergence_points[curr_t] = round(df['macd'].iloc[curr_t], 2)
-                if price_divergence_points[curr_t] is None:
-                    price_divergence_points[curr_t] = round(df['close'].iloc[curr_t], 2)
+    curr_rsi = df['rsi'].dropna().iloc[-1] if not df['rsi'].dropna().empty else 50
+    if curr_rsi >= 70:
+        rsi_status = f"RSI (14) : Overbought ({round(curr_rsi, 1)})"
+    elif curr_rsi <= 30:
+        rsi_status = f"RSI (14) : Oversold ({round(curr_rsi, 1)})"
+    else:
+        rsi_status = f"RSI (14) : Neutral ({round(curr_rsi, 1)})"
 
     def clean_series(series):
         return [None if np.isnan(val) else round(float(val), 2) for val in series]
@@ -314,7 +264,7 @@ def calculate_chart_indicators(candles):
         "rsi": clean_series(df['rsi'])
     }
 
-    return indicator_series, bb_status, macd_status, rsi_status, price_divergence_points, macd_divergence_points, rsi_divergence_points
+    return indicator_series, bb_status, macd_status, rsi_status
 
 # --- BLACK-SCHOLES IV & GREEKS ENGINE ---
 def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_type='CE'):
@@ -770,6 +720,13 @@ HTML_TEMPLATE = r"""
             margin: 12px 0 2px 0;
             font-weight: bold;
         }
+
+        /* Container to fix RSI infinite Y-axis elongation bug */
+        .rsi-wrapper {
+            position: relative;
+            height: 120px;
+            width: 100%;
+        }
     </style>
 </head>
 <body>
@@ -846,12 +803,12 @@ HTML_TEMPLATE = r"""
                 <div id="indicatorRibbon" class="indicator-ribbon">
                     <span id="ribbonBB" class="ribbon-item">BB (20,2) : -</span>
                     <span id="ribbonMACD" class="ribbon-item">MACD (12,26,9) : -</span>
-                    <span id="ribbonRSI" class="ribbon-item">RSI (14) Divergence : -</span>
+                    <span id="ribbonRSI" class="ribbon-item">RSI (14) : -</span>
                 </div>
 
                 <div class="header-flex">
                     <h3>Index Price & Bollinger Bands (20, 2)</h3>
-                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 250px;">
+                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 200px;">
                         <div class="pcr-control-box" title="Blank or 0 = Entire Option Chain">
                             <span>PCR &plusmn; Range:</span>
                             <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50">
@@ -874,11 +831,13 @@ HTML_TEMPLATE = r"""
                 <canvas id="mainChart" height="90"></canvas>
 
                 <!-- Subcharts for MACD and RSI -->
-                <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator with Divergence Points</div>
+                <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator</div>
                 <canvas id="macdChart" height="40"></canvas>
 
-                <div class="subchart-title">RSI (14) Indicator with Divergence Points</div>
-                <canvas id="rsiChart" height="70"></canvas>
+                <div class="subchart-title">RSI (14) Indicator</div>
+                <div class="rsi-wrapper">
+                    <canvas id="rsiChart"></canvas>
+                </div>
             </div>
 
             <div class="card">
@@ -936,8 +895,7 @@ HTML_TEMPLATE = r"""
                     { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true },
                     { label: 'BB Upper (20,2)', data: [], borderColor: 'rgba(255, 82, 82, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
                     { label: 'BB Middle SMA (20)', data: [], borderColor: 'rgba(255, 202, 40, 0.8)', borderWidth: 1, pointRadius: 0, spanGaps: true },
-                    { label: 'BB Lower (20,2)', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
-                    { label: 'Divergence Marker', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 5, pointStyle: 'rectRot', showLine: false }
+                    { label: 'BB Lower (20,2)', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true }
                 ] 
             },
             options: { 
@@ -959,8 +917,7 @@ HTML_TEMPLATE = r"""
                 datasets: [
                     { type: 'line', label: 'MACD (12, 26)', data: [], borderColor: '#2196f3', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
                     { type: 'line', label: 'Signal (9 EMA)', data: [], borderColor: '#ff9800', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
-                    { type: 'bar', label: 'MACD Hist', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' },
-                    { type: 'line', label: 'MACD Divergence', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 5, pointStyle: 'rectRot', showLine: false }
+                    { type: 'bar', label: 'MACD Hist', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' }
                 ]
             },
             options: {
@@ -973,15 +930,14 @@ HTML_TEMPLATE = r"""
             }
         });
 
-        // 3. RSI Sub-Chart (Taller Height & Better Scaling)
+        // 3. RSI Sub-Chart Fixed Bounds
         const ctxRSI = document.getElementById('rsiChart').getContext('2d');
         rsiChart = new Chart(ctxRSI, {
             type: 'line',
             data: {
                 labels: [],
                 datasets: [
-                    { label: 'RSI (14)', data: [], borderColor: '#e91e63', borderWidth: 1.8, pointRadius: 0, tension: 0.1, spanGaps: true },
-                    { label: 'RSI Divergence', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 5, pointStyle: 'rectRot', showLine: false }
+                    { label: 'RSI (14)', data: [], borderColor: '#e91e63', borderWidth: 1.8, pointRadius: 0, tension: 0.1, spanGaps: true }
                 ]
             },
             options: {
@@ -990,8 +946,8 @@ HTML_TEMPLATE = r"""
                 maintainAspectRatio: false,
                 scales: {
                     y: { 
-                        suggestedMin: 10, 
-                        suggestedMax: 90, 
+                        min: 0, 
+                        max: 100, 
                         grid: { color: '#2a2a2a' }, 
                         ticks: { stepSize: 20, color: '#aaa' } 
                     },
@@ -1051,7 +1007,7 @@ HTML_TEMPLATE = r"""
                     data.expiries.forEach((exp, idx) => {
                         let opt = document.createElement('option');
                         opt.value = exp; opt.textContent = exp;
-                        if(idx === 0) opt.selected = true; // Auto Select Nearest Expiry
+                        if(idx === 0) opt.selected = true;
                         select.appendChild(opt);
                     });
                     loadChain();
@@ -1227,22 +1183,19 @@ HTML_TEMPLATE = r"""
                         mainChart.data.datasets[1].data = data.indicators.bb_upper || [];
                         mainChart.data.datasets[2].data = data.indicators.bb_middle || [];
                         mainChart.data.datasets[3].data = data.indicators.bb_lower || [];
-                        mainChart.data.datasets[4].data = data.price_divergences || [];
 
                         // Plot MACD Subchart
                         macdChart.data.datasets[0].data = data.indicators.macd || [];
                         macdChart.data.datasets[1].data = data.indicators.macd_signal || [];
                         macdChart.data.datasets[2].data = data.indicators.macd_hist || [];
-                        macdChart.data.datasets[3].data = data.macd_divergences || [];
 
                         // Plot RSI Subchart
                         rsiChart.data.datasets[0].data = data.indicators.rsi || [];
-                        rsiChart.data.datasets[1].data = data.rsi_divergences || [];
                     }
 
                     const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
 
-                    let baseDatasets = mainChart.data.datasets.slice(0, 5);
+                    let baseDatasets = mainChart.data.datasets.slice(0, 4);
                     if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
                         targetBasket.legs.forEach((leg, lIdx) => {
                             let strikeVal = parseFloat(leg.strike);
@@ -1413,7 +1366,6 @@ def fetch_expiries():
         except Exception:
             pass
 
-    # Sort strictly by calendar date ascending (nearest date first)
     parsed_expiries.sort(key=lambda x: x[0])
     sorted_expiries = [item[1] for item in parsed_expiries]
     
@@ -1491,7 +1443,7 @@ def live_data():
     except Exception:
         pass
 
-    indicators, bb_status, macd_status, rsi_status, price_divs, macd_divs, rsi_divs = calculate_chart_indicators(index_candles)
+    indicators, bb_status, macd_status, rsi_status = calculate_chart_indicators(index_candles)
 
     option_chain_data = []
     if selected_expiry:
@@ -1705,9 +1657,6 @@ def live_data():
         "bb_status": bb_status,
         "macd_status": macd_status,
         "rsi_status": rsi_status,
-        "price_divergences": price_divs,
-        "macd_divergences": macd_divs,
-        "rsi_divergences": rsi_divs,
         "baskets": processed_baskets
     })
 
