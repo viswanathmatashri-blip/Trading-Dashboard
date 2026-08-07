@@ -20,7 +20,7 @@ PIN = os.environ.get("PIN")
 TOTP_SECRET = os.environ.get("TOTP_SECRET")
 
 IST = timezone(timedelta(hours=5, minutes=30))
-RISK_FREE_RATE = 0.065  # Standard Risk-Free Rate (~6.5%)
+RISK_FREE_RATE = 0.065
 
 INDEX_TOKENS = {
     "NIFTY": {"exchange": "NSE", "tradingsymbol": "NIFTY", "token": "99926000", "step": 50},
@@ -147,9 +147,9 @@ def fetch_option_chain_data(smart_api, symbol, expiry):
         pass
     return []
 
-# --- TECHNICAL INDICATORS ENGINE ---
+# --- FIXED TECHNICAL INDICATORS ENGINE ---
 def calculate_chart_indicators(candles):
-    """Calculates Bollinger Bands, MACD, and RSI Divergence metrics."""
+    """Calculates Bollinger Bands, MACD, and RSI without zero-padding bugs."""
     if not candles or len(candles) < 26:
         return {}, "BB Status : N/A", "MACD : N/A", "RSI divergence status : N/A"
 
@@ -165,16 +165,16 @@ def calculate_chart_indicators(candles):
     df['bb_lower'] = df['sma20'] - (df['std20'] * 2)
     df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['sma20']
 
-    # BB Status
-    recent_width = df['bb_width'].iloc[-1]
-    avg_width = df['bb_width'].tail(20).mean()
+    # Status checks
+    recent_width = df['bb_width'].dropna().iloc[-1] if not df['bb_width'].dropna().empty else 0
+    avg_width = df['bb_width'].dropna().tail(20).mean() if not df['bb_width'].dropna().empty else 0
     latest_close = df['close'].iloc[-1]
     
-    if recent_width < (avg_width * 0.75):
+    if recent_width > 0 and recent_width < (avg_width * 0.75):
         bb_status = "BB Status : Squeeze active"
-    elif latest_close >= df['bb_upper'].iloc[-1]:
+    elif not df['bb_upper'].dropna().empty and latest_close >= df['bb_upper'].dropna().iloc[-1]:
         bb_status = "BB Status : Upper Breakout"
-    elif latest_close <= df['bb_lower'].iloc[-1]:
+    elif not df['bb_lower'].dropna().empty and latest_close <= df['bb_lower'].dropna().iloc[-1]:
         bb_status = "BB Status : Lower Breakdown"
     else:
         bb_status = "BB Status : Normal"
@@ -186,7 +186,6 @@ def calculate_chart_indicators(candles):
     df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
     df['macd_hist'] = df['macd'] - df['macd_signal']
 
-    # MACD Status
     curr_macd = df['macd'].iloc[-1]
     curr_signal = df['macd_signal'].iloc[-1]
     prev_macd = df['macd'].iloc[-2]
@@ -201,39 +200,40 @@ def calculate_chart_indicators(candles):
     else:
         macd_status = "MACD : Downtrend Continuation"
 
-    # 3. RSI (14) & RSI Divergence Detection
+    # 3. RSI (14) & Divergence
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # RSI Divergence Status
     rsi_status = "RSI divergence status : None"
     if len(df) >= 14:
         p_curr, p_prev = df['close'].iloc[-1], df['close'].iloc[-5]
-        r_curr, r_prev = df['rsi'].iloc[-1], df['rsi'].iloc[-5]
+        r_curr, r_prev = df['rsi'].dropna().iloc[-1], df['rsi'].dropna().iloc[-5] if len(df['rsi'].dropna()) >= 5 else (0, 0)
 
         if p_curr > p_prev and r_curr < r_prev:
             rsi_status = "RSI divergence status : Bearish Divergence"
         elif p_curr < p_prev and r_curr > r_prev:
             rsi_status = "RSI divergence status : Bullish Divergence"
 
+    def clean_series(series):
+        return [None if np.isnan(val) else round(float(val), 2) for val in series]
+
     indicator_series = {
-        "bb_upper": df['bb_upper'].fillna(0).tolist(),
-        "bb_middle": df['sma20'].fillna(0).tolist(),
-        "bb_lower": df['bb_lower'].fillna(0).tolist(),
-        "macd": df['macd'].fillna(0).tolist(),
-        "macd_signal": df['macd_signal'].fillna(0).tolist(),
-        "macd_hist": df['macd_hist'].fillna(0).tolist(),
-        "rsi": df['rsi'].fillna(0).tolist()
+        "bb_upper": clean_series(df['bb_upper']),
+        "bb_middle": clean_series(df['sma20']),
+        "bb_lower": clean_series(df['bb_lower']),
+        "macd": clean_series(df['macd']),
+        "macd_signal": clean_series(df['macd_signal']),
+        "macd_hist": clean_series(df['macd_hist']),
+        "rsi": clean_series(df['rsi'])
     }
 
     return indicator_series, bb_status, macd_status, rsi_status
 
 # --- BLACK-SCHOLES IV & GREEKS ENGINE ---
 def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_type='CE'):
-    """Calculates IV dynamically from Option LTP using Newton-Raphson inversion."""
     if market_price <= 0 or spot <= 0 or strike <= 0 or t_years <= 0:
         return None
 
@@ -241,7 +241,7 @@ def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_typ
     if market_price <= intrinsic:
         return None
 
-    sigma = 0.15  # Initial guess (15%)
+    sigma = 0.15
     for _ in range(20):
         d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * math.sqrt(t_years))
         d2 = d1 - sigma * math.sqrt(t_years)
@@ -252,8 +252,8 @@ def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_typ
             price = strike * math.exp(-r * t_years) * norm.cdf(-d2) - spot * norm.cdf(-d1)
 
         vega = spot * norm.pdf(d1) * math.sqrt(t_years)
-        
         diff = price - market_price
+        
         if abs(diff) < 1e-4:
             return round(sigma * 100.0, 2)
             
@@ -275,7 +275,6 @@ def calculate_black_scholes_greeks(spot, strike, t_years, iv_pct, opt_type='CE')
 
     d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
     d2 = d1 - sigma * math.sqrt(t)
-
     pdf_d1 = norm.pdf(d1)
     
     gamma = pdf_d1 / (spot * sigma * math.sqrt(t))
@@ -300,7 +299,6 @@ def calculate_black_scholes_greeks(spot, strike, t_years, iv_pct, opt_type='CE')
 
 def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike, opt_type, expiry_str, symbol="NIFTY"):
     atm_strike = round(spot_price / step) * step
-    
     now = datetime.now(IST)
     try:
         exp_dt = datetime.strptime(expiry_str, "%d%b%Y").replace(hour=15, minute=30, tzinfo=IST)
@@ -368,7 +366,6 @@ def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike,
             pass
 
     atm_iv = atm_iv if atm_iv is not None else 10.0
-
     leg_greeks = calculate_black_scholes_greeks(spot_price, strike, t_years, atm_iv, opt_type)
     return round(atm_iv, 2), leg_greeks
 
@@ -566,7 +563,6 @@ HTML_TEMPLATE = r"""
         .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-bottom: 15px; }
         .chart-container-relative { position: relative; }
 
-        /* Indicator Status Ribbon on Top Right of Chart */
         .indicator-ribbon {
             position: absolute;
             top: 12px;
@@ -643,6 +639,13 @@ HTML_TEMPLATE = r"""
             margin-left: 8px;
             display: inline-flex;
             align-items: center;
+        }
+
+        .subchart-title {
+            font-size: 11px;
+            color: #aaa;
+            margin: 8px 0 2px 0;
+            font-weight: bold;
         }
     </style>
 </head>
@@ -723,7 +726,7 @@ HTML_TEMPLATE = r"""
                 </div>
 
                 <div class="header-flex">
-                    <h3>Index Strategy Chart & Indicators</h3>
+                    <h3>Index Price & Bollinger Bands</h3>
                     <div style="display: flex; gap: 10px; align-items: center; margin-right: 220px;">
                         <div>
                             <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Candle Timeframe:</label>
@@ -736,7 +739,14 @@ HTML_TEMPLATE = r"""
                         </div>
                     </div>
                 </div>
-                <canvas id="mainChart" height="100"></canvas>
+                <canvas id="mainChart" height="90"></canvas>
+
+                <!-- Subcharts for MACD and RSI -->
+                <div class="subchart-title">MACD Indicator</div>
+                <canvas id="macdChart" height="35"></canvas>
+
+                <div class="subchart-title">RSI (14) Indicator</div>
+                <canvas id="rsiChart" height="30"></canvas>
             </div>
 
             <div class="card">
@@ -771,7 +781,7 @@ HTML_TEMPLATE = r"""
         let selectedChartBasketId = null;
         let showStrikesPerBasket = {};
         let deletedBasketIds = new Set();
-        let mainChart, legsChart;
+        let mainChart, macdChart, rsiChart, legsChart;
         let refreshTimer = null;
 
         const CHART_COLORS = ['#00bcd4', '#ff9800', '#e91e63', '#4caf50', '#9c27b0', '#ffeb3b'];
@@ -784,25 +794,72 @@ HTML_TEMPLATE = r"""
             if (type === 'warn') pill.classList.add('pill-warn');
         }
 
+        // 1. Main Price & Bollinger Bands Chart
         const ctx = document.getElementById('mainChart').getContext('2d');
         mainChart = new Chart(ctx, {
             type: 'line',
             data: { 
                 labels: [], 
                 datasets: [
-                    { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, tension: 0.1, fill: { target: 'origin', above: 'rgba(0,255,136,0.08)', below: 'rgba(255,82,82,0.08)' } },
-                    { label: 'BB Upper', data: [], borderColor: 'rgba(255, 82, 82, 0.6)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0 },
-                    { label: 'BB Middle', data: [], borderColor: 'rgba(255, 202, 40, 0.6)', borderWidth: 1, pointRadius: 0 },
-                    { label: 'BB Lower', data: [], borderColor: 'rgba(76, 175, 80, 0.6)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0 }
+                    { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true },
+                    { label: 'BB Upper', data: [], borderColor: 'rgba(255, 82, 82, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
+                    { label: 'BB Middle', data: [], borderColor: 'rgba(255, 202, 40, 0.8)', borderWidth: 1, pointRadius: 0, spanGaps: true },
+                    { label: 'BB Lower', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true }
                 ] 
             },
             options: { 
                 animation: false,
                 responsive: true,
-                scales: { y: { display: true, position: 'left', grid: { color: '#2a2a2a' } } }
+                scales: { 
+                    y: { display: true, position: 'left', grid: { color: '#2a2a2a' } },
+                    x: { grid: { color: '#2a2a2a' } }
+                }
             }
         });
 
+        // 2. Separate MACD Sub-Chart
+        const ctxMACD = document.getElementById('macdChart').getContext('2d');
+        macdChart = new Chart(ctxMACD, {
+            type: 'bar',
+            data: {
+                labels: [],
+                datasets: [
+                    { type: 'line', label: 'MACD', data: [], borderColor: '#2196f3', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
+                    { type: 'line', label: 'Signal', data: [], borderColor: '#ff9800', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
+                    { type: 'bar', label: 'Histogram', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' }
+                ]
+            },
+            options: {
+                animation: false,
+                responsive: true,
+                scales: {
+                    y: { grid: { color: '#2a2a2a' } },
+                    x: { display: false }
+                }
+            }
+        });
+
+        // 3. Separate RSI Sub-Chart
+        const ctxRSI = document.getElementById('rsiChart').getContext('2d');
+        rsiChart = new Chart(ctxRSI, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    { label: 'RSI (14)', data: [], borderColor: '#e91e63', borderWidth: 1.5, pointRadius: 0, spanGaps: true }
+                ]
+            },
+            options: {
+                animation: false,
+                responsive: true,
+                scales: {
+                    y: { min: 0, max: 100, grid: { color: '#2a2a2a' }, ticks: { stepSize: 30 } },
+                    x: { grid: { color: '#2a2a2a' } }
+                }
+            }
+        });
+
+        // 4. Basket Option Premiums Chart
         const ctxLegs = document.getElementById('legsPremiumChart').getContext('2d');
         legsChart = new Chart(ctxLegs, {
             type: 'line',
@@ -1001,7 +1058,7 @@ HTML_TEMPLATE = r"""
                 document.getElementById('stExpiryMove').innerText = "±" + data.expected_expiry_move + " pts";
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Last Trading Day Data)";
 
-                // Update Indicator Ribbon Metrics
+                // Update Header Ribbon
                 document.getElementById('ribbonBB').innerText = data.bb_status;
                 document.getElementById('ribbonMACD').innerText = data.macd_status;
                 document.getElementById('ribbonRSI').innerText = data.rsi_status;
@@ -1010,23 +1067,26 @@ HTML_TEMPLATE = r"""
 
                 if (data.chart_labels && data.chart_labels.length > 0) {
                     mainChart.data.labels = data.chart_labels;
-                    mainChart.data.datasets[0].data = data.chart_prices;
+                    macdChart.data.labels = data.chart_labels;
+                    rsiChart.data.labels = data.chart_labels;
 
-                    // Plot Bollinger Bands
+                    // Plot Main Price Chart & Bollinger Bands
+                    mainChart.data.datasets[0].data = data.chart_prices;
                     if (data.indicators) {
                         mainChart.data.datasets[1].data = data.indicators.bb_upper || [];
                         mainChart.data.datasets[2].data = data.indicators.bb_middle || [];
                         mainChart.data.datasets[3].data = data.indicators.bb_lower || [];
+
+                        // Plot MACD Subchart
+                        macdChart.data.datasets[0].data = data.indicators.macd || [];
+                        macdChart.data.datasets[1].data = data.indicators.macd_signal || [];
+                        macdChart.data.datasets[2].data = data.indicators.macd_hist || [];
+
+                        // Plot RSI Subchart
+                        rsiChart.data.datasets[0].data = data.indicators.rsi || [];
                     }
 
                     const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
-                    const isProfitable = targetBasket ? targetBasket.basket_pnl >= 0 : true;
-                    
-                    mainChart.data.datasets[0].fill = {
-                        target: 'origin',
-                        above: isProfitable ? 'rgba(0,255,136,0.12)' : 'rgba(0,255,136,0.03)',
-                        below: !isProfitable ? 'rgba(255,82,82,0.12)' : 'rgba(255,82,82,0.03)'
-                    };
 
                     let baseDatasets = mainChart.data.datasets.slice(0, 4);
                     if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
@@ -1039,13 +1099,17 @@ HTML_TEMPLATE = r"""
                                 borderDash: [4, 4],
                                 borderWidth: 1.2,
                                 pointRadius: 0,
-                                fill: false
+                                fill: false,
+                                spanGaps: true
                             };
                             baseDatasets.push(strikeDataset);
                         });
                     }
                     mainChart.data.datasets = baseDatasets;
+
                     mainChart.update('none');
+                    macdChart.update('none');
+                    rsiChart.update('none');
                 }
 
                 const container = document.getElementById('basketsContainer');
@@ -1148,7 +1212,8 @@ HTML_TEMPLATE = r"""
                             pointRadius: 0,
                             pointHoverRadius: 4,
                             fill: { target: 'origin', above: isPositivePnl ? 'rgba(0,255,136,0.1)' : 'rgba(0,255,136,0.03)', below: !isPositivePnl ? 'rgba(255,82,82,0.1)' : 'rgba(255,82,82,0.03)' },
-                            tension: 0.1
+                            tension: 0.1,
+                            spanGaps: true
                         });
                     });
                 }
@@ -1255,7 +1320,6 @@ def live_data():
     except Exception:
         pass
 
-    # Calculate indicators & ribbon statuses
     indicators, bb_status, macd_status, rsi_status = calculate_chart_indicators(index_candles)
 
     option_chain_data = []
@@ -1413,7 +1477,7 @@ def live_data():
                 }
             })
 
-            aligned_series = [leg_prices_map.get(ts, current_ltp if isinstance(current_ltp, (int, float)) else entry_price) for ts in master_timestamps]
+            aligned_series = [leg_prices_map.get(ts, None) for ts in master_timestamps]
             leg_series_data.append({
                 "label": f"{strike} {opt_type} ({action})",
                 "prices": aligned_series
