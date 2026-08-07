@@ -147,6 +147,90 @@ def fetch_option_chain_data(smart_api, symbol, expiry):
         pass
     return []
 
+# --- TECHNICAL INDICATORS ENGINE ---
+def calculate_chart_indicators(candles):
+    """Calculates Bollinger Bands, MACD, and RSI Divergence metrics."""
+    if not candles or len(candles) < 26:
+        return {}, "BB Status : N/A", "MACD : N/A", "RSI divergence status : N/A"
+
+    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+
+    # 1. Bollinger Bands (20, 2)
+    df['sma20'] = df['close'].rolling(window=20).mean()
+    df['std20'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['sma20'] + (df['std20'] * 2)
+    df['bb_lower'] = df['sma20'] - (df['std20'] * 2)
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['sma20']
+
+    # BB Status
+    recent_width = df['bb_width'].iloc[-1]
+    avg_width = df['bb_width'].tail(20).mean()
+    latest_close = df['close'].iloc[-1]
+    
+    if recent_width < (avg_width * 0.75):
+        bb_status = "BB Status : Squeeze active"
+    elif latest_close >= df['bb_upper'].iloc[-1]:
+        bb_status = "BB Status : Upper Breakout"
+    elif latest_close <= df['bb_lower'].iloc[-1]:
+        bb_status = "BB Status : Lower Breakdown"
+    else:
+        bb_status = "BB Status : Normal"
+
+    # 2. MACD (12, 26, 9)
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = df['ema12'] - df['ema26']
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+
+    # MACD Status
+    curr_macd = df['macd'].iloc[-1]
+    curr_signal = df['macd_signal'].iloc[-1]
+    prev_macd = df['macd'].iloc[-2]
+    prev_signal = df['macd_signal'].iloc[-2]
+
+    if prev_macd <= prev_signal and curr_macd > curr_signal:
+        macd_status = "MACD : Breakout - Uptrend"
+    elif prev_macd >= prev_signal and curr_macd < curr_signal:
+        macd_status = "MACD : Breakdown - Downtrend"
+    elif curr_macd > curr_signal:
+        macd_status = "MACD : Uptrend Continuation"
+    else:
+        macd_status = "MACD : Downtrend Continuation"
+
+    # 3. RSI (14) & RSI Divergence Detection
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    # RSI Divergence Status
+    rsi_status = "RSI divergence status : None"
+    if len(df) >= 14:
+        p_curr, p_prev = df['close'].iloc[-1], df['close'].iloc[-5]
+        r_curr, r_prev = df['rsi'].iloc[-1], df['rsi'].iloc[-5]
+
+        if p_curr > p_prev and r_curr < r_prev:
+            rsi_status = "RSI divergence status : Bearish Divergence"
+        elif p_curr < p_prev and r_curr > r_prev:
+            rsi_status = "RSI divergence status : Bullish Divergence"
+
+    indicator_series = {
+        "bb_upper": df['bb_upper'].fillna(0).tolist(),
+        "bb_middle": df['sma20'].fillna(0).tolist(),
+        "bb_lower": df['bb_lower'].fillna(0).tolist(),
+        "macd": df['macd'].fillna(0).tolist(),
+        "macd_signal": df['macd_signal'].fillna(0).tolist(),
+        "macd_hist": df['macd_hist'].fillna(0).tolist(),
+        "rsi": df['rsi'].fillna(0).tolist()
+    }
+
+    return indicator_series, bb_status, macd_status, rsi_status
+
 # --- BLACK-SCHOLES IV & GREEKS ENGINE ---
 def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_type='CE'):
     """Calculates IV dynamically from Option LTP using Newton-Raphson inversion."""
@@ -228,7 +312,6 @@ def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike,
     t_years = days_remaining / 365.0
     atm_iv = None
 
-    # Step 1: Read impliedVolatility directly from API option chain if available
     if option_chain:
         for item in option_chain:
             item_strike = float(item.get('strikePrice', 0) or 0)
@@ -238,7 +321,6 @@ def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike,
                     atm_iv = iv_val
                     break
 
-    # Step 2: Dynamically calculate IV from ATM Call & Put LTPs using Black-Scholes inversion
     if atm_iv is None and smart_api and INSTRUMENT_DF is not None:
         try:
             match_ce = INSTRUMENT_DF[
@@ -277,7 +359,6 @@ def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike,
         except Exception:
             pass
 
-    # Step 3: Fetch real-time INDIA VIX index LTP if option pricing is unavailable
     if atm_iv is None and smart_api:
         try:
             vix_res = smart_api.ltpData("NSE", "INDIA VIX", "26009")
@@ -286,7 +367,6 @@ def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike,
         except Exception:
             pass
 
-    # Final fallback if market closed and no token data exists
     atm_iv = atm_iv if atm_iv is not None else 10.0
 
     leg_greeks = calculate_black_scholes_greeks(spot_price, strike, t_years, atm_iv, opt_type)
@@ -484,6 +564,25 @@ HTML_TEMPLATE = r"""
 
         .grid { display: grid; grid-template-columns: 360px 1fr; gap: 20px; margin-top: 15px; }
         .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-bottom: 15px; }
+        .chart-container-relative { position: relative; }
+
+        /* Indicator Status Ribbon on Top Right of Chart */
+        .indicator-ribbon {
+            position: absolute;
+            top: 12px;
+            right: 15px;
+            background: rgba(18, 18, 18, 0.88);
+            border: 1px solid #00bcd4;
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 11px;
+            font-family: monospace;
+            z-index: 10;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.6);
+            line-height: 1.4;
+        }
+        .ribbon-item { display: block; color: #00ff88; }
+
         h2, h3 { margin-top: 0; color: #00bcd4; }
         
         .header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
@@ -616,10 +715,16 @@ HTML_TEMPLATE = r"""
                 <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
             </div>
 
-            <div class="card">
+            <div class="card chart-container-relative">
+                <div id="indicatorRibbon" class="indicator-ribbon">
+                    <span id="ribbonBB" class="ribbon-item">BB Status : -</span>
+                    <span id="ribbonMACD" class="ribbon-item">MACD : -</span>
+                    <span id="ribbonRSI" class="ribbon-item">RSI divergence status : -</span>
+                </div>
+
                 <div class="header-flex">
-                    <h3>Index Strategy Chart & Analytics Controls</h3>
-                    <div style="display: flex; gap: 10px; align-items: center;">
+                    <h3>Index Strategy Chart & Indicators</h3>
+                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 220px;">
                         <div>
                             <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Candle Timeframe:</label>
                             <select id="timeframeSelect" class="chart-select" onchange="updateDashboard()">
@@ -682,7 +787,15 @@ HTML_TEMPLATE = r"""
         const ctx = document.getElementById('mainChart').getContext('2d');
         mainChart = new Chart(ctx, {
             type: 'line',
-            data: { labels: [], datasets: [{ label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, pointHoverRadius: 4, yAxisID: 'y', tension: 0.1, fill: { target: 'origin', above: 'rgba(0,255,136,0.08)', below: 'rgba(255,82,82,0.08)' } }] },
+            data: { 
+                labels: [], 
+                datasets: [
+                    { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, tension: 0.1, fill: { target: 'origin', above: 'rgba(0,255,136,0.08)', below: 'rgba(255,82,82,0.08)' } },
+                    { label: 'BB Upper', data: [], borderColor: 'rgba(255, 82, 82, 0.6)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0 },
+                    { label: 'BB Middle', data: [], borderColor: 'rgba(255, 202, 40, 0.6)', borderWidth: 1, pointRadius: 0 },
+                    { label: 'BB Lower', data: [], borderColor: 'rgba(76, 175, 80, 0.6)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0 }
+                ] 
+            },
             options: { 
                 animation: false,
                 responsive: true,
@@ -888,11 +1001,23 @@ HTML_TEMPLATE = r"""
                 document.getElementById('stExpiryMove').innerText = "±" + data.expected_expiry_move + " pts";
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Last Trading Day Data)";
 
+                // Update Indicator Ribbon Metrics
+                document.getElementById('ribbonBB').innerText = data.bb_status;
+                document.getElementById('ribbonMACD').innerText = data.macd_status;
+                document.getElementById('ribbonRSI').innerText = data.rsi_status;
+
                 const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
 
                 if (data.chart_labels && data.chart_labels.length > 0) {
                     mainChart.data.labels = data.chart_labels;
                     mainChart.data.datasets[0].data = data.chart_prices;
+
+                    // Plot Bollinger Bands
+                    if (data.indicators) {
+                        mainChart.data.datasets[1].data = data.indicators.bb_upper || [];
+                        mainChart.data.datasets[2].data = data.indicators.bb_middle || [];
+                        mainChart.data.datasets[3].data = data.indicators.bb_lower || [];
+                    }
 
                     const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
                     const isProfitable = targetBasket ? targetBasket.basket_pnl >= 0 : true;
@@ -903,7 +1028,7 @@ HTML_TEMPLATE = r"""
                         below: !isProfitable ? 'rgba(255,82,82,0.12)' : 'rgba(255,82,82,0.03)'
                     };
 
-                    let extraDatasets = [mainChart.data.datasets[0]];
+                    let baseDatasets = mainChart.data.datasets.slice(0, 4);
                     if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
                         targetBasket.legs.forEach((leg, lIdx) => {
                             let strikeVal = parseFloat(leg.strike);
@@ -916,10 +1041,10 @@ HTML_TEMPLATE = r"""
                                 pointRadius: 0,
                                 fill: false
                             };
-                            extraDatasets.push(strikeDataset);
+                            baseDatasets.push(strikeDataset);
                         });
                     }
-                    mainChart.data.datasets = extraDatasets;
+                    mainChart.data.datasets = baseDatasets;
                     mainChart.update('none');
                 }
 
@@ -1130,11 +1255,13 @@ def live_data():
     except Exception:
         pass
 
+    # Calculate indicators & ribbon statuses
+    indicators, bb_status, macd_status, rsi_status = calculate_chart_indicators(index_candles)
+
     option_chain_data = []
     if selected_expiry:
         option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
 
-    # Dynamic calculation of real-time ATM IV without hardcoded fallback values
     atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(
         smart_api, option_chain_data, spot_price, idx_info['step'], 
         spot_price, 'CE', selected_expiry or "31DEC2026", symbol=symbol
@@ -1233,7 +1360,6 @@ def live_data():
                     leg_pnl = (entry_price - current_ltp) * qty
                 basket_pnl += leg_pnl
 
-            # Calculate dynamic Black-Scholes Greeks per leg using precise implied volatility
             _, greeks = get_atm_iv_and_leg_greeks(
                 smart_api, option_chain_data, spot_price, idx_info['step'], 
                 strike, opt_type, exp_date, symbol=symbol
@@ -1337,6 +1463,10 @@ def live_data():
         "is_market_open": is_market_open(),
         "chart_labels": chart_labels,
         "chart_prices": chart_prices,
+        "indicators": indicators,
+        "bb_status": bb_status,
+        "macd_status": macd_status,
+        "rsi_status": rsi_status,
         "baskets": processed_baskets
     })
 
