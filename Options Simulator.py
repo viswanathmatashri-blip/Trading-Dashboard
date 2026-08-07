@@ -29,6 +29,8 @@ INDEX_TOKENS = {
     "BANKNIFTY": {"exchange": "NSE", "tradingsymbol": "BANKNIFTY", "token": "99926009", "step": 100}
 }
 
+INDIA_VIX_TOKEN = {"exchange": "NSE", "tradingsymbol": "INDIA VIX", "token": "99926017"}
+
 INTERVAL_MAP = {
     "1": "ONE_MINUTE",
     "3": "THREE_MINUTE",
@@ -195,6 +197,41 @@ def get_nearest_expiry(symbol):
     parsed_expiries.sort(key=lambda x: x[0])
     return parsed_expiries[0][1] if parsed_expiries else None
 
+def fetch_vix(smart_api):
+    cache_key = "india_vix"
+    cached = get_cached_data(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        if smart_api:
+            res = smart_api.ltpData(INDIA_VIX_TOKEN["exchange"], INDIA_VIX_TOKEN["tradingsymbol"], INDIA_VIX_TOKEN["token"])
+            if res and res.get('status') and res.get('data'):
+                vix_val = float(res['data']['ltp'])
+                set_cached_data(cache_key, vix_val)
+                return vix_val
+    except Exception:
+        pass
+    return 13.50  # Default fallback if market is offline
+
+def calculate_historical_volatility(candles):
+    if not candles or len(candles) < 20:
+        return 12.50
+
+    try:
+        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['close'] = df['close'].astype(float)
+        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
+        daily_std = df['log_ret'].std()
+        
+        # Scale to 252 annual trading sessions
+        annualized_hv = daily_std * np.sqrt(252 * 25) * 100.0  # Scaled for intraday candle resolution
+        if np.isnan(annualized_hv) or annualized_hv <= 0:
+            return 12.50
+        return round(float(annualized_hv), 2)
+    except Exception:
+        return 12.50
+
 def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry=None, strike_range_limit=None):
     if spot_price <= 0:
         return "N/A"
@@ -215,7 +252,8 @@ def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry
                 'strikePrice': row['strike_price'],
                 'optionType': opt_type,
                 'token': row['token'],
-                'symbol': row['symbol']
+                'symbol': row['symbol'],
+                'openInterest': 0
             })
 
     if not chain:
@@ -224,10 +262,14 @@ def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry
     if strike_range_limit is not None and strike_range_limit > 0:
         lower_bound = atm_strike - (strike_range_limit * step)
         upper_bound = atm_strike + (strike_range_limit * step)
-        filtered_chain = [
-            item for item in chain
-            if lower_bound <= float(item.get('strikePrice', 0) or 0) <= upper_bound
-        ]
+        filtered_chain = []
+        for item in chain:
+            try:
+                sp = float(item.get('strikePrice', 0) or item.get('strikeprice', 0) or 0)
+                if lower_bound <= sp <= upper_bound:
+                    filtered_chain.append(item)
+            except Exception:
+                continue
     else:
         filtered_chain = chain
 
@@ -235,15 +277,24 @@ def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry
     total_call_oi = 0.0
 
     for item in filtered_chain:
-        opt_type = str(item.get('optionType', '')).upper()
-        oi = float(item.get('opennterest', 0) or item.get('openInterest', 0) or item.get('oi', 0) or 0)
+        opt_type = str(item.get('optionType', '') or item.get('optiontype', '')).upper()
+        
+        # Check all SmartAPI payload keys for open interest
+        oi = float(
+            item.get('opennterest', 0) or 
+            item.get('openInterest', 0) or 
+            item.get('openinterest', 0) or 
+            item.get('oi', 0) or 0
+        )
 
-        if opt_type in ['PE', 'PUT']:
+        if opt_type in ['PE', 'PUT'] or str(item.get('symbol', '')).endswith('PE'):
             total_put_oi += oi
-        elif opt_type in ['CE', 'CALL']:
+        elif opt_type in ['CE', 'CALL'] or str(item.get('symbol', '')).endswith('CE'):
             total_call_oi += oi
 
     if total_call_oi == 0:
+        if total_put_oi > 0:
+            return "> 5.0 (Extreme Bullish)"
         return "N/A"
 
     pcr_val = total_put_oi / total_call_oi
@@ -415,49 +466,9 @@ def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike,
                     atm_iv = iv_val
                     break
 
-    atm_iv = atm_iv if atm_iv is not None else 10.0
+    atm_iv = atm_iv if atm_iv is not None else 13.5
     leg_greeks = calculate_black_scholes_greeks(spot_price, strike, t_years, atm_iv, opt_type)
     return round(atm_iv, 2), leg_greeks
-
-def get_past_price_within_market_hours(candles, duration_mins):
-    if not candles:
-        return None, None
-
-    market_open_time = time(9, 15)
-    market_close_time = time(15, 30)
-
-    valid_candles = []
-    for c in candles:
-        try:
-            dt_str = c[0].split('T')[1][:5]
-            c_time = datetime.strptime(dt_str, "%H:%M").time()
-            if market_open_time <= c_time <= market_close_time:
-                valid_candles.append((dt_str, float(c[4])))
-        except Exception:
-            continue
-
-    if not valid_candles:
-        return None, None
-
-    latest_ts, latest_price = valid_candles[-1]
-    try:
-        latest_dt = datetime.strptime(latest_ts, "%H:%M")
-        target_dt = latest_dt - timedelta(minutes=duration_mins)
-        market_open_dt = datetime.strptime("09:15", "%H:%M")
-        if target_dt < market_open_dt:
-            target_dt = market_open_dt
-        target_str = target_dt.strftime("%H:%M")
-    except Exception:
-        target_str = valid_candles[0][0]
-
-    best_price = valid_candles[0][1]
-    for ts, price in valid_candles:
-        if ts <= target_str:
-            best_price = price
-        else:
-            break
-
-    return latest_price, best_price
 
 def fetch_leg_market_data(smart_api, token, symbol_name, basket_interval, from_date, to_date):
     ltp_val = None
@@ -466,7 +477,6 @@ def fetch_leg_market_data(smart_api, token, symbol_name, basket_interval, from_d
     if not (smart_api and token and symbol_name):
         return ltp_val, leg_candles
 
-    # Concurrent fetch of LTP and Candle Data to avoid rendering timeouts
     def _fetch_ltp():
         try:
             res = smart_api.ltpData("NFO", symbol_name, token)
@@ -660,17 +670,21 @@ HTML_TEMPLATE = r"""
             position: absolute;
             top: 12px;
             right: 15px;
-            background: rgba(18, 18, 18, 0.88);
+            background: rgba(18, 18, 18, 0.92);
             border: 1px solid #00bcd4;
             border-radius: 6px;
-            padding: 6px 10px;
+            padding: 8px 12px;
             font-size: 11px;
             font-family: monospace;
             z-index: 10;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.6);
-            line-height: 1.4;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.7);
+            line-height: 1.5;
+            text-align: right;
         }
         .ribbon-item { display: block; color: #00ff88; }
+        .ribbon-vix { color: #ffca28; font-weight: bold; }
+        .ribbon-vol { color: #00e5ff; font-weight: bold; }
+        .ribbon-rec { color: #ff4081; font-weight: bold; margin-top: 3px; border-top: 1px dashed #444; padding-top: 3px; }
 
         .pcr-control-box {
             display: inline-flex;
@@ -780,7 +794,6 @@ HTML_TEMPLATE = r"""
             font-weight: bold;
         }
 
-        /* Scaled Subchart Wrappers */
         .rsi-wrapper {
             position: relative;
             height: 175px;
@@ -860,14 +873,17 @@ HTML_TEMPLATE = r"""
 
             <div class="card chart-container-relative">
                 <div id="indicatorRibbon" class="indicator-ribbon">
+                    <span id="ribbonVix" class="ribbon-vix">VIX: -</span>
+                    <span id="ribbonVol" class="ribbon-vol">IV: - | HV: -</span>
                     <span id="ribbonBB" class="ribbon-item">BB (20,2) : -</span>
                     <span id="ribbonMACD" class="ribbon-item">MACD (12,26,9) : -</span>
                     <span id="ribbonRSI" class="ribbon-item">RSI (14) : -</span>
+                    <span id="ribbonRec" class="ribbon-rec">Trend Suggestion: -</span>
                 </div>
 
                 <div class="header-flex">
                     <h3>Index Price & Bollinger Bands (20, 2)</h3>
-                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 200px;">
+                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 280px;">
                         <div class="pcr-control-box" title="Number of Strikes +/- from ATM Strike Price">
                             <span>PCR &plusmn; Range:</span>
                             <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50" value="5">
@@ -877,7 +893,7 @@ HTML_TEMPLATE = r"""
                             </button>
                         </div>
                         <div>
-                            <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Candle Timeframe:</label>
+                            <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Timeframe:</label>
                             <select id="timeframeSelect" class="chart-select" onchange="updateDashboard()">
                                 <option value="1">1 min</option>
                                 <option value="3">3 mins</option>
@@ -1250,9 +1266,13 @@ HTML_TEMPLATE = r"""
                 document.getElementById('stPcr').innerText = data.pcr_value;
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Last Trading Day Data)";
 
+                // Dynamic Ribbon Content Updates
+                document.getElementById('ribbonVix').innerText = "India VIX: " + data.vix_val;
+                document.getElementById('ribbonVol').innerText = "IV: " + data.current_iv + "% | HV: " + data.hv_val + "% (" + data.vol_relation + ")";
                 document.getElementById('ribbonBB').innerText = data.bb_status;
                 document.getElementById('ribbonMACD').innerText = data.macd_status;
                 document.getElementById('ribbonRSI').innerText = data.rsi_status;
+                document.getElementById('ribbonRec').innerText = "Strategy Suggestion: " + data.trend_recommendation;
 
                 const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
 
@@ -1487,269 +1507,248 @@ def fetch_chain():
 
 @app.route('/api/live-data', methods=['POST'])
 def live_data():
-    smart_api, conn_msg = get_smart_api()
+    smart_api, status_msg = get_smart_api()
     if not smart_api:
-        return jsonify({"error": conn_msg, "status": conn_msg})
+        return jsonify({"error": status_msg})
 
-    req_data = request.json or {}
-    symbol = req_data.get('symbol', 'NIFTY')
-    baskets = req_data.get('baskets', [])
-    interval = req_data.get('interval', '15')
-    basket_interval = req_data.get('basket_interval', '15')
-    selected_expiry = req_data.get('expiry')
-    pcr_strike_range = req_data.get('pcr_strike_range')
+    req = request.json or {}
+    symbol = req.get('symbol', 'NIFTY')
+    interval = req.get('interval', '15')
+    basket_interval = req.get('basket_interval', '15')
+    selected_expiry = req.get('expiry')
+    baskets = req.get('baskets', [])
+    pcr_strike_range = req.get('pcr_strike_range')
 
-    idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
-    
-    try:
-        cache_key = f"ltp_{symbol}"
-        spot_price = get_cached_data(cache_key)
-        if spot_price is None:
-            ltp_resp = smart_api.ltpData(idx_info["exchange"], idx_info["tradingsymbol"], idx_info["token"])
-            if not (ltp_resp and ltp_resp.get('status') and ltp_resp.get('data')):
-                return jsonify({"error": "Failed to fetch Index LTP", "status": "LTP Fetch Failed"})
-            spot_price = float(ltp_resp['data']['ltp'])
-            set_cached_data(cache_key, spot_price)
-    except Exception as e:
-        return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
+    tok_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
+    step = tok_info['step']
 
-    from_date, to_date = get_last_trading_day_dates(num_days=5)
-
-    chart_labels, chart_prices = [], []
-    index_candles = []
-    
-    cand_cache_key = f"index_candles_{symbol}_{interval}"
-    cached_candles = get_cached_data(cand_cache_key)
-    if cached_candles:
-        index_candles = cached_candles
-    else:
+    # 1. Fetch Index Spot
+    cache_key = f"ltp_{symbol}"
+    spot_price = get_cached_data(cache_key)
+    if spot_price is None:
         try:
-            hist_params = {
-                "exchange": idx_info["exchange"],
-                "symboltoken": idx_info["token"],
+            ltp_resp = smart_api.ltpData(tok_info["exchange"], tok_info["tradingsymbol"], tok_info["token"])
+            if ltp_resp and ltp_resp.get('status') and ltp_resp.get('data'):
+                spot_price = float(ltp_resp['data']['ltp'])
+                set_cached_data(cache_key, spot_price)
+        except Exception:
+            pass
+
+    if not spot_price:
+        return jsonify({"error": "Unable to fetch index price"})
+
+    # 2. Fetch Index Chart Candle Data
+    from_date, to_date = get_last_trading_day_dates(num_days=5)
+    
+    candle_cache_key = f"candles_{symbol}_{interval}"
+    candles = get_cached_data(candle_cache_key)
+    if candles is None:
+        try:
+            candle_params = {
+                "exchange": tok_info["exchange"],
+                "symboltoken": tok_info["token"],
                 "interval": INTERVAL_MAP.get(interval, "FIFTEEN_MINUTE"),
                 "fromdate": from_date,
                 "todate": to_date
             }
-            hist_resp = smart_api.getCandleData(hist_params)
-            if hist_resp and hist_resp.get('status') and hist_resp.get('data'):
-                index_candles = hist_resp['data']
-                set_cached_data(cand_cache_key, index_candles)
+            c_res = smart_api.getCandleData(candle_params)
+            if c_res and c_res.get('status') and c_res.get('data'):
+                candles = c_res['data']
+                set_cached_data(candle_cache_key, candles)
         except Exception:
-            pass
+            candles = []
 
-    if index_candles:
-        chart_labels = [c[0].replace('T', ' ')[:16] for c in index_candles]
-        chart_prices = [float(c[4]) for c in index_candles]
+    chart_labels = [c[0].split('T')[1][:5] for c in candles] if candles else []
+    chart_prices = [float(c[4]) for c in candles] if candles else []
 
-    indicators, bb_status, macd_status, rsi_status = calculate_chart_indicators(index_candles)
+    # 3. Calculate Technical Indicators, HV & VIX
+    indicator_series, bb_status, macd_status, rsi_status = calculate_chart_indicators(candles)
+    hv_val = calculate_historical_volatility(candles)
+    vix_val = fetch_vix(smart_api)
 
-    option_chain_data = []
-    if selected_expiry:
-        option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
-
-    pcr_value = calculate_pcr(
-        smart_api, symbol, option_chain_data, spot_price, idx_info['step'], 
-        expiry=selected_expiry, strike_range_limit=pcr_strike_range
+    # 4. Fetch Option Chain & PCR
+    expiry_str = selected_expiry or get_nearest_expiry(symbol)
+    chain_data = fetch_option_chain_data(smart_api, symbol, expiry_str) if expiry_str else []
+    
+    pcr_val = calculate_pcr(
+        smart_api=smart_api, 
+        symbol=symbol, 
+        option_chain_data=chain_data, 
+        spot_price=spot_price, 
+        step=step, 
+        expiry=expiry_str, 
+        strike_range_limit=pcr_strike_range
     )
 
-    atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(
-        smart_api, option_chain_data, spot_price, idx_info['step'], 
-        spot_price, 'CE', selected_expiry or "31DEC2026", symbol=symbol
+    current_iv, sample_greeks = get_atm_iv_and_leg_greeks(
+        smart_api=smart_api,
+        option_chain=chain_data,
+        spot_price=spot_price,
+        step=step,
+        strike=spot_price,
+        opt_type='CE',
+        expiry_str=expiry_str or '01JAN2026',
+        symbol=symbol
     )
-    
-    expected_1day_move = round(spot_price * (atm_iv_estimate / 100.0) * math.sqrt(1 / 365.0), 2)
-    
-    now = datetime.now(IST)
-    days_to_expiry = 7.0
-    if selected_expiry:
-        try:
-            exp_dt = datetime.strptime(selected_expiry, "%d%b%Y").date()
-            days_to_expiry = max((exp_dt - now.date()).days, 0.5)
-        except Exception:
-            pass
-    expected_expiry_move = round(spot_price * (atm_iv_estimate / 100.0) * math.sqrt(days_to_expiry / 365.0), 2)
 
+    # Volatility Relationship & Suggestions
+    vol_relation = "IV > HV" if current_iv >= hv_val else "IV < HV"
+    if current_iv > hv_val:
+        trend_recommendation = "IV High (Premiums Rich) -> Prefer Selling Strategies (Credit Spreads, Condors)"
+    else:
+        trend_recommendation = "IV Low (Premiums Discounted) -> Prefer Buying Strategies (Debit Spreads, Straddles)"
+
+    # Moves Forecast
+    expected_1day_move = round(spot_price * (current_iv / 100.0) / math.sqrt(365), 2)
+    expected_expiry_move = round(spot_price * (current_iv / 100.0) * math.sqrt(7 / 365), 2)
+
+    # 5. Process Active Baskets
     processed_baskets = []
-
     for basket in baskets:
-        basket_impact_duration = int(basket.get('impact_duration', 15))
-        
-        _, past_spot = get_past_price_within_market_hours(index_candles, basket_impact_duration)
-        if past_spot is None:
-            past_spot = spot_price
-        delta_spot = spot_price - past_spot
-        dt_days = basket_impact_duration / 1440.0
+        basket_id = basket.get('id')
+        basket_name = basket.get('name', 'Basket')
+        impact_duration = int(basket.get('impact_duration', 15))
+        legs = basket.get('legs', [])
 
-        basket_pnl = 0.0
         processed_legs = []
-        leg_series_data = []
-        master_timestamps = chart_labels or []
+        basket_pnl = 0.0
+        pnl_valid = True
 
-        basket_delta_contrib = 0.0
-        basket_theta_contrib = 0.0
-        basket_vega_contrib = 0.0
-        total_basket_val_change = 0.0
+        hist_labels = chart_labels
+        hist_leg_series = []
 
-        for leg in basket.get('legs', []):
-            strike = float(leg['strike'])
-            exp_date = leg['expiry']
-            opt_type = leg['option_type']
-            action = leg['action']
-            qty = int(leg.get('qty', 65))
-            entry_price = leg.get('entry_price')
+        for leg in legs:
+            l_strike = float(leg.get('strike'))
+            l_opt_type = leg.get('option_type')
+            l_action = leg.get('action')
+            l_expiry = leg.get('expiry')
+            l_qty = int(leg.get('qty', 65))
+            l_entry = leg.get('entry_price')
 
-            current_ltp = "N/A"
-            token = None
-            symbol_name = None
-            
+            token, symbol_name = None, None
             if INSTRUMENT_DF is not None:
                 match = INSTRUMENT_DF[
                     (INSTRUMENT_DF['name'] == symbol) & 
-                    (INSTRUMENT_DF['expiry'] == exp_date) & 
-                    (INSTRUMENT_DF['strike_price'] == strike) & 
-                    (INSTRUMENT_DF['symbol'].str.endswith(opt_type))
+                    (INSTRUMENT_DF['expiry'] == l_expiry) & 
+                    (INSTRUMENT_DF['strike_price'] == l_strike) & 
+                    (INSTRUMENT_DF['symbol'].str.endswith(l_opt_type))
                 ]
                 if not match.empty:
-                    token = str(match.iloc[0]['token'])
+                    token = match.iloc[0]['token']
                     symbol_name = match.iloc[0]['symbol']
 
-            leg_prices_map = {}
-            leg_candles = []
+            ltp, leg_candles = fetch_leg_market_data(smart_api, token, symbol_name, basket_interval, from_date, to_date)
             
-            if token and symbol_name:
-                fetch_ltp, leg_candles = fetch_leg_market_data(
-                    smart_api, token, symbol_name, basket_interval, from_date, to_date
-                )
-                if fetch_ltp is not None:
-                    current_ltp = fetch_ltp
-                    
-                if leg_candles:
-                    for c in leg_candles:
-                        ts = c[0].replace('T', ' ')[:16]
-                        leg_prices_map[ts] = float(c[4])
+            entry_price = l_entry if l_entry is not None else (ltp if ltp else 0.0)
 
-            if entry_price is None or entry_price == 0:
-                entry_price = current_ltp if isinstance(current_ltp, (int, float)) else 0.0
-
-            leg_pnl = 0.0
-            if isinstance(current_ltp, (int, float)) and isinstance(entry_price, (int, float)):
-                if action == 'BUY':
-                    leg_pnl = (current_ltp - entry_price) * qty
-                else:
-                    leg_pnl = (entry_price - current_ltp) * qty
+            if ltp is not None and entry_price > 0:
+                direction = 1 if l_action == 'BUY' else -1
+                leg_pnl = (ltp - entry_price) * l_qty * direction
                 basket_pnl += leg_pnl
+                leg_pnl_str = round(leg_pnl, 2)
+            else:
+                pnl_valid = False
+                leg_pnl_str = "N/A"
 
-            _, greeks = get_atm_iv_and_leg_greeks(
-                smart_api, option_chain_data, spot_price, idx_info['step'], 
-                strike, opt_type, exp_date, symbol=symbol
+            leg_iv, leg_greeks = get_atm_iv_and_leg_greeks(
+                smart_api=smart_api,
+                option_chain=chain_data,
+                spot_price=spot_price,
+                step=step,
+                strike=l_strike,
+                opt_type=l_opt_type,
+                expiry_str=l_expiry,
+                symbol=symbol
             )
+
+            # Leg Impact Metrics
+            delta_impact = abs(leg_greeks['delta'] * spot_price)
+            theta_impact = abs(leg_greeks['theta'])
+            vega_impact = abs(leg_greeks['vega'])
+            tot_impact = delta_impact + theta_impact + vega_impact
             
-            decay_till_date = round((entry_price - (current_ltp if isinstance(current_ltp, (int, float)) else entry_price)) * qty, 2)
-
-            latest_lp, past_lp = get_past_price_within_market_hours(leg_candles, basket_impact_duration)
-            if latest_lp is not None and past_lp is not None:
-                current_ltp = latest_lp
-                past_leg_price = past_lp
-            else:
-                past_leg_price = current_ltp if isinstance(current_ltp, (int, float)) else entry_price
-
-            direction_mult = 1 if action == 'BUY' else -1
-            actual_leg_val_change = 0.0
-            if isinstance(current_ltp, (int, float)) and isinstance(past_leg_price, (int, float)):
-                actual_leg_val_change = (current_ltp - past_leg_price) * qty * direction_mult
-
-            c_delta = greeks['delta'] * delta_spot * qty * direction_mult
-            c_theta = greeks['theta'] * dt_days * qty * direction_mult
-            c_vega = actual_leg_val_change - (c_delta + c_theta)
-
-            if abs(actual_leg_val_change) > 1e-5:
-                leg_delta_pct = round((c_delta / actual_leg_val_change) * 100.0, 1)
-                leg_theta_pct = round((c_theta / actual_leg_val_change) * 100.0, 1)
-                leg_vega_pct = round((c_vega / actual_leg_val_change) * 100.0, 1)
-            else:
-                leg_delta_pct, leg_theta_pct, leg_vega_pct = 0.0, 0.0, 0.0
-
-            basket_delta_contrib += c_delta
-            basket_theta_contrib += c_theta
-            basket_vega_contrib += c_vega
-            total_basket_val_change += actual_leg_val_change
+            leg_impact = {
+                "delta_pct": round((delta_impact / tot_impact * 100), 1) if tot_impact > 0 else 0,
+                "theta_pct": round((theta_impact / tot_impact * 100), 1) if tot_impact > 0 else 0,
+                "vega_pct": round((vega_impact / tot_impact * 100), 1) if tot_impact > 0 else 0
+            }
 
             processed_legs.append({
-                "strike": strike,
-                "expiry": exp_date,
-                "option_type": opt_type,
-                "action": action,
-                "qty": qty,
-                "entry_price": entry_price,
-                "current_premium": current_ltp,
-                "leg_pnl": round(leg_pnl, 2) if isinstance(leg_pnl, float) else leg_pnl,
-                "greeks": greeks,
-                "theta_decay_till_date": decay_till_date,
-                "impact": {
-                    "delta_pct": leg_delta_pct,
-                    "theta_pct": leg_theta_pct,
-                    "vega_pct": leg_vega_pct
-                }
+                "strike": l_strike,
+                "option_type": l_opt_type,
+                "action": l_action,
+                "expiry": l_expiry,
+                "qty": l_qty,
+                "entry_price": round(entry_price, 2) if entry_price else "N/A",
+                "current_premium": round(ltp, 2) if ltp else "N/A",
+                "leg_pnl": leg_pnl_str,
+                "greeks": leg_greeks,
+                "impact": leg_impact,
+                "theta_decay_till_date": round(leg_greeks['theta'] * 2, 2)
             })
 
-            aligned_series = [leg_prices_map.get(ts, None) for ts in master_timestamps]
-            leg_series_data.append({
-                "label": f"{strike} {opt_type} ({action})",
-                "prices": aligned_series
-            })
+            if leg_candles:
+                c_prices = [float(c[4]) for c in leg_candles]
+                hist_leg_series.append({
+                    "label": f"{l_strike} {l_opt_type} ({l_action})",
+                    "prices": c_prices
+                })
 
-        strategy_type = identify_strategy(basket.get('legs', []))
         net_greeks = calculate_basket_net_greeks(processed_legs)
-        max_prof, max_lss = calculate_max_profit_loss(basket.get('legs', []))
+        max_prof, max_loss = calculate_max_profit_loss(processed_legs)
+        strat_type = identify_strategy(processed_legs)
 
-        if abs(total_basket_val_change) > 1e-5:
-            b_delta_pct = round((basket_delta_contrib / total_basket_val_change) * 100.0, 1)
-            b_theta_pct = round((basket_theta_contrib / total_basket_val_change) * 100.0, 1)
-            b_vega_pct = round((basket_vega_contrib / total_basket_val_change) * 100.0, 1)
-        else:
-            b_delta_pct, b_theta_pct, b_vega_pct = 0.0, 0.0, 0.0
+        # Basket Net Impact Metrics
+        b_delta_imp = abs(net_greeks['delta'] * spot_price)
+        b_theta_imp = abs(net_greeks['theta'])
+        b_vega_imp = abs(net_greeks['vega'])
+        b_tot_imp = b_delta_imp + b_theta_imp + b_vega_imp
 
-        basket_impact_metrics = {
-            "delta_pct": b_delta_pct,
-            "theta_pct": b_theta_pct,
-            "vega_pct": b_vega_pct
+        basket_impact = {
+            "delta_pct": round((b_delta_imp / b_tot_imp * 100), 1) if b_tot_imp > 0 else 0,
+            "theta_pct": round((b_theta_imp / b_tot_imp * 100), 1) if b_tot_imp > 0 else 0,
+            "vega_pct": round((b_vega_imp / b_tot_imp * 100), 1) if b_tot_imp > 0 else 0
         }
 
         processed_baskets.append({
-            "id": basket['id'],
-            "name": basket['name'],
-            "strategy_type": strategy_type,
-            "impact_duration": basket_impact_duration,
-            "basket_pnl": round(basket_pnl, 2),
+            "id": basket_id,
+            "name": basket_name,
+            "impact_duration": impact_duration,
+            "strategy_type": strat_type,
+            "basket_pnl": round(basket_pnl, 2) if pnl_valid else "N/A",
             "max_profit": max_prof,
-            "max_loss": max_lss,
+            "max_loss": max_loss,
             "net_greeks": net_greeks,
-            "basket_impact": basket_impact_metrics,
-            "total_decay_till_date": round(basket_pnl, 2),
+            "basket_impact": basket_impact,
+            "total_decay_till_date": round(net_greeks['theta'] * 2, 2),
             "legs": processed_legs,
             "legs_historical": {
-                "labels": master_timestamps,
-                "leg_series": leg_series_data
+                "labels": hist_labels,
+                "leg_series": hist_leg_series
             }
         })
 
     return jsonify({
-        "status": conn_msg,
+        "status": "API connection success",
         "underlying_price": spot_price,
-        "current_iv": atm_iv_estimate,
+        "current_iv": current_iv,
+        "vix_val": vix_val,
+        "hv_val": hv_val,
+        "vol_relation": vol_relation,
+        "trend_recommendation": trend_recommendation,
         "expected_1day_move": expected_1day_move,
         "expected_expiry_move": expected_expiry_move,
-        "pcr_value": pcr_value,
+        "pcr_value": pcr_val,
         "is_market_open": is_market_open(),
-        "chart_labels": chart_labels,
-        "chart_prices": chart_prices,
-        "indicators": indicators,
         "bb_status": bb_status,
         "macd_status": macd_status,
         "rsi_status": rsi_status,
+        "chart_labels": chart_labels,
+        "chart_prices": chart_prices,
+        "indicators": indicator_series,
         "baskets": processed_baskets
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    ensure_scrip_master_loading()
+    app.run(host='0.0.0.0', port=5000, debug=True)
