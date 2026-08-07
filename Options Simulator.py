@@ -98,8 +98,10 @@ def download_scrip_master_thread():
             data = json.loads(content.decode('utf-8'))
             
             df = pd.DataFrame(data)
+            keep_cols = ['exch_seg', 'instrumenttype', 'name', 'expiry', 'strike', 'symbol', 'token']
+            df = df[[c for c in keep_cols if c in df.columns]]
             df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))].copy()
-            df['strike_price'] = df['strike'].astype(float) / 100.0
+            df['strike_price'] = pd.to_numeric(df['strike'], errors='coerce') / 100.0
             
             INSTRUMENT_DF = df
             SCRIP_MASTER_STATUS = "Scrip Master Loaded"
@@ -162,29 +164,26 @@ def get_nearest_expiry(symbol):
 
     for exp in raw_expiries:
         try:
-            exp_date = datetime.strptime(exp, "%d%b%Y").date()
+            exp_date = datetime.strptime(str(exp), "%d%b%Y").date()
             if exp_date >= now_date:
-                parsed_expiries.append((exp_date, exp))
+                parsed_expiries.append((exp_date, str(exp)))
         except Exception:
             pass
 
     parsed_expiries.sort(key=lambda x: x[0])
     return parsed_expiries[0][1] if parsed_expiries else None
 
-# --- PCR CALCULATION ENGINE ---
 def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry=None, strike_range_limit=None):
     if spot_price <= 0:
         return "N/A"
 
     atm_strike = round(spot_price / step) * step
 
-    # Fallback to nearest expiry if none is provided
     if not expiry:
         expiry = get_nearest_expiry(symbol)
 
     chain = option_chain_data
 
-    # If SmartAPI optionChain is empty, construct chain directly using scrip master
     if not chain and INSTRUMENT_DF is not None and expiry:
         filtered_df = INSTRUMENT_DF[(INSTRUMENT_DF['name'] == symbol) & (INSTRUMENT_DF['expiry'] == expiry)]
         chain = []
@@ -200,7 +199,6 @@ def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry
     if not chain:
         return "N/A"
 
-    # Filter by user-specified ATM strike range
     if strike_range_limit is not None and strike_range_limit > 0:
         lower_bound = atm_strike - (strike_range_limit * step)
         upper_bound = atm_strike + (strike_range_limit * step)
@@ -218,7 +216,6 @@ def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry
         opt_type = str(item.get('optionType', '')).upper()
         oi = float(item.get('opennterest', 0) or item.get('openInterest', 0) or item.get('oi', 0) or 0)
 
-        # If OI missing from optionChain payload, query market data API
         if oi == 0 and 'token' in item and smart_api:
             try:
                 ltp_res = smart_api.ltpData("NFO", item['symbol'], str(item['token']))
@@ -238,7 +235,6 @@ def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry
     pcr_val = total_put_oi / total_call_oi
     return round(pcr_val, 2)
 
-# --- TECHNICAL INDICATORS ENGINE ---
 def calculate_chart_indicators(candles):
     if not candles or len(candles) < 26:
         return {}, "BB (20,2) : N/A", "MACD (12,26,9) : N/A", "RSI (14) : N/A"
@@ -319,7 +315,6 @@ def calculate_chart_indicators(candles):
 
     return indicator_series, bb_status, macd_status, rsi_status
 
-# --- BLACK-SCHOLES IV & GREEKS ENGINE ---
 def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_type='CE'):
     if market_price <= 0 or spot <= 0 or strike <= 0 or t_years <= 0:
         return None
@@ -523,6 +518,7 @@ def calculate_max_profit_loss(legs):
     total_net_credit = 0.0
     short_calls, long_calls = [], []
     short_puts, long_puts = [], []
+    qty = 65
 
     for leg in legs:
         qty = int(leg.get('qty', 65))
@@ -775,10 +771,9 @@ HTML_TEMPLATE = r"""
             font-weight: bold;
         }
 
-        /* Scaled RSI chart container height to match MACD subchart scale */
         .rsi-wrapper {
             position: relative;
-            height: 200px;
+            height: 150px;
             width: 100%;
         }
     </style>
@@ -884,7 +879,6 @@ HTML_TEMPLATE = r"""
                 </div>
                 <canvas id="mainChart" height="90"></canvas>
 
-                <!-- Subcharts for MACD and RSI -->
                 <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator</div>
                 <canvas id="macdChart" height="100"></canvas>
 
@@ -939,7 +933,6 @@ HTML_TEMPLATE = r"""
             if (type === 'warn') pill.classList.add('pill-warn');
         }
 
-        // 1. Main Price & Bollinger Bands Chart
         const ctx = document.getElementById('mainChart').getContext('2d');
         mainChart = new Chart(ctx, {
             type: 'line',
@@ -962,7 +955,6 @@ HTML_TEMPLATE = r"""
             }
         });
 
-        // 2. MACD Sub-Chart
         const ctxMACD = document.getElementById('macdChart').getContext('2d');
         macdChart = new Chart(ctxMACD, {
             type: 'bar',
@@ -984,7 +976,6 @@ HTML_TEMPLATE = r"""
             }
         });
 
-        // 3. RSI Sub-Chart (Rescaled Y Axis 0-30-70-100)
         const ctxRSI = document.getElementById('rsiChart').getContext('2d');
         rsiChart = new Chart(ctxRSI, {
             type: 'line',
@@ -1004,7 +995,6 @@ HTML_TEMPLATE = r"""
                         max: 100, 
                         grid: { color: '#2a2a2a' }, 
                         ticks: { 
-                            values: [0, 30, 70, 100],
                             stepSize: 10,
                             color: '#aaa',
                             callback: function(val) {
@@ -1042,7 +1032,6 @@ HTML_TEMPLATE = r"""
             }
         });
 
-        // 4. Basket Option Premiums Chart
         const ctxLegs = document.getElementById('legsPremiumChart').getContext('2d');
         legsChart = new Chart(ctxLegs, {
             type: 'line',
@@ -1251,7 +1240,6 @@ HTML_TEMPLATE = r"""
                 document.getElementById('stPcr').innerText = data.pcr_value;
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Last Trading Day Data)";
 
-                // Update Header Ribbon
                 document.getElementById('ribbonBB').innerText = data.bb_status;
                 document.getElementById('ribbonMACD').innerText = data.macd_status;
                 document.getElementById('ribbonRSI').innerText = data.rsi_status;
@@ -1263,19 +1251,16 @@ HTML_TEMPLATE = r"""
                     macdChart.data.labels = data.chart_labels;
                     rsiChart.data.labels = data.chart_labels;
 
-                    // Plot Main Price Chart & Bollinger Bands
                     mainChart.data.datasets[0].data = data.chart_prices;
                     if (data.indicators) {
                         mainChart.data.datasets[1].data = data.indicators.bb_upper || [];
                         mainChart.data.datasets[2].data = data.indicators.bb_middle || [];
                         mainChart.data.datasets[3].data = data.indicators.bb_lower || [];
 
-                        // Plot MACD Subchart
                         macdChart.data.datasets[0].data = data.indicators.macd || [];
                         macdChart.data.datasets[1].data = data.indicators.macd_signal || [];
                         macdChart.data.datasets[2].data = data.indicators.macd_hist || [];
 
-                        // Plot RSI Subchart
                         rsiChart.data.datasets[0].data = data.indicators.rsi || [];
                     }
 
@@ -1445,9 +1430,9 @@ def fetch_expiries():
 
     for exp in raw_expiries:
         try:
-            exp_date = datetime.strptime(exp, "%d%b%Y").date()
+            exp_date = datetime.strptime(str(exp), "%d%b%Y").date()
             if exp_date >= now_date:
-                parsed_expiries.append((exp_date, exp))
+                parsed_expiries.append((exp_date, str(exp)))
         except Exception:
             pass
 
@@ -1466,7 +1451,7 @@ def fetch_chain():
     expiry = data.get('expiry')
 
     filtered = INSTRUMENT_DF[(INSTRUMENT_DF['name'] == symbol) & (INSTRUMENT_DF['expiry'] == expiry)]
-    strikes = sorted(filtered['strike_price'].unique().tolist())
+    strikes = sorted(filtered['strike_price'].dropna().unique().tolist())
 
     smart_api, _ = get_smart_api()
     atm = None
@@ -1534,7 +1519,6 @@ def live_data():
     if selected_expiry:
         option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
 
-    # Re-engineered PCR calculation call
     pcr_value = calculate_pcr(
         smart_api, symbol, option_chain_data, spot_price, idx_info['step'], 
         expiry=selected_expiry, strike_range_limit=pcr_strike_range
