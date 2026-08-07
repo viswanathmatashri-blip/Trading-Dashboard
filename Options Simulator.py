@@ -212,7 +212,7 @@ def fetch_vix(smart_api):
                 return vix_val
     except Exception:
         pass
-    return 13.50  # Default fallback if market is offline
+    return 13.50
 
 def calculate_historical_volatility(candles):
     if not candles or len(candles) < 20:
@@ -224,8 +224,7 @@ def calculate_historical_volatility(candles):
         df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
         daily_std = df['log_ret'].std()
         
-        # Scale to 252 annual trading sessions
-        annualized_hv = daily_std * np.sqrt(252 * 25) * 100.0  # Scaled for intraday candle resolution
+        annualized_hv = daily_std * np.sqrt(252 * 25) * 100.0
         if np.isnan(annualized_hv) or annualized_hv <= 0:
             return 12.50
         return round(float(annualized_hv), 2)
@@ -279,7 +278,6 @@ def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry
     for item in filtered_chain:
         opt_type = str(item.get('optionType', '') or item.get('optiontype', '')).upper()
         
-        # Check all SmartAPI payload keys for open interest
         oi = float(
             item.get('opennterest', 0) or 
             item.get('openInterest', 0) or 
@@ -308,8 +306,21 @@ def calculate_chart_indicators(candles):
     df['close'] = df['close'].astype(float)
     df['high'] = df['high'].astype(float)
     df['low'] = df['low'].astype(float)
+    df['volume'] = df['volume'].astype(float)
 
-    # 1. Bollinger Bands (20, 2)
+    # 1. Volume Weighted Average Price (VWAP)
+    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3.0
+    df['tp_v'] = df['typical_price'] * df['volume']
+    
+    # Calculate intraday cumulative sums reset per session
+    df['date'] = pd.to_datetime(df['timestamp']).dt.date
+    df['cum_tp_v'] = df.groupby('date')['tp_v'].cumsum()
+    df['cum_vol'] = df.groupby('date')['volume'].cumsum()
+    
+    # Handle zero volume cases cleanly
+    df['vwap'] = np.where(df['cum_vol'] > 0, df['cum_tp_v'] / df['cum_vol'], df['close'])
+
+    # 2. Bollinger Bands (20, 2)
     df['sma20'] = df['close'].rolling(window=20).mean()
     df['std20'] = df['close'].rolling(window=20).std()
     df['bb_upper'] = df['sma20'] + (df['std20'] * 2)
@@ -329,7 +340,7 @@ def calculate_chart_indicators(candles):
     else:
         bb_status = "BB (20,2) : Normal"
 
-    # 2. MACD (12, 26, 9)
+    # 3. MACD (12, 26, 9)
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = df['ema12'] - df['ema26']
@@ -350,7 +361,7 @@ def calculate_chart_indicators(candles):
     else:
         macd_status = "MACD (12,26,9) : Downtrend Continuation"
 
-    # 3. RSI (14)
+    # 4. RSI (14)
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
@@ -369,6 +380,7 @@ def calculate_chart_indicators(candles):
         return [None if np.isnan(val) else round(float(val), 2) for val in series]
 
     indicator_series = {
+        "vwap": clean_series(df['vwap']),
         "bb_upper": clean_series(df['bb_upper']),
         "bb_middle": clean_series(df['sma20']),
         "bb_lower": clean_series(df['bb_lower']),
@@ -668,18 +680,19 @@ HTML_TEMPLATE = r"""
 
         .indicator-ribbon {
             position: absolute;
-            top: 12px;
-            right: 15px;
+            top: 8px;
+            right: 5px;
             background: rgba(18, 18, 18, 0.92);
             border: 1px solid #00bcd4;
             border-radius: 6px;
-            padding: 8px 12px;
-            font-size: 11px;
+            padding: 6px 10px;
+            font-size: 10px;
             font-family: monospace;
             z-index: 10;
             box-shadow: 0 2px 8px rgba(0,0,0,0.7);
-            line-height: 1.5;
+            line-height: 1.4;
             text-align: right;
+            max-width: 300px;
         }
         .ribbon-item { display: block; color: #00ff88; }
         .ribbon-vix { color: #ffca28; font-weight: bold; }
@@ -882,8 +895,8 @@ HTML_TEMPLATE = r"""
                 </div>
 
                 <div class="header-flex">
-                    <h3>Index Price & Bollinger Bands (20, 2)</h3>
-                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 280px;">
+                    <h3>Index Price, VWAP & Bollinger Bands</h3>
+                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 320px;">
                         <div class="pcr-control-box" title="Number of Strikes +/- from ATM Strike Price">
                             <span>PCR &plusmn; Range:</span>
                             <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50" value="5">
@@ -966,6 +979,7 @@ HTML_TEMPLATE = r"""
                 labels: [], 
                 datasets: [
                     { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true },
+                    { label: 'VWAP', data: [], borderColor: '#ff00ff', borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true },
                     { label: 'BB Upper (20,2)', data: [], borderColor: 'rgba(255, 82, 82, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
                     { label: 'BB Middle SMA (20)', data: [], borderColor: 'rgba(255, 202, 40, 0.8)', borderWidth: 1, pointRadius: 0, spanGaps: true },
                     { label: 'BB Lower (20,2)', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true }
@@ -1266,7 +1280,6 @@ HTML_TEMPLATE = r"""
                 document.getElementById('stPcr').innerText = data.pcr_value;
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Last Trading Day Data)";
 
-                // Dynamic Ribbon Content Updates
                 document.getElementById('ribbonVix').innerText = "India VIX: " + data.vix_val;
                 document.getElementById('ribbonVol').innerText = "IV: " + data.current_iv + "% | HV: " + data.hv_val + "% (" + data.vol_relation + ")";
                 document.getElementById('ribbonBB').innerText = data.bb_status;
@@ -1283,9 +1296,10 @@ HTML_TEMPLATE = r"""
 
                     mainChart.data.datasets[0].data = data.chart_prices;
                     if (data.indicators) {
-                        mainChart.data.datasets[1].data = data.indicators.bb_upper || [];
-                        mainChart.data.datasets[2].data = data.indicators.bb_middle || [];
-                        mainChart.data.datasets[3].data = data.indicators.bb_lower || [];
+                        mainChart.data.datasets[1].data = data.indicators.vwap || [];
+                        mainChart.data.datasets[2].data = data.indicators.bb_upper || [];
+                        mainChart.data.datasets[3].data = data.indicators.bb_middle || [];
+                        mainChart.data.datasets[4].data = data.indicators.bb_lower || [];
 
                         macdChart.data.datasets[0].data = data.indicators.macd || [];
                         macdChart.data.datasets[1].data = data.indicators.macd_signal || [];
@@ -1296,7 +1310,7 @@ HTML_TEMPLATE = r"""
 
                     const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
 
-                    let baseDatasets = mainChart.data.datasets.slice(0, 4);
+                    let baseDatasets = mainChart.data.datasets.slice(0, 5);
                     if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
                         targetBasket.legs.forEach((leg, lIdx) => {
                             let strikeVal = parseFloat(leg.strike);
@@ -1591,14 +1605,12 @@ def live_data():
         symbol=symbol
     )
 
-    # Volatility Relationship & Suggestions
     vol_relation = "IV > HV" if current_iv >= hv_val else "IV < HV"
     if current_iv > hv_val:
         trend_recommendation = "IV High (Premiums Rich) -> Prefer Selling Strategies (Credit Spreads, Condors)"
     else:
         trend_recommendation = "IV Low (Premiums Discounted) -> Prefer Buying Strategies (Debit Spreads, Straddles)"
 
-    # Moves Forecast
     expected_1day_move = round(spot_price * (current_iv / 100.0) / math.sqrt(365), 2)
     expected_expiry_move = round(spot_price * (current_iv / 100.0) * math.sqrt(7 / 365), 2)
 
@@ -1661,7 +1673,6 @@ def live_data():
                 symbol=symbol
             )
 
-            # Leg Impact Metrics
             delta_impact = abs(leg_greeks['delta'] * spot_price)
             theta_impact = abs(leg_greeks['theta'])
             vega_impact = abs(leg_greeks['vega'])
@@ -1698,7 +1709,6 @@ def live_data():
         max_prof, max_loss = calculate_max_profit_loss(processed_legs)
         strat_type = identify_strategy(processed_legs)
 
-        # Basket Net Impact Metrics
         b_delta_imp = abs(net_greeks['delta'] * spot_price)
         b_theta_imp = abs(net_greeks['theta'])
         b_vega_imp = abs(net_greeks['vega'])
