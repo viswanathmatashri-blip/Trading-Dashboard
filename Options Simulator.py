@@ -121,20 +121,25 @@ def is_market_open():
         return False
     return time(9, 15) <= now.time() <= time(15, 30)
 
-def get_last_trading_day_dates():
+def get_last_trading_day_dates(num_days=5):
+    """Fetches multi-day window (default 5 trading days) to gather enough candles for indicators."""
     now = datetime.now(IST)
-    if is_market_open():
-        return now.strftime("%Y-%m-%d 09:15"), now.strftime("%Y-%m-%d %H:%M")
-    
-    target_date = now.date()
-    if now.time() < time(9, 15):
-        target_date -= timedelta(days=1)
+    end_date = now.date()
+    if not is_market_open() and now.time() < time(9, 15):
+        end_date -= timedelta(days=1)
         
-    while target_date.weekday() >= 5:
-        target_date -= timedelta(days=1)
+    while end_date.weekday() >= 5:
+        end_date -= timedelta(days=1)
 
-    from_str = target_date.strftime("%Y-%m-%d 09:15")
-    to_str = target_date.strftime("%Y-%m-%d 15:30")
+    start_date = end_date
+    trading_days = 0
+    while trading_days < num_days:
+        start_date -= timedelta(days=1)
+        if start_date.weekday() < 5:
+            trading_days += 1
+
+    from_str = start_date.strftime("%Y-%m-%d 09:15")
+    to_str = now.strftime("%Y-%m-%d %H:%M") if is_market_open() else end_date.strftime("%Y-%m-%d 15:30")
     return from_str, to_str
 
 def fetch_option_chain_data(smart_api, symbol, expiry):
@@ -168,7 +173,8 @@ def calculate_pcr(option_chain_data, spot_price, step, strike_range_limit=None):
 
     for item in filtered_chain:
         opt_type = str(item.get('optionType', '')).upper()
-        oi = float(item.get('opennterest', 0) or item.get('openInterest', 0) or 0)
+        # Flexibly extract Open Interest regardless of SmartAPI payload key casing
+        oi = float(item.get('opennterest', 0) or item.get('openInterest', 0) or item.get('oi', 0) or 0)
         
         if opt_type in ['PE', 'PUT']:
             total_put_oi += oi
@@ -181,10 +187,10 @@ def calculate_pcr(option_chain_data, spot_price, step, strike_range_limit=None):
     pcr_val = total_put_oi / total_call_oi
     return round(pcr_val, 2)
 
-# --- TECHNICAL INDICATORS ENGINE ---
+# --- TECHNICAL INDICATORS & DIVERGENCE ENGINE ---
 def calculate_chart_indicators(candles):
     if not candles or len(candles) < 26:
-        return {}, "BB (20,2) : N/A", "MACD (12,26,9) : N/A", "RSI (14) Divergence : N/A"
+        return {}, "BB (20,2) : N/A", "MACD (12,26,9) : N/A", "RSI (14) Divergence : N/A", [], [], []
 
     df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['close'] = df['close'].astype(float)
@@ -232,22 +238,45 @@ def calculate_chart_indicators(candles):
     else:
         macd_status = "MACD (12,26,9) : Downtrend Continuation"
 
-    # 3. RSI (14) & Divergence
+    # 3. RSI (14)
     delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
+    # Divergence Identification Algorithm
+    price_divergence_points = [None] * len(df)
+    macd_divergence_points = [None] * len(df)
+    rsi_divergence_points = [None] * len(df)
     rsi_status = "RSI (14) Divergence : None"
-    if len(df) >= 14:
-        p_curr, p_prev = df['close'].iloc[-1], df['close'].iloc[-5]
-        r_curr, r_prev = df['rsi'].dropna().iloc[-1], df['rsi'].dropna().iloc[-5] if len(df['rsi'].dropna()) >= 5 else (0, 0)
 
-        if p_curr > p_prev and r_curr < r_prev:
-            rsi_status = "RSI (14) Divergence : Bearish Divergence"
-        elif p_curr < p_prev and r_curr > r_prev:
-            rsi_status = "RSI (14) Divergence : Bullish Divergence"
+    window = 3
+    if len(df) >= 30:
+        for i in range(window + 10, len(df) - 1):
+            # Check for local price highs & RSI/MACD lower highs (Bearish Divergence)
+            if df['close'].iloc[i] > df['close'].iloc[i-window:i].max() and df['close'].iloc[i] > df['close'].iloc[i+1:i+window+1].max():
+                prev_high_idx = df['close'].iloc[i-15:i-window].idxmax()
+                if not pd.isna(prev_high_idx):
+                    if df['close'].iloc[i] > df['close'].loc[prev_high_idx]:
+                        if df['rsi'].iloc[i] < df['rsi'].loc[prev_high_idx]:
+                            rsi_status = "RSI (14) Divergence : Bearish Divergence"
+                            rsi_divergence_points[i] = round(df['rsi'].iloc[i], 2)
+                            price_divergence_points[i] = round(df['close'].iloc[i], 2)
+                        if df['macd'].iloc[i] < df['macd'].loc[prev_high_idx]:
+                            macd_divergence_points[i] = round(df['macd'].iloc[i], 2)
+
+            # Check for local price lows & RSI/MACD higher lows (Bullish Divergence)
+            if df['close'].iloc[i] < df['close'].iloc[i-window:i].min() and df['close'].iloc[i] < df['close'].iloc[i+1:i+window+1].min():
+                prev_low_idx = df['close'].iloc[i-15:i-window].idxmin()
+                if not pd.isna(prev_low_idx):
+                    if df['close'].iloc[i] < df['close'].loc[prev_low_idx]:
+                        if df['rsi'].iloc[i] > df['rsi'].loc[prev_low_idx]:
+                            rsi_status = "RSI (14) Divergence : Bullish Divergence"
+                            rsi_divergence_points[i] = round(df['rsi'].iloc[i], 2)
+                            price_divergence_points[i] = round(df['close'].iloc[i], 2)
+                        if df['macd'].iloc[i] > df['macd'].loc[prev_low_idx]:
+                            macd_divergence_points[i] = round(df['macd'].iloc[i], 2)
 
     def clean_series(series):
         return [None if np.isnan(val) else round(float(val), 2) for val in series]
@@ -262,7 +291,7 @@ def calculate_chart_indicators(candles):
         "rsi": clean_series(df['rsi'])
     }
 
-    return indicator_series, bb_status, macd_status, rsi_status
+    return indicator_series, bb_status, macd_status, rsi_status, price_divergence_points, macd_divergence_points, rsi_divergence_points
 
 # --- BLACK-SCHOLES IV & GREEKS ENGINE ---
 def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_type='CE'):
@@ -635,6 +664,22 @@ HTML_TEMPLATE = r"""
             color: #00ff88;
         }
 
+        .pcr-refresh-btn {
+            background: transparent;
+            border: 1px solid #00bcd4;
+            color: #00bcd4;
+            border-radius: 3px;
+            padding: 2px 6px;
+            cursor: pointer;
+            font-size: 11px;
+            margin: 0;
+            width: auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .pcr-refresh-btn:hover { background: rgba(0, 188, 212, 0.2); }
+
         h2, h3 { margin-top: 0; color: #00bcd4; }
         
         .header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
@@ -673,15 +718,14 @@ HTML_TEMPLATE = r"""
         }
 
         .header-spinner {
-            width: 14px;
-            height: 14px;
+            width: 12px;
+            height: 12px;
             border: 2px solid rgba(0, 188, 212, 0.3);
             border-radius: 50%;
             border-top-color: #00bcd4;
             animation: spin 0.8s linear infinite;
             display: inline-block;
             vertical-align: middle;
-            margin-left: 8px;
         }
 
         @keyframes spin {
@@ -786,8 +830,12 @@ HTML_TEMPLATE = r"""
                     <h3>Index Price & Bollinger Bands (20, 2)</h3>
                     <div style="display: flex; gap: 10px; align-items: center; margin-right: 250px;">
                         <div class="pcr-control-box" title="Blank or 0 = Entire Option Chain">
-                            <span>PCR Strike Range (&plusmn; Strikes):</span>
-                            <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50" onchange="updateDashboard()">
+                            <span>PCR &plusmn; Range:</span>
+                            <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50">
+                            <button class="pcr-refresh-btn" onclick="refreshPcrValue()" title="Recalculate PCR">
+                                <span id="pcrSpinner" class="header-spinner" style="display:none;"></span>
+                                🔄
+                            </button>
                         </div>
                         <div>
                             <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Candle Timeframe:</label>
@@ -803,10 +851,10 @@ HTML_TEMPLATE = r"""
                 <canvas id="mainChart" height="90"></canvas>
 
                 <!-- Subcharts for MACD and RSI -->
-                <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator</div>
+                <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator with Divergence Points</div>
                 <canvas id="macdChart" height="35"></canvas>
 
-                <div class="subchart-title">RSI (14) Indicator</div>
+                <div class="subchart-title">RSI (14) Indicator with Divergence Points</div>
                 <canvas id="rsiChart" height="30"></canvas>
             </div>
 
@@ -865,7 +913,8 @@ HTML_TEMPLATE = r"""
                     { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true },
                     { label: 'BB Upper (20,2)', data: [], borderColor: 'rgba(255, 82, 82, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
                     { label: 'BB Middle SMA (20)', data: [], borderColor: 'rgba(255, 202, 40, 0.8)', borderWidth: 1, pointRadius: 0, spanGaps: true },
-                    { label: 'BB Lower (20,2)', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true }
+                    { label: 'BB Lower (20,2)', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
+                    { label: 'Divergence Marker', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 5, pointStyle: 'rectRot', showLine: false }
                 ] 
             },
             options: { 
@@ -887,7 +936,8 @@ HTML_TEMPLATE = r"""
                 datasets: [
                     { type: 'line', label: 'MACD (12, 26)', data: [], borderColor: '#2196f3', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
                     { type: 'line', label: 'Signal (9 EMA)', data: [], borderColor: '#ff9800', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
-                    { type: 'bar', label: 'MACD Hist', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' }
+                    { type: 'bar', label: 'MACD Hist', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' },
+                    { type: 'line', label: 'MACD Divergence', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 4, showLine: false }
                 ]
             },
             options: {
@@ -907,7 +957,8 @@ HTML_TEMPLATE = r"""
             data: {
                 labels: [],
                 datasets: [
-                    { label: 'RSI (14)', data: [], borderColor: '#e91e63', borderWidth: 1.5, pointRadius: 0, spanGaps: true }
+                    { label: 'RSI (14)', data: [], borderColor: '#e91e63', borderWidth: 1.5, pointRadius: 0, spanGaps: true },
+                    { label: 'RSI Divergence', data: [], borderColor: '#ff0055', backgroundColor: '#ff0055', pointRadius: 4, showLine: false }
                 ]
             },
             options: {
@@ -943,6 +994,13 @@ HTML_TEMPLATE = r"""
             if (isChecked) {
                 refreshTimer = setInterval(updateDashboard, 5000);
             }
+        }
+
+        async function refreshPcrValue() {
+            const spinner = document.getElementById('pcrSpinner');
+            spinner.style.display = 'inline-block';
+            await updateDashboard();
+            spinner.style.display = 'none';
         }
 
         async function loadExpiries() {
@@ -1140,19 +1198,22 @@ HTML_TEMPLATE = r"""
                         mainChart.data.datasets[1].data = data.indicators.bb_upper || [];
                         mainChart.data.datasets[2].data = data.indicators.bb_middle || [];
                         mainChart.data.datasets[3].data = data.indicators.bb_lower || [];
+                        mainChart.data.datasets[4].data = data.price_divergences || [];
 
                         // Plot MACD Subchart
                         macdChart.data.datasets[0].data = data.indicators.macd || [];
                         macdChart.data.datasets[1].data = data.indicators.macd_signal || [];
                         macdChart.data.datasets[2].data = data.indicators.macd_hist || [];
+                        macdChart.data.datasets[3].data = data.macd_divergences || [];
 
                         // Plot RSI Subchart
                         rsiChart.data.datasets[0].data = data.indicators.rsi || [];
+                        rsiChart.data.datasets[1].data = data.rsi_divergences || [];
                     }
 
                     const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
 
-                    let baseDatasets = mainChart.data.datasets.slice(0, 4);
+                    let baseDatasets = mainChart.data.datasets.slice(0, 5);
                     if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
                         targetBasket.legs.forEach((leg, lIdx) => {
                             let strikeVal = parseFloat(leg.strike);
@@ -1365,7 +1426,8 @@ def live_data():
     except Exception as e:
         return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
 
-    from_date, to_date = get_last_trading_day_dates()
+    # Fetch 5 days worth of candles to satisfy Bollinger Bands, RSI, MACD requirements
+    from_date, to_date = get_last_trading_day_dates(num_days=5)
 
     chart_labels, chart_prices = [], []
     index_candles = []
@@ -1380,12 +1442,12 @@ def live_data():
         hist_resp = smart_api.getCandleData(hist_params)
         if hist_resp and hist_resp.get('status') and hist_resp.get('data'):
             index_candles = hist_resp['data']
-            chart_labels = [c[0].split('T')[1][:5] for c in index_candles]
+            chart_labels = [c[0].replace('T', ' ')[:16] for c in index_candles]
             chart_prices = [float(c[4]) for c in index_candles]
     except Exception:
         pass
 
-    indicators, bb_status, macd_status, rsi_status = calculate_chart_indicators(index_candles)
+    indicators, bb_status, macd_status, rsi_status, price_divs, macd_divs, rsi_divs = calculate_chart_indicators(index_candles)
 
     option_chain_data = []
     if selected_expiry:
@@ -1476,7 +1538,7 @@ def live_data():
                     if leg_hist_resp and leg_hist_resp.get('status') and leg_hist_resp.get('data'):
                         leg_candles = leg_hist_resp['data']
                         for c in leg_candles:
-                            ts = c[0].split('T')[1][:5]
+                            ts = c[0].replace('T', ' ')[:16]
                             leg_prices_map[ts] = float(c[4])
                 except Exception:
                     pass
@@ -1600,6 +1662,9 @@ def live_data():
         "bb_status": bb_status,
         "macd_status": macd_status,
         "rsi_status": rsi_status,
+        "price_divergences": price_divs,
+        "macd_divergences": macd_divs,
+        "rsi_divergences": rsi_divs,
         "baskets": processed_baskets
     })
 
