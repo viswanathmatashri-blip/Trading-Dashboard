@@ -151,29 +151,82 @@ def fetch_option_chain_data(smart_api, symbol, expiry):
         pass
     return []
 
+def get_nearest_expiry(symbol):
+    if INSTRUMENT_DF is None:
+        return None
+    filtered = INSTRUMENT_DF[INSTRUMENT_DF['name'] == symbol]
+    raw_expiries = filtered['expiry'].unique().tolist()
+    
+    parsed_expiries = []
+    now_date = datetime.now(IST).date()
+
+    for exp in raw_expiries:
+        try:
+            exp_date = datetime.strptime(exp, "%d%b%Y").date()
+            if exp_date >= now_date:
+                parsed_expiries.append((exp_date, exp))
+        except Exception:
+            pass
+
+    parsed_expiries.sort(key=lambda x: x[0])
+    return parsed_expiries[0][1] if parsed_expiries else None
+
 # --- PCR CALCULATION ENGINE ---
-def calculate_pcr(option_chain_data, spot_price, step, strike_range_limit=None):
-    if not option_chain_data:
+def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry=None, strike_range_limit=None):
+    if spot_price <= 0:
         return "N/A"
 
-    total_put_oi = 0
-    total_call_oi = 0
+    atm_strike = round(spot_price / step) * step
 
-    atm_strike = round(spot_price / step) * step if spot_price > 0 else None
+    # Fallback to nearest expiry if none is provided
+    if not expiry:
+        expiry = get_nearest_expiry(symbol)
 
-    filtered_chain = option_chain_data
-    if strike_range_limit is not None and strike_range_limit > 0 and atm_strike:
+    chain = option_chain_data
+
+    # If SmartAPI optionChain is empty, construct chain directly using scrip master
+    if not chain and INSTRUMENT_DF is not None and expiry:
+        filtered_df = INSTRUMENT_DF[(INSTRUMENT_DF['name'] == symbol) & (INSTRUMENT_DF['expiry'] == expiry)]
+        chain = []
+        for _, row in filtered_df.iterrows():
+            opt_type = 'CE' if str(row['symbol']).endswith('CE') else 'PE'
+            chain.append({
+                'strikePrice': row['strike_price'],
+                'optionType': opt_type,
+                'token': row['token'],
+                'symbol': row['symbol']
+            })
+
+    if not chain:
+        return "N/A"
+
+    # Filter by user-specified ATM strike range
+    if strike_range_limit is not None and strike_range_limit > 0:
         lower_bound = atm_strike - (strike_range_limit * step)
         upper_bound = atm_strike + (strike_range_limit * step)
         filtered_chain = [
-            item for item in option_chain_data
+            item for item in chain
             if lower_bound <= float(item.get('strikePrice', 0) or 0) <= upper_bound
         ]
+    else:
+        filtered_chain = chain
+
+    total_put_oi = 0.0
+    total_call_oi = 0.0
 
     for item in filtered_chain:
         opt_type = str(item.get('optionType', '')).upper()
         oi = float(item.get('opennterest', 0) or item.get('openInterest', 0) or item.get('oi', 0) or 0)
-        
+
+        # If OI missing from optionChain payload, query market data API
+        if oi == 0 and 'token' in item and smart_api:
+            try:
+                ltp_res = smart_api.ltpData("NFO", item['symbol'], str(item['token']))
+                if ltp_res and ltp_res.get('data'):
+                    oi = float(ltp_res['data'].get('opennterest', 0) or ltp_res['data'].get('openInterest', 0) or 0)
+            except Exception:
+                pass
+
         if opt_type in ['PE', 'PUT']:
             total_put_oi += oi
         elif opt_type in ['CE', 'CALL']:
@@ -570,6 +623,7 @@ HTML_TEMPLATE = r"""
     <meta charset="UTF-8">
     <title>Live SmartAPI Options Position Tracker</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@2.0.1"></script>
     <style>
         body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 20px; padding-top: 35px; }
         
@@ -721,10 +775,10 @@ HTML_TEMPLATE = r"""
             font-weight: bold;
         }
 
-        /* Container to fix RSI infinite Y-axis elongation bug */
+        /* Scaled RSI chart container height to match MACD subchart scale */
         .rsi-wrapper {
             position: relative;
-            height: 120px;
+            height: 200px;
             width: 100%;
         }
     </style>
@@ -809,9 +863,9 @@ HTML_TEMPLATE = r"""
                 <div class="header-flex">
                     <h3>Index Price & Bollinger Bands (20, 2)</h3>
                     <div style="display: flex; gap: 10px; align-items: center; margin-right: 200px;">
-                        <div class="pcr-control-box" title="Blank or 0 = Entire Option Chain">
+                        <div class="pcr-control-box" title="Number of Strikes +/- from ATM Strike Price">
                             <span>PCR &plusmn; Range:</span>
-                            <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50">
+                            <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50" value="5">
                             <button class="pcr-refresh-btn" onclick="refreshPcrValue()" title="Recalculate PCR">
                                 <span id="pcrSpinner" class="header-spinner" style="display:none;"></span>
                                 🔄
@@ -832,9 +886,9 @@ HTML_TEMPLATE = r"""
 
                 <!-- Subcharts for MACD and RSI -->
                 <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator</div>
-                <canvas id="macdChart" height="40"></canvas>
+                <canvas id="macdChart" height="100"></canvas>
 
-                <div class="subchart-title">RSI (14) Indicator</div>
+                <div class="subchart-title">RSI (14) Indicator (0-30-70-100 Rescaled)</div>
                 <div class="rsi-wrapper">
                     <canvas id="rsiChart"></canvas>
                 </div>
@@ -930,7 +984,7 @@ HTML_TEMPLATE = r"""
             }
         });
 
-        // 3. RSI Sub-Chart Fixed Bounds
+        // 3. RSI Sub-Chart (Rescaled Y Axis 0-30-70-100)
         const ctxRSI = document.getElementById('rsiChart').getContext('2d');
         rsiChart = new Chart(ctxRSI, {
             type: 'line',
@@ -949,9 +1003,41 @@ HTML_TEMPLATE = r"""
                         min: 0, 
                         max: 100, 
                         grid: { color: '#2a2a2a' }, 
-                        ticks: { stepSize: 20, color: '#aaa' } 
+                        ticks: { 
+                            values: [0, 30, 70, 100],
+                            stepSize: 10,
+                            color: '#aaa',
+                            callback: function(val) {
+                                if ([0, 30, 70, 100].includes(val)) return val;
+                                return '';
+                            }
+                        } 
                     },
                     x: { grid: { color: '#2a2a2a' }, ticks: { color: '#888' } }
+                },
+                plugins: {
+                    annotation: {
+                        annotations: {
+                            line70: {
+                                type: 'line',
+                                yMin: 70,
+                                yMax: 70,
+                                borderColor: 'rgba(255, 82, 82, 0.6)',
+                                borderWidth: 1,
+                                borderDash: [4, 4],
+                                label: { display: true, content: 'Overbought (70)', color: '#ff5252', position: 'start', font: { size: 10 } }
+                            },
+                            line30: {
+                                type: 'line',
+                                yMin: 30,
+                                yMax: 30,
+                                borderColor: 'rgba(76, 175, 80, 0.6)',
+                                borderWidth: 1,
+                                borderDash: [4, 4],
+                                label: { display: true, content: 'Oversold (30)', color: '#4caf50', position: 'start', font: { size: 10 } }
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -1354,7 +1440,6 @@ def fetch_expiries():
     filtered = INSTRUMENT_DF[INSTRUMENT_DF['name'] == symbol]
     raw_expiries = filtered['expiry'].unique().tolist()
 
-    # --- CHRONOLOGICAL EXPIRY SORTING ENGINE ---
     parsed_expiries = []
     now_date = datetime.now(IST).date()
 
@@ -1449,7 +1534,11 @@ def live_data():
     if selected_expiry:
         option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
 
-    pcr_value = calculate_pcr(option_chain_data, spot_price, idx_info['step'], pcr_strike_range)
+    # Re-engineered PCR calculation call
+    pcr_value = calculate_pcr(
+        smart_api, symbol, option_chain_data, spot_price, idx_info['step'], 
+        expiry=selected_expiry, strike_range_limit=pcr_strike_range
+    )
 
     atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(
         smart_api, option_chain_data, spot_price, idx_info['step'], 
