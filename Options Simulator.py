@@ -147,11 +147,44 @@ def fetch_option_chain_data(smart_api, symbol, expiry):
         pass
     return []
 
-# --- FIXED TECHNICAL INDICATORS ENGINE ---
+# --- PCR CALCULATION ENGINE ---
+def calculate_pcr(option_chain_data, spot_price, step, strike_range_limit=None):
+    if not option_chain_data:
+        return "N/A"
+
+    total_put_oi = 0
+    total_call_oi = 0
+
+    atm_strike = round(spot_price / step) * step if spot_price > 0 else None
+
+    filtered_chain = option_chain_data
+    if strike_range_limit is not None and strike_range_limit > 0 and atm_strike:
+        lower_bound = atm_strike - (strike_range_limit * step)
+        upper_bound = atm_strike + (strike_range_limit * step)
+        filtered_chain = [
+            item for item in option_chain_data
+            if lower_bound <= float(item.get('strikePrice', 0) or 0) <= upper_bound
+        ]
+
+    for item in filtered_chain:
+        opt_type = str(item.get('optionType', '')).upper()
+        oi = float(item.get('opennterest', 0) or item.get('openInterest', 0) or 0)
+        
+        if opt_type in ['PE', 'PUT']:
+            total_put_oi += oi
+        elif opt_type in ['CE', 'CALL']:
+            total_call_oi += oi
+
+    if total_call_oi == 0:
+        return "N/A"
+
+    pcr_val = total_put_oi / total_call_oi
+    return round(pcr_val, 2)
+
+# --- TECHNICAL INDICATORS ENGINE ---
 def calculate_chart_indicators(candles):
-    """Calculates Bollinger Bands, MACD, and RSI without zero-padding bugs."""
     if not candles or len(candles) < 26:
-        return {}, "BB Status : N/A", "MACD : N/A", "RSI divergence status : N/A"
+        return {}, "BB (20,2) : N/A", "MACD (12,26,9) : N/A", "RSI (14) Divergence : N/A"
 
     df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['close'] = df['close'].astype(float)
@@ -165,19 +198,18 @@ def calculate_chart_indicators(candles):
     df['bb_lower'] = df['sma20'] - (df['std20'] * 2)
     df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['sma20']
 
-    # Status checks
     recent_width = df['bb_width'].dropna().iloc[-1] if not df['bb_width'].dropna().empty else 0
     avg_width = df['bb_width'].dropna().tail(20).mean() if not df['bb_width'].dropna().empty else 0
     latest_close = df['close'].iloc[-1]
     
     if recent_width > 0 and recent_width < (avg_width * 0.75):
-        bb_status = "BB Status : Squeeze active"
+        bb_status = "BB (20,2) : Squeeze active"
     elif not df['bb_upper'].dropna().empty and latest_close >= df['bb_upper'].dropna().iloc[-1]:
-        bb_status = "BB Status : Upper Breakout"
+        bb_status = "BB (20,2) : Upper Breakout"
     elif not df['bb_lower'].dropna().empty and latest_close <= df['bb_lower'].dropna().iloc[-1]:
-        bb_status = "BB Status : Lower Breakdown"
+        bb_status = "BB (20,2) : Lower Breakdown"
     else:
-        bb_status = "BB Status : Normal"
+        bb_status = "BB (20,2) : Normal"
 
     # 2. MACD (12, 26, 9)
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
@@ -192,13 +224,13 @@ def calculate_chart_indicators(candles):
     prev_signal = df['macd_signal'].iloc[-2]
 
     if prev_macd <= prev_signal and curr_macd > curr_signal:
-        macd_status = "MACD : Breakout - Uptrend"
+        macd_status = "MACD (12,26,9) : Bullish Crossover"
     elif prev_macd >= prev_signal and curr_macd < curr_signal:
-        macd_status = "MACD : Breakdown - Downtrend"
+        macd_status = "MACD (12,26,9) : Bearish Crossover"
     elif curr_macd > curr_signal:
-        macd_status = "MACD : Uptrend Continuation"
+        macd_status = "MACD (12,26,9) : Uptrend Continuation"
     else:
-        macd_status = "MACD : Downtrend Continuation"
+        macd_status = "MACD (12,26,9) : Downtrend Continuation"
 
     # 3. RSI (14) & Divergence
     delta = df['close'].diff()
@@ -207,15 +239,15 @@ def calculate_chart_indicators(candles):
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    rsi_status = "RSI divergence status : None"
+    rsi_status = "RSI (14) Divergence : None"
     if len(df) >= 14:
         p_curr, p_prev = df['close'].iloc[-1], df['close'].iloc[-5]
         r_curr, r_prev = df['rsi'].dropna().iloc[-1], df['rsi'].dropna().iloc[-5] if len(df['rsi'].dropna()) >= 5 else (0, 0)
 
         if p_curr > p_prev and r_curr < r_prev:
-            rsi_status = "RSI divergence status : Bearish Divergence"
+            rsi_status = "RSI (14) Divergence : Bearish Divergence"
         elif p_curr < p_prev and r_curr > r_prev:
-            rsi_status = "RSI divergence status : Bullish Divergence"
+            rsi_status = "RSI (14) Divergence : Bullish Divergence"
 
     def clean_series(series):
         return [None if np.isnan(val) else round(float(val), 2) for val in series]
@@ -579,6 +611,30 @@ HTML_TEMPLATE = r"""
         }
         .ribbon-item { display: block; color: #00ff88; }
 
+        .pcr-control-box {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid #00bcd4;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            color: #fff;
+        }
+
+        .pcr-input {
+            width: 50px !important;
+            padding: 2px 4px !important;
+            margin: 0 !important;
+            height: 22px;
+            font-size: 11px;
+            text-align: center;
+            background: #121212;
+            border: 1px solid #555;
+            color: #00ff88;
+        }
+
         h2, h3 { margin-top: 0; color: #00bcd4; }
         
         .header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
@@ -715,19 +771,24 @@ HTML_TEMPLATE = r"""
                 <div class="status-item">Dynamic ATM IV: <span id="stIv" class="status-value">-</span></div>
                 <div class="status-item">Expected 1-Day Move: <span id="stMove" class="status-value">-</span></div>
                 <div class="status-item">Expected Expiry Move: <span id="stExpiryMove" class="status-value">-</span></div>
+                <div class="status-item">PCR: <span id="stPcr" class="status-value">-</span></div>
                 <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
             </div>
 
             <div class="card chart-container-relative">
                 <div id="indicatorRibbon" class="indicator-ribbon">
-                    <span id="ribbonBB" class="ribbon-item">BB Status : -</span>
-                    <span id="ribbonMACD" class="ribbon-item">MACD : -</span>
-                    <span id="ribbonRSI" class="ribbon-item">RSI divergence status : -</span>
+                    <span id="ribbonBB" class="ribbon-item">BB (20,2) : -</span>
+                    <span id="ribbonMACD" class="ribbon-item">MACD (12,26,9) : -</span>
+                    <span id="ribbonRSI" class="ribbon-item">RSI (14) Divergence : -</span>
                 </div>
 
                 <div class="header-flex">
-                    <h3>Index Price & Bollinger Bands</h3>
-                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 220px;">
+                    <h3>Index Price & Bollinger Bands (20, 2)</h3>
+                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 250px;">
+                        <div class="pcr-control-box" title="Blank or 0 = Entire Option Chain">
+                            <span>PCR Strike Range (&plusmn; Strikes):</span>
+                            <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50" onchange="updateDashboard()">
+                        </div>
                         <div>
                             <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Candle Timeframe:</label>
                             <select id="timeframeSelect" class="chart-select" onchange="updateDashboard()">
@@ -742,7 +803,7 @@ HTML_TEMPLATE = r"""
                 <canvas id="mainChart" height="90"></canvas>
 
                 <!-- Subcharts for MACD and RSI -->
-                <div class="subchart-title">MACD Indicator</div>
+                <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator</div>
                 <canvas id="macdChart" height="35"></canvas>
 
                 <div class="subchart-title">RSI (14) Indicator</div>
@@ -802,9 +863,9 @@ HTML_TEMPLATE = r"""
                 labels: [], 
                 datasets: [
                     { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true },
-                    { label: 'BB Upper', data: [], borderColor: 'rgba(255, 82, 82, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
-                    { label: 'BB Middle', data: [], borderColor: 'rgba(255, 202, 40, 0.8)', borderWidth: 1, pointRadius: 0, spanGaps: true },
-                    { label: 'BB Lower', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true }
+                    { label: 'BB Upper (20,2)', data: [], borderColor: 'rgba(255, 82, 82, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
+                    { label: 'BB Middle SMA (20)', data: [], borderColor: 'rgba(255, 202, 40, 0.8)', borderWidth: 1, pointRadius: 0, spanGaps: true },
+                    { label: 'BB Lower (20,2)', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true }
                 ] 
             },
             options: { 
@@ -817,16 +878,16 @@ HTML_TEMPLATE = r"""
             }
         });
 
-        // 2. Separate MACD Sub-Chart
+        // 2. Separate MACD Sub-Chart (12, 26, 9 EMA)
         const ctxMACD = document.getElementById('macdChart').getContext('2d');
         macdChart = new Chart(ctxMACD, {
             type: 'bar',
             data: {
                 labels: [],
                 datasets: [
-                    { type: 'line', label: 'MACD', data: [], borderColor: '#2196f3', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
-                    { type: 'line', label: 'Signal', data: [], borderColor: '#ff9800', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
-                    { type: 'bar', label: 'Histogram', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' }
+                    { type: 'line', label: 'MACD (12, 26)', data: [], borderColor: '#2196f3', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
+                    { type: 'line', label: 'Signal (9 EMA)', data: [], borderColor: '#ff9800', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
+                    { type: 'bar', label: 'MACD Hist', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' }
                 ]
             },
             options: {
@@ -1035,6 +1096,7 @@ HTML_TEMPLATE = r"""
             const interval = document.getElementById('timeframeSelect').value;
             const basketInterval = document.getElementById('basketTimeframeSelect').value;
             const selectedExpiry = document.getElementById('expirySelect').value;
+            const pcrRangeVal = document.getElementById('pcrStrikeRange').value;
 
             activeBaskets = activeBaskets.filter(b => !deletedBasketIds.has(b.id));
 
@@ -1044,7 +1106,8 @@ HTML_TEMPLATE = r"""
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ 
                         symbol, exchange, interval, basket_interval: basketInterval, 
-                        expiry: selectedExpiry, baskets: activeBaskets 
+                        expiry: selectedExpiry, baskets: activeBaskets,
+                        pcr_strike_range: pcrRangeVal ? parseInt(pcrRangeVal) : null
                     })
                 });
                 const data = await res.json();
@@ -1056,6 +1119,7 @@ HTML_TEMPLATE = r"""
                 document.getElementById('stIv').innerText = data.current_iv + "%";
                 document.getElementById('stMove').innerText = "±" + data.expected_1day_move + " pts";
                 document.getElementById('stExpiryMove').innerText = "±" + data.expected_expiry_move + " pts";
+                document.getElementById('stPcr').innerText = data.pcr_value;
                 document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Last Trading Day Data)";
 
                 // Update Header Ribbon
@@ -1288,6 +1352,7 @@ def live_data():
     interval = req_data.get('interval', '15')
     basket_interval = req_data.get('basket_interval', '15')
     selected_expiry = req_data.get('expiry')
+    pcr_strike_range = req_data.get('pcr_strike_range')
 
     idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
     
@@ -1325,6 +1390,9 @@ def live_data():
     option_chain_data = []
     if selected_expiry:
         option_chain_data = fetch_option_chain_data(smart_api, symbol, selected_expiry)
+
+    # Compute PCR
+    pcr_value = calculate_pcr(option_chain_data, spot_price, idx_info['step'], pcr_strike_range)
 
     atm_iv_estimate, _ = get_atm_iv_and_leg_greeks(
         smart_api, option_chain_data, spot_price, idx_info['step'], 
@@ -1524,6 +1592,7 @@ def live_data():
         "current_iv": atm_iv_estimate,
         "expected_1day_move": expected_1day_move,
         "expected_expiry_move": expected_expiry_move,
+        "pcr_value": pcr_value,
         "is_market_open": is_market_open(),
         "chart_labels": chart_labels,
         "chart_prices": chart_prices,
