@@ -4,6 +4,8 @@ import math
 import pyotp
 import threading
 import requests
+import time as time_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
 from datetime import datetime, time, timezone, timedelta
@@ -38,6 +40,20 @@ smart_api_session = None
 INSTRUMENT_DF = None
 SCRIP_MASTER_STATUS = "Initializing Scrip Master..."
 IS_DOWNLOADING_MASTER = False
+
+# Memory Caching to Prevent Render 502 Bad Gateway Timeouts
+API_CACHE = {}
+CACHE_TTL_SECONDS = 10
+
+def get_cached_data(key):
+    if key in API_CACHE:
+        val, ts = API_CACHE[key]
+        if time_module.time() - ts < CACHE_TTL_SECONDS:
+            return val
+    return None
+
+def set_cached_data(key, val):
+    API_CACHE[key] = (val, time_module.time())
 
 def get_smart_api():
     global smart_api_session
@@ -144,10 +160,16 @@ def get_last_trading_day_dates(num_days=5):
     return from_str, to_str
 
 def fetch_option_chain_data(smart_api, symbol, expiry):
+    cache_key = f"chain_{symbol}_{expiry}"
+    cached = get_cached_data(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         chain_params = {"name": symbol, "expirydate": expiry}
         res = smart_api.optionChain(chain_params)
         if res and res.get('status') and res.get('data'):
+            set_cached_data(cache_key, res['data'])
             return res['data']
     except Exception:
         pass
@@ -215,14 +237,6 @@ def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry
     for item in filtered_chain:
         opt_type = str(item.get('optionType', '')).upper()
         oi = float(item.get('opennterest', 0) or item.get('openInterest', 0) or item.get('oi', 0) or 0)
-
-        if oi == 0 and 'token' in item and smart_api:
-            try:
-                ltp_res = smart_api.ltpData("NFO", item['symbol'], str(item['token']))
-                if ltp_res and ltp_res.get('data'):
-                    oi = float(ltp_res['data'].get('opennterest', 0) or ltp_res['data'].get('openInterest', 0) or 0)
-            except Exception:
-                pass
 
         if opt_type in ['PE', 'PUT']:
             total_put_oi += oi
@@ -401,52 +415,6 @@ def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike,
                     atm_iv = iv_val
                     break
 
-    if atm_iv is None and smart_api and INSTRUMENT_DF is not None:
-        try:
-            match_ce = INSTRUMENT_DF[
-                (INSTRUMENT_DF['name'] == symbol) & 
-                (INSTRUMENT_DF['expiry'] == expiry_str) & 
-                (INSTRUMENT_DF['strike_price'] == atm_strike) & 
-                (INSTRUMENT_DF['symbol'].str.endswith('CE'))
-            ]
-            match_pe = INSTRUMENT_DF[
-                (INSTRUMENT_DF['name'] == symbol) & 
-                (INSTRUMENT_DF['expiry'] == expiry_str) & 
-                (INSTRUMENT_DF['strike_price'] == atm_strike) & 
-                (INSTRUMENT_DF['symbol'].str.endswith('PE'))
-            ]
-
-            ce_ltp, pe_ltp = None, None
-            if not match_ce.empty:
-                res_ce = smart_api.ltpData("NFO", match_ce.iloc[0]['symbol'], str(match_ce.iloc[0]['token']))
-                if res_ce and res_ce.get('data'):
-                    ce_ltp = float(res_ce['data']['ltp'])
-
-            if not match_pe.empty:
-                res_pe = smart_api.ltpData("NFO", match_pe.iloc[0]['symbol'], str(match_pe.iloc[0]['token']))
-                if res_pe and res_pe.get('data'):
-                    pe_ltp = float(res_pe['data']['ltp'])
-
-            iv_ce = calculate_implied_volatility(ce_ltp, spot_price, atm_strike, t_years, RISK_FREE_RATE, 'CE') if ce_ltp else None
-            iv_pe = calculate_implied_volatility(pe_ltp, spot_price, atm_strike, t_years, RISK_FREE_RATE, 'PE') if pe_ltp else None
-
-            if iv_ce and iv_pe:
-                atm_iv = (iv_ce + iv_pe) / 2.0
-            elif iv_ce:
-                atm_iv = iv_ce
-            elif iv_pe:
-                atm_iv = iv_pe
-        except Exception:
-            pass
-
-    if atm_iv is None and smart_api:
-        try:
-            vix_res = smart_api.ltpData("NSE", "INDIA VIX", "26009")
-            if vix_res and vix_res.get('data'):
-                atm_iv = float(vix_res['data']['ltp'])
-        except Exception:
-            pass
-
     atm_iv = atm_iv if atm_iv is not None else 10.0
     leg_greeks = calculate_black_scholes_greeks(spot_price, strike, t_years, atm_iv, opt_type)
     return round(atm_iv, 2), leg_greeks
@@ -490,6 +458,47 @@ def get_past_price_within_market_hours(candles, duration_mins):
             break
 
     return latest_price, best_price
+
+def fetch_leg_market_data(smart_api, token, symbol_name, basket_interval, from_date, to_date):
+    ltp_val = None
+    leg_candles = []
+    
+    if not (smart_api and token and symbol_name):
+        return ltp_val, leg_candles
+
+    # Concurrent fetch of LTP and Candle Data to avoid rendering timeouts
+    def _fetch_ltp():
+        try:
+            res = smart_api.ltpData("NFO", symbol_name, token)
+            if res and res.get('status') and res.get('data'):
+                return float(res['data']['ltp'])
+        except Exception:
+            pass
+        return None
+
+    def _fetch_candles():
+        try:
+            params = {
+                "exchange": "NFO",
+                "symboltoken": token,
+                "interval": INTERVAL_MAP.get(basket_interval, "FIFTEEN_MINUTE"),
+                "fromdate": from_date,
+                "todate": to_date
+            }
+            res = smart_api.getCandleData(params)
+            if res and res.get('status') and res.get('data'):
+                return res['data']
+        except Exception:
+            pass
+        return []
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_ltp = executor.submit(_fetch_ltp)
+        f_cand = executor.submit(_fetch_candles)
+        ltp_val = f_ltp.result()
+        leg_candles = f_cand.result()
+
+    return ltp_val, leg_candles
 
 def calculate_basket_net_greeks(legs):
     net_delta, net_gamma, net_theta, net_vega = 0.0, 0.0, 0.0, 0.0
@@ -771,9 +780,10 @@ HTML_TEMPLATE = r"""
             font-weight: bold;
         }
 
+        /* Scaled Subchart Wrappers */
         .rsi-wrapper {
             position: relative;
-            height: 150px;
+            height: 175px;
             width: 100%;
         }
     </style>
@@ -880,7 +890,7 @@ HTML_TEMPLATE = r"""
                 <canvas id="mainChart" height="90"></canvas>
 
                 <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator</div>
-                <canvas id="macdChart" height="100"></canvas>
+                <canvas id="macdChart" height="65"></canvas>
 
                 <div class="subchart-title">RSI (14) Indicator (0-30-70-100 Rescaled)</div>
                 <div class="rsi-wrapper">
@@ -1458,9 +1468,16 @@ def fetch_chain():
     if smart_api and symbol in INDEX_TOKENS:
         try:
             tok_info = INDEX_TOKENS[symbol]
-            ltp_resp = smart_api.ltpData(tok_info["exchange"], tok_info["tradingsymbol"], tok_info["token"])
-            if ltp_resp and ltp_resp.get('status') and ltp_resp.get('data'):
-                spot = float(ltp_resp['data']['ltp'])
+            
+            cache_key = f"ltp_{symbol}"
+            spot = get_cached_data(cache_key)
+            if spot is None:
+                ltp_resp = smart_api.ltpData(tok_info["exchange"], tok_info["tradingsymbol"], tok_info["token"])
+                if ltp_resp and ltp_resp.get('status') and ltp_resp.get('data'):
+                    spot = float(ltp_resp['data']['ltp'])
+                    set_cached_data(cache_key, spot)
+
+            if spot:
                 step = tok_info['step']
                 atm = round(spot / step) * step
         except Exception:
@@ -1485,11 +1502,14 @@ def live_data():
     idx_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
     
     try:
-        ltp_resp = smart_api.ltpData(idx_info["exchange"], idx_info["tradingsymbol"], idx_info["token"])
-        if not (ltp_resp and ltp_resp.get('status') and ltp_resp.get('data')):
-            return jsonify({"error": "Failed to fetch Index LTP", "status": "LTP Fetch Failed"})
-        
-        spot_price = float(ltp_resp['data']['ltp'])
+        cache_key = f"ltp_{symbol}"
+        spot_price = get_cached_data(cache_key)
+        if spot_price is None:
+            ltp_resp = smart_api.ltpData(idx_info["exchange"], idx_info["tradingsymbol"], idx_info["token"])
+            if not (ltp_resp and ltp_resp.get('status') and ltp_resp.get('data')):
+                return jsonify({"error": "Failed to fetch Index LTP", "status": "LTP Fetch Failed"})
+            spot_price = float(ltp_resp['data']['ltp'])
+            set_cached_data(cache_key, spot_price)
     except Exception as e:
         return jsonify({"error": str(e), "status": f"API Error: {str(e)}"})
 
@@ -1497,21 +1517,30 @@ def live_data():
 
     chart_labels, chart_prices = [], []
     index_candles = []
-    try:
-        hist_params = {
-            "exchange": idx_info["exchange"],
-            "symboltoken": idx_info["token"],
-            "interval": INTERVAL_MAP.get(interval, "FIFTEEN_MINUTE"),
-            "fromdate": from_date,
-            "todate": to_date
-        }
-        hist_resp = smart_api.getCandleData(hist_params)
-        if hist_resp and hist_resp.get('status') and hist_resp.get('data'):
-            index_candles = hist_resp['data']
-            chart_labels = [c[0].replace('T', ' ')[:16] for c in index_candles]
-            chart_prices = [float(c[4]) for c in index_candles]
-    except Exception:
-        pass
+    
+    cand_cache_key = f"index_candles_{symbol}_{interval}"
+    cached_candles = get_cached_data(cand_cache_key)
+    if cached_candles:
+        index_candles = cached_candles
+    else:
+        try:
+            hist_params = {
+                "exchange": idx_info["exchange"],
+                "symboltoken": idx_info["token"],
+                "interval": INTERVAL_MAP.get(interval, "FIFTEEN_MINUTE"),
+                "fromdate": from_date,
+                "todate": to_date
+            }
+            hist_resp = smart_api.getCandleData(hist_params)
+            if hist_resp and hist_resp.get('status') and hist_resp.get('data'):
+                index_candles = hist_resp['data']
+                set_cached_data(cand_cache_key, index_candles)
+        except Exception:
+            pass
+
+    if index_candles:
+        chart_labels = [c[0].replace('T', ' ')[:16] for c in index_candles]
+        chart_prices = [float(c[4]) for c in index_candles]
 
     indicators, bb_status, macd_status, rsi_status = calculate_chart_indicators(index_candles)
 
@@ -1542,6 +1571,7 @@ def live_data():
     expected_expiry_move = round(spot_price * (atm_iv_estimate / 100.0) * math.sqrt(days_to_expiry / 365.0), 2)
 
     processed_baskets = []
+
     for basket in baskets:
         basket_impact_duration = int(basket.get('impact_duration', 15))
         
@@ -1586,30 +1616,18 @@ def live_data():
 
             leg_prices_map = {}
             leg_candles = []
+            
             if token and symbol_name:
-                try:
-                    opt_ltp_resp = smart_api.ltpData("NFO", symbol_name, token)
-                    if opt_ltp_resp and opt_ltp_resp.get('status') and opt_ltp_resp.get('data'):
-                        current_ltp = float(opt_ltp_resp['data']['ltp'])
-                except Exception:
-                    pass
-
-                try:
-                    leg_hist_params = {
-                        "exchange": "NFO",
-                        "symboltoken": token,
-                        "interval": INTERVAL_MAP.get(basket_interval, "FIFTEEN_MINUTE"),
-                        "fromdate": from_date,
-                        "todate": to_date
-                    }
-                    leg_hist_resp = smart_api.getCandleData(leg_hist_params)
-                    if leg_hist_resp and leg_hist_resp.get('status') and leg_hist_resp.get('data'):
-                        leg_candles = leg_hist_resp['data']
-                        for c in leg_candles:
-                            ts = c[0].replace('T', ' ')[:16]
-                            leg_prices_map[ts] = float(c[4])
-                except Exception:
-                    pass
+                fetch_ltp, leg_candles = fetch_leg_market_data(
+                    smart_api, token, symbol_name, basket_interval, from_date, to_date
+                )
+                if fetch_ltp is not None:
+                    current_ltp = fetch_ltp
+                    
+                if leg_candles:
+                    for c in leg_candles:
+                        ts = c[0].replace('T', ' ')[:16]
+                        leg_prices_map[ts] = float(c[4])
 
             if entry_price is None or entry_price == 0:
                 entry_price = current_ltp if isinstance(current_ltp, (int, float)) else 0.0
