@@ -168,7 +168,8 @@ def fetch_option_chain_data(smart_api, symbol, expiry):
         return cached
 
     try:
-        chain_params = {"name": symbol, "expirydate": expiry}
+        formatted_expiry = datetime.strptime(expiry, "%d%b%Y").strftime("%d%b%Y").upper()
+        chain_params = {"name": symbol, "expirydate": formatted_expiry}
         res = smart_api.optionChain(chain_params)
         if res and res.get('status') and res.get('data'):
             set_cached_data(cache_key, res['data'])
@@ -1691,7 +1692,20 @@ def fetch_full_option_chain():
 
     chain_raw = fetch_option_chain_data(smart_api, symbol, expiry)
     
-    # Structure Chain Map by Strike Price
+    # Off-market / Maintenance fallback: Build chain structure from INSTRUMENT_DF
+    if not chain_raw and INSTRUMENT_DF is not None:
+        filtered_df = INSTRUMENT_DF[(INSTRUMENT_DF['name'] == symbol) & (INSTRUMENT_DF['expiry'] == expiry)]
+        chain_raw = []
+        for _, row in filtered_df.iterrows():
+            opt_type = 'CE' if str(row['symbol']).endswith('CE') else 'PE'
+            chain_raw.append({
+                'strikePrice': row['strike_price'],
+                'optionType': opt_type,
+                'ltp': 0.0,
+                'openInterest': 0,
+                'impliedVolatility': 13.5
+            })
+
     chain_map = {}
     total_call_oi = 0
     total_put_oi = 0
