@@ -308,19 +308,15 @@ def calculate_chart_indicators(candles):
     df['low'] = df['low'].astype(float)
     df['volume'] = df['volume'].astype(float)
 
-    # 1. Volume Weighted Average Price (VWAP)
+    # VWAP
     df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3.0
     df['tp_v'] = df['typical_price'] * df['volume']
-    
-    # Calculate intraday cumulative sums reset per session
     df['date'] = pd.to_datetime(df['timestamp']).dt.date
     df['cum_tp_v'] = df.groupby('date')['tp_v'].cumsum()
     df['cum_vol'] = df.groupby('date')['volume'].cumsum()
-    
-    # Handle zero volume cases cleanly
     df['vwap'] = np.where(df['cum_vol'] > 0, df['cum_tp_v'] / df['cum_vol'], df['close'])
 
-    # 2. Bollinger Bands (20, 2)
+    # Bollinger Bands
     df['sma20'] = df['close'].rolling(window=20).mean()
     df['std20'] = df['close'].rolling(window=20).std()
     df['bb_upper'] = df['sma20'] + (df['std20'] * 2)
@@ -340,7 +336,7 @@ def calculate_chart_indicators(candles):
     else:
         bb_status = "BB (20,2) : Normal"
 
-    # 3. MACD (12, 26, 9)
+    # MACD
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = df['ema12'] - df['ema26']
@@ -361,7 +357,7 @@ def calculate_chart_indicators(candles):
     else:
         macd_status = "MACD (12,26,9) : Downtrend Continuation"
 
-    # 4. RSI (14)
+    # RSI
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
@@ -391,37 +387,6 @@ def calculate_chart_indicators(candles):
     }
 
     return indicator_series, bb_status, macd_status, rsi_status
-
-def calculate_implied_volatility(market_price, spot, strike, t_years, r, opt_type='CE'):
-    if market_price <= 0 or spot <= 0 or strike <= 0 or t_years <= 0:
-        return None
-
-    intrinsic = max(0, spot - strike) if opt_type.upper() in ['CE', 'CALL'] else max(0, strike - spot)
-    if market_price <= intrinsic:
-        return None
-
-    sigma = 0.15
-    for _ in range(20):
-        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * math.sqrt(t_years))
-        d2 = d1 - sigma * math.sqrt(t_years)
-
-        if opt_type.upper() in ['CE', 'CALL']:
-            price = spot * norm.cdf(d1) - strike * math.exp(-r * t_years) * norm.cdf(d2)
-        else:
-            price = strike * math.exp(-r * t_years) * norm.cdf(-d2) - spot * norm.cdf(-d1)
-
-        vega = spot * norm.pdf(d1) * math.sqrt(t_years)
-        diff = price - market_price
-        
-        if abs(diff) < 1e-4:
-            return round(sigma * 100.0, 2)
-            
-        if vega < 1e-6:
-            break
-            
-        sigma = sigma - diff / vega
-
-    return round(max(sigma, 0.01) * 100.0, 2)
 
 def calculate_black_scholes_greeks(spot, strike, t_years, iv_pct, opt_type='CE'):
     greeks = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
@@ -755,9 +720,65 @@ HTML_TEMPLATE = r"""
         
         .pending-leg-item { display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 6px; border-radius: 4px; margin-top: 5px; font-size: 12px; }
 
-        .status-bar { display: flex; gap: 12px; background: #262626; padding: 10px; border-radius: 6px; font-weight: bold; margin-bottom: 15px; flex-wrap: wrap; }
+        .status-bar { display: flex; gap: 12px; background: #262626; padding: 10px; border-radius: 6px; font-weight: bold; margin-bottom: 5px; flex-wrap: wrap; }
         .status-item { font-size: 12px; }
         .status-value { color: #00ff88; }
+
+        /* Collapsible Option Chain Ribbon Styles */
+        .option-chain-collapsible {
+            background: #1a1a1a;
+            border: 1px solid #00bcd4;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            overflow: hidden;
+        }
+
+        .option-chain-header {
+            background: #252525;
+            padding: 8px 14px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            font-weight: bold;
+            color: #00bcd4;
+            user-select: none;
+        }
+
+        .option-chain-header:hover { background: #2f2f2f; }
+
+        .option-chain-content {
+            display: none;
+            padding: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .option-chain-metrics {
+            display: flex;
+            gap: 20px;
+            background: #121212;
+            padding: 8px 12px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            font-size: 12px;
+            border: 1px solid #333;
+        }
+
+        .metric-item { display: flex; gap: 6px; }
+        .metric-label { color: #aaa; }
+        .metric-val { font-weight: bold; color: #00ff88; }
+
+        .oc-table { width: 100%; border-collapse: collapse; font-size: 11px; text-align: center; }
+        .oc-table th, .oc-table td { padding: 6px 4px; border: 1px solid #333; }
+        .oc-table th { background: #232323; color: #00bcd4; position: sticky; top: 0; }
+        .oc-table tr:hover { background: #262626; }
+        .atm-row { background: rgba(0, 188, 212, 0.15) !important; font-weight: bold; }
+        .call-col { color: #00ff88; }
+        .put-col { color: #ff5252; }
+        .strike-col { background: #181818; color: #fff; font-weight: bold; }
+
         .pnl-pos { color: #00ff88; font-weight: bold; }
         .pnl-neg { color: #ff5252; font-weight: bold; }
         .pnl-err { color: #ff9800; font-weight: bold; }
@@ -829,13 +850,13 @@ HTML_TEMPLATE = r"""
             <div class="card">
                 <h3>1. Select Underlying & Expiry</h3>
                 <label>Index Symbol</label>
-                <select id="symbol" onchange="loadExpiries()">
+                <select id="symbol" onchange="onUnderlyingOrExpiryChange()">
                     <option value="NIFTY">NIFTY 50</option>
                     <option value="BANKNIFTY">BANKNIFTY</option>
                 </select>
 
                 <label>Expiry Date</label>
-                <select id="expirySelect" onchange="loadChain()"></select>
+                <select id="expirySelect" onchange="onUnderlyingOrExpiryChange()"></select>
 
                 <label>Exchange Segment</label>
                 <select id="exchange">
@@ -875,6 +896,7 @@ HTML_TEMPLATE = r"""
         </div>
 
         <div>
+            <!-- Main Index Status Ribbon -->
             <div class="status-bar">
                 <div class="status-item">Index LTP: <span id="stIndex" class="status-value">-</span></div>
                 <div class="status-item">Dynamic ATM IV: <span id="stIv" class="status-value">-</span></div>
@@ -882,6 +904,58 @@ HTML_TEMPLATE = r"""
                 <div class="status-item">Expected Expiry Move: <span id="stExpiryMove" class="status-value">-</span></div>
                 <div class="status-item">PCR: <span id="stPcr" class="status-value">-</span></div>
                 <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
+            </div>
+
+            <!-- Collapsible Option Chain Ribbon -->
+            <div class="option-chain-collapsible">
+                <div class="option-chain-header" onclick="toggleOptionChain()">
+                    <span>📊 Full Option Chain Table (<span id="ocTitleSymbol">NIFTY</span> - <span id="ocTitleExpiry">-</span>)</span>
+                    <span id="ocToggleArrow">▼ Show Option Chain</span>
+                </div>
+                <div class="option-chain-content" id="ocContent">
+                    <div class="option-chain-metrics">
+                        <div class="metric-item">
+                            <span class="metric-label">Total Call OI:</span>
+                            <span class="metric-val" id="ocCallOI" style="color: #00ff88;">-</span>
+                        </div>
+                        <div class="metric-item">
+                            <span class="metric-label">Total Put OI:</span>
+                            <span class="metric-val" id="ocPutOI" style="color: #ff5252;">-</span>
+                        </div>
+                        <div class="metric-item">
+                            <span class="metric-label">Put-Call Ratio (PCR):</span>
+                            <span class="metric-val" id="ocPCR" style="color: #00bcd4;">-</span>
+                        </div>
+                    </div>
+                    
+                    <table class="oc-table">
+                        <thead>
+                            <tr>
+                                <th colspan="6" style="color: #00ff88; border-bottom: 1px solid #444;">CALLS</th>
+                                <th>STRIKE</th>
+                                <th colspan="6" style="color: #ff5252; border-bottom: 1px solid #444;">PUTS</th>
+                            </tr>
+                            <tr>
+                                <th>OI</th>
+                                <th>LTP</th>
+                                <th>&Delta;</th>
+                                <th>&Gamma;</th>
+                                <th>&Theta;</th>
+                                <th>&Nu;</th>
+                                <th>Strike</th>
+                                <th>&Nu;</th>
+                                <th>&Theta;</th>
+                                <th>&Gamma;</th>
+                                <th>&Delta;</th>
+                                <th>LTP</th>
+                                <th>OI</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ocTableBody">
+                            <tr><td colspan="13" style="text-align:center; padding: 15px; color:#aaa;">Click to expand and load Option Chain data...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 
             <div class="card chart-container-relative">
@@ -961,6 +1035,7 @@ HTML_TEMPLATE = r"""
         let deletedBasketIds = new Set();
         let mainChart, macdChart, rsiChart, legsChart;
         let refreshTimer = null;
+        let isOptionChainExpanded = false;
 
         const CHART_COLORS = ['#00bcd4', '#ff9800', '#e91e63', '#4caf50', '#9c27b0', '#ffeb3b'];
 
@@ -1049,21 +1124,11 @@ HTML_TEMPLATE = r"""
                     annotation: {
                         annotations: {
                             line70: {
-                                type: 'line',
-                                yMin: 70,
-                                yMax: 70,
-                                borderColor: 'rgba(255, 82, 82, 0.6)',
-                                borderWidth: 1,
-                                borderDash: [4, 4],
+                                type: 'line', yMin: 70, yMax: 70, borderColor: 'rgba(255, 82, 82, 0.6)', borderWidth: 1, borderDash: [4, 4],
                                 label: { display: true, content: 'Overbought (70)', color: '#ff5252', position: 'start', font: { size: 10 } }
                             },
                             line30: {
-                                type: 'line',
-                                yMin: 30,
-                                yMax: 30,
-                                borderColor: 'rgba(76, 175, 80, 0.6)',
-                                borderWidth: 1,
-                                borderDash: [4, 4],
+                                type: 'line', yMin: 30, yMax: 30, borderColor: 'rgba(76, 175, 80, 0.6)', borderWidth: 1, borderDash: [4, 4],
                                 label: { display: true, content: 'Oversold (30)', color: '#4caf50', position: 'start', font: { size: 10 } }
                             }
                         }
@@ -1092,7 +1157,10 @@ HTML_TEMPLATE = r"""
             if (refreshTimer) clearInterval(refreshTimer);
 
             if (isChecked) {
-                refreshTimer = setInterval(updateDashboard, 5000);
+                refreshTimer = setInterval(() => {
+                    updateDashboard();
+                    if(isOptionChainExpanded) loadFullOptionChainTable();
+                }, 5000);
             }
         }
 
@@ -1100,7 +1168,81 @@ HTML_TEMPLATE = r"""
             const spinner = document.getElementById('pcrSpinner');
             spinner.style.display = 'inline-block';
             await updateDashboard();
+            if(isOptionChainExpanded) await loadFullOptionChainTable();
             spinner.style.display = 'none';
+        }
+
+        function toggleOptionChain() {
+            const content = document.getElementById('ocContent');
+            const arrow = document.getElementById('ocToggleArrow');
+            isOptionChainExpanded = !isOptionChainExpanded;
+
+            if (isOptionChainExpanded) {
+                content.style.display = 'block';
+                arrow.innerText = '▲ Hide Option Chain';
+                loadFullOptionChainTable();
+            } else {
+                content.style.display = 'none';
+                arrow.innerText = '▼ Show Option Chain';
+            }
+        }
+
+        function onUnderlyingOrExpiryChange() {
+            loadExpiries().then(() => {
+                if(isOptionChainExpanded) loadFullOptionChainTable();
+            });
+        }
+
+        async function loadFullOptionChainTable() {
+            const symbol = document.getElementById('symbol').value;
+            const expiry = document.getElementById('expirySelect').value;
+
+            document.getElementById('ocTitleSymbol').innerText = symbol;
+            document.getElementById('ocTitleExpiry').innerText = expiry || '-';
+
+            if (!expiry) return;
+
+            try {
+                const res = await fetch('/api/fetch-full-option-chain', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ symbol, expiry })
+                });
+                const data = await res.json();
+
+                if (data.status === "success") {
+                    document.getElementById('ocCallOI').innerText = data.total_call_oi.toLocaleString('en-IN');
+                    document.getElementById('ocPutOI').innerText = data.total_put_oi.toLocaleString('en-IN');
+                    document.getElementById('ocPCR').innerText = data.pcr_value;
+
+                    const tbody = document.getElementById('ocTableBody');
+                    tbody.innerHTML = '';
+
+                    data.rows.forEach(row => {
+                        let tr = document.createElement('tr');
+                        if (row.is_atm) tr.className = 'atm-row';
+
+                        tr.innerHTML = `
+                            <td class="call-col">${row.call_oi ? row.call_oi.toLocaleString('en-IN') : '-'}</td>
+                            <td class="call-col">₹${row.call_ltp !== null ? row.call_ltp : '-'}</td>
+                            <td>${row.call_delta !== null ? row.call_delta : '-'}</td>
+                            <td>${row.call_gamma !== null ? row.call_gamma : '-'}</td>
+                            <td>${row.call_theta !== null ? row.call_theta : '-'}</td>
+                            <td>${row.call_vega !== null ? row.call_vega : '-'}</td>
+                            <td class="strike-col">${row.strike}</td>
+                            <td>${row.put_vega !== null ? row.put_vega : '-'}</td>
+                            <td>${row.put_theta !== null ? row.put_theta : '-'}</td>
+                            <td>${row.put_gamma !== null ? row.put_gamma : '-'}</td>
+                            <td>${row.put_delta !== null ? row.put_delta : '-'}</td>
+                            <td class="put-col">₹${row.put_ltp !== null ? row.put_ltp : '-'}</td>
+                            <td class="put-col">${row.put_oi ? row.put_oi.toLocaleString('en-IN') : '-'}</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                }
+            } catch(e) {
+                console.error("Could not load option chain", e);
+            }
         }
 
         async function loadExpiries() {
@@ -1117,12 +1259,13 @@ HTML_TEMPLATE = r"""
                 if (data.status) updateStatus(data.status, data.status.includes("Downloading") ? "warn" : "info");
 
                 const select = document.getElementById('expirySelect');
+                const prevExp = select.value;
                 select.innerHTML = '';
                 if(data.expiries && data.expiries.length > 0) {
                     data.expiries.forEach((exp, idx) => {
                         let opt = document.createElement('option');
                         opt.value = exp; opt.textContent = exp;
-                        if(idx === 0) opt.selected = true;
+                        if(exp === prevExp || idx === 0) opt.selected = true;
                         select.appendChild(opt);
                     });
                     loadChain();
@@ -1518,6 +1661,116 @@ def fetch_chain():
             pass
 
     return jsonify({"strikes": strikes, "atm": atm})
+
+@app.route('/api/fetch-full-option-chain', methods=['POST'])
+def fetch_full_option_chain():
+    smart_api, _ = get_smart_api()
+    data = request.json or {}
+    symbol = data.get('symbol', 'NIFTY')
+    expiry = data.get('expiry')
+
+    if not smart_api or not expiry:
+        return jsonify({"status": "error", "rows": [], "total_call_oi": 0, "total_put_oi": 0, "pcr_value": "N/A"})
+
+    tok_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
+    step = tok_info['step']
+
+    # Fetch Index Spot
+    cache_key = f"ltp_{symbol}"
+    spot_price = get_cached_data(cache_key)
+    if spot_price is None:
+        try:
+            ltp_resp = smart_api.ltpData(tok_info["exchange"], tok_info["tradingsymbol"], tok_info["token"])
+            if ltp_resp and ltp_resp.get('status') and ltp_resp.get('data'):
+                spot_price = float(ltp_resp['data']['ltp'])
+                set_cached_data(cache_key, spot_price)
+        except Exception:
+            spot_price = 0.0
+
+    atm_strike = round(spot_price / step) * step if spot_price > 0 else 0
+
+    chain_raw = fetch_option_chain_data(smart_api, symbol, expiry)
+    
+    # Structure Chain Map by Strike Price
+    chain_map = {}
+    total_call_oi = 0
+    total_put_oi = 0
+
+    now = datetime.now(IST)
+    try:
+        exp_dt = datetime.strptime(expiry, "%d%b%Y").replace(hour=15, minute=30, tzinfo=IST)
+        days_remaining = max((exp_dt - now).total_seconds() / (24 * 3600), 0.001)
+    except Exception:
+        days_remaining = 1.0
+    t_years = days_remaining / 365.0
+
+    for item in chain_raw:
+        try:
+            sp = float(item.get('strikePrice', 0) or item.get('strikeprice', 0) or 0)
+            opt_type = str(item.get('optionType', '') or item.get('optiontype', '')).upper()
+            if not opt_type:
+                opt_type = 'CE' if str(item.get('symbol', '')).endswith('CE') else 'PE'
+
+            ltp = float(item.get('ltp', 0) or item.get('lastPrice', 0) or 0)
+            oi = int(item.get('openInterest', 0) or item.get('opennterest', 0) or item.get('oi', 0) or 0)
+            iv = float(item.get('impliedVolatility', 0) or item.get('iv', 0) or 13.5)
+            if iv <= 0: iv = 13.5
+
+            if sp not in chain_map:
+                chain_map[sp] = {'CE': None, 'PE': None}
+
+            greeks = calculate_black_scholes_greeks(spot_price, sp, t_years, iv, opt_type)
+
+            chain_map[sp][opt_type] = {
+                'ltp': round(ltp, 2),
+                'oi': oi,
+                'greeks': greeks
+            }
+
+            if opt_type in ['CE', 'CALL']:
+                total_call_oi += oi
+            else:
+                total_put_oi += oi
+
+        except Exception:
+            continue
+
+    sorted_strikes = sorted(chain_map.keys())
+    
+    rows = []
+    for sp in sorted_strikes:
+        ce = chain_map[sp]['CE'] or {}
+        pe = chain_map[sp]['PE'] or {}
+        
+        ce_g = ce.get('greeks', {})
+        pe_g = pe.get('greeks', {})
+
+        rows.append({
+            'strike': sp,
+            'is_atm': sp == atm_strike,
+            'call_oi': ce.get('oi', 0),
+            'call_ltp': ce.get('ltp', None),
+            'call_delta': ce_g.get('delta', None),
+            'call_gamma': ce_g.get('gamma', None),
+            'call_theta': ce_g.get('theta', None),
+            'call_vega': ce_g.get('vega', None),
+            'put_oi': pe.get('oi', 0),
+            'put_ltp': pe.get('ltp', None),
+            'put_delta': pe_g.get('delta', None),
+            'put_gamma': pe_g.get('gamma', None),
+            'put_theta': pe_g.get('theta', None),
+            'put_vega': pe_g.get('vega', None)
+        })
+
+    pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else "N/A"
+
+    return jsonify({
+        "status": "success",
+        "rows": rows,
+        "total_call_oi": total_call_oi,
+        "total_put_oi": total_put_oi,
+        "pcr_value": pcr
+    })
 
 @app.route('/api/live-data', methods=['POST'])
 def live_data():
