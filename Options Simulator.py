@@ -44,9 +44,24 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS Styling
+# Custom CSS Styling (Includes anti-dimming and hidden spinner rules)
 custom_css = """
 <style>
+/* Disable Streamlit's default screen dimming/opacity reduction on rerun */
+.stApp {
+    opacity: 1 !important;
+}
+
+/* Hide the native running spinner / loading indicator overlay that causes flashes */
+[data-testid="stStatusWidget"], .stSpinner {
+    display: none !important;
+}
+
+/* Keep running fragments fully opaque */
+div[data-testid="stFragment"] {
+    opacity: 1 !important;
+}
+
 html, body, [data-testid="stAppViewContainer"] {
     background-color: #0E1117 !important;
     color: #FAFAFA !important;
@@ -627,7 +642,6 @@ def fetch_live_data(selected_interval_label="5 min"):
         }
 
     except Exception as e:
-        # Clear cached instance if session expired or rate limited
         if "exceeding access rate" in str(e).lower() or "access denied" in str(e).lower():
             st.session_state["smart_api_instance"] = None
         st.warning(f"API Rate limit / sync notice: Retrying on next cycle...")
