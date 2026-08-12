@@ -435,10 +435,12 @@ interval_mapping = {
     "15 min": ("FIFTEEN_MINUTE", 30)
 }
 
-# --- DATA FETCHING ENGINE ---
-def fetch_live_data(selected_interval_label="5 min"):
+# --- SECURE SESSION HANDLER (PREVENTS RATE LIMIT BAN) ---
+def get_smart_api_client():
+    if "smart_api_instance" in st.session_state and st.session_state["smart_api_instance"] is not None:
+        return st.session_state["smart_api_instance"]
+
     if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-        st.error("Missing SmartAPI credentials! Please set them up in Render's Environment Variables.")
         return None
 
     try:
@@ -447,170 +449,188 @@ def fetch_live_data(selected_interval_label="5 min"):
         session = smart_api.generateSession(CLIENT_CODE, PIN, totp_token)
 
         if session.get("status"):
-            index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
-            spot_token = index_token_map.get(Index_Name, "99926000")
+            st.session_state["smart_api_instance"] = smart_api
+            return smart_api
+    except Exception:
+        pass
+    return None
 
-            spot_resp = smart_api.ltpData(exchange="NSE", tradingsymbol=Index_Name, symboltoken=spot_token)
-            spot_price = float(spot_resp["data"]["ltp"]) if spot_resp.get("status") and spot_resp.get("data") else 24500.0
+# --- DATA FETCHING ENGINE ---
+def fetch_live_data(selected_interval_label="5 min"):
+    smart_api = get_smart_api_client()
+    if not smart_api:
+        st.error("Missing credentials or failed to generate SmartAPI session! Check Render Environment Variables.")
+        return None
 
-            index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, "NSE", days=hv_days)
+    try:
+        index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
+        spot_token = index_token_map.get(Index_Name, "99926000")
 
-            ist_tz = pytz.timezone("Asia/Kolkata")
-            now_dt = datetime.datetime.now(ist_tz)
+        spot_resp = smart_api.ltpData(exchange="NSE", tradingsymbol=Index_Name, symboltoken=spot_token)
+        spot_price = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") and spot_resp.get("data") else 24500.0
 
-            api_interval, lookback_days = interval_mapping.get(selected_interval_label, ("FIVE_MINUTE", 15))
-            from_dt = now_dt - datetime.timedelta(days=lookback_days)
+        index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, "NSE", days=hv_days)
 
-            candle_param = {
-                "exchange": "NSE",
-                "symboltoken": spot_token,
-                "interval": api_interval,
-                "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
-                "todate": now_dt.strftime("%Y-%m-%d 15:30")
-            }
-            candle_res = smart_api.getCandleData(candle_param)
-            df_candles = pd.DataFrame()
+        ist_tz = pytz.timezone("Asia/Kolkata")
+        now_dt = datetime.datetime.now(ist_tz)
 
-            if candle_res and candle_res.get("status") and candle_res.get("data"):
-                df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
-                df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
-                df_candles = compute_technical_indicators(df_candles)
+        api_interval, lookback_days = interval_mapping.get(selected_interval_label, ("FIVE_MINUTE", 15))
+        from_dt = now_dt - datetime.timedelta(days=lookback_days)
 
-            expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
-            time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
-            T = max(time_diff_seconds / (365.0 * 24 * 3600), 1e-5)
+        candle_param = {
+            "exchange": "NSE",
+            "symboltoken": spot_token,
+            "interval": api_interval,
+            "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+            "todate": now_dt.strftime("%Y-%m-%d 15:30")
+        }
+        candle_res = smart_api.getCandleData(candle_param)
+        df_candles = pd.DataFrame()
 
-            atm_strike = min(all_expiry_strikes, key=lambda x: abs(x - spot_price)) if all_expiry_strikes else spot_price
-            atm_idx = all_expiry_strikes.index(atm_strike) if all_expiry_strikes else 0
-            filtered_strikes = all_expiry_strikes[max(0, atm_idx - strikes_below): min(len(all_expiry_strikes), atm_idx + strikes_above + 1)] if all_expiry_strikes else []
+        if candle_res and candle_res.get("status") and candle_res.get("data"):
+            df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+            df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
+            df_candles = compute_technical_indicators(df_candles)
 
-            tokens_to_fetch = set()
-            strike_mapping = []
+        expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
+        time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
+        T = max(time_diff_seconds / (365.0 * 24 * 3600), 1e-5)
 
-            for strike in filtered_strikes:
-                strike_int = int(strike)
-                c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "CE")
-                p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "PE")
+        atm_strike = min(all_expiry_strikes, key=lambda x: abs(x - spot_price)) if all_expiry_strikes else spot_price
+        atm_idx = all_expiry_strikes.index(atm_strike) if all_expiry_strikes else 0
+        filtered_strikes = all_expiry_strikes[max(0, atm_idx - strikes_below): min(len(all_expiry_strikes), atm_idx + strikes_above + 1)] if all_expiry_strikes else []
 
-                if c_tok: tokens_to_fetch.add(c_tok)
-                if p_tok: tokens_to_fetch.add(p_tok)
+        tokens_to_fetch = set()
+        strike_mapping = []
 
-                strike_mapping.append({
-                    "strike": strike_int,
-                    "call_tok": c_tok,
-                    "put_tok": p_tok
-                })
+        for strike in filtered_strikes:
+            strike_int = int(strike)
+            c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "CE")
+            p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "PE")
 
-            basket_tokens_info = {}
-            for leg in st.session_state.get("basket_legs", []):
-                k = int(leg["strike"])
-                t = leg["type"]
-                tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
-                if tok:
-                    tokens_to_fetch.add(tok)
-                    basket_tokens_info[f"{k}_{t}"] = tok
+            if c_tok: tokens_to_fetch.add(c_tok)
+            if p_tok: tokens_to_fetch.add(p_tok)
 
-            tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
+            strike_mapping.append({
+                "strike": strike_int,
+                "call_tok": c_tok,
+                "put_tok": p_tok
+            })
 
-            market_data = {}
-            chunk_size = 50
-            for i in range(0, len(tokens_to_fetch_list), chunk_size):
-                chunk = tokens_to_fetch_list[i:i + chunk_size]
-                res = smart_api.getMarketData("FULL", {Exchange: chunk})
-                if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
-                    for item in res["data"]["fetched"]:
-                        vol_val = (
-                            item.get("volume") or
-                            item.get("totTrdVol") or
-                            item.get("volumeTraded") or
-                            item.get("tradeVolume") or
-                            item.get("v") or 0
-                        )
+        basket_tokens_info = {}
+        for leg in st.session_state.get("basket_legs", []):
+            k = int(leg["strike"])
+            t = leg["type"]
+            tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
+            if tok:
+                tokens_to_fetch.add(tok)
+                basket_tokens_info[f"{k}_{t}"] = tok
 
-                        market_data[str(item["symbolToken"])] = {
-                            "ltp": float(item.get("ltp", 0.0)),
-                            "oi": int(item.get("opnInterest", 0)),
-                            "pnl_oi": int(item.get("netChange", 0)),
-                            "volume": int(vol_val)
-                        }
+        tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
 
-            atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
-            atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
+        market_data = {}
+        chunk_size = 40
+        for i in range(0, len(tokens_to_fetch_list), chunk_size):
+            chunk = tokens_to_fetch_list[i:i + chunk_size]
+            res = smart_api.getMarketData("FULL", {Exchange: chunk})
+            if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
+                for item in res["data"]["fetched"]:
+                    vol_val = (
+                        item.get("volume") or
+                        item.get("totTrdVol") or
+                        item.get("volumeTraded") or
+                        item.get("tradeVolume") or
+                        item.get("v") or 0
+                    )
 
-            atm_c_ltp = market_data.get(atm_c_tok, {}).get("ltp", 0.0)
-            atm_p_ltp = market_data.get(atm_p_tok, {}).get("ltp", 0.0)
+                    market_data[str(item["symbolToken"])] = {
+                        "ltp": float(item.get("ltp", 0.0)),
+                        "oi": int(item.get("opnInterest", 0)),
+                        "pnl_oi": int(item.get("netChange", 0)),
+                        "volume": int(vol_val)
+                    }
+            time.sleep(0.1) # Prevents rate-limiting
 
-            F = atm_strike + math.exp(rate_param * T) * (atm_c_ltp - atm_p_ltp) if (atm_c_ltp > 0 and atm_p_ltp > 0) else spot_price
+        atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
+        atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
 
-            lot_size = LOT_SIZES.get(Index_Name, 25)
-            chain_results = []
-            total_call_oi = total_put_oi = 0
-            total_net_gex_oi = 0.0
-            total_net_gex_vol = 0.0
-            all_ivs = []
+        atm_c_ltp = market_data.get(atm_c_tok, {}).get("ltp", 0.0)
+        atm_p_ltp = market_data.get(atm_p_tok, {}).get("ltp", 0.0)
 
-            for row in strike_mapping:
-                K = row["strike"]
-                c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "pnl_oi": 0, "volume": 0})
-                p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "pnl_oi": 0, "volume": 0})
+        F = atm_strike + math.exp(rate_param * T) * (atm_c_ltp - atm_p_ltp) if (atm_c_ltp > 0 and atm_p_ltp > 0) else spot_price
 
-                iv = VolatilityEngine.calculate_iv(c_info["ltp"] if K >= F else p_info["ltp"], F, K, T, rate_param, "c" if K >= F else "p")
-                if iv == 0.0:
-                    iv = index_hv
+        lot_size = LOT_SIZES.get(Index_Name, 25)
+        chain_results = []
+        total_call_oi = total_put_oi = 0
+        total_net_gex_oi = 0.0
+        total_net_gex_vol = 0.0
+        all_ivs = []
 
-                c_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, iv, "c")
-                p_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, iv, "p")
+        for row in strike_mapping:
+            K = row["strike"]
+            c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "pnl_oi": 0, "volume": 0})
+            p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "pnl_oi": 0, "volume": 0})
 
-                call_gex_oi = c_greeks["gamma"] * c_info["oi"] * spot_price * lot_size
-                put_gex_oi = p_greeks["gamma"] * p_info["oi"] * spot_price * lot_size
-                net_gex_oi = call_gex_oi - put_gex_oi
-                total_net_gex_oi += net_gex_oi
+            iv = VolatilityEngine.calculate_iv(c_info["ltp"] if K >= F else p_info["ltp"], F, K, T, rate_param, "c" if K >= F else "p")
+            if iv == 0.0:
+                iv = index_hv
 
-                call_gex_vol = c_greeks["gamma"] * c_info["volume"] * spot_price * lot_size
-                put_gex_vol = p_greeks["gamma"] * p_info["volume"] * spot_price * lot_size
-                net_gex_vol = call_gex_vol - put_gex_vol
-                total_net_gex_vol += net_gex_vol
+            c_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, iv, "c")
+            p_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, iv, "p")
 
-                if iv > 0: all_ivs.append(iv)
-                total_call_oi += c_info["oi"]
-                total_put_oi += p_info["oi"]
+            call_gex_oi = c_greeks["gamma"] * c_info["oi"] * spot_price * lot_size
+            put_gex_oi = p_greeks["gamma"] * p_info["oi"] * spot_price * lot_size
+            net_gex_oi = call_gex_oi - put_gex_oi
+            total_net_gex_oi += net_gex_oi
 
-                chain_results.append({
-                    "C_Vol": c_info["volume"], "C_ΔOI": c_info["pnl_oi"], "C_OI": c_info["oi"],
-                    "C_Δ": round(c_greeks["delta"], 2), "C_γ": round(c_greeks["gamma"], 4),
-                    "C_θ": round(c_greeks["theta"], 2), "C_ν": round(c_greeks["vega"], 2),
-                    "C_IV_val": iv, "C_IV": f"{iv * 100:.1f}%", "C_LTP": c_info["ltp"],
-                    "Strike": K,
-                    "Net_GEX_OI": round(net_gex_oi, 2),
-                    "Net_GEX_Vol": round(net_gex_vol, 2),
-                    "P_LTP": p_info["ltp"], "P_IV_val": iv, "P_IV": f"{iv * 100:.1f}%",
-                    "P_Δ": round(p_greeks["delta"], 2), "P_γ": round(p_greeks["gamma"], 4),
-                    "P_θ": round(p_greeks["theta"], 2), "P_ν": round(p_greeks["vega"], 2),
-                    "P_OI": p_info["oi"], "P_ΔOI": p_info["pnl_oi"], "P_Vol": p_info["volume"]
-                })
+            call_gex_vol = c_greeks["gamma"] * c_info["volume"] * spot_price * lot_size
+            put_gex_vol = p_greeks["gamma"] * p_info["volume"] * spot_price * lot_size
+            net_gex_vol = call_gex_vol - put_gex_vol
+            total_net_gex_vol += net_gex_vol
 
-            pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
-            iv_percentile = 0.0
-            if all_ivs:
-                min_iv, max_iv = min(all_ivs), max(all_ivs)
-                atm_c_iv = VolatilityEngine.calculate_iv(atm_c_ltp, F, atm_strike, T, rate_param, "c")
-                if max_iv > min_iv and atm_c_iv > 0:
-                    iv_percentile = ((atm_c_iv - min_iv) / (max_iv - min_iv)) * 100.0
+            if iv > 0: all_ivs.append(iv)
+            total_call_oi += c_info["oi"]
+            total_put_oi += p_info["oi"]
 
-            max_pain_strike = VolatilityEngine.calculate_max_pain(chain_results)
-            levels = calculate_support_resistance_targets(chain_results, spot_price, max_pain_strike)
+            chain_results.append({
+                "C_Vol": c_info["volume"], "C_ΔOI": c_info["pnl_oi"], "C_OI": c_info["oi"],
+                "C_Δ": round(c_greeks["delta"], 2), "C_γ": round(c_greeks["gamma"], 4),
+                "C_θ": round(c_greeks["theta"], 2), "C_ν": round(c_greeks["vega"], 2),
+                "C_IV_val": iv, "C_IV": f"{iv * 100:.1f}%", "C_LTP": c_info["ltp"],
+                "Strike": K,
+                "Net_GEX_OI": round(net_gex_oi, 2),
+                "Net_GEX_Vol": round(net_gex_vol, 2),
+                "P_LTP": p_info["ltp"], "P_IV_val": iv, "P_IV": f"{iv * 100:.1f}%",
+                "P_Δ": round(p_greeks["delta"], 2), "P_γ": round(p_greeks["gamma"], 4),
+                "P_θ": round(p_greeks["theta"], 2), "P_ν": round(p_greeks["vega"], 2),
+                "P_OI": p_info["oi"], "P_ΔOI": p_info["pnl_oi"], "P_Vol": p_info["volume"]
+            })
 
-            return {
-                "spot_price": spot_price, "F": F, "T": T, "index_hv": index_hv, "iv_percentile": iv_percentile,
-                "pcr": pcr, "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
-                "total_net_gex_oi": total_net_gex_oi, "total_net_gex_vol": total_net_gex_vol,
-                "max_pain_strike": max_pain_strike, "levels": levels, "df_candles": df_candles,
-                "chain_results": chain_results, "market_data": market_data, "basket_tokens_info": basket_tokens_info,
-                "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST")
-            }
+        pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
+        iv_percentile = 0.0
+        if all_ivs:
+            min_iv, max_iv = min(all_ivs), max(all_ivs)
+            atm_c_iv = VolatilityEngine.calculate_iv(atm_c_ltp, F, atm_strike, T, rate_param, "c")
+            if max_iv > min_iv and atm_c_iv > 0:
+                iv_percentile = ((atm_c_iv - min_iv) / (max_iv - min_iv)) * 100.0
+
+        max_pain_strike = VolatilityEngine.calculate_max_pain(chain_results)
+        levels = calculate_support_resistance_targets(chain_results, spot_price, max_pain_strike)
+
+        return {
+            "spot_price": spot_price, "F": F, "T": T, "index_hv": index_hv, "iv_percentile": iv_percentile,
+            "pcr": pcr, "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
+            "total_net_gex_oi": total_net_gex_oi, "total_net_gex_vol": total_net_gex_vol,
+            "max_pain_strike": max_pain_strike, "levels": levels, "df_candles": df_candles,
+            "chain_results": chain_results, "market_data": market_data, "basket_tokens_info": basket_tokens_info,
+            "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST")
+        }
 
     except Exception as e:
-        st.error(f"Error fetching live data: {str(e)}")
+        # Clear cached instance if session expired or rate limited
+        if "exceeding access rate" in str(e).lower() or "access denied" in str(e).lower():
+            st.session_state["smart_api_instance"] = None
+        st.warning(f"API Rate limit / sync notice: Retrying on next cycle...")
         return None
 
 if run_btn or "data_store" not in st.session_state:
@@ -625,7 +645,6 @@ def live_dashboard_fragment():
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
 
-    # Silently fetch new background data tick
     refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
     if refreshed_data:
         st.session_state["data_store"] = refreshed_data
