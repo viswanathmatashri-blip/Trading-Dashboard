@@ -46,11 +46,9 @@ st.set_page_config(
 # Custom CSS Styling enforcing dark theme UI elements
 custom_css = """
 <style>
-/* Enforce Dark Theme Defaults */
 .stApp, html, body, [data-testid="stAppViewContainer"] {
     background-color: #0E1117 !important;
     color: #FAFAFA !important;
-    opacity: 1 !important;
 }
 
 [data-testid="stSidebar"] {
@@ -58,7 +56,6 @@ custom_css = """
     width: 310px !important;
 }
 
-/* Disable Streamlit's default screen dimming/opacity reduction on rerun */
 [data-testid="stStatusWidget"], .stSpinner {
     display: none !important;
 }
@@ -130,6 +127,8 @@ if "basket_legs" not in st.session_state:
     st.session_state["basket_legs"] = []
 if "selected_timeframe" not in st.session_state:
     st.session_state["selected_timeframe"] = "5 min"
+if "prev_oi_cache" not in st.session_state:
+    st.session_state["prev_oi_cache"] = {}
 
 LOT_SIZES = {
     "NIFTY": 25,
@@ -307,7 +306,6 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
         "Straddle_Cost": round(atm_straddle_cost, 2)
     }
 
-# --- TECHNICAL INDICATOR ENGINE (FIXED VWAP ACCORDING TO LOOKBACK) ---
 def compute_technical_indicators(df_candles: pd.DataFrame, hv_lookback_days: int = 30) -> pd.DataFrame:
     df = df_candles.copy()
     if df.empty or len(df) < 5:
@@ -336,11 +334,9 @@ def compute_technical_indicators(df_candles: pd.DataFrame, hv_lookback_days: int
     df["rsi"] = 100 - (100 / (1 + rs))
     df["rsi"] = df["rsi"].fillna(50)
 
-    # Corrected VWAP Calculation Engine
-    bars_per_day = 75  # 375 mins / 5 mins
+    bars_per_day = 75
     window_bars = max(20, int(hv_lookback_days * bars_per_day))
 
-    # Ensure volume is non-zero to avoid VWAP collapsing directly onto Close
     df["vol_safe"] = np.where(df["volume"] <= 0, 1e-5, df["volume"])
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["tp_vol"] = df["tp"] * df["vol_safe"]
@@ -374,9 +370,9 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
     return ""
 
 def get_prev_day_close_oi(smart_api, exchange, token):
-    """
-    OPTION 2 IMPLEMENTATION: Fetch Previous Day Close OI using historical getOIData API
-    """
+    if token in st.session_state["prev_oi_cache"]:
+        return st.session_state["prev_oi_cache"][token]
+
     try:
         ist_tz = pytz.timezone("Asia/Kolkata")
         today = datetime.datetime.now(ist_tz).date()
@@ -398,7 +394,9 @@ def get_prev_day_close_oi(smart_api, exchange, token):
 
         hist_oi_resp = smart_api.getOIData(oi_param)
         if hist_oi_resp and hist_oi_resp.get("status") and hist_oi_resp.get("data"):
-            return float(hist_oi_resp["data"][-1]["oi"])
+            val = float(hist_oi_resp["data"][-1]["oi"])
+            st.session_state["prev_oi_cache"][token] = val
+            return val
     except Exception:
         pass
     return None
@@ -506,7 +504,6 @@ def get_smart_api_client():
 def fetch_live_data(selected_interval_label="5 min"):
     smart_api = get_smart_api_client()
     if not smart_api:
-        st.error("Missing credentials or failed to generate SmartAPI session! Check Render Environment Variables.")
         return None
 
     try:
@@ -594,10 +591,8 @@ def fetch_live_data(selected_interval_label="5 min"):
 
                     curr_oi = int(item.get("opnInterest", 0))
 
-                    # Calculate OI Change using Option 2: Historical getOIData for Previous Day Close OI
                     prev_close_oi = get_prev_day_close_oi(smart_api, Exchange, token_str)
                     
-                    # Fallback to current minus net change if historical getOIData returns None
                     if prev_close_oi is None:
                         net_change_oi = int(item.get("netChange", 0))
                         prev_close_oi = curr_oi - net_change_oi
@@ -610,7 +605,6 @@ def fetch_live_data(selected_interval_label="5 min"):
                         "pct_change_oi": pct_change_oi,
                         "volume": int(vol_val)
                     }
-            time.sleep(0.1)
 
         atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
         atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
@@ -702,19 +696,20 @@ def fetch_live_data(selected_interval_label="5 min"):
     except Exception as e:
         if "exceeding access rate" in str(e).lower() or "access denied" in str(e).lower():
             st.session_state["smart_api_instance"] = None
-        st.warning("API Rate limit / sync notice: Retrying on next cycle...")
         return None
 
+# Initial Fetch Setup
 if run_btn or "data_store" not in st.session_state:
-    new_data = fetch_live_data(st.session_state["selected_timeframe"])
-    if new_data:
-        st.session_state["data_store"] = new_data
+    initial_data = fetch_live_data(st.session_state["selected_timeframe"])
+    if initial_data:
+        st.session_state["data_store"] = initial_data
 
 # --- AUTO-REFRESHING FRAGMENT ---
 @st.fragment(run_every=5)
 def live_dashboard_fragment():
-    if "data_store" not in st.session_state:
-        st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
+    if "data_store" not in st.session_state or st.session_state["data_store"] is None:
+        st.error("🔑 **API Connection / Credentials Missing**")
+        st.warning("Please verify that your **API_KEY**, **CLIENT_CODE**, **PIN**, and **TOTP_SECRET** are set in your `.env` file or environment variables, then click **🚀 Fetch Chain & Greeks**.")
         return
 
     refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
@@ -921,7 +916,6 @@ def live_dashboard_fragment():
         row2_col3.metric("Vol Accelerator (-GEX)", f"{lvls['GEX_Accelerator'] if lvls['GEX_Accelerator'] else 'None'}")
         row2_col4.metric("Zero Gamma / Flip Point", f"{lvls['Zero_Gamma_Flip']}")
 
-        # --- NET GAMMA vs VOLUME & OI SEPARATE CHARTS ---
         st.markdown("---")
         df_chain = pd.DataFrame(data["chain_results"])
 
@@ -1185,24 +1179,30 @@ def live_dashboard_fragment():
 
         st.subheader("Option Chain Data & Greeks (Δ, γ, θ, ν)")
 
-        df_greeks_display = pd.DataFrame(data["chain_results"]).drop(columns=["C_IV_val", "P_IV_val", "Net_GEX_OI", "Net_GEX_Vol"], errors="ignore")
+        chain_list = data.get("chain_results", [])
 
-        c_oi_max = df_greeks_display["C_OI"].max() if "C_OI" in df_greeks_display.columns else 1
-        p_oi_max = df_greeks_display["P_OI"].max() if "P_OI" in df_greeks_display.columns else 1
+        if chain_list:
+            df_greeks_display = pd.DataFrame(chain_list).drop(
+                columns=["C_IV_val", "P_IV_val", "Net_GEX_OI", "Net_GEX_Vol"], 
+                errors="ignore"
+            )
 
-        styled_greeks = df_greeks_display.style.background_gradient(
-            subset=["C_OI"],
-            cmap="Greens",
-            vmin=0,
-            vmax=c_oi_max
-        ).background_gradient(
-            subset=["P_OI"],
-            cmap="Reds",
-            vmin=0,
-            vmax=p_oi_max
-        )
+            column_order = [
+                "C_Vol", "C_ΔOI", "C_OI", "C_Δ", "C_γ", "C_θ", "C_ν", "C_IV", "C_LTP",
+                "Strike",
+                "P_LTP", "P_IV", "P_Δ", "P_γ", "P_θ", "P_ν", "P_OI", "P_ΔOI", "P_Vol"
+            ]
+            
+            available_cols = [col for col in column_order if col in df_greeks_display.columns]
+            df_greeks_display = df_greeks_display[available_cols]
 
-        st.dataframe(styled_greeks, use_container_width=True)
+            st.dataframe(
+                df_greeks_display,
+                use_container_width=True,
+                hide_index=True,
+                height=450
+            )
+        else:
+            st.warning("⚠️ No option chain data available for the selected parameters.")
 
-# Run fragment loop
 live_dashboard_fragment()
