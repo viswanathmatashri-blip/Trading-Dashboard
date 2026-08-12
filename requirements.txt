@@ -17,3 +17,4 @@ pyotp==2.9.0
 google-genai
 pytz
 python-dotenv
+matplotlib
