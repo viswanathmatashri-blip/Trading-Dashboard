@@ -307,14 +307,14 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
         "Straddle_Cost": round(atm_straddle_cost, 2)
     }
 
-# --- TECHNICAL INDICATOR ENGINE (MODIFIED FOR HV LOOKBACK VWAP) ---
+# --- TECHNICAL INDICATOR ENGINE (FIXED VWAP ACCORDING TO LOOKBACK) ---
 def compute_technical_indicators(df_candles: pd.DataFrame, hv_lookback_days: int = 30) -> pd.DataFrame:
     df = df_candles.copy()
-    if df.empty or len(df) < 20:
+    if df.empty or len(df) < 5:
         return df
 
-    df["bb_middle"] = df["close"].rolling(window=20, min_periods=20).mean()
-    df["bb_std"] = df["close"].rolling(window=20, min_periods=20).std()
+    df["bb_middle"] = df["close"].rolling(window=20, min_periods=1).mean()
+    df["bb_std"] = df["close"].rolling(window=20, min_periods=1).std().fillna(0)
     df["bb_upper"] = df["bb_middle"] + (2 * df["bb_std"])
     df["bb_lower"] = df["bb_middle"] - (2 * df["bb_std"])
     df["bb_bandwidth"] = np.where(df["bb_middle"] > 0, (df["bb_upper"] - df["bb_lower"]) / df["bb_middle"], 0)
@@ -329,24 +329,26 @@ def compute_technical_indicators(df_candles: pd.DataFrame, hv_lookback_days: int
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
     df["rsi"] = df["rsi"].fillna(50)
 
-    # Calculate VWAP across HV Lookback (days) instead of intraday reset
-    bars_per_day = 75  # Approximate intraday bars for NSE (5-min interval)
+    # Corrected VWAP Calculation Engine
+    bars_per_day = 75  # 375 mins / 5 mins
     window_bars = max(20, int(hv_lookback_days * bars_per_day))
 
+    # Ensure volume is non-zero to avoid VWAP collapsing directly onto Close
+    df["vol_safe"] = np.where(df["volume"] <= 0, 1e-5, df["volume"])
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["tp_vol"] = df["tp"] * df["volume"]
+    df["tp_vol"] = df["tp"] * df["vol_safe"]
 
     rolling_tp_vol = df["tp_vol"].rolling(window=window_bars, min_periods=1).sum()
-    rolling_vol = df["volume"].rolling(window=window_bars, min_periods=1).sum()
+    rolling_vol = df["vol_safe"].rolling(window=window_bars, min_periods=1).sum()
 
-    df["vwap"] = np.where(rolling_vol > 0, rolling_tp_vol / rolling_vol, df["close"])
+    df["vwap"] = rolling_tp_vol / rolling_vol
 
     return df
 
@@ -550,23 +552,20 @@ def fetch_live_data(selected_interval_label="5 min"):
             res = smart_api.getMarketData("FULL", {Exchange: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
+                    # Exact parameter extraction mapping tradeVolume from SmartAPI
                     vol_val = (
                         item.get("tradeVolume") or
-                        item.get("volume") or
                         item.get("totTrdVol") or
                         item.get("volumeTraded") or
+                        item.get("volume") or
                         item.get("v") or 0
                     )
 
                     curr_oi = int(item.get("opnInterest", 0))
                     net_change_oi = int(item.get("netChange", 0))
 
-                    # Calculate Actual Open Interest Percentage Change
                     prev_close_oi = curr_oi - net_change_oi
-                    if prev_close_oi > 0:
-                        pct_change_oi = ((curr_oi - prev_close_oi) / prev_close_oi) * 100.0
-                    else:
-                        pct_change_oi = 0.0
+                    pct_change_oi = ((curr_oi - prev_close_oi) / prev_close_oi * 100.0) if prev_close_oi > 0 else 0.0
 
                     market_data[str(item["symbolToken"])] = {
                         "ltp": float(item.get("ltp", 0.0)),
@@ -718,7 +717,7 @@ def live_dashboard_fragment():
                 st.session_state["data_store"] = updated_chart_data
                 st.rerun()
 
-    if not df_full.empty and len(df_full) >= 20:
+    if not df_full.empty and len(df_full) >= 5:
         latest_row = df_full.iloc[-1]
 
         rsi_val = latest_row["rsi"]
