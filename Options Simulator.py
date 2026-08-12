@@ -119,8 +119,6 @@ if "basket_legs" not in st.session_state:
     st.session_state["basket_legs"] = []
 if "selected_timeframe" not in st.session_state:
     st.session_state["selected_timeframe"] = "5 min"
-if "auto_refresh_state" not in st.session_state:
-    st.session_state["auto_refresh_state"] = False
 
 LOT_SIZES = {
     "NIFTY": 25,
@@ -443,13 +441,7 @@ def fetch_live_data(selected_interval_label="5 min"):
         st.error("Missing SmartAPI credentials! Please set them up in Render's Environment Variables.")
         return None
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
     try:
-        status_text.text("Authenticating with SmartAPI...")
-        progress_bar.progress(10)
-
         smart_api = SmartConnect(api_key=API_KEY)
         totp_token = pyotp.TOTP(TOTP_SECRET).now()
         session = smart_api.generateSession(CLIENT_CODE, PIN, totp_token)
@@ -457,9 +449,6 @@ def fetch_live_data(selected_interval_label="5 min"):
         if session.get("status"):
             index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
             spot_token = index_token_map.get(Index_Name, "99926000")
-
-            status_text.text("Fetching Historical Data & Technical Indicators...")
-            progress_bar.progress(25)
 
             spot_resp = smart_api.ltpData(exchange="NSE", tradingsymbol=Index_Name, symboltoken=spot_token)
             spot_price = float(spot_resp["data"]["ltp"]) if spot_resp.get("status") and spot_resp.get("data") else 24500.0
@@ -523,9 +512,6 @@ def fetch_live_data(selected_interval_label="5 min"):
 
             tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
 
-            status_text.text("Batch fetching option market data...")
-            progress_bar.progress(50)
-
             market_data = {}
             chunk_size = 50
             for i in range(0, len(tokens_to_fetch_list), chunk_size):
@@ -547,9 +533,6 @@ def fetch_live_data(selected_interval_label="5 min"):
                             "pnl_oi": int(item.get("netChange", 0)),
                             "volume": int(vol_val)
                         }
-
-            status_text.text("Calculating Greeks, GEX & Option Chain...")
-            progress_bar.progress(80)
 
             atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
             atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
@@ -617,10 +600,6 @@ def fetch_live_data(selected_interval_label="5 min"):
             max_pain_strike = VolatilityEngine.calculate_max_pain(chain_results)
             levels = calculate_support_resistance_targets(chain_results, spot_price, max_pain_strike)
 
-            progress_bar.progress(100)
-            status_text.empty()
-            progress_bar.empty()
-
             return {
                 "spot_price": spot_price, "F": F, "T": T, "index_hv": index_hv, "iv_percentile": iv_percentile,
                 "pcr": pcr, "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
@@ -631,27 +610,34 @@ def fetch_live_data(selected_interval_label="5 min"):
             }
 
     except Exception as e:
-        status_text.empty()
-        progress_bar.empty()
         st.error(f"Error fetching live data: {str(e)}")
         return None
 
-if run_btn or st.session_state.get("auto_refresh_state", False):
+if run_btn or "data_store" not in st.session_state:
     new_data = fetch_live_data(st.session_state["selected_timeframe"])
     if new_data:
         st.session_state["data_store"] = new_data
 
-# --- DISPLAY MAIN DASHBOARD ---
-if "data_store" in st.session_state:
+# --- AUTO-REFRESHING FRAGMENT (Seamless Background Updates Every 5s) ---
+@st.fragment(run_every=5)
+def live_dashboard_fragment():
+    if "data_store" not in st.session_state:
+        st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
+        return
+
+    # Silently fetch new background data tick
+    refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
+    if refreshed_data:
+        st.session_state["data_store"] = refreshed_data
+
     data = st.session_state["data_store"]
 
     with st.container(border=True):
-        col_title, col_refresh = st.columns([0.75, 0.25])
+        col_title, col_status = st.columns([0.80, 0.20])
         with col_title:
             st.markdown("<h1 class='custom-heading'>📊 Option Chain Technical Analysis</h1>", unsafe_allow_html=True)
-        with col_refresh:
-            auto_refresh = st.checkbox("🔄 Auto Refresh (5s)", value=st.session_state["auto_refresh_state"])
-            st.session_state["auto_refresh_state"] = auto_refresh
+        with col_status:
+            st.markdown("<span class='status-badge badge-bullish'>Live Auto-Sync (5s)</span>", unsafe_allow_html=True)
 
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Spot (Syn. Fut)", f"{data['spot_price']:.2f} ({data['F']:.2f})")
@@ -669,7 +655,7 @@ if "data_store" in st.session_state:
     with chart_head_col:
         st.markdown("<span style='font-weight: 700; color: #00E676; font-size: 18px;'>📈 Underlying Technical Charts</span>", unsafe_allow_html=True)
     with tf_col:
-        selected_tf = st.selectbox("Timeframe", ["1 min", "3 min", "5 min", "15 min"], index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"]), key="tf_select")
+        selected_tf = st.selectbox("Timeframe", ["1 min", "3 min", "5 min", "15 min"], index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"]), key="tf_select_frag")
         if selected_tf != st.session_state["selected_timeframe"]:
             st.session_state["selected_timeframe"] = selected_tf
             updated_chart_data = fetch_live_data(selected_tf)
@@ -1153,6 +1139,5 @@ if "data_store" in st.session_state:
 
         st.dataframe(styled_greeks, use_container_width=True)
 
-if st.session_state.get("auto_refresh_state", False):
-    time.sleep(5)
-    st.rerun()
+# Run the seamless fragment loop
+live_dashboard_fragment()
