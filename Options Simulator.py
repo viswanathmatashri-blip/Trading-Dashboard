@@ -373,6 +373,36 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
         pass
     return ""
 
+def get_prev_day_close_oi(smart_api, exchange, token):
+    """
+    OPTION 2 IMPLEMENTATION: Fetch Previous Day Close OI using historical getOIData API
+    """
+    try:
+        ist_tz = pytz.timezone("Asia/Kolkata")
+        today = datetime.datetime.now(ist_tz).date()
+        prev_day = today - datetime.timedelta(days=1)
+        if prev_day.weekday() == 5:
+            prev_day = today - datetime.timedelta(days=2)
+        elif prev_day.weekday() == 6:
+            prev_day = today - datetime.timedelta(days=3)
+
+        prev_day_str = prev_day.strftime("%Y-%m-%d")
+
+        oi_param = {
+            "exchange": exchange,
+            "symboltoken": str(token),
+            "interval": "ONE_DAY",
+            "fromdate": f"{prev_day_str} 09:15",
+            "todate": f"{prev_day_str} 15:30"
+        }
+
+        hist_oi_resp = smart_api.getOIData(oi_param)
+        if hist_oi_resp and hist_oi_resp.get("status") and hist_oi_resp.get("data"):
+            return float(hist_oi_resp["data"][-1]["oi"])
+    except Exception:
+        pass
+    return None
+
 # --- SIDEBAR SETUP ---
 st.sidebar.markdown("### ⚙️ Parameters & Strategy Builder")
 
@@ -552,7 +582,8 @@ def fetch_live_data(selected_interval_label="5 min"):
             res = smart_api.getMarketData("FULL", {Exchange: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
-                    # Exact parameter extraction mapping tradeVolume from SmartAPI
+                    token_str = str(item["symbolToken"])
+                    
                     vol_val = (
                         item.get("tradeVolume") or
                         item.get("totTrdVol") or
@@ -562,12 +593,18 @@ def fetch_live_data(selected_interval_label="5 min"):
                     )
 
                     curr_oi = int(item.get("opnInterest", 0))
-                    net_change_oi = int(item.get("netChange", 0))
 
-                    prev_close_oi = curr_oi - net_change_oi
-                    pct_change_oi = ((curr_oi - prev_close_oi) / prev_close_oi * 100.0) if prev_close_oi > 0 else 0.0
+                    # Calculate OI Change using Option 2: Historical getOIData for Previous Day Close OI
+                    prev_close_oi = get_prev_day_close_oi(smart_api, Exchange, token_str)
+                    
+                    # Fallback to current minus net change if historical getOIData returns None
+                    if prev_close_oi is None:
+                        net_change_oi = int(item.get("netChange", 0))
+                        prev_close_oi = curr_oi - net_change_oi
 
-                    market_data[str(item["symbolToken"])] = {
+                    pct_change_oi = ((curr_oi - prev_close_oi) / prev_close_oi * 100.0) if (prev_close_oi and prev_close_oi > 0) else 0.0
+
+                    market_data[token_str] = {
                         "ltp": float(item.get("ltp", 0.0)),
                         "oi": curr_oi,
                         "pct_change_oi": pct_change_oi,
