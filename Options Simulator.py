@@ -1,2031 +1,1158 @@
 import os
-import json
+import logging
+import warnings
+import time
+import datetime
 import math
-import pyotp
-import threading
-import requests
-import time as time_module
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas as pd
 import numpy as np
-from datetime import datetime, time, timezone, timedelta
-from flask import Flask, render_template_string, jsonify, request
+import pandas as pd
+import pyotp
+import pytz
+import streamlit as st
+import plotly.graph_objects as plt_go
+from plotly.subplots import make_subplots
+from dotenv import load_dotenv
+from scipy.optimize import brentq
 from SmartApi import SmartConnect
-from scipy.stats import norm
 
-app = Flask(__name__)
-
-# Environment Configuration
-API_KEY = os.environ.get("API_KEY")
-CLIENT_CODE = os.environ.get("CLIENT_CODE")
-PIN = os.environ.get("PIN")
-TOTP_SECRET = os.environ.get("TOTP_SECRET")
-
-IST = timezone(timedelta(hours=5, minutes=30))
-RISK_FREE_RATE = 0.065
-
-INDEX_TOKENS = {
-    "NIFTY": {"exchange": "NSE", "tradingsymbol": "NIFTY", "token": "99926000", "step": 50},
-    "BANKNIFTY": {"exchange": "NSE", "tradingsymbol": "BANKNIFTY", "token": "99926009", "step": 100}
-}
-
-INDIA_VIX_TOKEN = {"exchange": "NSE", "tradingsymbol": "INDIA VIX", "token": "99926017"}
-
-INTERVAL_MAP = {
-    "1": "ONE_MINUTE",
-    "3": "THREE_MINUTE",
-    "5": "FIVE_MINUTE",
-    "15": "FIFTEEN_MINUTE"
-}
-
-smart_api_session = None
-INSTRUMENT_DF = None
-SCRIP_MASTER_STATUS = "Initializing Scrip Master..."
-IS_DOWNLOADING_MASTER = False
-
-# Memory Caching to Prevent Render 502 Bad Gateway Timeouts
-API_CACHE = {}
-CACHE_TTL_SECONDS = 10
-
-def get_cached_data(key):
-    if key in API_CACHE:
-        val, ts = API_CACHE[key]
-        if time_module.time() - ts < CACHE_TTL_SECONDS:
-            return val
-    return None
-
-def set_cached_data(key, val):
-    API_CACHE[key] = (val, time_module.time())
-
-def get_smart_api():
-    global smart_api_session
-    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-        return None, "Missing Render Env Variables"
-
-    try:
-        if smart_api_session is None:
-            obj = SmartConnect(api_key=API_KEY)
-            totp = pyotp.TOTP(TOTP_SECRET).now()
-            data = obj.generateSession(CLIENT_CODE, PIN, totp)
-            
-            if data and data.get('status') and data.get('data') and data['data'].get('jwtToken'):
-                smart_api_session = obj
-                return smart_api_session, "API connection success"
-            else:
-                msg = data.get('message', 'Authentication Failed') if data else 'No response from SmartAPI'
-                return None, f"Couldnt log in: {msg}"
-        else:
-            return smart_api_session, "API connection success"
-            
-    except Exception as e:
-        smart_api_session = None
-        return None, f"Couldnt log in: {str(e)}"
-
-def download_scrip_master_thread():
-    global INSTRUMENT_DF, SCRIP_MASTER_STATUS, IS_DOWNLOADING_MASTER
-    if INSTRUMENT_DF is not None or IS_DOWNLOADING_MASTER:
-        return
-
-    IS_DOWNLOADING_MASTER = True
-    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-
-    try:
-        SCRIP_MASTER_STATUS = "Downloading Scrip Master: 0%"
-        response = requests.get(url, headers=headers, stream=True, timeout=60)
-        
-        if response.status_code == 200:
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            chunks = []
-            
-            for chunk in response.iter_content(chunk_size=1024 * 512):
-                if chunk:
-                    chunks.append(chunk)
-                    downloaded += len(chunk)
-                    mb_dl = round(downloaded / (1024 * 1024), 1)
-                    if total_size > 0:
-                        mb_tot = round(total_size / (1024 * 1024), 1)
-                        pct = int((downloaded / total_size) * 100)
-                        SCRIP_MASTER_STATUS = f"Downloading Scrip Master: {mb_dl} MB / {mb_tot} MB ({pct}%)"
-                    else:
-                        SCRIP_MASTER_STATUS = f"Downloading Scrip Master: {mb_dl} MB"
-
-            SCRIP_MASTER_STATUS = "Processing Scrip Master JSON..."
-            content = b"".join(chunks)
-            data = json.loads(content.decode('utf-8'))
-            
-            df = pd.DataFrame(data)
-            keep_cols = ['exch_seg', 'instrumenttype', 'name', 'expiry', 'strike', 'symbol', 'token']
-            df = df[[c for c in keep_cols if c in df.columns]]
-            df = df[(df['exch_seg'] == 'NFO') & (df['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))].copy()
-            df['strike_price'] = pd.to_numeric(df['strike'], errors='coerce') / 100.0
-            
-            INSTRUMENT_DF = df
-            SCRIP_MASTER_STATUS = "Scrip Master Loaded"
-        else:
-            SCRIP_MASTER_STATUS = f"Scrip Master HTTP Error {response.status_code}"
-    except Exception as e:
-        SCRIP_MASTER_STATUS = f"Scrip Master Download Failed: {str(e)}"
-    finally:
-        IS_DOWNLOADING_MASTER = False
-
-def ensure_scrip_master_loading():
-    if INSTRUMENT_DF is None and not IS_DOWNLOADING_MASTER:
-        t = threading.Thread(target=download_scrip_master_thread, daemon=True)
-        t.start()
-
-def is_market_open():
-    now = datetime.now(IST)
-    if now.weekday() >= 5:
-        return False
-    return time(9, 15) <= now.time() <= time(15, 30)
-
-def get_last_trading_day_dates(num_days=5):
-    now = datetime.now(IST)
-    end_date = now.date()
-    if not is_market_open() and now.time() < time(9, 15):
-        end_date -= timedelta(days=1)
-        
-    while end_date.weekday() >= 5:
-        end_date -= timedelta(days=1)
-
-    start_date = end_date
-    trading_days = 0
-    while trading_days < num_days:
-        start_date -= timedelta(days=1)
-        if start_date.weekday() < 5:
-            trading_days += 1
-
-    from_str = start_date.strftime("%Y-%m-%d 09:15")
-    to_str = now.strftime("%Y-%m-%d %H:%M") if is_market_open() else end_date.strftime("%Y-%m-%d 15:30")
-    return from_str, to_str
-
-def fetch_option_chain_data(smart_api, symbol, expiry):
-    cache_key = f"chain_{symbol}_{expiry}"
-    cached = get_cached_data(cache_key)
-    if cached is not None:
-        return cached
-
-    try:
-        formatted_expiry = datetime.strptime(expiry, "%d%b%Y").strftime("%d%b%Y").upper()
-        chain_params = {"name": symbol, "expirydate": formatted_expiry}
-        res = smart_api.optionChain(chain_params)
-        if res and res.get('status') and res.get('data'):
-            set_cached_data(cache_key, res['data'])
-            return res['data']
-    except Exception:
-        pass
-    return []
-
-def get_nearest_expiry(symbol):
-    if INSTRUMENT_DF is None:
-        return None
-    filtered = INSTRUMENT_DF[INSTRUMENT_DF['name'] == symbol]
-    raw_expiries = filtered['expiry'].unique().tolist()
-    
-    parsed_expiries = []
-    now_date = datetime.now(IST).date()
-
-    for exp in raw_expiries:
-        try:
-            exp_date = datetime.strptime(str(exp), "%d%b%Y").date()
-            if exp_date >= now_date:
-                parsed_expiries.append((exp_date, str(exp)))
-        except Exception:
-            pass
-
-    parsed_expiries.sort(key=lambda x: x[0])
-    return parsed_expiries[0][1] if parsed_expiries else None
-
-def fetch_vix(smart_api):
-    cache_key = "india_vix"
-    cached = get_cached_data(cache_key)
-    if cached is not None:
-        return cached
-
-    try:
-        if smart_api:
-            res = smart_api.ltpData(INDIA_VIX_TOKEN["exchange"], INDIA_VIX_TOKEN["tradingsymbol"], INDIA_VIX_TOKEN["token"])
-            if res and res.get('status') and res.get('data'):
-                vix_val = float(res['data']['ltp'])
-                set_cached_data(cache_key, vix_val)
-                return vix_val
-    except Exception:
-        pass
-    return 13.50
-
-def calculate_historical_volatility(candles):
-    if not candles or len(candles) < 20:
-        return 12.50
-
-    try:
-        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['close'] = df['close'].astype(float)
-        df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-        daily_std = df['log_ret'].std()
-        
-        annualized_hv = daily_std * np.sqrt(252 * 25) * 100.0
-        if np.isnan(annualized_hv) or annualized_hv <= 0:
-            return 12.50
-        return round(float(annualized_hv), 2)
-    except Exception:
-        return 12.50
-
-def calculate_pcr(smart_api, symbol, option_chain_data, spot_price, step, expiry=None, strike_range_limit=None):
-    if spot_price <= 0:
-        return "N/A"
-
-    atm_strike = round(spot_price / step) * step
-
-    if not expiry:
-        expiry = get_nearest_expiry(symbol)
-
-    chain = option_chain_data
-
-    if not chain and INSTRUMENT_DF is not None and expiry:
-        filtered_df = INSTRUMENT_DF[(INSTRUMENT_DF['name'] == symbol) & (INSTRUMENT_DF['expiry'] == expiry)]
-        chain = []
-        for _, row in filtered_df.iterrows():
-            opt_type = 'CE' if str(row['symbol']).endswith('CE') else 'PE'
-            chain.append({
-                'strikePrice': row['strike_price'],
-                'optionType': opt_type,
-                'token': row['token'],
-                'symbol': row['symbol'],
-                'openInterest': 0
-            })
-
-    if not chain:
-        return "N/A"
-
-    if strike_range_limit is not None and strike_range_limit > 0:
-        lower_bound = atm_strike - (strike_range_limit * step)
-        upper_bound = atm_strike + (strike_range_limit * step)
-        filtered_chain = []
-        for item in chain:
-            try:
-                sp = float(item.get('strikePrice', 0) or item.get('strikeprice', 0) or 0)
-                if lower_bound <= sp <= upper_bound:
-                    filtered_chain.append(item)
-            except Exception:
-                continue
-    else:
-        filtered_chain = chain
-
-    total_put_oi = 0.0
-    total_call_oi = 0.0
-
-    for item in filtered_chain:
-        opt_type = str(item.get('optionType', '') or item.get('optiontype', '')).upper()
-        
-        oi = float(
-            item.get('opennterest', 0) or 
-            item.get('openInterest', 0) or 
-            item.get('openinterest', 0) or 
-            item.get('oi', 0) or 0
+# Setup .streamlit/config.toml programmatically for forced dark theme
+os.makedirs(".streamlit", exist_ok=True)
+config_path = os.path.join(".streamlit", "config.toml")
+if not os.path.exists(config_path):
+    with open(config_path, "w") as f:
+        f.write(
+            """[theme]
+base="dark"
+primaryColor="#00E676"
+backgroundColor="#0E1117"
+secondaryBackgroundColor="#1E222D"
+textColor="#FAFAFA"
+"""
         )
 
-        if opt_type in ['PE', 'PUT'] or str(item.get('symbol', '')).endswith('PE'):
-            total_put_oi += oi
-        elif opt_type in ['CE', 'CALL'] or str(item.get('symbol', '')).endswith('CE'):
-            total_call_oi += oi
+logging.getLogger("streamlit.runtime.scriptrunner.script_runner").setLevel(logging.ERROR)
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
+logging.getLogger("streamlit").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
 
-    if total_call_oi == 0:
-        if total_put_oi > 0:
-            return "> 5.0 (Extreme Bullish)"
-        return "N/A"
+load_dotenv()
 
-    pcr_val = total_put_oi / total_call_oi
-    return round(pcr_val, 2)
+st.set_page_config(
+    page_title="Option Chain Technical Analysis",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-def calculate_chart_indicators(candles):
-    if not candles or len(candles) < 26:
-        return {}, "BB (20,2) : N/A", "MACD (12,26,9) : N/A", "RSI (14) : N/A"
+# Custom CSS Styling
+custom_css = """
+<style>
+html, body, [data-testid="stAppViewContainer"] {
+    background-color: #0E1117 !important;
+    color: #FAFAFA !important;
+}
 
-    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['close'] = df['close'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['volume'] = df['volume'].astype(float)
+section[data-testid="stSidebar"] {
+    width: 310px !important;
+}
 
-    # VWAP
-    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3.0
-    df['tp_v'] = df['typical_price'] * df['volume']
-    df['date'] = pd.to_datetime(df['timestamp']).dt.date
-    df['cum_tp_v'] = df.groupby('date')['tp_v'].cumsum()
-    df['cum_vol'] = df.groupby('date')['volume'].cumsum()
-    df['vwap'] = np.where(df['cum_vol'] > 0, df['cum_tp_v'] / df['cum_vol'], df['close'])
+.block-container {
+    padding-top: 1.0rem !important;
+    padding-bottom: 1rem !important;
+}
 
-    # Bollinger Bands
-    df['sma20'] = df['close'].rolling(window=20).mean()
-    df['std20'] = df['close'].rolling(window=20).std()
-    df['bb_upper'] = df['sma20'] + (df['std20'] * 2)
-    df['bb_lower'] = df['sma20'] - (df['std20'] * 2)
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['sma20']
+header[data-testid="stHeader"] {
+    background-color: rgba(0, 0, 0, 0) !important;
+}
 
-    recent_width = df['bb_width'].dropna().iloc[-1] if not df['bb_width'].dropna().empty else 0
-    avg_width = df['bb_width'].dropna().tail(20).mean() if not df['bb_width'].dropna().empty else 0
-    latest_close = df['close'].iloc[-1]
-    
-    if recent_width > 0 and recent_width < (avg_width * 0.75):
-        bb_status = "BB (20,2) : Squeeze active"
-    elif not df['bb_upper'].dropna().empty and latest_close >= df['bb_upper'].dropna().iloc[-1]:
-        bb_status = "BB (20,2) : Upper Breakout"
-    elif not df['bb_lower'].dropna().empty and latest_close <= df['bb_lower'].dropna().iloc[-1]:
-        bb_status = "BB (20,2) : Lower Breakdown"
-    else:
-        bb_status = "BB (20,2) : Normal"
+h1, h2, h3, .custom-heading {
+    color: #00E676 !important;
+    font-size: 20px !important;
+    font-weight: 700 !important;
+    margin-bottom: 0.2rem !important;
+}
 
-    # MACD
-    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = df['ema12'] - df['ema26']
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
+div[data-testid="stMetricValue"] {
+    font-size: 18px !important;
+    color: #00E676 !important;
+}
 
-    curr_macd = df['macd'].iloc[-1]
-    curr_signal = df['macd_signal'].iloc[-1]
-    prev_macd = df['macd'].iloc[-2]
-    prev_signal = df['macd_signal'].iloc[-2]
+.update-timestamp {
+    font-size: 13px;
+    color: #00E676;
+    font-weight: 600;
+    text-align: right;
+}
 
-    if prev_macd <= prev_signal and curr_macd > curr_signal:
-        macd_status = "MACD (12,26,9) : Bullish Crossover"
-    elif prev_macd >= prev_signal and curr_macd < curr_signal:
-        macd_status = "MACD (12,26,9) : Bearish Crossover"
-    elif curr_macd > curr_signal:
-        macd_status = "MACD (12,26,9) : Uptrend Continuation"
-    else:
-        macd_status = "MACD (12,26,9) : Downtrend Continuation"
+div[data-baseweb="select"] > div {
+    background-color: #1E222D !important;
+    color: #FAFAFA !important;
+    border-color: #363C4E !important;
+}
 
-    # RSI
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+.stButton>button {
+    border-radius: 6px;
+    font-weight: 600;
+}
 
-    curr_rsi = df['rsi'].dropna().iloc[-1] if not df['rsi'].dropna().empty else 50
-    if curr_rsi >= 70:
-        rsi_status = f"RSI (14) : Overbought ({round(curr_rsi, 1)})"
-    elif curr_rsi <= 30:
-        rsi_status = f"RSI (14) : Oversold ({round(curr_rsi, 1)})"
-    else:
-        rsi_status = f"RSI (14) : Neutral ({round(curr_rsi, 1)})"
+.status-badge {
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-block;
+    margin-right: 8px;
+}
+.badge-bullish { background-color: rgba(0, 230, 118, 0.15); color: #00E676; border: 1px solid #00E676; }
+.badge-bearish { background-color: rgba(255, 82, 82, 0.15); color: #FF5252; border: 1px solid #FF5252; }
+.badge-neutral { background-color: rgba(255, 152, 0, 0.15); color: #FF9800; border: 1px solid #FF9800; }
+</style>
+"""
+st.markdown(custom_css, unsafe_allow_html=True)
 
-    def clean_series(series):
-        return [None if np.isnan(val) else round(float(val), 2) for val in series]
+API_KEY = os.getenv("API_KEY", "")
+CLIENT_CODE = os.getenv("CLIENT_CODE", "")
+PIN = os.getenv("PIN", "")
+TOTP_SECRET = os.getenv("TOTP_SECRET", "")
 
-    indicator_series = {
-        "vwap": clean_series(df['vwap']),
-        "bb_upper": clean_series(df['bb_upper']),
-        "bb_middle": clean_series(df['sma20']),
-        "bb_lower": clean_series(df['bb_lower']),
-        "macd": clean_series(df['macd']),
-        "macd_signal": clean_series(df['macd_signal']),
-        "macd_hist": clean_series(df['macd_hist']),
-        "rsi": clean_series(df['rsi'])
-    }
+if "basket_legs" not in st.session_state:
+    st.session_state["basket_legs"] = []
+if "selected_timeframe" not in st.session_state:
+    st.session_state["selected_timeframe"] = "5 min"
+if "auto_refresh_state" not in st.session_state:
+    st.session_state["auto_refresh_state"] = False
 
-    return indicator_series, bb_status, macd_status, rsi_status
+LOT_SIZES = {
+    "NIFTY": 25,
+    "BANKNIFTY": 15,
+    "FINNIFTY": 25,
+    "MIDCPNIFTY": 50
+}
 
-def calculate_black_scholes_greeks(spot, strike, t_years, iv_pct, opt_type='CE'):
-    greeks = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "expected_day_theta": 0.0}
-    sigma = max(iv_pct, 1.0) / 100.0
-    t = max(t_years, 0.0001)
-    r = RISK_FREE_RATE
+# --- VOLATILITY & GREEKS ENGINE ---
+class VolatilityEngine:
+    @staticmethod
+    def _norm_cdf(x: float) -> float:
+        return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
-    if spot <= 0 or strike <= 0:
-        return greeks
+    @staticmethod
+    def _norm_pdf(x: float) -> float:
+        return math.exp(-0.5 * x**2) / math.sqrt(2.0 * math.pi)
 
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
-    d2 = d1 - sigma * math.sqrt(t)
-    pdf_d1 = norm.pdf(d1)
-    
-    gamma = pdf_d1 / (spot * sigma * math.sqrt(t))
-    vega = (spot * pdf_d1 * math.sqrt(t)) / 100.0
+    @classmethod
+    def black_scholes_price(cls, S: float, K: float, T: float, r: float, sigma: float, flag: str = "c") -> float:
+        if T <= 0 or sigma <= 0:
+            return 0.0
+        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        if flag.lower() == "c":
+            return S * cls._norm_cdf(d1) - K * math.exp(-r * T) * cls._norm_cdf(d2)
+        return K * math.exp(-r * T) * cls._norm_cdf(-d2) - S * cls._norm_cdf(-d1)
 
-    if opt_type.upper() in ['CE', 'CALL']:
-        delta = norm.cdf(d1)
-        theta_annual = - (spot * pdf_d1 * sigma) / (2 * math.sqrt(t)) - r * strike * math.exp(-r * t) * norm.cdf(d2)
-    else:
-        delta = norm.cdf(d1) - 1.0
-        theta_annual = - (spot * pdf_d1 * sigma) / (2 * math.sqrt(t)) + r * strike * math.exp(-r * t) * norm.cdf(-d2)
+    @classmethod
+    def calculate_greeks(cls, S: float, K: float, T: float, r: float, sigma: float, flag: str = "c") -> dict:
+        if T <= 0 or sigma <= 0:
+            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
 
-    theta_day = theta_annual / 365.0
+        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        pdf_d1 = cls._norm_pdf(d1)
 
-    return {
-        "delta": round(delta, 4),
-        "gamma": round(gamma, 6),
-        "theta": round(theta_day, 4),
-        "vega": round(vega, 4),
-        "expected_day_theta": round(theta_day, 4)
-    }
+        gamma = pdf_d1 / (S * sigma * math.sqrt(T))
+        vega = (S * pdf_d1 * math.sqrt(T)) / 100.0
 
-def get_atm_iv_and_leg_greeks(smart_api, option_chain, spot_price, step, strike, opt_type, expiry_str, symbol="NIFTY"):
-    atm_strike = round(spot_price / step) * step
-    now = datetime.now(IST)
-    try:
-        exp_dt = datetime.strptime(expiry_str, "%d%b%Y").replace(hour=15, minute=30, tzinfo=IST)
-        time_diff = exp_dt - now
-        days_remaining = max(time_diff.total_seconds() / (24 * 3600), 0.001)
-    except Exception:
-        days_remaining = 1.0
-        
-    t_years = days_remaining / 365.0
-    atm_iv = None
+        if flag.lower() == "c":
+            delta = cls._norm_cdf(d1)
+            theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * cls._norm_cdf(d2)) / 365.0
+        else:
+            delta = cls._norm_cdf(d1) - 1.0
+            theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * cls._norm_cdf(-d2)) / 365.0
 
-    if option_chain:
-        for item in option_chain:
-            item_strike = float(item.get('strikePrice', 0) or 0)
-            if abs(item_strike - atm_strike) < 0.01:
-                iv_val = float(item.get('impliedVolatility', 0) or 0)
-                if iv_val > 0:
-                    atm_iv = iv_val
-                    break
+        return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
 
-    atm_iv = atm_iv if atm_iv is not None else 13.5
-    leg_greeks = calculate_black_scholes_greeks(spot_price, strike, t_years, atm_iv, opt_type)
-    return round(atm_iv, 2), leg_greeks
+    @classmethod
+    def calculate_iv(cls, market_price: float, S: float, K: float, T: float, r: float = 0.10, flag: str = "c") -> float:
+        if market_price <= 0.05 or T <= 0:
+            return 0.0
+        df = math.exp(-r * T)
+        intrinsic = max(0.0, S - K * df) if flag.lower() == "c" else max(0.0, K * df - S)
 
-def fetch_leg_market_data(smart_api, token, symbol_name, basket_interval, from_date, to_date):
-    ltp_val = None
-    leg_candles = []
-    
-    if not (smart_api and token and symbol_name):
-        return ltp_val, leg_candles
+        if market_price <= intrinsic:
+            return 0.0
 
-    def _fetch_ltp():
+        def objective_function(sigma: float) -> float:
+            return cls.black_scholes_price(S, K, T, r, sigma, flag) - market_price
+
         try:
-            res = smart_api.ltpData("NFO", symbol_name, token)
-            if res and res.get('status') and res.get('data'):
-                return float(res['data']['ltp'])
+            return float(brentq(objective_function, a=1e-4, b=10.0, xtol=1e-4))
+        except (ValueError, RuntimeError):
+            return 0.0
+
+    @classmethod
+    def calculate_hv(cls, smart_api, symbol_token: str, exchange: str = "NSE", days: int = 30) -> float:
+        try:
+            to_date = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+            from_date = to_date - datetime.timedelta(days=int(days * 1.6) + 10)
+
+            param = {
+                "exchange": exchange,
+                "symboltoken": symbol_token,
+                "interval": "ONE_DAY",
+                "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
+                "todate": to_date.strftime("%Y-%m-%d 15:30")
+            }
+            hist_data = smart_api.getCandleData(param)
+            if hist_data and hist_data.get("status") and hist_data.get("data"):
+                df_hist = pd.DataFrame(hist_data["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df_hist["close"] = df_hist["close"].astype(float)
+                df_hist = df_hist.tail(days + 1)
+                log_returns = np.log(df_hist["close"] / df_hist["close"].shift(1)).dropna()
+
+                if len(log_returns) >= 5:
+                    return float(np.std(log_returns, ddof=1) * np.sqrt(252))
         except Exception:
             pass
+        return 0.15
+
+    @staticmethod
+    def calculate_max_pain(chain_data: list) -> int:
+        strikes = [row["Strike"] for row in chain_data]
+        if not strikes:
+            return 0
+
+        losses = {}
+        for spot_hypo in strikes:
+            total_loss = 0.0
+            for row in chain_data:
+                k = row["Strike"]
+                c_oi = row["C_OI"]
+                p_oi = row["P_OI"]
+
+                if spot_hypo > k:
+                    total_loss += (spot_hypo - k) * c_oi
+                if spot_hypo < k:
+                    total_loss += (k - spot_hypo) * p_oi
+
+            losses[spot_hypo] = total_loss
+
+        return min(losses, key=losses.get)
+
+# --- OPTION CHAIN & LEVEL CALCULATOR ---
+def calculate_support_resistance_targets(chain_data: list, spot_price: float, max_pain: int):
+    if not chain_data:
+        return {}
+
+    df = pd.DataFrame(chain_data)
+
+    res_df = df.sort_values(by="C_OI", ascending=False)
+    r1 = res_df.iloc[0]["Strike"] if len(res_df) > 0 else spot_price
+    r2 = res_df.iloc[1]["Strike"] if len(res_df) > 1 else r1
+
+    sup_df = df.sort_values(by="P_OI", ascending=False)
+    s1 = sup_df.iloc[0]["Strike"] if len(sup_df) > 0 else spot_price
+    s2 = sup_df.iloc[1]["Strike"] if len(sup_df) > 1 else s1
+
+    r1, r2 = min(r1, r2), max(r1, r2)
+    s1, s2 = max(s1, s2), min(s1, s2)
+
+    df_sorted = df.sort_values(by="Strike").reset_index(drop=True)
+
+    above_spot = df_sorted[df_sorted["Strike"] >= spot_price]
+    below_spot = df_sorted[df_sorted["Strike"] < spot_price]
+
+    gex_res_row = above_spot.sort_values(by="Net_GEX_OI", ascending=False).head(1) if not above_spot.empty else pd.DataFrame()
+    gex_resistance = gex_res_row.iloc[0]["Strike"] if not gex_res_row.empty and gex_res_row.iloc[0]["Net_GEX_OI"] > 0 else r1
+
+    gex_sup_row = below_spot.sort_values(by="Net_GEX_OI", ascending=False).head(1) if not below_spot.empty else pd.DataFrame()
+    gex_support = gex_sup_row.iloc[0]["Strike"] if not gex_sup_row.empty and gex_sup_row.iloc[0]["Net_GEX_OI"] > 0 else s1
+
+    neg_gex_row = df_sorted.sort_values(by="Net_GEX_OI", ascending=True).head(1)
+    gex_accelerator = neg_gex_row.iloc[0]["Strike"] if not neg_gex_row.empty and neg_gex_row.iloc[0]["Net_GEX_OI"] < 0 else None
+
+    flip_candidates = []
+    for i in range(1, len(df_sorted)):
+        prev_gex = df_sorted.loc[i-1, "Net_GEX_OI"]
+        curr_gex = df_sorted.loc[i, "Net_GEX_OI"]
+
+        if (prev_gex < 0 and curr_gex >= 0) or (prev_gex >= 0 and curr_gex < 0):
+            chosen_strike = df_sorted.loc[i, "Strike"] if abs(curr_gex) < abs(prev_gex) else df_sorted.loc[i-1, "Strike"]
+            flip_candidates.append(chosen_strike)
+
+    zero_gamma_strike = min(flip_candidates, key=lambda x: abs(x - spot_price)) if flip_candidates else spot_price
+
+    atm_row = df.iloc[(df['Strike'] - spot_price).abs().argsort()[:1]].iloc[0]
+    atm_straddle_cost = atm_row["C_LTP"] + atm_row["P_LTP"]
+
+    target_upside = round(spot_price + atm_straddle_cost, 2)
+    target_downside = round(spot_price - atm_straddle_cost, 2)
+
+    return {
+        "S1": s1, "S2": s2, "R1": r1, "R2": r2,
+        "GEX_Support": gex_support,
+        "GEX_Resistance": gex_resistance,
+        "GEX_Accelerator": gex_accelerator,
+        "Zero_Gamma_Flip": zero_gamma_strike,
+        "MaxPain": max_pain,
+        "Target_Up": target_upside,
+        "Target_Down": target_downside,
+        "Straddle_Cost": round(atm_straddle_cost, 2)
+    }
+
+# --- TECHNICAL INDICATOR ENGINE ---
+def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
+    df = df_candles.copy()
+    if df.empty or len(df) < 20:
+        return df
+
+    df["bb_middle"] = df["close"].rolling(window=20, min_periods=20).mean()
+    df["bb_std"] = df["close"].rolling(window=20, min_periods=20).std()
+    df["bb_upper"] = df["bb_middle"] + (2 * df["bb_std"])
+    df["bb_lower"] = df["bb_middle"] - (2 * df["bb_std"])
+    df["bb_bandwidth"] = np.where(df["bb_middle"] > 0, (df["bb_upper"] - df["bb_lower"]) / df["bb_middle"], 0)
+
+    ema_12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema_26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd"] = ema_12 - ema_26
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -1 * delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].fillna(50)
+
+    df["date_group"] = pd.to_datetime(df["time"]).dt.date
+    df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    df["tp_vol"] = df["tp"] * df["volume"]
+
+    df["cum_vol"] = df.groupby("date_group")["volume"].cumsum()
+    df["cum_tp_vol"] = df.groupby("date_group")["tp_vol"].cumsum()
+    df["vwap"] = np.where(df["cum_vol"] > 0, df["cum_tp_vol"] / df["cum_vol"], df["close"])
+
+    return df
+
+@st.cache_data(ttl=3600)
+def download_master_scrip():
+    scrip_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    return pd.read_json(scrip_url)
+
+def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
+    try:
+        exp_str = target_dt.strftime("%d%b%y").upper()
+        exact_symbol = f"{index_name}{exp_str}{int(strike)}{opt_type}"
+
+        sym_match = df_exp[df_exp["symbol"] == exact_symbol]
+        if not sym_match.empty:
+            return str(sym_match.iloc[0]["token"])
+
+        fallback_match = df_exp[(df_exp["strike_num"] == int(strike)) & (df_exp["symbol"].str.endswith(opt_type))]
+        if not fallback_match.empty:
+            return str(fallback_match.iloc[0]["token"])
+    except Exception:
+        pass
+    return ""
+
+# --- SIDEBAR SETUP ---
+st.sidebar.markdown("### ⚙️ Parameters & Strategy Builder")
+
+df_master = download_master_scrip()
+
+with st.sidebar.expander("1. Market Parameters", expanded=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
+    with c2:
+        Exchange = st.selectbox("Exchange", ["NFO", "BFO"])
+
+    rate_param = st.number_input("Risk Free Rate (r)", min_value=0.0, max_value=0.15, value=0.10, step=0.01)
+
+    df_options = df_master[
+        (df_master["exch_seg"] == Exchange)
+        & (df_master["name"] == Index_Name)
+        & (df_master["instrumenttype"].isin(["OPTIDX", "OPTSTK"]))
+    ].copy()
+
+    df_options["expiry_dt"] = pd.to_datetime(df_options["expiry"], format="%d%b%Y")
+    today_dt = pd.to_datetime(datetime.date.today())
+    valid_expiries = sorted(df_options[df_options["expiry_dt"] >= today_dt]["expiry_dt"].unique())
+    expiry_options_str = [pd.to_datetime(exp).strftime("%d%b%Y").upper() for exp in valid_expiries]
+
+    selected_expiry_str = st.selectbox("Expiry Date", expiry_options_str if expiry_options_str else ["N/A"])
+
+    c3, c4 = st.columns(2)
+    with c3:
+        strikes_below = st.number_input("Below ATM", min_value=1, max_value=50, value=10, step=1)
+    with c4:
+        strikes_above = st.number_input("Above ATM", min_value=1, max_value=50, value=10, step=1)
+
+    hv_days = st.slider("HV Lookback (Days)", min_value=10, max_value=90, value=30, step=5)
+
+target_expiry_dt = pd.to_datetime(selected_expiry_str, format="%d%b%Y") if selected_expiry_str != "N/A" else today_dt
+df_expiry = df_options[df_options["expiry_dt"] == target_expiry_dt].copy()
+df_expiry["strike_num"] = pd.to_numeric(df_expiry["strike"], errors="coerce") / 100.0
+
+all_expiry_strikes = sorted(df_expiry["strike_num"].dropna().unique())
+
+with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
+    selected_strike = st.selectbox("Option Strike Price", all_expiry_strikes if all_expiry_strikes else [24500])
+
+    b_col1, b_col2 = st.columns(2)
+    with b_col1:
+        opt_type = st.selectbox("Option Type", ["CE", "PE"])
+    with b_col2:
+        trade_action = st.selectbox("Trade Action", ["BUY", "SELL"])
+
+    entry_price_input = st.number_input("Entry Price (₹) [0 for LTP]", min_value=0.0, value=0.0, step=0.5)
+    qty_lots = st.number_input("Quantity / Units", min_value=1, value=65, step=1)
+
+    c_btn1, c_btn2 = st.columns(2)
+    with c_btn1:
+        if st.button("+ Add Leg", use_container_width=True):
+            st.session_state["basket_legs"].append({
+                "strike": int(selected_strike),
+                "type": opt_type,
+                "action": trade_action,
+                "entry_price": entry_price_input,
+                "qty": qty_lots
+            })
+            st.success("Leg Added!")
+            st.rerun()
+    with c_btn2:
+        if st.button("Clear Basket", use_container_width=True):
+            st.session_state["basket_legs"] = []
+            st.rerun()
+
+run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
+
+interval_mapping = {
+    "1 min": ("ONE_MINUTE", 7),
+    "3 min": ("THREE_MINUTE", 10),
+    "5 min": ("FIVE_MINUTE", 15),
+    "15 min": ("FIFTEEN_MINUTE", 30)
+}
+
+# --- DATA FETCHING ENGINE ---
+def fetch_live_data(selected_interval_label="5 min"):
+    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
+        st.error("Missing SmartAPI credentials! Please set them up in Render's Environment Variables.")
         return None
 
-    def _fetch_candles():
-        try:
-            params = {
-                "exchange": "NFO",
-                "symboltoken": token,
-                "interval": INTERVAL_MAP.get(basket_interval, "FIFTEEN_MINUTE"),
-                "fromdate": from_date,
-                "todate": to_date
-            }
-            res = smart_api.getCandleData(params)
-            if res and res.get('status') and res.get('data'):
-                return res['data']
-        except Exception:
-            pass
-        return []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        f_ltp = executor.submit(_fetch_ltp)
-        f_cand = executor.submit(_fetch_candles)
-        ltp_val = f_ltp.result()
-        leg_candles = f_cand.result()
-
-    return ltp_val, leg_candles
-
-def calculate_basket_net_greeks(legs):
-    net_delta, net_gamma, net_theta, net_vega = 0.0, 0.0, 0.0, 0.0
-    for leg in legs:
-        qty = int(leg.get('qty', 65))
-        direction = 1 if leg.get('action') == 'BUY' else -1
-        g = leg.get('greeks', {})
-        
-        net_delta += (g.get('delta', 0.0) * qty * direction)
-        net_gamma += (g.get('gamma', 0.0) * qty * direction)
-        net_theta += (g.get('theta', 0.0) * qty * direction)
-        net_vega += (g.get('vega', 0.0) * qty * direction)
-
-    return {
-        "delta": round(net_delta, 2),
-        "gamma": round(net_gamma, 4),
-        "theta": round(net_theta, 2),
-        "vega": round(net_vega, 2),
-        "expected_day_theta": round(net_theta, 2)
-    }
-
-def calculate_max_profit_loss(legs):
-    if not legs:
-        return "₹0", "₹0"
-
-    total_net_credit = 0.0
-    short_calls, long_calls = [], []
-    short_puts, long_puts = [], []
-    qty = 65
-
-    for leg in legs:
-        qty = int(leg.get('qty', 65))
-        entry_price = float(leg.get('entry_price', 0.0) or 0.0)
-        action = leg.get('action', 'BUY')
-        opt_type = leg.get('option_type', 'CE')
-        strike = float(leg.get('strike', 0))
-
-        if action == 'SELL':
-            total_net_credit += (entry_price * qty)
-            if opt_type in ['CE', 'C']:
-                short_calls.append(strike)
-            else:
-                short_puts.append(strike)
-        elif action == 'BUY':
-            total_net_credit -= (entry_price * qty)
-            if opt_type in ['CE', 'C']:
-                long_calls.append(strike)
-            else:
-                long_puts.append(strike)
-
-    call_hedged = False
-    call_width = 0
-    if short_calls:
-        if long_calls and min(long_calls) > max(short_calls):
-            call_hedged = True
-            call_width = min(long_calls) - max(short_calls)
-
-    put_hedged = False
-    put_width = 0
-    if short_puts:
-        if long_puts and max(long_puts) < min(short_puts):
-            put_hedged = True
-            put_width = min(short_puts) - max(long_puts)
-
-    if short_calls and short_puts and call_hedged and put_hedged:
-        max_width = max(call_width, put_width) * qty
-        max_profit = total_net_credit
-        max_loss = max_width - total_net_credit
-        return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
-
-    if short_calls and call_hedged and not short_puts:
-        max_width = call_width * qty
-        max_profit = total_net_credit
-        max_loss = max_width - total_net_credit
-        return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
-
-    if short_puts and put_hedged and not short_calls:
-        max_width = put_width * qty
-        max_profit = total_net_credit
-        max_loss = max_width - total_net_credit
-        return f"₹{round(max_profit, 2)}", f"₹{round(max_loss, 2)}"
-
-    max_profit_str = "Uncapped" if (long_calls or long_puts) and not (short_calls or short_puts) else f"₹{round(total_net_credit, 2)}"
-    max_loss_str = "Uncapped" if (short_calls and not call_hedged) or (short_puts and not put_hedged) else "Defined"
-
-    return max_profit_str, max_loss_str
-
-def identify_strategy(legs):
-    if not legs:
-        return "Custom Strategy"
-    
-    n_legs = len(legs)
-    buys = [l for l in legs if l['action'] == 'BUY']
-    sells = [l for l in legs if l['action'] == 'SELL']
-
-    if n_legs == 1:
-        leg = legs[0]
-        return f"Long {leg['option_type']}" if leg['action'] == 'BUY' else f"Short {leg['option_type']}"
-
-    if n_legs == 2:
-        if len(buys) == 1 and len(sells) == 1:
-            b_leg, s_leg = buys[0], sells[0]
-            if b_leg['option_type'] == 'CE' and s_leg['option_type'] == 'CE':
-                return "Bull Call Spread" if b_leg['strike'] < s_leg['strike'] else "Bear Call Spread"
-            if b_leg['option_type'] == 'PE' and s_leg['option_type'] == 'PE':
-                return "Bear Put Spread" if b_leg['strike'] > s_leg['strike'] else "Bull Put Spread"
-        elif len(buys) == 2:
-            if set(l['option_type'] for l in buys) == {'CE', 'PE'}:
-                strikes = set(l['strike'] for l in buys)
-                return "Long Straddle" if len(strikes) == 1 else "Long Strangle"
-        elif len(sells) == 2:
-            if set(l['option_type'] for l in sells) == {'CE', 'PE'}:
-                strikes = set(l['strike'] for l in sells)
-                return "Short Straddle" if len(strikes) == 1 else "Short Strangle"
-
-    if n_legs == 4 and len(buys) == 2 and len(sells) == 2:
-        types = set(l['option_type'] for l in legs)
-        if types == {'CE', 'PE'}:
-            return "Iron Condor"
-
-    return "Custom Multi-Leg"
-
-HTML_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Live SmartAPI Options Position Tracker</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@2.0.1"></script>
-    <style>
-        body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 20px; padding-top: 35px; }
-        
-        #apiStatusPill {
-            position: fixed; top: 10px; left: 15px; z-index: 9999;
-            background: rgba(20, 20, 20, 0.95); border: 1px solid #00bcd4;
-            color: #00ff88; padding: 6px 14px; border-radius: 20px;
-            font-size: 11px; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-            max-width: 90vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-        }
-
-        #refreshToggleOverlay {
-            position: fixed; top: 10px; right: 15px; z-index: 9999;
-            background: rgba(20, 20, 20, 0.95); border: 1px solid #444;
-            color: #fff; padding: 8px 16px; border-radius: 20px;
-            font-size: 11px; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-            display: flex; align-items: center; gap: 8px; cursor: pointer;
-            white-space: nowrap; width: auto; max-width: none;
-        }
-
-        .pill-err { border-color: #ff5252 !important; color: #ff5252 !important; }
-        .pill-warn { border-color: #ffca28 !important; color: #ffca28 !important; }
-
-        .grid { display: grid; grid-template-columns: 360px 1fr; gap: 20px; margin-top: 15px; }
-        .card { background: #1e1e1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-bottom: 15px; }
-        .chart-container-relative { position: relative; }
-
-        .indicator-ribbon {
-            position: absolute;
-            top: 8px;
-            right: 5px;
-            background: rgba(18, 18, 18, 0.92);
-            border: 1px solid #00bcd4;
-            border-radius: 6px;
-            padding: 6px 10px;
-            font-size: 10px;
-            font-family: monospace;
-            z-index: 10;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.7);
-            line-height: 1.4;
-            text-align: right;
-            max-width: 300px;
-        }
-        .ribbon-item { display: block; color: #00ff88; }
-        .ribbon-vix { color: #ffca28; font-weight: bold; }
-        .ribbon-vol { color: #00e5ff; font-weight: bold; }
-        .ribbon-rec { color: #ff4081; font-weight: bold; margin-top: 3px; border-top: 1px dashed #444; padding-top: 3px; }
-
-        .pcr-control-box {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid #00bcd4;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            color: #fff;
-        }
-
-        .pcr-input {
-            width: 50px !important;
-            padding: 2px 4px !important;
-            margin: 0 !important;
-            height: 22px;
-            font-size: 11px;
-            text-align: center;
-            background: #121212;
-            border: 1px solid #555;
-            color: #00ff88;
-        }
-
-        .pcr-refresh-btn {
-            background: transparent;
-            border: 1px solid #00bcd4;
-            color: #00bcd4;
-            border-radius: 3px;
-            padding: 2px 6px;
-            cursor: pointer;
-            font-size: 11px;
-            margin: 0;
-            width: auto;
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-        }
-        .pcr-refresh-btn:hover { background: rgba(0, 188, 212, 0.2); }
-
-        h2, h3 { margin-top: 0; color: #00bcd4; }
-        
-        .header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-        .header-flex h3 { margin: 0; }
-        .chart-select { width: auto !important; padding: 4px 8px !important; margin: 0 !important; font-size: 12px; }
-
-        label { display: block; margin-top: 10px; font-size: 12px; color: #aaa; }
-        select, input, button { width: 100%; padding: 8px; margin-top: 5px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
-        button { background: #00bcd4; color: black; font-weight: bold; cursor: pointer; border: none; margin-top: 15px; }
-        button:hover { background: #008ba3; }
-        
-        .btn-delete { background: #ff5252; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; width: auto; margin: 0; display: inline-flex; align-items: center; gap: 4px; }
-        .btn-delete:hover { background: #d32f2f; }
-        
-        .pending-leg-item { display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 6px; border-radius: 4px; margin-top: 5px; font-size: 12px; }
-
-        .status-bar { display: flex; gap: 12px; background: #262626; padding: 10px; border-radius: 6px; font-weight: bold; margin-bottom: 5px; flex-wrap: wrap; }
-        .status-item { font-size: 12px; }
-        .status-value { color: #00ff88; }
-
-        /* Collapsible Option Chain Ribbon Styles */
-        .option-chain-collapsible {
-            background: #1a1a1a;
-            border: 1px solid #00bcd4;
-            border-radius: 6px;
-            margin-bottom: 15px;
-            overflow: hidden;
-        }
-
-        .option-chain-header {
-            background: #252525;
-            padding: 8px 14px;
-            cursor: pointer;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 13px;
-            font-weight: bold;
-            color: #00bcd4;
-            user-select: none;
-        }
-
-        .option-chain-header:hover { background: #2f2f2f; }
-
-        .option-chain-content {
-            display: none;
-            padding: 12px;
-            max-height: 400px;
-            overflow-y: auto;
-        }
-
-        .option-chain-metrics {
-            display: flex;
-            gap: 20px;
-            background: #121212;
-            padding: 8px 12px;
-            border-radius: 4px;
-            margin-bottom: 10px;
-            font-size: 12px;
-            border: 1px solid #333;
-        }
-
-        .metric-item { display: flex; gap: 6px; }
-        .metric-label { color: #aaa; }
-        .metric-val { font-weight: bold; color: #00ff88; }
-
-        .oc-table { width: 100%; border-collapse: collapse; font-size: 11px; text-align: center; }
-        .oc-table th, .oc-table td { padding: 6px 4px; border: 1px solid #333; }
-        .oc-table th { background: #232323; color: #00bcd4; position: sticky; top: 0; }
-        .oc-table tr:hover { background: #262626; }
-        .atm-row { background: rgba(0, 188, 212, 0.15) !important; font-weight: bold; }
-        .call-col { color: #00ff88; }
-        .put-col { color: #ff5252; }
-        .strike-col { background: #181818; color: #fff; font-weight: bold; }
-
-        .pnl-pos { color: #00ff88; font-weight: bold; }
-        .pnl-neg { color: #ff5252; font-weight: bold; }
-        .pnl-err { color: #ff9800; font-weight: bold; }
-        .greek-tag { font-family: monospace; background: #2d2d2d; padding: 3px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; display: inline-block; margin-top: 4px; }
-        .basket-summary-tag { font-family: monospace; background: #1a3835; border: 1px solid #00bcd4; padding: 3px 7px; border-radius: 4px; font-size: 11px; color: #00e5ff; margin-left: 6px; display: inline-block; margin-top: 4px; }
-        .strategy-badge { background: #00bcd4; color: #000; font-weight: bold; padding: 2px 8px; border-radius: 12px; font-size: 11px; margin-left: 8px; }
-
-        .chart-checkbox-container {
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            font-size: 11px;
-            color: #00ff88;
-            margin-right: 12px;
-            cursor: pointer;
-            user-select: none;
-        }
-
-        .header-spinner {
-            width: 12px;
-            height: 12px;
-            border: 2px solid rgba(0, 188, 212, 0.3);
-            border-radius: 50%;
-            border-top-color: #00bcd4;
-            animation: spin 0.8s linear infinite;
-            display: inline-block;
-            vertical-align: middle;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        .basket-status-msg {
-            font-size: 11px;
-            color: #00bcd4;
-            font-weight: normal;
-            margin-left: 8px;
-            display: inline-flex;
-            align-items: center;
-        }
-
-        .subchart-title {
-            font-size: 11px;
-            color: #aaa;
-            margin: 12px 0 2px 0;
-            font-weight: bold;
-        }
-
-        .rsi-wrapper {
-            position: relative;
-            height: 175px;
-            width: 100%;
-        }
-    </style>
-</head>
-<body>
-
-    <div id="apiStatusPill">Status: Logging in API...</div>
-
-    <div id="refreshToggleOverlay">
-        <input type="checkbox" id="chkAutoRefresh" checked onchange="toggleRefreshInterval()" style="margin:0; width:auto;">
-        <label for="chkAutoRefresh" style="margin:0; cursor:pointer; color:#fff; white-space:nowrap; display:inline;">Enable Refresh 5 sec</label>
-    </div>
-
-    <h2>Real-Market Options Strategy Tracker (SmartAPI Live)</h2>
-    <div class="grid">
-        <div>
-            <div class="card">
-                <h3>1. Select Underlying & Expiry</h3>
-                <label>Index Symbol</label>
-                <select id="symbol" onchange="onUnderlyingOrExpiryChange()">
-                    <option value="NIFTY">NIFTY 50</option>
-                    <option value="BANKNIFTY">BANKNIFTY</option>
-                </select>
-
-                <label>Expiry Date</label>
-                <select id="expirySelect" onchange="onUnderlyingOrExpiryChange()"></select>
-
-                <label>Exchange Segment</label>
-                <select id="exchange">
-                    <option value="NFO">NFO</option>
-                </select>
-            </div>
-
-            <div class="card">
-                <h3>2. Build Strategy Basket</h3>
-                <label>Strike Price</label>
-                <select id="strikeSelect"></select>
-
-                <label>Option Type</label>
-                <select id="optType">
-                    <option value="CE">CE (Call)</option>
-                    <option value="PE">PE (Put)</option>
-                </select>
-
-                <label>Trade Action</label>
-                <select id="action">
-                    <option value="BUY">BUY</option>
-                    <option value="SELL" selected>SELL</option>
-                </select>
-
-                <label>Entry Price (₹)</label>
-                <input type="number" id="entryPrice" placeholder="Auto-fetches LTP if blank" step="0.05">
-
-                <label>Quantity / Lots</label>
-                <input type="number" id="qty" value="65">
-
-                <button onclick="addLegToPending()">+ Add Position Leg</button>
-                
-                <div id="pendingContainer" style="margin-top: 12px;"></div>
-                
-                <button onclick="deployBasket()" style="background: #4caf50; color: white;">Execute Strategy Basket</button>
-            </div>
-        </div>
-
-        <div>
-            <!-- Main Index Status Ribbon -->
-            <div class="status-bar">
-                <div class="status-item">Index LTP: <span id="stIndex" class="status-value">-</span></div>
-                <div class="status-item">Dynamic ATM IV: <span id="stIv" class="status-value">-</span></div>
-                <div class="status-item">Expected 1-Day Move: <span id="stMove" class="status-value">-</span></div>
-                <div class="status-item">Expected Expiry Move: <span id="stExpiryMove" class="status-value">-</span></div>
-                <div class="status-item">PCR: <span id="stPcr" class="status-value">-</span></div>
-                <div class="status-item">Market Status: <span id="stMarketStatus" class="status-value">-</span></div>
-            </div>
-
-            <!-- Collapsible Option Chain Ribbon -->
-            <div class="option-chain-collapsible">
-                <div class="option-chain-header" onclick="toggleOptionChain()">
-                    <span>📊 Full Option Chain Table (<span id="ocTitleSymbol">NIFTY</span> - <span id="ocTitleExpiry">-</span>)</span>
-                    <span id="ocToggleArrow">▼ Show Option Chain</span>
-                </div>
-                <div class="option-chain-content" id="ocContent">
-                    <div class="option-chain-metrics">
-                        <div class="metric-item">
-                            <span class="metric-label">Total Call OI:</span>
-                            <span class="metric-val" id="ocCallOI" style="color: #00ff88;">-</span>
-                        </div>
-                        <div class="metric-item">
-                            <span class="metric-label">Total Put OI:</span>
-                            <span class="metric-val" id="ocPutOI" style="color: #ff5252;">-</span>
-                        </div>
-                        <div class="metric-item">
-                            <span class="metric-label">Put-Call Ratio (PCR):</span>
-                            <span class="metric-val" id="ocPCR" style="color: #00bcd4;">-</span>
-                        </div>
-                    </div>
-                    
-                    <table class="oc-table">
-                        <thead>
-                            <tr>
-                                <th colspan="6" style="color: #00ff88; border-bottom: 1px solid #444;">CALLS</th>
-                                <th>STRIKE</th>
-                                <th colspan="6" style="color: #ff5252; border-bottom: 1px solid #444;">PUTS</th>
-                            </tr>
-                            <tr>
-                                <th>OI</th>
-                                <th>LTP</th>
-                                <th>&Delta;</th>
-                                <th>&Gamma;</th>
-                                <th>&Theta;</th>
-                                <th>&Nu;</th>
-                                <th>Strike</th>
-                                <th>&Nu;</th>
-                                <th>&Theta;</th>
-                                <th>&Gamma;</th>
-                                <th>&Delta;</th>
-                                <th>LTP</th>
-                                <th>OI</th>
-                            </tr>
-                        </thead>
-                        <tbody id="ocTableBody">
-                            <tr><td colspan="13" style="text-align:center; padding: 15px; color:#aaa;">Click to expand and load Option Chain data...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card chart-container-relative">
-                <div id="indicatorRibbon" class="indicator-ribbon">
-                    <span id="ribbonVix" class="ribbon-vix">VIX: -</span>
-                    <span id="ribbonVol" class="ribbon-vol">IV: - | HV: -</span>
-                    <span id="ribbonBB" class="ribbon-item">BB (20,2) : -</span>
-                    <span id="ribbonMACD" class="ribbon-item">MACD (12,26,9) : -</span>
-                    <span id="ribbonRSI" class="ribbon-item">RSI (14) : -</span>
-                    <span id="ribbonRec" class="ribbon-rec">Trend Suggestion: -</span>
-                </div>
-
-                <div class="header-flex">
-                    <h3>Index Price, VWAP & Bollinger Bands</h3>
-                    <div style="display: flex; gap: 10px; align-items: center; margin-right: 320px;">
-                        <div class="pcr-control-box" title="Number of Strikes +/- from ATM Strike Price">
-                            <span>PCR &plusmn; Range:</span>
-                            <input type="number" id="pcrStrikeRange" class="pcr-input" placeholder="All" min="1" max="50" value="5">
-                            <button class="pcr-refresh-btn" onclick="refreshPcrValue()" title="Recalculate PCR">
-                                <span id="pcrSpinner" class="header-spinner" style="display:none;"></span>
-                                🔄
-                            </button>
-                        </div>
-                        <div>
-                            <label style="display:inline; color:#aaa; font-size:11px; margin-right:3px;">Timeframe:</label>
-                            <select id="timeframeSelect" class="chart-select" onchange="updateDashboard()">
-                                <option value="1">1 min</option>
-                                <option value="3">3 mins</option>
-                                <option value="5">5 mins</option>
-                                <option value="15" selected>15 mins</option>
-                            </select>
-                        </div>
-                    </div>
-                </div>
-                <canvas id="mainChart" height="90"></canvas>
-
-                <div class="subchart-title">MACD (12, 26, 9 EMA) Indicator</div>
-                <canvas id="macdChart" height="65"></canvas>
-
-                <div class="subchart-title">RSI (14) Indicator (0-30-70-100 Rescaled)</div>
-                <div class="rsi-wrapper">
-                    <canvas id="rsiChart"></canvas>
-                </div>
-            </div>
-
-            <div class="card">
-                <div style="display: flex; align-items: center;">
-                    <h3 style="margin: 0;">Active Basket Positions & Real-Time Option LTP</h3>
-                    <span id="basketHeaderStatus"></span>
-                </div>
-                <div id="basketsContainer" style="margin-top: 15px;"></div>
-            </div>
-
-            <div class="card">
-                <div class="header-flex">
-                    <h3>Basket Legs Real-Time Premium Chart & P&L Zones</h3>
-                    <div>
-                        <label style="display:inline; color:#aaa; font-size:12px; margin-right:5px;">Basket Candle Timeframe:</label>
-                        <select id="basketTimeframeSelect" class="chart-select" onchange="updateDashboard()">
-                            <option value="1">1 min</option>
-                            <option value="3">3 mins</option>
-                            <option value="5">5 mins</option>
-                            <option value="15" selected>15 mins</option>
-                        </select>
-                    </div>
-                </div>
-                <canvas id="legsPremiumChart" height="120"></canvas>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        let pendingLegs = [];
-        let activeBaskets = [];
-        let selectedChartBasketId = null;
-        let showStrikesPerBasket = {};
-        let deletedBasketIds = new Set();
-        let mainChart, macdChart, rsiChart, legsChart;
-        let refreshTimer = null;
-        let isOptionChainExpanded = false;
-
-        const CHART_COLORS = ['#00bcd4', '#ff9800', '#e91e63', '#4caf50', '#9c27b0', '#ffeb3b'];
-
-        function updateStatus(text, type='info') {
-            const pill = document.getElementById('apiStatusPill');
-            pill.innerText = 'Status: ' + text;
-            pill.className = '';
-            if (type === 'error') pill.classList.add('pill-err');
-            if (type === 'warn') pill.classList.add('pill-warn');
-        }
-
-        const ctx = document.getElementById('mainChart').getContext('2d');
-        mainChart = new Chart(ctx, {
-            type: 'line',
-            data: { 
-                labels: [], 
-                datasets: [
-                    { label: 'Index Spot Price', data: [], borderColor: '#00bcd4', borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true },
-                    { label: 'VWAP', data: [], borderColor: '#ff00ff', borderWidth: 1.5, pointRadius: 0, tension: 0.1, spanGaps: true },
-                    { label: 'BB Upper (20,2)', data: [], borderColor: 'rgba(255, 82, 82, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true },
-                    { label: 'BB Middle SMA (20)', data: [], borderColor: 'rgba(255, 202, 40, 0.8)', borderWidth: 1, pointRadius: 0, spanGaps: true },
-                    { label: 'BB Lower (20,2)', data: [], borderColor: 'rgba(76, 175, 80, 0.8)', borderWidth: 1, borderDash: [3, 3], pointRadius: 0, spanGaps: true }
-                ] 
-            },
-            options: { 
-                animation: false,
-                responsive: true,
-                scales: { 
-                    y: { display: true, position: 'left', grid: { color: '#2a2a2a' } },
-                    x: { grid: { color: '#2a2a2a' } }
-                }
-            }
-        });
-
-        const ctxMACD = document.getElementById('macdChart').getContext('2d');
-        macdChart = new Chart(ctxMACD, {
-            type: 'bar',
-            data: {
-                labels: [],
-                datasets: [
-                    { type: 'line', label: 'MACD (12, 26)', data: [], borderColor: '#2196f3', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
-                    { type: 'line', label: 'Signal (9 EMA)', data: [], borderColor: '#ff9800', borderWidth: 1.2, pointRadius: 0, spanGaps: true },
-                    { type: 'bar', label: 'MACD Hist', data: [], backgroundColor: 'rgba(0, 188, 212, 0.4)' }
-                ]
-            },
-            options: {
-                animation: false,
-                responsive: true,
-                scales: {
-                    y: { grid: { color: '#2a2a2a' } },
-                    x: { display: false }
-                }
-            }
-        });
-
-        const ctxRSI = document.getElementById('rsiChart').getContext('2d');
-        rsiChart = new Chart(ctxRSI, {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [
-                    { label: 'RSI (14)', data: [], borderColor: '#e91e63', borderWidth: 1.8, pointRadius: 0, tension: 0.1, spanGaps: true }
-                ]
-            },
-            options: {
-                animation: false,
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {
-                    y: { 
-                        min: 0, 
-                        max: 100, 
-                        grid: { color: '#2a2a2a' }, 
-                        ticks: { 
-                            stepSize: 10,
-                            color: '#aaa',
-                            callback: function(val) {
-                                if ([0, 30, 70, 100].includes(val)) return val;
-                                return '';
-                            }
-                        } 
-                    },
-                    x: { grid: { color: '#2a2a2a' }, ticks: { color: '#888' } }
-                },
-                plugins: {
-                    annotation: {
-                        annotations: {
-                            line70: {
-                                type: 'line', yMin: 70, yMax: 70, borderColor: 'rgba(255, 82, 82, 0.6)', borderWidth: 1, borderDash: [4, 4],
-                                label: { display: true, content: 'Overbought (70)', color: '#ff5252', position: 'start', font: { size: 10 } }
-                            },
-                            line30: {
-                                type: 'line', yMin: 30, yMax: 30, borderColor: 'rgba(76, 175, 80, 0.6)', borderWidth: 1, borderDash: [4, 4],
-                                label: { display: true, content: 'Oversold (30)', color: '#4caf50', position: 'start', font: { size: 10 } }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        const ctxLegs = document.getElementById('legsPremiumChart').getContext('2d');
-        legsChart = new Chart(ctxLegs, {
-            type: 'line',
-            data: { labels: [], datasets: [] },
-            options: {
-                animation: false,
-                responsive: true,
-                interaction: { mode: 'index', intersect: false },
-                scales: {
-                    x: { grid: { color: '#2a2a2a' } },
-                    y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Option Premium (₹)', color: '#00bcd4' }, grid: { color: '#2a2a2a' } }
-                }
-            }
-        });
-
-        function toggleRefreshInterval() {
-            const isChecked = document.getElementById('chkAutoRefresh').checked;
-            if (refreshTimer) clearInterval(refreshTimer);
-
-            if (isChecked) {
-                refreshTimer = setInterval(() => {
-                    updateDashboard();
-                    if(isOptionChainExpanded) loadFullOptionChainTable();
-                }, 5000);
-            }
-        }
-
-        async function refreshPcrValue() {
-            const spinner = document.getElementById('pcrSpinner');
-            spinner.style.display = 'inline-block';
-            await updateDashboard();
-            if(isOptionChainExpanded) await loadFullOptionChainTable();
-            spinner.style.display = 'none';
-        }
-
-        function toggleOptionChain() {
-            const content = document.getElementById('ocContent');
-            const arrow = document.getElementById('ocToggleArrow');
-            isOptionChainExpanded = !isOptionChainExpanded;
-
-            if (isOptionChainExpanded) {
-                content.style.display = 'block';
-                arrow.innerText = '▲ Hide Option Chain';
-                loadFullOptionChainTable();
-            } else {
-                content.style.display = 'none';
-                arrow.innerText = '▼ Show Option Chain';
-            }
-        }
-
-        function onUnderlyingOrExpiryChange() {
-            loadExpiries().then(() => {
-                if(isOptionChainExpanded) loadFullOptionChainTable();
-            });
-        }
-
-        async function loadFullOptionChainTable() {
-            const symbol = document.getElementById('symbol').value;
-            const expiry = document.getElementById('expirySelect').value;
-
-            document.getElementById('ocTitleSymbol').innerText = symbol;
-            document.getElementById('ocTitleExpiry').innerText = expiry || '-';
-
-            if (!expiry) return;
-
-            try {
-                const res = await fetch('/api/fetch-full-option-chain', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ symbol, expiry })
-                });
-                const data = await res.json();
-
-                if (data.status === "success") {
-                    document.getElementById('ocCallOI').innerText = data.total_call_oi.toLocaleString('en-IN');
-                    document.getElementById('ocPutOI').innerText = data.total_put_oi.toLocaleString('en-IN');
-                    document.getElementById('ocPCR').innerText = data.pcr_value;
-
-                    const tbody = document.getElementById('ocTableBody');
-                    tbody.innerHTML = '';
-
-                    data.rows.forEach(row => {
-                        let tr = document.createElement('tr');
-                        if (row.is_atm) tr.className = 'atm-row';
-
-                        tr.innerHTML = `
-                            <td class="call-col">${row.call_oi ? row.call_oi.toLocaleString('en-IN') : '-'}</td>
-                            <td class="call-col">₹${row.call_ltp !== null ? row.call_ltp : '-'}</td>
-                            <td>${row.call_delta !== null ? row.call_delta : '-'}</td>
-                            <td>${row.call_gamma !== null ? row.call_gamma : '-'}</td>
-                            <td>${row.call_theta !== null ? row.call_theta : '-'}</td>
-                            <td>${row.call_vega !== null ? row.call_vega : '-'}</td>
-                            <td class="strike-col">${row.strike}</td>
-                            <td>${row.put_vega !== null ? row.put_vega : '-'}</td>
-                            <td>${row.put_theta !== null ? row.put_theta : '-'}</td>
-                            <td>${row.put_gamma !== null ? row.put_gamma : '-'}</td>
-                            <td>${row.put_delta !== null ? row.put_delta : '-'}</td>
-                            <td class="put-col">₹${row.put_ltp !== null ? row.put_ltp : '-'}</td>
-                            <td class="put-col">${row.put_oi ? row.put_oi.toLocaleString('en-IN') : '-'}</td>
-                        `;
-                        tbody.appendChild(tr);
-                    });
-                }
-            } catch(e) {
-                console.error("Could not load option chain", e);
-            }
-        }
-
-        async function loadExpiries() {
-            updateStatus("Initializing...", "warn");
-            const symbol = document.getElementById('symbol').value;
-            try {
-                const res = await fetch('/api/fetch-expiries', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ symbol })
-                });
-                const data = await res.json();
-                
-                if (data.status) updateStatus(data.status, data.status.includes("Downloading") ? "warn" : "info");
-
-                const select = document.getElementById('expirySelect');
-                const prevExp = select.value;
-                select.innerHTML = '';
-                if(data.expiries && data.expiries.length > 0) {
-                    data.expiries.forEach((exp, idx) => {
-                        let opt = document.createElement('option');
-                        opt.value = exp; opt.textContent = exp;
-                        if(exp === prevExp || idx === 0) opt.selected = true;
-                        select.appendChild(opt);
-                    });
-                    loadChain();
-                } else if (data.status && data.status.includes("Downloading")) {
-                    setTimeout(loadExpiries, 2000);
-                }
-            } catch(e) { updateStatus("Couldnt log in: Network Error", "error"); }
-        }
-
-        async function loadChain() {
-            const symbol = document.getElementById('symbol').value;
-            const expiry = document.getElementById('expirySelect').value;
-            if (!expiry) return;
-
-            try {
-                const res = await fetch('/api/fetch-chain', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ symbol, expiry })
-                });
-                const data = await res.json();
-
-                const select = document.getElementById('strikeSelect');
-                select.innerHTML = '';
-                if(data.strikes && data.strikes.length > 0) {
-                    data.strikes.forEach(s => {
-                        let opt = document.createElement('option');
-                        opt.value = s; opt.textContent = s;
-                        if(s === data.atm) opt.selected = true;
-                        select.appendChild(opt);
-                    });
-                }
-            } catch(e) { updateStatus("Couldnt fetch live price from API", "error"); }
-        }
-
-        function addLegToPending() {
-            const strike = document.getElementById('strikeSelect').value;
-            const expiry = document.getElementById('expirySelect').value;
-            const option_type = document.getElementById('optType').value;
-            const action = document.getElementById('action').value;
-            const entry_price = document.getElementById('entryPrice').value;
-            const qty = document.getElementById('qty').value;
-
-            pendingLegs.push({ 
-                strike, expiry, option_type, action, 
-                entry_price: entry_price ? parseFloat(entry_price) : null, 
-                qty: parseInt(qty) 
-            });
-            renderPendingLegs();
-        }
-
-        function removePendingLeg(index) {
-            pendingLegs.splice(index, 1);
-            renderPendingLegs();
-        }
-
-        function renderPendingLegs() {
-            const container = document.getElementById('pendingContainer');
-            if (pendingLegs.length === 0) { container.innerHTML = ''; return; }
-
-            let html = `<div style="font-size: 12px; color: #ffca28; margin-bottom: 5px; font-weight: bold;">
-                Pending Basket (${pendingLegs.length} leg(s)):
-            </div>`;
-
-            pendingLegs.forEach((leg, idx) => {
-                let entryText = leg.entry_price ? `₹${leg.entry_price}` : 'Auto LTP';
-                html += `
-                    <div class="pending-leg-item">
-                        <span>${leg.strike} ${leg.option_type} (${leg.action}) | ${leg.qty} Qty | ${entryText}</span>
-                        <button class="btn-delete" onclick="removePendingLeg(${idx})" title="Remove Leg">❌</button>
-                    </div>`;
-            });
-            container.innerHTML = html;
-        }
-
-        function deployBasket() {
-            if (pendingLegs.length === 0) return alert("Add position legs first.");
-            const basketId = Date.now();
-            const newBasketName = `Basket #${activeBaskets.length + 1}`;
-            
-            if (!selectedChartBasketId) selectedChartBasketId = basketId;
-            showStrikesPerBasket[basketId] = false;
-
-            activeBaskets.push({ id: basketId, name: newBasketName, impact_duration: 15, legs: [...pendingLegs] });
-            pendingLegs = [];
-            renderPendingLegs();
-
-            const statusElem = document.getElementById('basketHeaderStatus');
-            statusElem.innerHTML = `<span class="basket-status-msg"><span class="header-spinner"></span> Adding ${newBasketName}...</span>`;
-
-            updateDashboard().then(() => {
-                statusElem.innerHTML = '';
-            });
-        }
-
-        function deleteBasket(basketId) {
-            deletedBasketIds.add(basketId);
-            activeBaskets = activeBaskets.filter(b => b.id !== basketId);
-            delete showStrikesPerBasket[basketId];
-            
-            if (selectedChartBasketId === basketId) {
-                selectedChartBasketId = activeBaskets.length > 0 ? activeBaskets[0].id : null;
-            }
-            
-            updateDashboard();
-        }
-
-        function toggleBasketChart(basketId) {
-            selectedChartBasketId = selectedChartBasketId === basketId ? null : basketId;
-            updateDashboard();
-        }
-
-        function toggleShowStrikes(basketId, checkbox) {
-            showStrikesPerBasket[basketId] = checkbox.checked;
-            updateDashboard();
-        }
-
-        function updateBasketImpactDuration(basketId, val) {
-            const basket = activeBaskets.find(b => b.id === basketId);
-            if (basket) {
-                basket.impact_duration = parseInt(val);
-                updateDashboard();
-            }
-        }
-
-        async function updateDashboard() {
-            const symbol = document.getElementById('symbol').value;
-            const exchange = document.getElementById('exchange').value;
-            const interval = document.getElementById('timeframeSelect').value;
-            const basketInterval = document.getElementById('basketTimeframeSelect').value;
-            const selectedExpiry = document.getElementById('expirySelect').value;
-            const pcrRangeVal = document.getElementById('pcrStrikeRange').value;
-
-            activeBaskets = activeBaskets.filter(b => !deletedBasketIds.has(b.id));
-
-            try {
-                const res = await fetch('/api/live-data', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ 
-                        symbol, exchange, interval, basket_interval: basketInterval, 
-                        expiry: selectedExpiry, baskets: activeBaskets,
-                        pcr_strike_range: pcrRangeVal ? parseInt(pcrRangeVal) : null
-                    })
-                });
-                const data = await res.json();
-
-                if (data.status) updateStatus(data.status, "info");
-                if (data.error) { document.getElementById('stIndex').innerText = data.error; return; }
-
-                document.getElementById('stIndex').innerText = data.underlying_price;
-                document.getElementById('stIv').innerText = data.current_iv + "%";
-                document.getElementById('stMove').innerText = "±" + data.expected_1day_move + " pts";
-                document.getElementById('stExpiryMove').innerText = "±" + data.expected_expiry_move + " pts";
-                document.getElementById('stPcr').innerText = data.pcr_value;
-                document.getElementById('stMarketStatus').innerText = data.is_market_open ? "OPEN (Live)" : "CLOSED (Last Trading Day Data)";
-
-                document.getElementById('ribbonVix').innerText = "India VIX: " + data.vix_val;
-                document.getElementById('ribbonVol').innerText = "IV: " + data.current_iv + "% | HV: " + data.hv_val + "% (" + data.vol_relation + ")";
-                document.getElementById('ribbonBB').innerText = data.bb_status;
-                document.getElementById('ribbonMACD').innerText = data.macd_status;
-                document.getElementById('ribbonRSI').innerText = data.rsi_status;
-                document.getElementById('ribbonRec').innerText = "Strategy Suggestion: " + data.trend_recommendation;
-
-                const validBaskets = (data.baskets || []).filter(b => !deletedBasketIds.has(b.id));
-
-                if (data.chart_labels && data.chart_labels.length > 0) {
-                    mainChart.data.labels = data.chart_labels;
-                    macdChart.data.labels = data.chart_labels;
-                    rsiChart.data.labels = data.chart_labels;
-
-                    mainChart.data.datasets[0].data = data.chart_prices;
-                    if (data.indicators) {
-                        mainChart.data.datasets[1].data = data.indicators.vwap || [];
-                        mainChart.data.datasets[2].data = data.indicators.bb_upper || [];
-                        mainChart.data.datasets[3].data = data.indicators.bb_middle || [];
-                        mainChart.data.datasets[4].data = data.indicators.bb_lower || [];
-
-                        macdChart.data.datasets[0].data = data.indicators.macd || [];
-                        macdChart.data.datasets[1].data = data.indicators.macd_signal || [];
-                        macdChart.data.datasets[2].data = data.indicators.macd_hist || [];
-
-                        rsiChart.data.datasets[0].data = data.indicators.rsi || [];
-                    }
-
-                    const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
-
-                    let baseDatasets = mainChart.data.datasets.slice(0, 5);
-                    if (targetBasket && showStrikesPerBasket[targetBasket.id]) {
-                        targetBasket.legs.forEach((leg, lIdx) => {
-                            let strikeVal = parseFloat(leg.strike);
-                            let strikeDataset = {
-                                label: `Strike: ${strikeVal} ${leg.option_type}`,
-                                data: new Array(data.chart_labels.length).fill(strikeVal),
-                                borderColor: CHART_COLORS[lIdx % CHART_COLORS.length],
-                                borderDash: [4, 4],
-                                borderWidth: 1.2,
-                                pointRadius: 0,
-                                fill: false,
-                                spanGaps: true
-                            };
-                            baseDatasets.push(strikeDataset);
-                        });
-                    }
-                    mainChart.data.datasets = baseDatasets;
-
-                    mainChart.update('none');
-                    macdChart.update('none');
-                    rsiChart.update('none');
-                }
-
-                const container = document.getElementById('basketsContainer');
-                container.innerHTML = '';
-
-                validBaskets.forEach(b => {
-                    let pnlDisplay = typeof b.basket_pnl === 'number' ? `₹${b.basket_pnl}` : b.basket_pnl;
-                    let pnlClass = typeof b.basket_pnl === 'number' ? (b.basket_pnl >= 0 ? 'pnl-pos' : 'pnl-neg') : 'pnl-err';
-                    let isChecked = selectedChartBasketId === b.id;
-                    let strikesChecked = showStrikesPerBasket[b.id] ? 'checked' : '';
-
-                    let html = `<div style="border-bottom: 1px solid #333; padding: 10px 0;">
-                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
-                            <div style="display:flex; align-items:center; flex-wrap:wrap; gap:4px;">
-                                <strong>${b.name}</strong>
-                                <span class="strategy-badge">${b.strategy_type}</span>
-                                <span class="${pnlClass}" style="margin-left: 10px; margin-right: 10px;">Live P&L: ${pnlDisplay}</span>
-                                
-                                <span class="basket-summary-tag">Net &Delta;: ₹${b.net_greeks.delta} /pt <small>(${b.basket_impact.delta_pct}%)</small></span>
-                                <span class="basket-summary-tag">Net &Gamma;: ₹${b.net_greeks.gamma} /pt&sup2;</span>
-                                <span class="basket-summary-tag">Net &Theta;: ₹${b.net_greeks.theta} /day <small>(${b.basket_impact.theta_pct}%)</small></span>
-                                <span class="basket-summary-tag">Net &Nu;: ₹${b.net_greeks.vega} /1% IV <small>(${b.basket_impact.vega_pct}%)</small></span>
-                                <span class="basket-summary-tag" style="color:#00ff88; border-color:#00ff88; background:#1b3821;">Tot Decay: ₹${b.total_decay_till_date}</span>
-                                <span class="basket-summary-tag" style="color:#ffca28; border-color:#ffca28; background:#38321b;">Exp Day &Theta;: ₹${b.net_greeks.expected_day_theta}</span>
-                            </div>
-                            
-                            <div style="display:flex; align-items:center; gap: 8px;">
-                                <label class="chart-checkbox-container" title="Show leg strike lines on underlying index chart">
-                                    <input type="checkbox" ${strikesChecked} onchange="toggleShowStrikes(${b.id}, this)" style="width:auto; margin:0;">
-                                    <span>Show Strikes on Chart</span>
-                                </label>
-                                <label class="chart-checkbox-container">
-                                    <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleBasketChart(${b.id})" style="width:auto; margin:0;">
-                                    <span>Load Chart</span>
-                                </label>
-                                <select class="chart-select" onchange="updateBasketImpactDuration(${b.id}, this.value)" title="Duration of % Impact">
-                                    <option value="3" ${b.impact_duration === 3 ? 'selected' : ''}>3 mins</option>
-                                    <option value="5" ${b.impact_duration === 5 ? 'selected' : ''}>5 mins</option>
-                                    <option value="15" ${b.impact_duration === 15 ? 'selected' : ''}>15 mins</option>
-                                </select>
-                                <button class="btn-delete" onclick="deleteBasket(${b.id})">🗑️ Delete Basket</button>
-                            </div>
-                        </div>
-                        
-                        <div style="margin-top: 6px; font-size: 12px; color: #aaa;">
-                            <strong>Max Profit:</strong> <span style="color:#00ff88; margin-right:15px;">${b.max_profit}</span>
-                            <strong>Max Loss:</strong> <span style="color:#ff5252;">${b.max_loss}</span>
-                        </div>`;
-
-                    b.legs.forEach((leg) => {
-                        let ltpText = typeof leg.current_premium === 'number' ? `₹${leg.current_premium}` : leg.current_premium;
-                        let entryText = typeof leg.entry_price === 'number' ? `₹${leg.entry_price}` : leg.entry_price;
-                        let legPnlText = typeof leg.leg_pnl === 'number' ? `₹${leg.leg_pnl}` : leg.leg_pnl;
-
-                        html += `
-                            <div style="margin-top:6px; font-size:13px;">
-                                <span>[${leg.expiry}] ${leg.strike} ${leg.option_type} (${leg.action}) | Entry: ${entryText} | Real LTP: ${ltpText} | P&L: ${legPnlText}</span>
-                                <div>
-                                    <span class="greek-tag">&Delta;: ${leg.greeks.delta} <small style="color:#00bcd4;">(${leg.impact.delta_pct}%)</small></span>
-                                    <span class="greek-tag">&Gamma;: ${leg.greeks.gamma}</span>
-                                    <span class="greek-tag">&Theta;: ${leg.greeks.theta} <small style="color:#00bcd4;">(${leg.impact.theta_pct}%)</small></span>
-                                    <span class="greek-tag">&Nu;: ${leg.greeks.vega} <small style="color:#00bcd4;">(${leg.impact.vega_pct}%)</small></span>
-                                    <span class="greek-tag" style="color:#00ff88;">Decay Till Date: ₹${leg.theta_decay_till_date}</span>
-                                    <span class="greek-tag" style="color:#00bcd4;">Exp Day Theta: ${leg.greeks.expected_day_theta}</span>
-                                </div>
-                            </div>`;
-                    });
-                    html += `</div>`;
-                    container.innerHTML += html;
-                });
-
-                const targetBasket = validBaskets.find(b => b.id === selectedChartBasketId);
-                if (targetBasket) {
-                    updateLegsHistoricalChart(targetBasket);
-                } else {
-                    legsChart.data.labels = [];
-                    legsChart.data.datasets = [];
-                    legsChart.update('none');
-                }
-
-            } catch(e) { updateStatus("Couldnt fetch live price from API", "error"); }
-        }
-
-        function updateLegsHistoricalChart(basket) {
-            if (!basket || !basket.legs_historical) return;
-
-            const hist = basket.legs_historical;
-            if (hist.labels && hist.labels.length > 0) {
-                legsChart.data.labels = hist.labels;
-                let datasets = [];
-
-                if (hist.leg_series) {
-                    hist.leg_series.forEach((series, idx) => {
-                        let isPositivePnl = basket.basket_pnl >= 0;
-                        datasets.push({
-                            label: series.label,
-                            data: series.prices,
-                            borderColor: CHART_COLORS[idx % CHART_COLORS.length],
-                            borderWidth: 2,
-                            pointRadius: 0,
-                            pointHoverRadius: 4,
-                            fill: { target: 'origin', above: isPositivePnl ? 'rgba(0,255,136,0.1)' : 'rgba(0,255,136,0.03)', below: !isPositivePnl ? 'rgba(255,82,82,0.1)' : 'rgba(255,82,82,0.03)' },
-                            tension: 0.1,
-                            spanGaps: true
-                        });
-                    });
-                }
-
-                legsChart.data.datasets = datasets;
-                legsChart.update('none');
-            }
-        }
-
-        loadExpiries();
-        toggleRefreshInterval();
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    ensure_scrip_master_loading()
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/fetch-expiries', methods=['POST'])
-def fetch_expiries():
-    ensure_scrip_master_loading()
-    if INSTRUMENT_DF is None:
-        return jsonify({"expiries": [], "status": SCRIP_MASTER_STATUS})
-
-    data = request.json or {}
-    symbol = data.get('symbol', 'NIFTY')
-
-    filtered = INSTRUMENT_DF[INSTRUMENT_DF['name'] == symbol]
-    raw_expiries = filtered['expiry'].unique().tolist()
-
-    parsed_expiries = []
-    now_date = datetime.now(IST).date()
-
-    for exp in raw_expiries:
-        try:
-            exp_date = datetime.strptime(str(exp), "%d%b%Y").date()
-            if exp_date >= now_date:
-                parsed_expiries.append((exp_date, str(exp)))
-        except Exception:
-            pass
-
-    parsed_expiries.sort(key=lambda x: x[0])
-    sorted_expiries = [item[1] for item in parsed_expiries]
-    
-    return jsonify({"expiries": sorted_expiries, "status": "API connection success"})
-
-@app.route('/api/fetch-chain', methods=['POST'])
-def fetch_chain():
-    if INSTRUMENT_DF is None:
-        return jsonify({"strikes": [], "atm": None})
-
-    data = request.json or {}
-    symbol = data.get('symbol', 'NIFTY')
-    expiry = data.get('expiry')
-
-    filtered = INSTRUMENT_DF[(INSTRUMENT_DF['name'] == symbol) & (INSTRUMENT_DF['expiry'] == expiry)]
-    strikes = sorted(filtered['strike_price'].dropna().unique().tolist())
-
-    smart_api, _ = get_smart_api()
-    atm = None
-    if smart_api and symbol in INDEX_TOKENS:
-        try:
-            tok_info = INDEX_TOKENS[symbol]
-            
-            cache_key = f"ltp_{symbol}"
-            spot = get_cached_data(cache_key)
-            if spot is None:
-                ltp_resp = smart_api.ltpData(tok_info["exchange"], tok_info["tradingsymbol"], tok_info["token"])
-                if ltp_resp and ltp_resp.get('status') and ltp_resp.get('data'):
-                    spot = float(ltp_resp['data']['ltp'])
-                    set_cached_data(cache_key, spot)
-
-            if spot:
-                step = tok_info['step']
-                atm = round(spot / step) * step
-        except Exception:
-            pass
-
-    return jsonify({"strikes": strikes, "atm": atm})
-
-@app.route('/api/fetch-full-option-chain', methods=['POST'])
-def fetch_full_option_chain():
-    smart_api, _ = get_smart_api()
-    data = request.json or {}
-    symbol = data.get('symbol', 'NIFTY')
-    expiry = data.get('expiry')
-
-    if not smart_api or not expiry:
-        return jsonify({"status": "error", "rows": [], "total_call_oi": 0, "total_put_oi": 0, "pcr_value": "N/A"})
-
-    tok_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
-    step = tok_info['step']
-
-    # Fetch Index Spot
-    cache_key = f"ltp_{symbol}"
-    spot_price = get_cached_data(cache_key)
-    if spot_price is None:
-        try:
-            ltp_resp = smart_api.ltpData(tok_info["exchange"], tok_info["tradingsymbol"], tok_info["token"])
-            if ltp_resp and ltp_resp.get('status') and ltp_resp.get('data'):
-                spot_price = float(ltp_resp['data']['ltp'])
-                set_cached_data(cache_key, spot_price)
-        except Exception:
-            spot_price = 0.0
-
-    atm_strike = round(spot_price / step) * step if spot_price > 0 else 0
-
-    chain_raw = fetch_option_chain_data(smart_api, symbol, expiry)
-    
-    # Off-market / Maintenance fallback: Build chain structure from INSTRUMENT_DF
-    if not chain_raw and INSTRUMENT_DF is not None:
-        filtered_df = INSTRUMENT_DF[(INSTRUMENT_DF['name'] == symbol) & (INSTRUMENT_DF['expiry'] == expiry)]
-        chain_raw = []
-        for _, row in filtered_df.iterrows():
-            opt_type = 'CE' if str(row['symbol']).endswith('CE') else 'PE'
-            chain_raw.append({
-                'strikePrice': row['strike_price'],
-                'optionType': opt_type,
-                'ltp': 0.0,
-                'openInterest': 0,
-                'impliedVolatility': 13.5
-            })
-
-    chain_map = {}
-    total_call_oi = 0
-    total_put_oi = 0
-
-    now = datetime.now(IST)
     try:
-        exp_dt = datetime.strptime(expiry, "%d%b%Y").replace(hour=15, minute=30, tzinfo=IST)
-        days_remaining = max((exp_dt - now).total_seconds() / (24 * 3600), 0.001)
-    except Exception:
-        days_remaining = 1.0
-    t_years = days_remaining / 365.0
+        status_text.text("Authenticating with SmartAPI...")
+        progress_bar.progress(10)
 
-    for item in chain_raw:
-        try:
-            sp = float(item.get('strikePrice', 0) or item.get('strikeprice', 0) or 0)
-            opt_type = str(item.get('optionType', '') or item.get('optiontype', '')).upper()
-            if not opt_type:
-                opt_type = 'CE' if str(item.get('symbol', '')).endswith('CE') else 'PE'
+        smart_api = SmartConnect(api_key=API_KEY)
+        totp_token = pyotp.TOTP(TOTP_SECRET).now()
+        session = smart_api.generateSession(CLIENT_CODE, PIN, totp_token)
 
-            ltp = float(item.get('ltp', 0) or item.get('lastPrice', 0) or 0)
-            oi = int(item.get('openInterest', 0) or item.get('opennterest', 0) or item.get('oi', 0) or 0)
-            iv = float(item.get('impliedVolatility', 0) or item.get('iv', 0) or 13.5)
-            if iv <= 0: iv = 13.5
+        if session.get("status"):
+            index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
+            spot_token = index_token_map.get(Index_Name, "99926000")
 
-            if sp not in chain_map:
-                chain_map[sp] = {'CE': None, 'PE': None}
+            status_text.text("Fetching Historical Data & Technical Indicators...")
+            progress_bar.progress(25)
 
-            greeks = calculate_black_scholes_greeks(spot_price, sp, t_years, iv, opt_type)
+            spot_resp = smart_api.ltpData(exchange="NSE", tradingsymbol=Index_Name, symboltoken=spot_token)
+            spot_price = float(spot_resp["data"]["ltp"]) if spot_resp.get("status") and spot_resp.get("data") else 24500.0
 
-            chain_map[sp][opt_type] = {
-                'ltp': round(ltp, 2),
-                'oi': oi,
-                'greeks': greeks
+            index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, "NSE", days=hv_days)
+
+            ist_tz = pytz.timezone("Asia/Kolkata")
+            now_dt = datetime.datetime.now(ist_tz)
+
+            api_interval, lookback_days = interval_mapping.get(selected_interval_label, ("FIVE_MINUTE", 15))
+            from_dt = now_dt - datetime.timedelta(days=lookback_days)
+
+            candle_param = {
+                "exchange": "NSE",
+                "symboltoken": spot_token,
+                "interval": api_interval,
+                "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+                "todate": now_dt.strftime("%Y-%m-%d 15:30")
             }
+            candle_res = smart_api.getCandleData(candle_param)
+            df_candles = pd.DataFrame()
 
-            if opt_type in ['CE', 'CALL']:
-                total_call_oi += oi
-            else:
-                total_put_oi += oi
+            if candle_res and candle_res.get("status") and candle_res.get("data"):
+                df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+                df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
+                df_candles = compute_technical_indicators(df_candles)
 
-        except Exception:
-            continue
+            expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
+            time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
+            T = max(time_diff_seconds / (365.0 * 24 * 3600), 1e-5)
 
-    sorted_strikes = sorted(chain_map.keys())
-    
-    rows = []
-    for sp in sorted_strikes:
-        ce = chain_map[sp]['CE'] or {}
-        pe = chain_map[sp]['PE'] or {}
-        
-        ce_g = ce.get('greeks', {})
-        pe_g = pe.get('greeks', {})
+            atm_strike = min(all_expiry_strikes, key=lambda x: abs(x - spot_price)) if all_expiry_strikes else spot_price
+            atm_idx = all_expiry_strikes.index(atm_strike) if all_expiry_strikes else 0
+            filtered_strikes = all_expiry_strikes[max(0, atm_idx - strikes_below): min(len(all_expiry_strikes), atm_idx + strikes_above + 1)] if all_expiry_strikes else []
 
-        rows.append({
-            'strike': sp,
-            'is_atm': sp == atm_strike,
-            'call_oi': ce.get('oi', 0),
-            'call_ltp': ce.get('ltp', None),
-            'call_delta': ce_g.get('delta', None),
-            'call_gamma': ce_g.get('gamma', None),
-            'call_theta': ce_g.get('theta', None),
-            'call_vega': ce_g.get('vega', None),
-            'put_oi': pe.get('oi', 0),
-            'put_ltp': pe.get('ltp', None),
-            'put_delta': pe_g.get('delta', None),
-            'put_gamma': pe_g.get('gamma', None),
-            'put_theta': pe_g.get('theta', None),
-            'put_vega': pe_g.get('vega', None)
-        })
+            tokens_to_fetch = set()
+            strike_mapping = []
 
-    pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else "N/A"
+            for strike in filtered_strikes:
+                strike_int = int(strike)
+                c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "CE")
+                p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "PE")
 
-    return jsonify({
-        "status": "success",
-        "rows": rows,
-        "total_call_oi": total_call_oi,
-        "total_put_oi": total_put_oi,
-        "pcr_value": pcr
-    })
+                if c_tok: tokens_to_fetch.add(c_tok)
+                if p_tok: tokens_to_fetch.add(p_tok)
 
-@app.route('/api/live-data', methods=['POST'])
-def live_data():
-    smart_api, status_msg = get_smart_api()
-    if not smart_api:
-        return jsonify({"error": status_msg})
-
-    req = request.json or {}
-    symbol = req.get('symbol', 'NIFTY')
-    interval = req.get('interval', '15')
-    basket_interval = req.get('basket_interval', '15')
-    selected_expiry = req.get('expiry')
-    baskets = req.get('baskets', [])
-    pcr_strike_range = req.get('pcr_strike_range')
-
-    tok_info = INDEX_TOKENS.get(symbol, INDEX_TOKENS['NIFTY'])
-    step = tok_info['step']
-
-    # 1. Fetch Index Spot
-    cache_key = f"ltp_{symbol}"
-    spot_price = get_cached_data(cache_key)
-    if spot_price is None:
-        try:
-            ltp_resp = smart_api.ltpData(tok_info["exchange"], tok_info["tradingsymbol"], tok_info["token"])
-            if ltp_resp and ltp_resp.get('status') and ltp_resp.get('data'):
-                spot_price = float(ltp_resp['data']['ltp'])
-                set_cached_data(cache_key, spot_price)
-        except Exception:
-            pass
-
-    if not spot_price:
-        return jsonify({"error": "Unable to fetch index price"})
-
-    # 2. Fetch Index Chart Candle Data
-    from_date, to_date = get_last_trading_day_dates(num_days=5)
-    
-    candle_cache_key = f"candles_{symbol}_{interval}"
-    candles = get_cached_data(candle_cache_key)
-    if candles is None:
-        try:
-            candle_params = {
-                "exchange": tok_info["exchange"],
-                "symboltoken": tok_info["token"],
-                "interval": INTERVAL_MAP.get(interval, "FIFTEEN_MINUTE"),
-                "fromdate": from_date,
-                "todate": to_date
-            }
-            c_res = smart_api.getCandleData(candle_params)
-            if c_res and c_res.get('status') and c_res.get('data'):
-                candles = c_res['data']
-                set_cached_data(candle_cache_key, candles)
-        except Exception:
-            candles = []
-
-    chart_labels = [c[0].split('T')[1][:5] for c in candles] if candles else []
-    chart_prices = [float(c[4]) for c in candles] if candles else []
-
-    # 3. Calculate Technical Indicators, HV & VIX
-    indicator_series, bb_status, macd_status, rsi_status = calculate_chart_indicators(candles)
-    hv_val = calculate_historical_volatility(candles)
-    vix_val = fetch_vix(smart_api)
-
-    # 4. Fetch Option Chain & PCR
-    expiry_str = selected_expiry or get_nearest_expiry(symbol)
-    chain_data = fetch_option_chain_data(smart_api, symbol, expiry_str) if expiry_str else []
-    
-    pcr_val = calculate_pcr(
-        smart_api=smart_api, 
-        symbol=symbol, 
-        option_chain_data=chain_data, 
-        spot_price=spot_price, 
-        step=step, 
-        expiry=expiry_str, 
-        strike_range_limit=pcr_strike_range
-    )
-
-    current_iv, sample_greeks = get_atm_iv_and_leg_greeks(
-        smart_api=smart_api,
-        option_chain=chain_data,
-        spot_price=spot_price,
-        step=step,
-        strike=spot_price,
-        opt_type='CE',
-        expiry_str=expiry_str or '01JAN2026',
-        symbol=symbol
-    )
-
-    vol_relation = "IV > HV" if current_iv >= hv_val else "IV < HV"
-    if current_iv > hv_val:
-        trend_recommendation = "IV High (Premiums Rich) -> Prefer Selling Strategies (Credit Spreads, Condors)"
-    else:
-        trend_recommendation = "IV Low (Premiums Discounted) -> Prefer Buying Strategies (Debit Spreads, Straddles)"
-
-    expected_1day_move = round(spot_price * (current_iv / 100.0) / math.sqrt(365), 2)
-    expected_expiry_move = round(spot_price * (current_iv / 100.0) * math.sqrt(7 / 365), 2)
-
-    # 5. Process Active Baskets
-    processed_baskets = []
-    for basket in baskets:
-        basket_id = basket.get('id')
-        basket_name = basket.get('name', 'Basket')
-        impact_duration = int(basket.get('impact_duration', 15))
-        legs = basket.get('legs', [])
-
-        processed_legs = []
-        basket_pnl = 0.0
-        pnl_valid = True
-
-        hist_labels = chart_labels
-        hist_leg_series = []
-
-        for leg in legs:
-            l_strike = float(leg.get('strike'))
-            l_opt_type = leg.get('option_type')
-            l_action = leg.get('action')
-            l_expiry = leg.get('expiry')
-            l_qty = int(leg.get('qty', 65))
-            l_entry = leg.get('entry_price')
-
-            token, symbol_name = None, None
-            if INSTRUMENT_DF is not None:
-                match = INSTRUMENT_DF[
-                    (INSTRUMENT_DF['name'] == symbol) & 
-                    (INSTRUMENT_DF['expiry'] == l_expiry) & 
-                    (INSTRUMENT_DF['strike_price'] == l_strike) & 
-                    (INSTRUMENT_DF['symbol'].str.endswith(l_opt_type))
-                ]
-                if not match.empty:
-                    token = match.iloc[0]['token']
-                    symbol_name = match.iloc[0]['symbol']
-
-            ltp, leg_candles = fetch_leg_market_data(smart_api, token, symbol_name, basket_interval, from_date, to_date)
-            
-            entry_price = l_entry if l_entry is not None else (ltp if ltp else 0.0)
-
-            if ltp is not None and entry_price > 0:
-                direction = 1 if l_action == 'BUY' else -1
-                leg_pnl = (ltp - entry_price) * l_qty * direction
-                basket_pnl += leg_pnl
-                leg_pnl_str = round(leg_pnl, 2)
-            else:
-                pnl_valid = False
-                leg_pnl_str = "N/A"
-
-            leg_iv, leg_greeks = get_atm_iv_and_leg_greeks(
-                smart_api=smart_api,
-                option_chain=chain_data,
-                spot_price=spot_price,
-                step=step,
-                strike=l_strike,
-                opt_type=l_opt_type,
-                expiry_str=l_expiry,
-                symbol=symbol
-            )
-
-            delta_impact = abs(leg_greeks['delta'] * spot_price)
-            theta_impact = abs(leg_greeks['theta'])
-            vega_impact = abs(leg_greeks['vega'])
-            tot_impact = delta_impact + theta_impact + vega_impact
-            
-            leg_impact = {
-                "delta_pct": round((delta_impact / tot_impact * 100), 1) if tot_impact > 0 else 0,
-                "theta_pct": round((theta_impact / tot_impact * 100), 1) if tot_impact > 0 else 0,
-                "vega_pct": round((vega_impact / tot_impact * 100), 1) if tot_impact > 0 else 0
-            }
-
-            processed_legs.append({
-                "strike": l_strike,
-                "option_type": l_opt_type,
-                "action": l_action,
-                "expiry": l_expiry,
-                "qty": l_qty,
-                "entry_price": round(entry_price, 2) if entry_price else "N/A",
-                "current_premium": round(ltp, 2) if ltp else "N/A",
-                "leg_pnl": leg_pnl_str,
-                "greeks": leg_greeks,
-                "impact": leg_impact,
-                "theta_decay_till_date": round(leg_greeks['theta'] * 2, 2)
-            })
-
-            if leg_candles:
-                c_prices = [float(c[4]) for c in leg_candles]
-                hist_leg_series.append({
-                    "label": f"{l_strike} {l_opt_type} ({l_action})",
-                    "prices": c_prices
+                strike_mapping.append({
+                    "strike": strike_int,
+                    "call_tok": c_tok,
+                    "put_tok": p_tok
                 })
 
-        net_greeks = calculate_basket_net_greeks(processed_legs)
-        max_prof, max_loss = calculate_max_profit_loss(processed_legs)
-        strat_type = identify_strategy(processed_legs)
+            basket_tokens_info = {}
+            for leg in st.session_state.get("basket_legs", []):
+                k = int(leg["strike"])
+                t = leg["type"]
+                tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
+                if tok:
+                    tokens_to_fetch.add(tok)
+                    basket_tokens_info[f"{k}_{t}"] = tok
 
-        b_delta_imp = abs(net_greeks['delta'] * spot_price)
-        b_theta_imp = abs(net_greeks['theta'])
-        b_vega_imp = abs(net_greeks['vega'])
-        b_tot_imp = b_delta_imp + b_theta_imp + b_vega_imp
+            tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
 
-        basket_impact = {
-            "delta_pct": round((b_delta_imp / b_tot_imp * 100), 1) if b_tot_imp > 0 else 0,
-            "theta_pct": round((b_theta_imp / b_tot_imp * 100), 1) if b_tot_imp > 0 else 0,
-            "vega_pct": round((b_vega_imp / b_tot_imp * 100), 1) if b_tot_imp > 0 else 0
-        }
+            status_text.text("Batch fetching option market data...")
+            progress_bar.progress(50)
 
-        processed_baskets.append({
-            "id": basket_id,
-            "name": basket_name,
-            "impact_duration": impact_duration,
-            "strategy_type": strat_type,
-            "basket_pnl": round(basket_pnl, 2) if pnl_valid else "N/A",
-            "max_profit": max_prof,
-            "max_loss": max_loss,
-            "net_greeks": net_greeks,
-            "basket_impact": basket_impact,
-            "total_decay_till_date": round(net_greeks['theta'] * 2, 2),
-            "legs": processed_legs,
-            "legs_historical": {
-                "labels": hist_labels,
-                "leg_series": hist_leg_series
+            market_data = {}
+            chunk_size = 50
+            for i in range(0, len(tokens_to_fetch_list), chunk_size):
+                chunk = tokens_to_fetch_list[i:i + chunk_size]
+                res = smart_api.getMarketData("FULL", {Exchange: chunk})
+                if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
+                    for item in res["data"]["fetched"]:
+                        vol_val = (
+                            item.get("volume") or
+                            item.get("totTrdVol") or
+                            item.get("volumeTraded") or
+                            item.get("tradeVolume") or
+                            item.get("v") or 0
+                        )
+
+                        market_data[str(item["symbolToken"])] = {
+                            "ltp": float(item.get("ltp", 0.0)),
+                            "oi": int(item.get("opnInterest", 0)),
+                            "pnl_oi": int(item.get("netChange", 0)),
+                            "volume": int(vol_val)
+                        }
+
+            status_text.text("Calculating Greeks, GEX & Option Chain...")
+            progress_bar.progress(80)
+
+            atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
+            atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
+
+            atm_c_ltp = market_data.get(atm_c_tok, {}).get("ltp", 0.0)
+            atm_p_ltp = market_data.get(atm_p_tok, {}).get("ltp", 0.0)
+
+            F = atm_strike + math.exp(rate_param * T) * (atm_c_ltp - atm_p_ltp) if (atm_c_ltp > 0 and atm_p_ltp > 0) else spot_price
+
+            lot_size = LOT_SIZES.get(Index_Name, 25)
+            chain_results = []
+            total_call_oi = total_put_oi = 0
+            total_net_gex_oi = 0.0
+            total_net_gex_vol = 0.0
+            all_ivs = []
+
+            for row in strike_mapping:
+                K = row["strike"]
+                c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "pnl_oi": 0, "volume": 0})
+                p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "pnl_oi": 0, "volume": 0})
+
+                iv = VolatilityEngine.calculate_iv(c_info["ltp"] if K >= F else p_info["ltp"], F, K, T, rate_param, "c" if K >= F else "p")
+                if iv == 0.0:
+                    iv = index_hv
+
+                c_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, iv, "c")
+                p_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, iv, "p")
+
+                call_gex_oi = c_greeks["gamma"] * c_info["oi"] * spot_price * lot_size
+                put_gex_oi = p_greeks["gamma"] * p_info["oi"] * spot_price * lot_size
+                net_gex_oi = call_gex_oi - put_gex_oi
+                total_net_gex_oi += net_gex_oi
+
+                call_gex_vol = c_greeks["gamma"] * c_info["volume"] * spot_price * lot_size
+                put_gex_vol = p_greeks["gamma"] * p_info["volume"] * spot_price * lot_size
+                net_gex_vol = call_gex_vol - put_gex_vol
+                total_net_gex_vol += net_gex_vol
+
+                if iv > 0: all_ivs.append(iv)
+                total_call_oi += c_info["oi"]
+                total_put_oi += p_info["oi"]
+
+                chain_results.append({
+                    "C_Vol": c_info["volume"], "C_ΔOI": c_info["pnl_oi"], "C_OI": c_info["oi"],
+                    "C_Δ": round(c_greeks["delta"], 2), "C_γ": round(c_greeks["gamma"], 4),
+                    "C_θ": round(c_greeks["theta"], 2), "C_ν": round(c_greeks["vega"], 2),
+                    "C_IV_val": iv, "C_IV": f"{iv * 100:.1f}%", "C_LTP": c_info["ltp"],
+                    "Strike": K,
+                    "Net_GEX_OI": round(net_gex_oi, 2),
+                    "Net_GEX_Vol": round(net_gex_vol, 2),
+                    "P_LTP": p_info["ltp"], "P_IV_val": iv, "P_IV": f"{iv * 100:.1f}%",
+                    "P_Δ": round(p_greeks["delta"], 2), "P_γ": round(p_greeks["gamma"], 4),
+                    "P_θ": round(p_greeks["theta"], 2), "P_ν": round(p_greeks["vega"], 2),
+                    "P_OI": p_info["oi"], "P_ΔOI": p_info["pnl_oi"], "P_Vol": p_info["volume"]
+                })
+
+            pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
+            iv_percentile = 0.0
+            if all_ivs:
+                min_iv, max_iv = min(all_ivs), max(all_ivs)
+                atm_c_iv = VolatilityEngine.calculate_iv(atm_c_ltp, F, atm_strike, T, rate_param, "c")
+                if max_iv > min_iv and atm_c_iv > 0:
+                    iv_percentile = ((atm_c_iv - min_iv) / (max_iv - min_iv)) * 100.0
+
+            max_pain_strike = VolatilityEngine.calculate_max_pain(chain_results)
+            levels = calculate_support_resistance_targets(chain_results, spot_price, max_pain_strike)
+
+            progress_bar.progress(100)
+            status_text.empty()
+            progress_bar.empty()
+
+            return {
+                "spot_price": spot_price, "F": F, "T": T, "index_hv": index_hv, "iv_percentile": iv_percentile,
+                "pcr": pcr, "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
+                "total_net_gex_oi": total_net_gex_oi, "total_net_gex_vol": total_net_gex_vol,
+                "max_pain_strike": max_pain_strike, "levels": levels, "df_candles": df_candles,
+                "chain_results": chain_results, "market_data": market_data, "basket_tokens_info": basket_tokens_info,
+                "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST")
             }
-        })
 
-    return jsonify({
-        "status": "API connection success",
-        "underlying_price": spot_price,
-        "current_iv": current_iv,
-        "vix_val": vix_val,
-        "hv_val": hv_val,
-        "vol_relation": vol_relation,
-        "trend_recommendation": trend_recommendation,
-        "expected_1day_move": expected_1day_move,
-        "expected_expiry_move": expected_expiry_move,
-        "pcr_value": pcr_val,
-        "is_market_open": is_market_open(),
-        "bb_status": bb_status,
-        "macd_status": macd_status,
-        "rsi_status": rsi_status,
-        "chart_labels": chart_labels,
-        "chart_prices": chart_prices,
-        "indicators": indicator_series,
-        "baskets": processed_baskets
-    })
+    except Exception as e:
+        status_text.empty()
+        progress_bar.empty()
+        st.error(f"Error fetching live data: {str(e)}")
+        return None
 
-if __name__ == '__main__':
-    ensure_scrip_master_loading()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+if run_btn or st.session_state.get("auto_refresh_state", False):
+    new_data = fetch_live_data(st.session_state["selected_timeframe"])
+    if new_data:
+        st.session_state["data_store"] = new_data
+
+# --- DISPLAY MAIN DASHBOARD ---
+if "data_store" in st.session_state:
+    data = st.session_state["data_store"]
+
+    with st.container(border=True):
+        col_title, col_refresh = st.columns([0.75, 0.25])
+        with col_title:
+            st.markdown("<h1 class='custom-heading'>📊 Option Chain Technical Analysis</h1>", unsafe_allow_html=True)
+        with col_refresh:
+            auto_refresh = st.checkbox("🔄 Auto Refresh (5s)", value=st.session_state["auto_refresh_state"])
+            st.session_state["auto_refresh_state"] = auto_refresh
+
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Spot (Syn. Fut)", f"{data['spot_price']:.2f} ({data['F']:.2f})")
+        m2.metric("Max Pain", f"{data['max_pain_strike']}")
+        m3.metric("Net GEX (OI)", f"₹{data['total_net_gex_oi']/1e7:.2f} Cr")
+        m4.metric("ATM IV Rank", f"{data['iv_percentile']:.1f}%")
+        m5.metric("PCR (OI)", f"{data['pcr']:.2f}")
+        m6.metric("Total Call / Put OI", f"{data['total_call_oi'] // 1000}k / {data['total_put_oi'] // 1000}k")
+
+        st.markdown(f"<div class='update-timestamp'>Updated as on {data['timestamp']}</div>", unsafe_allow_html=True)
+
+    df_full = data.get("df_candles", pd.DataFrame())
+
+    chart_head_col, tf_col = st.columns([0.70, 0.30])
+    with chart_head_col:
+        st.markdown("<span style='font-weight: 700; color: #00E676; font-size: 18px;'>📈 Underlying Technical Charts</span>", unsafe_allow_html=True)
+    with tf_col:
+        selected_tf = st.selectbox("Timeframe", ["1 min", "3 min", "5 min", "15 min"], index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"]), key="tf_select")
+        if selected_tf != st.session_state["selected_timeframe"]:
+            st.session_state["selected_timeframe"] = selected_tf
+            updated_chart_data = fetch_live_data(selected_tf)
+            if updated_chart_data:
+                st.session_state["data_store"] = updated_chart_data
+                st.rerun()
+
+    if not df_full.empty and len(df_full) >= 20:
+        latest_row = df_full.iloc[-1]
+
+        rsi_val = latest_row["rsi"]
+        rsi_status = "Oversold" if rsi_val < 30 else ("Overbought" if rsi_val > 70 else "Neutral")
+        rsi_badge_cls = "badge-bearish" if rsi_val > 70 else ("badge-bullish" if rsi_val < 30 else "badge-neutral")
+
+        macd_val = latest_row["macd"]
+        macd_sig = latest_row["macd_signal"]
+        macd_status = "Bullish Crossover" if macd_val > macd_sig else "Bearish Crossover"
+        macd_badge_cls = "badge-bullish" if macd_val > macd_sig else "badge-bearish"
+
+        recent_bw = df_full["bb_bandwidth"].tail(20)
+        bw_threshold = recent_bw.quantile(0.20)
+        is_sqz = latest_row["bb_bandwidth"] <= bw_threshold
+        sqz_status = "Squeeze Active" if is_sqz else "Normal Expansion"
+        sqz_badge_cls = "badge-neutral" if is_sqz else "badge-bullish"
+
+        st.markdown(
+            f"""
+            <div style='margin-bottom: 8px;'>
+                <span class='status-badge {sqz_badge_cls}'>BB Squeeze: {sqz_status}</span>
+                <span class='status-badge {macd_badge_cls}'>MACD Status: {macd_status}</span>
+                <span class='status-badge {rsi_badge_cls}'>RSI (14): {rsi_val:.1f} ({rsi_status})</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        df_full["session_date"] = pd.to_datetime(df_full["time"]).dt.date
+        last_3_dates = sorted(df_full["session_date"].unique())[-3:]
+        df_chart = df_full[df_full["session_date"].isin(last_3_dates)].copy()
+        df_chart["time_str"] = pd.to_datetime(df_chart["time"]).dt.strftime("%d-%b %H:%M")
+
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.55, 0.25, 0.20])
+
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot Price", line=dict(color="#00E676", width=2)), row=1, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper (20, 2)", line=dict(color="rgba(33, 150, 243, 0.5)", width=1)), row=1, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_lower"], mode="lines", name="BB Lower (20, 2)", line=dict(color="rgba(33, 150, 243, 0.5)", width=1), fill='tonexty', fillcolor='rgba(33, 150, 243, 0.05)'), row=1, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["vwap"], mode="lines", name="VWAP (Intraday)", line=dict(color="#FF9800", width=2, dash="dot")), row=1, col=1)
+
+        colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
+        fig.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="MACD Hist", marker_color=colors_macd), row=2, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD (12, 26, 9) [{macd_val:.2f}]", line=dict(color="#2196F3", width=1.5)), row=2, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Signal [{macd_sig:.2f}]", line=dict(color="#FF9800", width=1.5)), row=2, col=1)
+
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name=f"RSI (14) [{rsi_val:.1f}]", line=dict(color="#E040FB", width=1.5)), row=3, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=3, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=3, col=1)
+
+        min_p = min(df_chart["close"].min(), df_chart["vwap"].min(), df_chart["bb_lower"].min())
+        max_p = max(df_chart["close"].max(), df_chart["vwap"].max(), df_chart["bb_upper"].max())
+        padding = (max_p - min_p) * 0.05
+
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#0E1117",
+            plot_bgcolor="#0E1117",
+            height=500,
+            margin=dict(l=20, r=20, t=10, b=10),
+            showlegend=True,
+            hovermode="x unified"
+        )
+        fig.update_yaxes(range=[min_p - padding, max_p + padding], tickformat="d", row=1, col=1)
+        fig.update_xaxes(type="category", nticks=12)
+        fig.update_traces(hovertemplate="%{y:.2f}", row=1, col=1)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --- STRATEGY BASKET DISPLAY SECTION ---
+    st.markdown("---")
+    st.subheader("🧺 Strategy Basket Analytics")
+
+    if st.session_state["basket_legs"]:
+        market_data_store = data.get("market_data", {})
+        basket_tokens_info = data.get("basket_tokens_info", {})
+        F_val = data.get("F", data["spot_price"])
+        T_val = data.get("T", 1e-5)
+        hv_val = data.get("index_hv", 0.15)
+
+        calculated_legs = []
+        tot_pnl = 0.0
+        tot_delta = 0.0
+        tot_gamma = 0.0
+        tot_theta = 0.0
+        tot_vega = 0.0
+
+        for leg in st.session_state["basket_legs"]:
+            k = leg["strike"]
+            t = leg["type"]
+            act = leg["action"]
+            qty = leg["qty"]
+
+            tok = basket_tokens_info.get(f"{k}_{t}", "")
+            ltp = market_data_store.get(tok, {}).get("ltp", 0.0) if tok else 0.0
+            entry_p = leg["entry_price"] if leg["entry_price"] > 0 else ltp
+
+            pricing_p = ltp if ltp > 0 else entry_p
+            leg_iv = VolatilityEngine.calculate_iv(pricing_p, F_val, k, T_val, rate_param, "c" if t == "CE" else "p")
+            if leg_iv == 0.0:
+                leg_iv = hv_val
+
+            greeks = VolatilityEngine.calculate_greeks(F_val, k, T_val, rate_param, leg_iv, "c" if t == "CE" else "p")
+
+            mult = 1.0 if act == "BUY" else -1.0
+
+            pnl_per_unit = (ltp - entry_p) if act == "BUY" else (entry_p - ltp)
+            leg_pnl = pnl_per_unit * qty if ltp > 0 else 0.0
+
+            pos_delta = greeks["delta"] * qty * mult
+            pos_gamma = greeks["gamma"] * qty * mult
+            pos_theta = greeks["theta"] * qty * mult
+            pos_vega = greeks["vega"] * qty * mult
+
+            tot_pnl += leg_pnl
+            tot_delta += pos_delta
+            tot_gamma += pos_gamma
+            tot_theta += pos_theta
+            tot_vega += pos_vega
+
+            calculated_legs.append({
+                "Action": act,
+                "Strike": k,
+                "Type": t,
+                "Qty": qty,
+                "Entry (₹)": round(entry_p, 2),
+                "LTP (₹)": round(ltp, 2),
+                "P&L (₹)": round(leg_pnl, 2),
+                "Delta (Δ)": round(pos_delta, 2),
+                "Gamma (γ)": round(pos_gamma, 4),
+                "Theta (θ)": round(pos_theta, 2),
+                "Vega (ν)": round(pos_vega, 2)
+            })
+
+        with st.container(border=True):
+            st.markdown("**Combined Basket Summary**")
+            b_m1, b_m2, b_m3, b_m4, b_m5 = st.columns(5)
+            b_m1.metric("Net P&L (₹)", f"₹{tot_pnl:,.2f}")
+            b_m2.metric("Net Delta (Δ)", f"{tot_delta:.2f}")
+            b_m3.metric("Net Gamma (γ)", f"{tot_gamma:.4f}")
+            b_m4.metric("Net Theta (θ)", f"{tot_theta:.2f}")
+            b_m5.metric("Net Vega (ν)", f"{tot_vega:.2f}")
+
+        df_basket_display = pd.DataFrame(calculated_legs)
+        st.markdown("**Individual Legs Breakdown**")
+        st.dataframe(df_basket_display, use_container_width=True)
+    else:
+        st.info("No legs added to strategy basket yet. Use sidebar **2. Build Strategy Basket** to add positions.")
+
+    # --- OPTION CHAIN DERIVED KEY LEVELS & TARGETS ---
+    st.markdown("---")
+    st.subheader("🎯 Option Chain Derived Key Levels & Targets")
+
+    lvls = data.get("levels", {})
+    if lvls:
+        row1_col1, row1_col2, row1_col3, row1_col4 = st.columns(4)
+        row1_col1.metric("OI Resistance 1 (R1)", f"{lvls['R1']}")
+        row1_col2.metric("OI Resistance 2 (R2)", f"{lvls['R2']}")
+        row1_col3.metric("OI Support 1 (S1)", f"{lvls['S1']}")
+        row1_col4.metric("OI Support 2 (S2)", f"{lvls['S2']}")
+
+        row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
+        row2_col1.metric("GEX Support / Magnet", f"{lvls['GEX_Support']}")
+        row2_col2.metric("GEX Resistance / Magnet", f"{lvls['GEX_Resistance']}")
+        row2_col3.metric("Vol Accelerator (-GEX)", f"{lvls['GEX_Accelerator'] if lvls['GEX_Accelerator'] else 'None'}")
+        row2_col4.metric("Zero Gamma / Flip Point", f"{lvls['Zero_Gamma_Flip']}")
+
+        # --- NET GAMMA vs VOLUME & OI SEPARATE CHARTS ---
+        st.markdown("---")
+        df_chain = pd.DataFrame(data["chain_results"])
+
+        if not df_chain.empty:
+            df_chain["Total_Vol"] = df_chain["C_Vol"] + df_chain["P_Vol"]
+            df_chain["Total_OI"] = df_chain["C_OI"] + df_chain["P_OI"]
+
+            def calculate_synced_ranges(v1_pos, v1_neg, v2_pos, v2_neg):
+                y1_max = max(v1_pos.max(), 1.0)
+                y1_min = min(v1_neg.min(), -1.0)
+                y2_max = max(v2_pos.max(), 1.0)
+                y2_min = min(v2_neg.min(), -1.0)
+
+                ratio1 = abs(y1_min) / y1_max
+                ratio2 = abs(y2_min) / y2_max
+                max_ratio = max(ratio1, ratio2)
+
+                range1 = [-y1_max * max_ratio * 1.05, y1_max * 1.05]
+                range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
+                return range1, range2
+
+            # ==========================================
+            # CHART 1: NET GAMMA EXPOSURE (VOLUME-BASED) vs VOLUME
+            # ==========================================
+            st.subheader("📊 Volume-Based Net Gamma Exposure vs Trading Volume")
+
+            gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
+
+            fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
+
+            fig_vol.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["Net_GEX_Vol"],
+                    name="Net Gamma (Vol-Based)",
+                    marker_color=gex_vol_colors,
+                    opacity=0.85,
+                    width=25,
+                    hovertemplate="Strike: %{x}<br>Net GEX (Vol): ₹%{y:,.0f}<extra></extra>"
+                ),
+                secondary_y=True
+            )
+
+            fig_vol.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["C_Vol"],
+                    name="Call Volume",
+                    marker_color="#81C784",
+                    opacity=0.6,
+                    hovertemplate="Strike: %{x}<br>Call Vol: %{y:,}<extra></extra>"
+                ),
+                secondary_y=False
+            )
+
+            fig_vol.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=-df_chain["P_Vol"],
+                    name="Put Volume",
+                    marker_color="#FF8A80",
+                    opacity=0.6,
+                    hovertemplate="Strike: %{x}<br>Put Vol: %{customdata:,}<extra></extra>",
+                    customdata=df_chain["P_Vol"]
+                ),
+                secondary_y=False
+            )
+
+            fig_vol.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
+            fig_vol.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
+            fig_vol.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip Point")
+
+            v1_range, v2_range = calculate_synced_ranges(
+                df_chain["C_Vol"], -df_chain["P_Vol"],
+                df_chain["Net_GEX_Vol"], df_chain["Net_GEX_Vol"]
+            )
+
+            fig_vol.update_layout(
+                title="Strike-wise Volume-Based Net Gamma & Volume Profile (Call Vol Above / Put Vol Below)",
+                template="plotly_dark",
+                paper_bgcolor="#0E1117",
+                plot_bgcolor="#0E1117",
+                height=480,
+                barmode="overlay",
+                margin=dict(l=20, r=20, t=40, b=10),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            fig_vol.update_xaxes(type="linear", tickformat="d", dtick=100)
+            fig_vol.update_yaxes(
+                title_text="Put Vol (Below) | Call Vol (Above)",
+                range=v1_range,
+                secondary_y=False,
+                showgrid=True,
+                gridcolor="#262930",
+                zeroline=True,
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
+            )
+            fig_vol.update_yaxes(
+                title_text="Net GEX (Vol-Based ₹)",
+                range=v2_range,
+                secondary_y=True,
+                showgrid=False,
+                zeroline=True,
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
+            )
+
+            st.plotly_chart(fig_vol, use_container_width=True)
+
+            # ==========================================
+            # CHART 2: NET GAMMA EXPOSURE (OI-BASED) vs OPEN INTEREST
+            # ==========================================
+            st.subheader("📈 OI-Based Net Gamma Exposure vs Open Interest (OI)")
+
+            gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
+
+            fig_oi = make_subplots(specs=[[{"secondary_y": True}]])
+
+            fig_oi.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["Net_GEX_OI"],
+                    name="Net Gamma (OI-Based)",
+                    marker_color=gex_oi_colors,
+                    opacity=0.85,
+                    width=25,
+                    hovertemplate="Strike: %{x}<br>Net GEX (OI): ₹%{y:,.0f}<extra></extra>"
+                ),
+                secondary_y=True
+            )
+
+            fig_oi.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["C_OI"],
+                    name="Call OI",
+                    marker_color="#2E7D32",
+                    opacity=0.6,
+                    hovertemplate="Strike: %{x}<br>Call OI: %{y:,}<extra></extra>"
+                ),
+                secondary_y=False
+            )
+
+            fig_oi.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=-df_chain["P_OI"],
+                    name="Put OI",
+                    marker_color="#C62828",
+                    opacity=0.6,
+                    hovertemplate="Strike: %{x}<br>Put OI: %{customdata:,}<extra></extra>",
+                    customdata=df_chain["P_OI"]
+                ),
+                secondary_y=False
+            )
+
+            fig_oi.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
+            fig_oi.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
+            fig_oi.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip Point")
+
+            oi1_range, oi2_range = calculate_synced_ranges(
+                df_chain["C_OI"], -df_chain["P_OI"],
+                df_chain["Net_GEX_OI"], df_chain["Net_GEX_OI"]
+            )
+
+            fig_oi.update_layout(
+                title="Strike-wise OI-Based Net Gamma & Open Interest Profile (Call OI Above / Put OI Below)",
+                template="plotly_dark",
+                paper_bgcolor="#0E1117",
+                plot_bgcolor="#0E1117",
+                height=480,
+                barmode="overlay",
+                margin=dict(l=20, r=20, t=40, b=10),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            fig_oi.update_xaxes(type="linear", tickformat="d", dtick=100)
+            fig_oi.update_yaxes(
+                title_text="Put OI (Below) | Call OI (Above)",
+                range=oi1_range,
+                secondary_y=False,
+                showgrid=True,
+                gridcolor="#262930",
+                zeroline=True,
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
+            )
+            fig_oi.update_yaxes(
+                title_text="Net GEX (OI-Based ₹)",
+                range=oi2_range,
+                secondary_y=True,
+                showgrid=False,
+                zeroline=True,
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
+            )
+
+            st.plotly_chart(fig_oi, use_container_width=True)
+
+            spot_price = data["spot_price"]
+            zero_gamma_flip = lvls.get("Zero_Gamma_Flip", spot_price)
+            call_wall_strike = lvls.get("R1", spot_price)
+            put_wall_strike = lvls.get("S1", spot_price)
+            max_gex_oi_strike = df_chain.loc[df_chain["Net_GEX_OI"].abs().idxmax()]["Strike"] if not df_chain.empty else spot_price
+
+            def analyze_strike(row):
+                K = row["Strike"]
+                c_vol, p_vol = row["C_Vol"], row["P_Vol"]
+                c_oi, p_oi = row["C_OI"], row["P_OI"]
+                gex_oi = row["Net_GEX_OI"]
+
+                denom_br = p_vol + c_oi * 0.05
+                br_k = (c_vol + p_oi * 0.05) / denom_br if denom_br > 0 else 1.0
+
+                tot_vol_strike = c_vol + p_vol
+                nar_k = (c_vol - p_vol) / tot_vol_strike if tot_vol_strike > 0 else 0.0
+
+                is_pos_gamma_regime = spot_price > zero_gamma_flip
+                is_neg_gamma_regime = spot_price < zero_gamma_flip
+
+                if K == call_wall_strike and spot_price >= call_wall_strike and br_k > 2.5 and nar_k > 0.30:
+                    return "🚀 Gamma Squeeze: Spot crossed Call Wall with extreme call aggressors. Dealers market-buy spot to hedge short deltas."
+                elif is_neg_gamma_regime and K == put_wall_strike and spot_price <= put_wall_strike and br_k < 0.4 and nar_k < -0.30:
+                    return "🔥 Crash Cascade: Spot broke Put Wall in negative GEX regime. High put volume forces dealers to short spot aggressively."
+                elif K == zero_gamma_flip:
+                    return f"⚡ Zero Gamma Flip Point ({K}): Regime boundary switch. Above = Volatility dampening (mean-reversion); Below = Volatility acceleration (trending)."
+                elif K == call_wall_strike and is_pos_gamma_regime and br_k <= 1.2 and nar_k <= 0.15:
+                    return f"🔴 Call Wall Resistance ({K}): Dealers long call gamma. They sell spot as price approaches, capping upside velocity."
+                elif K == put_wall_strike and is_pos_gamma_regime and br_k <= 1.2 and nar_k >= -0.15:
+                    return f"🟢 Put Wall Support ({K}): Dealers long put gamma. They buy spot as price falls, dampening downside momentum."
+                elif K == max_gex_oi_strike and abs(K - spot_price) <= (0.01 * spot_price) and br_k < 1.2:
+                    return f"🧲 True Magnet / Pinning Level ({K}): High GEX concentration near spot with balanced flow. Dealers suppress volatility; expect price pinning."
+                elif K == max_gex_oi_strike and 1.2 <= br_k <= 2.5:
+                    bias = "Upward Bias" if nar_k > 0.30 else ("Downward Bias" if nar_k < -0.30 else "Chop / No Trade Zone")
+                    return f"⚠️ Uncertain Zone ({K}): Flow is heavily contested (BR_K: {br_k:.2f}). Market directional skew: {bias}."
+                elif gex_oi > 0:
+                    return "🔵 Positive Gamma Zone: Dealer hedging creates mean-reverting price action and dampens volatility."
+                elif gex_oi < 0:
+                    return "🟠 Negative Gamma Zone: Dealer hedging amplifies price moves; thin liquidity zone."
+                else:
+                    return "⚪ Neutral Liquidity Zone: Balanced GEX exposure with standard transactional churn."
+
+            df_chain["Market_Structure_Analysis"] = df_chain.apply(analyze_strike, axis=1)
+
+            st.markdown("**🔍 Strike-wise PCRs & Market Structure Analysis**")
+
+            df_chain["PCR_OI"] = np.where(df_chain["C_OI"] > 0, df_chain["P_OI"] / df_chain["C_OI"], 0.0)
+            df_chain["PCR_Vol"] = np.where(df_chain["C_Vol"] > 0, df_chain["P_Vol"] / df_chain["C_Vol"], 0.0)
+
+            analysis_df = df_chain[["Strike", "PCR_OI", "PCR_Vol", "Market_Structure_Analysis"]]
+
+            st.markdown(
+                """
+                <style>
+                [data-testid="stDataFrame"] td {
+                    white-space: normal !important;
+                    word-wrap: break-word !important;
+                    word-break: break-word !important;
+                }
+                [data-testid="stDataFrame"] div[role="gridcell"] {
+                    white-space: normal !important;
+                    word-wrap: break-wrap !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+
+            st.dataframe(
+                analysis_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Strike": st.column_config.NumberColumn("Strike", format="%d", width="small"),
+                    "PCR_OI": st.column_config.NumberColumn("PCR (OI)", format="%.2f", width="small"),
+                    "PCR_Vol": st.column_config.NumberColumn("PCR (Vol)", format="%.2f", width="small"),
+                    "Market_Structure_Analysis": st.column_config.TextColumn(
+                        "Market Structure Analysis",
+                        width="large"
+                    )
+                }
+            )
+
+        st.subheader("Option Chain Data & Greeks (Δ, γ, θ, ν)")
+
+        df_greeks_display = pd.DataFrame(data["chain_results"]).drop(columns=["C_IV_val", "P_IV_val", "Net_GEX_OI", "Net_GEX_Vol"], errors="ignore")
+
+        c_oi_max = df_greeks_display["C_OI"].max() if "C_OI" in df_greeks_display.columns else 1
+        p_oi_max = df_greeks_display["P_OI"].max() if "P_OI" in df_greeks_display.columns else 1
+
+        styled_greeks = df_greeks_display.style.background_gradient(
+            subset=["C_OI"],
+            cmap="Greens",
+            vmin=0,
+            vmax=c_oi_max
+        ).background_gradient(
+            subset=["P_OI"],
+            cmap="Reds",
+            vmin=0,
+            vmax=p_oi_max
+        )
+
+        st.dataframe(styled_greeks, use_container_width=True)
+
+if st.session_state.get("auto_refresh_state", False):
+    time.sleep(5)
+    st.rerun()
