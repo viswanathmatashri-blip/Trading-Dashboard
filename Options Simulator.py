@@ -619,14 +619,34 @@ def get_smart_api_client():
         pass
     return None
 
+# Top ribbon container for initial dashboard execution progress
+main_top_progress_holder = st.container()
+
 # --- DATA FETCHING ENGINE ---
-def fetch_live_data(selected_interval_label="5 min"):
+def fetch_live_data(selected_interval_label="5 min", progress_container=None):
+    p_bar = None
+    p_status = None
+    if progress_container is not None:
+        p_bar = progress_container.progress(0.0)
+        p_status = progress_container.empty()
+
+    def update_p(pct, msg):
+        if p_bar is not None:
+            p_bar.progress(min(1.0, max(0.0, pct)))
+        if p_status is not None:
+            p_status.caption(f"⏳ {msg}")
+
+    update_p(0.10, "Authenticating SmartAPI Session...")
+
     smart_api = get_smart_api_client()
     if not smart_api:
+        if p_bar: p_bar.empty()
+        if p_status: p_status.empty()
         st.error("Missing credentials or failed to generate SmartAPI session! Check Render Environment Variables.")
         return None
 
     try:
+        update_p(0.20, f"Fetching Live Spot & Historical Volatility for {Index_Name}...")
         index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
         spot_token = index_token_map.get(Index_Name, "99926000")
 
@@ -635,6 +655,7 @@ def fetch_live_data(selected_interval_label="5 min"):
 
         index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, "NSE", days=hv_days)
 
+        update_p(0.35, "Fetching Historical Underlying Candle Data...")
         ist_tz = pytz.timezone("Asia/Kolkata")
         now_dt = datetime.datetime.now(ist_tz)
 
@@ -667,6 +688,7 @@ def fetch_live_data(selected_interval_label="5 min"):
         tokens_to_fetch = set()
         strike_mapping = []
 
+        update_p(0.50, "Mapping Option Chain Tokens...")
         for strike in filtered_strikes:
             strike_int = int(strike)
             c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "CE")
@@ -692,6 +714,7 @@ def fetch_live_data(selected_interval_label="5 min"):
 
         tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
 
+        update_p(0.65, "Fetching Live Market Depth & Prices...")
         market_data = {}
         chunk_size = 40
         for i in range(0, len(tokens_to_fetch_list), chunk_size):
@@ -715,6 +738,7 @@ def fetch_live_data(selected_interval_label="5 min"):
                     }
             time.sleep(0.1) # Prevents rate-limiting
 
+        update_p(0.85, "Calculating Option Greeks & Gamma Exposure Profile...")
         atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
         atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
 
@@ -770,6 +794,7 @@ def fetch_live_data(selected_interval_label="5 min"):
                 "P_OI": p_info["oi"], "P_ΔOI": p_info["pnl_oi"], "P_Vol": p_info["volume"]
             })
 
+        update_p(0.95, "Finalizing Level Calculations & Dashboard View...")
         pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
         iv_percentile = 0.0
         if all_ivs:
@@ -781,6 +806,10 @@ def fetch_live_data(selected_interval_label="5 min"):
         max_pain_strike = VolatilityEngine.calculate_max_pain(chain_results)
         levels = calculate_support_resistance_targets(chain_results, spot_price, max_pain_strike)
 
+        update_p(1.0, "Done!")
+        if p_bar: p_bar.empty()
+        if p_status: p_status.empty()
+
         return {
             "spot_price": spot_price, "F": F, "T": T, "index_hv": index_hv, "iv_percentile": iv_percentile,
             "pcr": pcr, "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
@@ -791,13 +820,15 @@ def fetch_live_data(selected_interval_label="5 min"):
         }
 
     except Exception as e:
+        if p_bar: p_bar.empty()
+        if p_status: p_status.empty()
         if "exceeding access rate" in str(e).lower() or "access denied" in str(e).lower():
             st.session_state["smart_api_instance"] = None
         st.warning(f"API Rate limit / sync notice: Retrying on next cycle...")
         return None
 
 if run_btn or "data_store" not in st.session_state:
-    new_data = fetch_live_data(st.session_state["selected_timeframe"])
+    new_data = fetch_live_data(st.session_state["selected_timeframe"], progress_container=main_top_progress_holder)
     if new_data:
         st.session_state["data_store"] = new_data
 
@@ -849,7 +880,8 @@ def zscore_analysis_fragment():
 
         out_cols = ['Call_GEX_Z', 'Put_GEX_Z', 'Net_GEX_Z', 'Call_Vol_Z', 'Put_Vol_Z']
         
-        styled_z_df = last_5[out_cols].style.applymap(
+        # Fixed Pandas Styler Deprecation Error: Replaced .applymap() with .map()
+        styled_z_df = last_5[out_cols].style.map(
             style_z,
             subset=out_cols
         ).format({col: "{:.2f}" for col in out_cols})
