@@ -872,7 +872,7 @@ def zscore_analysis_fragment():
             if val >= 1.5:
                 return 'background-color: #ff4d4d; color: white; font-weight: bold;'
             elif val <= -1.5:
-                return 'background-color: #4da6ff; color: white; font-weight: bold;'
+                return 'background-color: #ff4d4d; color: white; font-weight: bold;'
             elif 0.5 <= val < 1.5:
                 return 'background-color: #ffea80; color: black;'
             else:
