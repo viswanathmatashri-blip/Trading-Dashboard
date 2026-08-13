@@ -192,7 +192,7 @@ class VolatilityEngine:
             return cls.black_scholes_price(S, K, T, r, sigma, flag) - market_price
 
         try:
-            return float(brentq(objective_function, a=1e-4, b=10.0, xtol=1e-4))
+            return float(brentq(objective_function, a=1e-4, b=5.0, xtol=1e-3))
         except (ValueError, RuntimeError):
             return 0.0
 
@@ -348,7 +348,7 @@ def compute_technical_indicators(df_candles: pd.DataFrame, hv_lookback_days: int
 
     return df
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)
 def download_master_scrip():
     scrip_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     return pd.read_json(scrip_url)
@@ -369,10 +369,10 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
         pass
     return ""
 
-def get_prev_day_close_oi(smart_api, exchange, token):
-    if token in st.session_state["prev_oi_cache"]:
-        return st.session_state["prev_oi_cache"][token]
-
+def get_prev_day_close_oi_batch(smart_api, exchange, tokens):
+    missing_tokens = [t for t in tokens if t not in st.session_state["prev_oi_cache"]]
+    if not missing_tokens:
+        return
     try:
         ist_tz = pytz.timezone("Asia/Kolkata")
         today = datetime.datetime.now(ist_tz).date()
@@ -384,22 +384,22 @@ def get_prev_day_close_oi(smart_api, exchange, token):
 
         prev_day_str = prev_day.strftime("%Y-%m-%d")
 
-        oi_param = {
-            "exchange": exchange,
-            "symboltoken": str(token),
-            "interval": "ONE_DAY",
-            "fromdate": f"{prev_day_str} 09:15",
-            "todate": f"{prev_day_str} 15:30"
-        }
-
-        hist_oi_resp = smart_api.getOIData(oi_param)
-        if hist_oi_resp and hist_oi_resp.get("status") and hist_oi_resp.get("data"):
-            val = float(hist_oi_resp["data"][-1]["oi"])
-            st.session_state["prev_oi_cache"][token] = val
-            return val
+        for token in missing_tokens:
+            try:
+                oi_param = {
+                    "exchange": exchange,
+                    "symboltoken": str(token),
+                    "interval": "ONE_DAY",
+                    "fromdate": f"{prev_day_str} 09:15",
+                    "todate": f"{prev_day_str} 15:30"
+                }
+                hist_oi_resp = smart_api.getOIData(oi_param)
+                if hist_oi_resp and hist_oi_resp.get("status") and hist_oi_resp.get("data"):
+                    st.session_state["prev_oi_cache"][token] = float(hist_oi_resp["data"][-1]["oi"])
+            except Exception:
+                pass
     except Exception:
         pass
-    return None
 
 # --- SIDEBAR SETUP ---
 st.sidebar.markdown("### ⚙️ Parameters & Strategy Builder")
@@ -572,8 +572,11 @@ def fetch_live_data(selected_interval_label="5 min"):
 
         tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
 
+        # Batch fill missing historical OI caches to reduce repeated API loops
+        get_prev_day_close_oi_batch(smart_api, Exchange, tokens_to_fetch_list)
+
         market_data = {}
-        chunk_size = 40
+        chunk_size = 50
         for i in range(0, len(tokens_to_fetch_list), chunk_size):
             chunk = tokens_to_fetch_list[i:i + chunk_size]
             res = smart_api.getMarketData("FULL", {Exchange: chunk})
@@ -590,8 +593,7 @@ def fetch_live_data(selected_interval_label="5 min"):
                     )
 
                     curr_oi = int(item.get("opnInterest", 0))
-
-                    prev_close_oi = get_prev_day_close_oi(smart_api, Exchange, token_str)
+                    prev_close_oi = st.session_state["prev_oi_cache"].get(token_str)
                     
                     if prev_close_oi is None:
                         net_change_oi = int(item.get("netChange", 0))
