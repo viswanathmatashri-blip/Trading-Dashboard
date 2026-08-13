@@ -13,6 +13,7 @@ import plotly.graph_objects as plt_go
 from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 from scipy.optimize import brentq
+from scipy.stats import norm
 from SmartApi import SmartConnect
 
 # Setup .streamlit/config.toml programmatically for forced dark theme
@@ -370,6 +371,120 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
     except Exception:
         pass
     return ""
+
+# --- GEX & TRADE VOLUME Z-SCORE COMPUTATION HELPERS ---
+def calculate_gamma_norm(S, K, T, r=0.07, sigma=0.15):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    return gamma
+
+def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_size):
+    try:
+        options_scrips = df_scrip_master[
+            (df_scrip_master['exch_seg'] == 'NFO') & 
+            (df_scrip_master['name'] == symbol) & 
+            (df_scrip_master['instrumenttype'] == 'OPTIDX')
+        ].copy()
+
+        if options_scrips.empty:
+            return pd.DataFrame()
+
+        options_scrips['expiry_dt'] = pd.to_datetime(options_scrips['expiry'], format='%d%b%Y', errors='coerce')
+        now = datetime.datetime.now()
+        active_contracts = options_scrips[options_scrips['expiry_dt'] >= now].copy()
+        if active_contracts.empty:
+            active_contracts = options_scrips.copy()
+
+        nearest_expiry = active_contracts['expiry_dt'].min()
+        current_expiry_scrips = active_contracts[active_contracts['expiry_dt'] == nearest_expiry].copy()
+
+        dte_days = max((nearest_expiry - now).days, 1)
+        T = dte_days / 365.0
+
+        current_expiry_scrips['strike_num'] = pd.to_numeric(current_expiry_scrips['strike'], errors='coerce') / 100.0
+        strikes = sorted(current_expiry_scrips['strike_num'].dropna().unique())
+        if len(strikes) > 10:
+            mid_idx = len(strikes) // 2
+            selected_strikes = strikes[max(0, mid_idx - 5): min(len(strikes), mid_idx + 5)]
+            current_expiry_scrips = current_expiry_scrips[current_expiry_scrips['strike_num'].isin(selected_strikes)]
+
+        calls = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('CE')]
+        puts = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('PE')]
+
+        from_date = (now - datetime.timedelta(days=int(days) + 30)).strftime("%Y-%m-%d 09:15")
+        to_date = now.strftime("%Y-%m-%d 15:30")
+
+        daily_call_gex, daily_call_vol = {}, {}
+        daily_put_gex, daily_put_vol = {}, {}
+
+        def process_options(df_tokens, target_gex, target_vol, is_call=True):
+            for _, row in df_tokens.iterrows():
+                strike_price = float(row['strike_num'])
+                spot_price = strike_price
+                gamma = calculate_gamma_norm(S=spot_price, K=strike_price, T=T)
+                token_str = str(row['token'])
+
+                candle_params = {
+                    "exchange": "NFO",
+                    "symboltoken": token_str,
+                    "interval": "ONE_DAY",
+                    "fromdate": from_date,
+                    "todate": to_date
+                }
+                try:
+                    c_res = smart_api.getCandleData(candle_params)
+                    if c_res and c_res.get('status') and c_res.get('data'):
+                        for c_item in c_res['data']:
+                            date_str = c_item[0].split('T')[0]
+                            vol_val = float(c_item[5])
+                            target_vol[date_str] = target_vol.get(date_str, 0.0) + vol_val
+                except Exception:
+                    pass
+
+                oi_params = {
+                    "exchange": "NFO",
+                    "symboltoken": token_str,
+                    "interval": "ONE_DAY",
+                    "fromdate": from_date,
+                    "todate": to_date
+                }
+                try:
+                    oi_res = smart_api.getOIData(oi_params)
+                    if oi_res and oi_res.get('status') and oi_res.get('data'):
+                        for item in oi_res['data']:
+                            date_str = item.get('time', '').split('T')[0]
+                            oi_val = float(item.get('oi', 0))
+                            gex_val = gamma * oi_val * lot_size * (spot_price ** 2) * 0.01
+                            if not is_call:
+                                gex_val = -gex_val
+                            target_gex[date_str] = target_gex.get(date_str, 0.0) + gex_val
+                except Exception:
+                    pass
+
+        process_options(calls, daily_call_gex, daily_call_vol, is_call=True)
+        process_options(puts, daily_put_gex, daily_put_vol, is_call=False)
+
+        df = pd.DataFrame({
+            'Call_GEX': daily_call_gex,
+            'Put_GEX': daily_put_gex,
+            'Call_Vol': daily_call_vol,
+            'Put_Vol': daily_put_vol
+        }).fillna(0.0).sort_index()
+
+        df['Net_GEX'] = df['Call_GEX'] + df['Put_GEX']
+
+        target_cols = ['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol']
+        for col in target_cols:
+            mean = df[col].rolling(window=int(days), min_periods=3).mean()
+            std = df[col].rolling(window=int(days), min_periods=3).std()
+            z = (df[col] - mean) / std.replace(0, np.nan)
+            df[f'{col}_Z'] = z.fillna(0.0)
+
+        return df.fillna(0.0)
+    except Exception:
+        return pd.DataFrame()
 
 # --- SIDEBAR SETUP ---
 st.sidebar.markdown("### ⚙️ Parameters & Strategy Builder")
@@ -1067,110 +1182,44 @@ def live_dashboard_fragment():
 
             st.plotly_chart(fig_oi, use_container_width=True)
 
-            spot_price = data["spot_price"]
-            zero_gamma_flip = lvls.get("Zero_Gamma_Flip", spot_price)
-            call_wall_strike = lvls.get("R1", spot_price)
-            put_wall_strike = lvls.get("S1", spot_price)
-            max_gex_oi_strike = df_chain.loc[df_chain["Net_GEX_OI"].abs().idxmax()]["Strike"] if not df_chain.empty else spot_price
+            # ==========================================
+            # ⚡ GEX & TRADE VOLUME Z-SCORE ANALYSIS MODULE
+            # ==========================================
+            st.markdown("---")
+            st.subheader(f"⚡ GEX & Trade Volume Z-Scores Analysis ({Index_Name})")
+            st.caption(f"Lookback Window: **{hv_days} Days** (Uses HV Lookback setting from sidebar)")
 
-            def analyze_strike(row):
-                K = row["Strike"]
-                c_vol, p_vol = row["C_Vol"], row["P_Vol"]
-                c_oi, p_oi = row["C_OI"], row["P_OI"]
-                gex_oi = row["Net_GEX_OI"]
+            smart_api = get_smart_api_client()
+            if smart_api:
+                lot_size = LOT_SIZES.get(Index_Name, 25)
+                z_df = fetch_historical_gex_zscores(smart_api, Index_Name, hv_days, df_master, lot_size)
 
-                denom_br = p_vol + c_oi * 0.05
-                br_k = (c_vol + p_oi * 0.05) / denom_br if denom_br > 0 else 1.0
+                if not z_df.empty:
+                    last_5 = z_df.tail(5).copy()
 
-                tot_vol_strike = c_vol + p_vol
-                nar_k = (c_vol - p_vol) / tot_vol_strike if tot_vol_strike > 0 else 0.0
+                    def style_z(val):
+                        if val >= 1.5:
+                            return 'background-color: #ff4d4d; color: white; font-weight: bold;'
+                        elif val <= -1.5:
+                            return 'background-color: #4da6ff; color: white; font-weight: bold;'
+                        elif 0.5 <= val < 1.5:
+                            return 'background-color: #ffea80; color: black;'
+                        else:
+                            return 'background-color: #b3ffb3; color: black;'
 
-                is_pos_gamma_regime = spot_price > zero_gamma_flip
-                is_neg_gamma_regime = spot_price < zero_gamma_flip
+                    out_cols = ['Call_GEX_Z', 'Put_GEX_Z', 'Net_GEX_Z', 'Call_Vol_Z', 'Put_Vol_Z']
+                    
+                    styled_z_df = last_5[out_cols].style.applymap(
+                        style_z,
+                        subset=out_cols
+                    ).format({col: "{:.2f}" for col in out_cols})
 
-                if K == call_wall_strike and spot_price >= call_wall_strike and br_k > 2.5 and nar_k > 0.30:
-                    return "🚀 Gamma Squeeze: Spot crossed Call Wall with extreme call aggressors. Dealers market-buy spot to hedge short deltas."
-                elif is_neg_gamma_regime and K == put_wall_strike and spot_price <= put_wall_strike and br_k < 0.4 and nar_k < -0.30:
-                    return "🔥 Crash Cascade: Spot broke Put Wall in negative GEX regime. High put volume forces dealers to short spot aggressively."
-                elif K == zero_gamma_flip:
-                    return f"⚡ Zero Gamma Flip Point ({K}): Regime boundary switch. Above = Volatility dampening (mean-reversion); Below = Volatility acceleration (trending)."
-                elif K == call_wall_strike and is_pos_gamma_regime and br_k <= 1.2 and nar_k <= 0.15:
-                    return f"🔴 Call Wall Resistance ({K}): Dealers long call gamma. They sell spot as price approaches, capping upside velocity."
-                elif K == put_wall_strike and is_pos_gamma_regime and br_k <= 1.2 and nar_k >= -0.15:
-                    return f"🟢 Put Wall Support ({K}): Dealers long put gamma. They buy spot as price falls, dampening downside momentum."
-                elif K == max_gex_oi_strike and abs(K - spot_price) <= (0.01 * spot_price) and br_k < 1.2:
-                    return f"🧲 True Magnet / Pinning Level ({K}): High GEX concentration near spot with balanced flow. Dealers suppress volatility; expect price pinning."
-                elif K == max_gex_oi_strike and 1.2 <= br_k <= 2.5:
-                    bias = "Upward Bias" if nar_k > 0.30 else ("Downward Bias" if nar_k < -0.30 else "Chop / No Trade Zone")
-                    return f"⚠️ Uncertain Zone ({K}): Flow is heavily contested (BR_K: {br_k:.2f}). Market directional skew: {bias}."
-                elif gex_oi > 0:
-                    return "🔵 Positive Gamma Zone: Dealer hedging creates mean-reverting price action and dampens volatility."
-                elif gex_oi < 0:
-                    return "🟠 Negative Gamma Zone: Dealer hedging amplifies price moves; thin liquidity zone."
+                    st.dataframe(styled_z_df, use_container_width=True)
+
+                    with st.expander("🔍 Inspect Raw Calculated Daily Totals (GEX & Volume)"):
+                        st.dataframe(z_df[['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol']].tail(10), use_container_width=True)
                 else:
-                    return "⚪ Neutral Liquidity Zone: Balanced GEX exposure with standard transactional churn."
-
-            df_chain["Market_Structure_Analysis"] = df_chain.apply(analyze_strike, axis=1)
-
-            st.markdown("**🔍 Strike-wise PCRs & Market Structure Analysis**")
-
-            df_chain["PCR_OI"] = np.where(df_chain["C_OI"] > 0, df_chain["P_OI"] / df_chain["C_OI"], 0.0)
-            df_chain["PCR_Vol"] = np.where(df_chain["C_Vol"] > 0, df_chain["P_Vol"] / df_chain["C_Vol"], 0.0)
-
-            analysis_df = df_chain[["Strike", "PCR_OI", "PCR_Vol", "Market_Structure_Analysis"]]
-
-            st.markdown(
-                """
-                <style>
-                [data-testid="stDataFrame"] td {
-                    white-space: normal !important;
-                    word-wrap: break-word !important;
-                    word-break: break-word !important;
-                }
-                [data-testid="stDataFrame"] div[role="gridcell"] {
-                    white-space: normal !important;
-                    word-wrap: break-wrap !important;
-                }
-                </style>
-                """,
-                unsafe_allow_html=True
-            )
-
-            st.dataframe(
-                analysis_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Strike": st.column_config.NumberColumn("Strike", format="%d", width="small"),
-                    "PCR_OI": st.column_config.NumberColumn("PCR (OI)", format="%.2f", width="small"),
-                    "PCR_Vol": st.column_config.NumberColumn("PCR (Vol)", format="%.2f", width="small"),
-                    "Market_Structure_Analysis": st.column_config.TextColumn(
-                        "Market Structure Analysis",
-                        width="large"
-                    )
-                }
-            )
-
-        st.subheader("Option Chain Data & Greeks (Δ, γ, θ, ν)")
-
-        df_greeks_display = pd.DataFrame(data["chain_results"]).drop(columns=["C_IV_val", "P_IV_val", "Net_GEX_OI", "Net_GEX_Vol"], errors="ignore")
-
-        c_oi_max = df_greeks_display["C_OI"].max() if "C_OI" in df_greeks_display.columns else 1
-        p_oi_max = df_greeks_display["P_OI"].max() if "P_OI" in df_greeks_display.columns else 1
-
-        styled_greeks = df_greeks_display.style.background_gradient(
-            subset=["C_OI"],
-            cmap="Greens",
-            vmin=0,
-            vmax=c_oi_max
-        ).background_gradient(
-            subset=["P_OI"],
-            cmap="Reds",
-            vmin=0,
-            vmax=p_oi_max
-        )
-
-        st.dataframe(styled_greeks, use_container_width=True)
+                    st.info("Insufficient historical candle/OI data available to compute Z-Scores.")
 
 # Run the seamless fragment loop
 live_dashboard_fragment()
