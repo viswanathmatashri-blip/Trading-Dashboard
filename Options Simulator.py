@@ -135,6 +135,12 @@ if "basket_legs" not in st.session_state:
     st.session_state["basket_legs"] = []
 if "selected_timeframe" not in st.session_state:
     st.session_state["selected_timeframe"] = "5 min"
+if "enable_main_refresh" not in st.session_state:
+    st.session_state["enable_main_refresh"] = False
+if "enable_zscore_refresh" not in st.session_state:
+    st.session_state["enable_zscore_refresh"] = False
+if "zscore_data_store" not in st.session_state:
+    st.session_state["zscore_data_store"] = pd.DataFrame()
 
 LOT_SIZES = {
     "NIFTY": 25,
@@ -380,7 +386,7 @@ def calculate_gamma_norm(S, K, T, r=0.07, sigma=0.15):
     gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
     return gamma
 
-def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_size):
+def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_size, progress_container=None):
     try:
         options_scrips = df_scrip_master[
             (df_scrip_master['exch_seg'] == 'NFO') & 
@@ -419,8 +425,26 @@ def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_s
         daily_call_gex, daily_call_vol = {}, {}
         daily_put_gex, daily_put_vol = {}, {}
 
+        total_tokens = len(calls) + len(puts)
+        processed_count = 0
+
+        p_bar = None
+        p_status = None
+        if progress_container is not None:
+            p_bar = progress_container.progress(0.0)
+            p_status = progress_container.empty()
+
         def process_options(df_tokens, target_gex, target_vol, is_call=True):
+            nonlocal processed_count
             for _, row in df_tokens.iterrows():
+                processed_count += 1
+                if p_bar is not None and total_tokens > 0:
+                    pct = min(1.0, processed_count / total_tokens)
+                    p_bar.progress(pct)
+                    opt_label = "Calls" if is_call else "Puts"
+                    if p_status is not None:
+                        p_status.caption(f"⏳ Fetching historical data for {symbol} {opt_label} ({processed_count}/{total_tokens})...")
+
                 strike_price = float(row['strike_num'])
                 spot_price = strike_price
                 gamma = calculate_gamma_norm(S=spot_price, K=strike_price, T=T)
@@ -466,6 +490,9 @@ def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_s
         process_options(calls, daily_call_gex, daily_call_vol, is_call=True)
         process_options(puts, daily_put_gex, daily_put_vol, is_call=False)
 
+        if p_status is not None:
+            p_status.caption("✅ Calculating Z-Score rolling metrics...")
+
         df = pd.DataFrame({
             'Call_GEX': daily_call_gex,
             'Put_GEX': daily_put_gex,
@@ -482,8 +509,15 @@ def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_s
             z = (df[col] - mean) / std.replace(0, np.nan)
             df[f'{col}_Z'] = z.fillna(0.0)
 
+        if p_bar is not None:
+            p_bar.empty()
+        if p_status is not None:
+            p_status.empty()
+
         return df.fillna(0.0)
     except Exception:
+        if progress_container is not None:
+            progress_container.empty()
         return pd.DataFrame()
 
 # --- SIDEBAR SETUP ---
@@ -767,25 +801,90 @@ if run_btn or "data_store" not in st.session_state:
     if new_data:
         st.session_state["data_store"] = new_data
 
-# --- AUTO-REFRESHING FRAGMENT (Seamless Background Updates Every 5s) ---
-@st.fragment(run_every=5)
+# --- SEPARATE FRAGMENT FOR GEX & VOLUME Z-SCORE ENGINE (5-MIN REFRESH OPTION) ---
+@st.fragment(run_every=300 if st.session_state.get("enable_zscore_refresh", False) else None)
+def zscore_analysis_fragment():
+    st.markdown("---")
+    head_c1, head_c2 = st.columns([0.65, 0.35])
+    with head_c1:
+        st.subheader(f"⚡ GEX & Trade Volume Z-Scores Analysis ({Index_Name})")
+        st.caption(f"Lookback Window: **{hv_days} Days** (Uses HV Lookback setting from sidebar)")
+    with head_c2:
+        st.write("")
+        enable_z_ref = st.checkbox("Enable Z-Score Auto-Refresh (5 min)", value=st.session_state["enable_zscore_refresh"], key="cb_zscore_refresh")
+        if enable_z_ref != st.session_state["enable_zscore_refresh"]:
+            st.session_state["enable_zscore_refresh"] = enable_z_ref
+            st.rerun()
+
+    btn_c1, btn_c2 = st.columns([0.30, 0.70])
+    with btn_c1:
+        calc_z_btn = st.button("🔄 Compute / Refresh Z-Scores", use_container_width=True)
+
+    progress_holder = st.container()
+
+    smart_api = get_smart_api_client()
+
+    if calc_z_btn or st.session_state["zscore_data_store"].empty:
+        if smart_api:
+            lot_size = LOT_SIZES.get(Index_Name, 25)
+            z_df = fetch_historical_gex_zscores(smart_api, Index_Name, hv_days, df_master, lot_size, progress_container=progress_holder)
+            st.session_state["zscore_data_store"] = z_df
+        else:
+            st.error("SmartAPI Session is uninitialized. Cannot calculate Z-Scores.")
+
+    z_df = st.session_state["zscore_data_store"]
+
+    if not z_df.empty:
+        last_5 = z_df.tail(5).copy()
+
+        def style_z(val):
+            if val >= 1.5:
+                return 'background-color: #ff4d4d; color: white; font-weight: bold;'
+            elif val <= -1.5:
+                return 'background-color: #4da6ff; color: white; font-weight: bold;'
+            elif 0.5 <= val < 1.5:
+                return 'background-color: #ffea80; color: black;'
+            else:
+                return 'background-color: #b3ffb3; color: black;'
+
+        out_cols = ['Call_GEX_Z', 'Put_GEX_Z', 'Net_GEX_Z', 'Call_Vol_Z', 'Put_Vol_Z']
+        
+        styled_z_df = last_5[out_cols].style.applymap(
+            style_z,
+            subset=out_cols
+        ).format({col: "{:.2f}" for col in out_cols})
+
+        st.dataframe(styled_z_df, use_container_width=True)
+
+        with st.expander("🔍 Inspect Raw Calculated Daily Totals (GEX & Volume)"):
+            st.dataframe(z_df[['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol']].tail(10), use_container_width=True)
+    else:
+        st.info("Click '🔄 Compute / Refresh Z-Scores' above to load historical Z-Score analysis.")
+
+# --- AUTO-REFRESHING FRAGMENT FOR MAIN DASHBOARD (5s REFRESH OPTION) ---
+@st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
 def live_dashboard_fragment():
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
 
-    refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
-    if refreshed_data:
-        st.session_state["data_store"] = refreshed_data
+    if st.session_state.get("enable_main_refresh", False):
+        refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
+        if refreshed_data:
+            st.session_state["data_store"] = refreshed_data
 
     data = st.session_state["data_store"]
 
     with st.container(border=True):
-        col_title, col_status = st.columns([0.80, 0.20])
+        col_title, col_status = st.columns([0.65, 0.35])
         with col_title:
             st.markdown("<h1 class='custom-heading'>📊 Option Chain Technical Analysis</h1>", unsafe_allow_html=True)
         with col_status:
-            st.markdown("<span class='status-badge badge-bullish'>Live Auto-Sync (5s)</span>", unsafe_allow_html=True)
+            st.write("")
+            cb_main = st.checkbox("Enable Auto-Refresh (5s)", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
+            if cb_main != st.session_state["enable_main_refresh"]:
+                st.session_state["enable_main_refresh"] = cb_main
+                st.rerun()
 
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Spot (Syn. Fut)", f"{data['spot_price']:.2f} ({data['F']:.2f})")
@@ -1000,9 +1099,7 @@ def live_dashboard_fragment():
                 range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
                 return range1, range2
 
-            # ==========================================
             # CHART 1: NET GAMMA EXPOSURE (VOLUME-BASED) vs VOLUME
-            # ==========================================
             st.subheader("📊 Volume-Based Net Gamma Exposure vs Trading Volume")
 
             gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
@@ -1091,9 +1188,7 @@ def live_dashboard_fragment():
 
             st.plotly_chart(fig_vol, use_container_width=True)
 
-            # ==========================================
             # CHART 2: NET GAMMA EXPOSURE (OI-BASED) vs OPEN INTEREST
-            # ==========================================
             st.subheader("📈 OI-Based Net Gamma Exposure vs Open Interest (OI)")
 
             gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
@@ -1182,44 +1277,8 @@ def live_dashboard_fragment():
 
             st.plotly_chart(fig_oi, use_container_width=True)
 
-            # ==========================================
-            # ⚡ GEX & TRADE VOLUME Z-SCORE ANALYSIS MODULE
-            # ==========================================
-            st.markdown("---")
-            st.subheader(f"⚡ GEX & Trade Volume Z-Scores Analysis ({Index_Name})")
-            st.caption(f"Lookback Window: **{hv_days} Days** (Uses HV Lookback setting from sidebar)")
-
-            smart_api = get_smart_api_client()
-            if smart_api:
-                lot_size = LOT_SIZES.get(Index_Name, 25)
-                z_df = fetch_historical_gex_zscores(smart_api, Index_Name, hv_days, df_master, lot_size)
-
-                if not z_df.empty:
-                    last_5 = z_df.tail(5).copy()
-
-                    def style_z(val):
-                        if val >= 1.5:
-                            return 'background-color: #ff4d4d; color: white; font-weight: bold;'
-                        elif val <= -1.5:
-                            return 'background-color: #4da6ff; color: white; font-weight: bold;'
-                        elif 0.5 <= val < 1.5:
-                            return 'background-color: #ffea80; color: black;'
-                        else:
-                            return 'background-color: #b3ffb3; color: black;'
-
-                    out_cols = ['Call_GEX_Z', 'Put_GEX_Z', 'Net_GEX_Z', 'Call_Vol_Z', 'Put_Vol_Z']
-                    
-                    styled_z_df = last_5[out_cols].style.applymap(
-                        style_z,
-                        subset=out_cols
-                    ).format({col: "{:.2f}" for col in out_cols})
-
-                    st.dataframe(styled_z_df, use_container_width=True)
-
-                    with st.expander("🔍 Inspect Raw Calculated Daily Totals (GEX & Volume)"):
-                        st.dataframe(z_df[['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol']].tail(10), use_container_width=True)
-                else:
-                    st.info("Insufficient historical candle/OI data available to compute Z-Scores.")
-
-# Run the seamless fragment loop
+# Run main dashboard fragment
 live_dashboard_fragment()
+
+# Run separate isolated Z-Score engine fragment
+zscore_analysis_fragment()
