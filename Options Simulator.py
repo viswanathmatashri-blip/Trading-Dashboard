@@ -15,19 +15,20 @@ from dotenv import load_dotenv
 from scipy.optimize import brentq
 from SmartApi import SmartConnect
 
-# Setup .streamlit/config.toml programmatically for forced dark theme by default
+# Setup .streamlit/config.toml programmatically for forced dark theme
 os.makedirs(".streamlit", exist_ok=True)
 config_path = os.path.join(".streamlit", "config.toml")
-with open(config_path, "w") as f:
-    f.write(
-        """[theme]
+if not os.path.exists(config_path):
+    with open(config_path, "w") as f:
+        f.write(
+            """[theme]
 base="dark"
 primaryColor="#00E676"
 backgroundColor="#0E1117"
 secondaryBackgroundColor="#1E222D"
 textColor="#FAFAFA"
 """
-    )
+        )
 
 logging.getLogger("streamlit.runtime.scriptrunner.script_runner").setLevel(logging.ERROR)
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -43,25 +44,31 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS Styling enforcing dark theme UI elements
+# Custom CSS Styling (Includes anti-dimming and hidden spinner rules)
 custom_css = """
 <style>
-.stApp, html, body, [data-testid="stAppViewContainer"] {
-    background-color: #0E1117 !important;
-    color: #FAFAFA !important;
+/* Disable Streamlit's default screen dimming/opacity reduction on rerun */
+.stApp {
+    opacity: 1 !important;
 }
 
-[data-testid="stSidebar"] {
-    background-color: #1E222D !important;
-    width: 310px !important;
-}
-
+/* Hide the native running spinner / loading indicator overlay that causes flashes */
 [data-testid="stStatusWidget"], .stSpinner {
     display: none !important;
 }
 
+/* Keep running fragments fully opaque */
 div[data-testid="stFragment"] {
     opacity: 1 !important;
+}
+
+html, body, [data-testid="stAppViewContainer"] {
+    background-color: #0E1117 !important;
+    color: #FAFAFA !important;
+}
+
+section[data-testid="stSidebar"] {
+    width: 310px !important;
 }
 
 .block-container {
@@ -127,8 +134,6 @@ if "basket_legs" not in st.session_state:
     st.session_state["basket_legs"] = []
 if "selected_timeframe" not in st.session_state:
     st.session_state["selected_timeframe"] = "5 min"
-if "prev_oi_cache" not in st.session_state:
-    st.session_state["prev_oi_cache"] = {}
 
 LOT_SIZES = {
     "NIFTY": 25,
@@ -192,7 +197,7 @@ class VolatilityEngine:
             return cls.black_scholes_price(S, K, T, r, sigma, flag) - market_price
 
         try:
-            return float(brentq(objective_function, a=1e-4, b=5.0, xtol=1e-3))
+            return float(brentq(objective_function, a=1e-4, b=10.0, xtol=1e-4))
         except (ValueError, RuntimeError):
             return 0.0
 
@@ -306,13 +311,14 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
         "Straddle_Cost": round(atm_straddle_cost, 2)
     }
 
-def compute_technical_indicators(df_candles: pd.DataFrame, hv_lookback_days: int = 30) -> pd.DataFrame:
+# --- TECHNICAL INDICATOR ENGINE ---
+def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
     df = df_candles.copy()
-    if df.empty or len(df) < 5:
+    if df.empty or len(df) < 20:
         return df
 
-    df["bb_middle"] = df["close"].rolling(window=20, min_periods=1).mean()
-    df["bb_std"] = df["close"].rolling(window=20, min_periods=1).std().fillna(0)
+    df["bb_middle"] = df["close"].rolling(window=20, min_periods=20).mean()
+    df["bb_std"] = df["close"].rolling(window=20, min_periods=20).std()
     df["bb_upper"] = df["bb_middle"] + (2 * df["bb_std"])
     df["bb_lower"] = df["bb_middle"] - (2 * df["bb_std"])
     df["bb_bandwidth"] = np.where(df["bb_middle"] > 0, (df["bb_upper"] - df["bb_lower"]) / df["bb_middle"], 0)
@@ -327,28 +333,24 @@ def compute_technical_indicators(df_candles: pd.DataFrame, hv_lookback_days: int
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
     df["rsi"] = df["rsi"].fillna(50)
 
-    bars_per_day = 75
-    window_bars = max(20, int(hv_lookback_days * bars_per_day))
-
-    df["vol_safe"] = np.where(df["volume"] <= 0, 1e-5, df["volume"])
+    df["date_group"] = pd.to_datetime(df["time"]).dt.date
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["tp_vol"] = df["tp"] * df["vol_safe"]
+    df["tp_vol"] = df["tp"] * df["volume"]
 
-    rolling_tp_vol = df["tp_vol"].rolling(window=window_bars, min_periods=1).sum()
-    rolling_vol = df["vol_safe"].rolling(window=window_bars, min_periods=1).sum()
-
-    df["vwap"] = rolling_tp_vol / rolling_vol
+    df["cum_vol"] = df.groupby("date_group")["volume"].cumsum()
+    df["cum_tp_vol"] = df.groupby("date_group")["tp_vol"].cumsum()
+    df["vwap"] = np.where(df["cum_vol"] > 0, df["cum_tp_vol"] / df["cum_vol"], df["close"])
 
     return df
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=3600)
 def download_master_scrip():
     scrip_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     return pd.read_json(scrip_url)
@@ -368,38 +370,6 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
     except Exception:
         pass
     return ""
-
-def get_prev_day_close_oi_batch(smart_api, exchange, tokens):
-    missing_tokens = [t for t in tokens if t not in st.session_state["prev_oi_cache"]]
-    if not missing_tokens:
-        return
-    try:
-        ist_tz = pytz.timezone("Asia/Kolkata")
-        today = datetime.datetime.now(ist_tz).date()
-        prev_day = today - datetime.timedelta(days=1)
-        if prev_day.weekday() == 5:
-            prev_day = today - datetime.timedelta(days=2)
-        elif prev_day.weekday() == 6:
-            prev_day = today - datetime.timedelta(days=3)
-
-        prev_day_str = prev_day.strftime("%Y-%m-%d")
-
-        for token in missing_tokens:
-            try:
-                oi_param = {
-                    "exchange": exchange,
-                    "symboltoken": str(token),
-                    "interval": "ONE_DAY",
-                    "fromdate": f"{prev_day_str} 09:15",
-                    "todate": f"{prev_day_str} 15:30"
-                }
-                hist_oi_resp = smart_api.getOIData(oi_param)
-                if hist_oi_resp and hist_oi_resp.get("status") and hist_oi_resp.get("data"):
-                    st.session_state["prev_oi_cache"][token] = float(hist_oi_resp["data"][-1]["oi"])
-            except Exception:
-                pass
-    except Exception:
-        pass
 
 # --- SIDEBAR SETUP ---
 st.sidebar.markdown("### ⚙️ Parameters & Strategy Builder")
@@ -480,7 +450,7 @@ interval_mapping = {
     "15 min": ("FIFTEEN_MINUTE", 30)
 }
 
-# --- SECURE SESSION HANDLER ---
+# --- SECURE SESSION HANDLER (PREVENTS RATE LIMIT BAN) ---
 def get_smart_api_client():
     if "smart_api_instance" in st.session_state and st.session_state["smart_api_instance"] is not None:
         return st.session_state["smart_api_instance"]
@@ -504,6 +474,7 @@ def get_smart_api_client():
 def fetch_live_data(selected_interval_label="5 min"):
     smart_api = get_smart_api_client()
     if not smart_api:
+        st.error("Missing credentials or failed to generate SmartAPI session! Check Render Environment Variables.")
         return None
 
     try:
@@ -534,7 +505,7 @@ def fetch_live_data(selected_interval_label="5 min"):
         if candle_res and candle_res.get("status") and candle_res.get("data"):
             df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
             df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
-            df_candles = compute_technical_indicators(df_candles, hv_lookback_days=hv_days)
+            df_candles = compute_technical_indicators(df_candles)
 
         expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
         time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
@@ -572,41 +543,28 @@ def fetch_live_data(selected_interval_label="5 min"):
 
         tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
 
-        # Batch fill missing historical OI caches to reduce repeated API loops
-        get_prev_day_close_oi_batch(smart_api, Exchange, tokens_to_fetch_list)
-
         market_data = {}
-        chunk_size = 50
+        chunk_size = 40
         for i in range(0, len(tokens_to_fetch_list), chunk_size):
             chunk = tokens_to_fetch_list[i:i + chunk_size]
             res = smart_api.getMarketData("FULL", {Exchange: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
-                    token_str = str(item["symbolToken"])
-                    
                     vol_val = (
-                        item.get("tradeVolume") or
+                        item.get("volume") or
                         item.get("totTrdVol") or
                         item.get("volumeTraded") or
-                        item.get("volume") or
+                        item.get("tradeVolume") or
                         item.get("v") or 0
                     )
 
-                    curr_oi = int(item.get("opnInterest", 0))
-                    prev_close_oi = st.session_state["prev_oi_cache"].get(token_str)
-                    
-                    if prev_close_oi is None:
-                        net_change_oi = int(item.get("netChange", 0))
-                        prev_close_oi = curr_oi - net_change_oi
-
-                    pct_change_oi = ((curr_oi - prev_close_oi) / prev_close_oi * 100.0) if (prev_close_oi and prev_close_oi > 0) else 0.0
-
-                    market_data[token_str] = {
+                    market_data[str(item["symbolToken"])] = {
                         "ltp": float(item.get("ltp", 0.0)),
-                        "oi": curr_oi,
-                        "pct_change_oi": pct_change_oi,
+                        "oi": int(item.get("opnInterest", 0)),
+                        "pnl_oi": int(item.get("netChange", 0)),
                         "volume": int(vol_val)
                     }
+            time.sleep(0.1) # Prevents rate-limiting
 
         atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
         atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
@@ -625,8 +583,8 @@ def fetch_live_data(selected_interval_label="5 min"):
 
         for row in strike_mapping:
             K = row["strike"]
-            c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "pct_change_oi": 0.0, "volume": 0})
-            p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "pct_change_oi": 0.0, "volume": 0})
+            c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "pnl_oi": 0, "volume": 0})
+            p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "pnl_oi": 0, "volume": 0})
 
             iv = VolatilityEngine.calculate_iv(c_info["ltp"] if K >= F else p_info["ltp"], F, K, T, rate_param, "c" if K >= F else "p")
             if iv == 0.0:
@@ -650,29 +608,17 @@ def fetch_live_data(selected_interval_label="5 min"):
             total_put_oi += p_info["oi"]
 
             chain_results.append({
-                "C_Vol": c_info["volume"], 
-                "C_ΔOI": f"{c_info['pct_change_oi']:+.2f}%", 
-                "C_OI": c_info["oi"],
-                "C_Δ": round(c_greeks["delta"], 2), 
-                "C_γ": round(c_greeks["gamma"], 4),
-                "C_θ": round(c_greeks["theta"], 2), 
-                "C_ν": round(c_greeks["vega"], 2),
-                "C_IV_val": iv, 
-                "C_IV": f"{iv * 100:.1f}%", 
-                "C_LTP": c_info["ltp"],
+                "C_Vol": c_info["volume"], "C_ΔOI": c_info["pnl_oi"], "C_OI": c_info["oi"],
+                "C_Δ": round(c_greeks["delta"], 2), "C_γ": round(c_greeks["gamma"], 4),
+                "C_θ": round(c_greeks["theta"], 2), "C_ν": round(c_greeks["vega"], 2),
+                "C_IV_val": iv, "C_IV": f"{iv * 100:.1f}%", "C_LTP": c_info["ltp"],
                 "Strike": K,
                 "Net_GEX_OI": round(net_gex_oi, 2),
                 "Net_GEX_Vol": round(net_gex_vol, 2),
-                "P_LTP": p_info["ltp"], 
-                "P_IV_val": iv, 
-                "P_IV": f"{iv * 100:.1f}%",
-                "P_Δ": round(p_greeks["delta"], 2), 
-                "P_γ": round(p_greeks["gamma"], 4),
-                "P_θ": round(p_greeks["theta"], 2), 
-                "P_ν": round(p_greeks["vega"], 2),
-                "P_OI": p_info["oi"], 
-                "P_ΔOI": f"{p_info['pct_change_oi']:+.2f}%", 
-                "P_Vol": p_info["volume"]
+                "P_LTP": p_info["ltp"], "P_IV_val": iv, "P_IV": f"{iv * 100:.1f}%",
+                "P_Δ": round(p_greeks["delta"], 2), "P_γ": round(p_greeks["gamma"], 4),
+                "P_θ": round(p_greeks["theta"], 2), "P_ν": round(p_greeks["vega"], 2),
+                "P_OI": p_info["oi"], "P_ΔOI": p_info["pnl_oi"], "P_Vol": p_info["volume"]
             })
 
         pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
@@ -698,20 +644,19 @@ def fetch_live_data(selected_interval_label="5 min"):
     except Exception as e:
         if "exceeding access rate" in str(e).lower() or "access denied" in str(e).lower():
             st.session_state["smart_api_instance"] = None
+        st.warning(f"API Rate limit / sync notice: Retrying on next cycle...")
         return None
 
-# Initial Fetch Setup
 if run_btn or "data_store" not in st.session_state:
-    initial_data = fetch_live_data(st.session_state["selected_timeframe"])
-    if initial_data:
-        st.session_state["data_store"] = initial_data
+    new_data = fetch_live_data(st.session_state["selected_timeframe"])
+    if new_data:
+        st.session_state["data_store"] = new_data
 
-# --- AUTO-REFRESHING FRAGMENT ---
+# --- AUTO-REFRESHING FRAGMENT (Seamless Background Updates Every 5s) ---
 @st.fragment(run_every=5)
 def live_dashboard_fragment():
-    if "data_store" not in st.session_state or st.session_state["data_store"] is None:
-        st.error("🔑 **API Connection / Credentials Missing**")
-        st.warning("Please verify that your **API_KEY**, **CLIENT_CODE**, **PIN**, and **TOTP_SECRET** are set in your `.env` file or environment variables, then click **🚀 Fetch Chain & Greeks**.")
+    if "data_store" not in st.session_state:
+        st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
 
     refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
@@ -751,7 +696,7 @@ def live_dashboard_fragment():
                 st.session_state["data_store"] = updated_chart_data
                 st.rerun()
 
-    if not df_full.empty and len(df_full) >= 5:
+    if not df_full.empty and len(df_full) >= 20:
         latest_row = df_full.iloc[-1]
 
         rsi_val = latest_row["rsi"]
@@ -790,7 +735,7 @@ def live_dashboard_fragment():
         fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot Price", line=dict(color="#00E676", width=2)), row=1, col=1)
         fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper (20, 2)", line=dict(color="rgba(33, 150, 243, 0.5)", width=1)), row=1, col=1)
         fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_lower"], mode="lines", name="BB Lower (20, 2)", line=dict(color="rgba(33, 150, 243, 0.5)", width=1), fill='tonexty', fillcolor='rgba(33, 150, 243, 0.05)'), row=1, col=1)
-        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["vwap"], mode="lines", name=f"VWAP ({hv_days}D Lookback)", line=dict(color="#FF9800", width=2, dash="dot")), row=1, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["vwap"], mode="lines", name="VWAP (Intraday)", line=dict(color="#FF9800", width=2, dash="dot")), row=1, col=1)
 
         colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
         fig.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="MACD Hist", marker_color=colors_macd), row=2, col=1)
@@ -918,6 +863,7 @@ def live_dashboard_fragment():
         row2_col3.metric("Vol Accelerator (-GEX)", f"{lvls['GEX_Accelerator'] if lvls['GEX_Accelerator'] else 'None'}")
         row2_col4.metric("Zero Gamma / Flip Point", f"{lvls['Zero_Gamma_Flip']}")
 
+        # --- NET GAMMA vs VOLUME & OI SEPARATE CHARTS ---
         st.markdown("---")
         df_chain = pd.DataFrame(data["chain_results"])
 
@@ -939,6 +885,9 @@ def live_dashboard_fragment():
                 range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
                 return range1, range2
 
+            # ==========================================
+            # CHART 1: NET GAMMA EXPOSURE (VOLUME-BASED) vs VOLUME
+            # ==========================================
             st.subheader("📊 Volume-Based Net Gamma Exposure vs Trading Volume")
 
             gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
@@ -1027,6 +976,9 @@ def live_dashboard_fragment():
 
             st.plotly_chart(fig_vol, use_container_width=True)
 
+            # ==========================================
+            # CHART 2: NET GAMMA EXPOSURE (OI-BASED) vs OPEN INTEREST
+            # ==========================================
             st.subheader("📈 OI-Based Net Gamma Exposure vs Open Interest (OI)")
 
             gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
@@ -1137,26 +1089,26 @@ def live_dashboard_fragment():
                 is_neg_gamma_regime = spot_price < zero_gamma_flip
 
                 if K == call_wall_strike and spot_price >= call_wall_strike and br_k > 2.5 and nar_k > 0.30:
-                    return "🚀 Gamma Squeeze: Spot crossed Call Wall with extreme call aggressors."
+                    return "🚀 Gamma Squeeze: Spot crossed Call Wall with extreme call aggressors. Dealers market-buy spot to hedge short deltas."
                 elif is_neg_gamma_regime and K == put_wall_strike and spot_price <= put_wall_strike and br_k < 0.4 and nar_k < -0.30:
-                    return "🔥 Crash Cascade: Spot broke Put Wall in negative GEX regime."
+                    return "🔥 Crash Cascade: Spot broke Put Wall in negative GEX regime. High put volume forces dealers to short spot aggressively."
                 elif K == zero_gamma_flip:
-                    return f"⚡ Zero Gamma Flip Point ({K}): Regime boundary switch."
+                    return f"⚡ Zero Gamma Flip Point ({K}): Regime boundary switch. Above = Volatility dampening (mean-reversion); Below = Volatility acceleration (trending)."
                 elif K == call_wall_strike and is_pos_gamma_regime and br_k <= 1.2 and nar_k <= 0.15:
-                    return f"🔴 Call Wall Resistance ({K}): Dealers long call gamma."
+                    return f"🔴 Call Wall Resistance ({K}): Dealers long call gamma. They sell spot as price approaches, capping upside velocity."
                 elif K == put_wall_strike and is_pos_gamma_regime and br_k <= 1.2 and nar_k >= -0.15:
-                    return f"🟢 Put Wall Support ({K}): Dealers long put gamma."
+                    return f"🟢 Put Wall Support ({K}): Dealers long put gamma. They buy spot as price falls, dampening downside momentum."
                 elif K == max_gex_oi_strike and abs(K - spot_price) <= (0.01 * spot_price) and br_k < 1.2:
-                    return f"🧲 True Magnet / Pinning Level ({K}): High GEX concentration near spot."
+                    return f"🧲 True Magnet / Pinning Level ({K}): High GEX concentration near spot with balanced flow. Dealers suppress volatility; expect price pinning."
                 elif K == max_gex_oi_strike and 1.2 <= br_k <= 2.5:
                     bias = "Upward Bias" if nar_k > 0.30 else ("Downward Bias" if nar_k < -0.30 else "Chop / No Trade Zone")
-                    return f"⚠️ Uncertain Zone ({K}): Flow is heavily contested. Skew: {bias}."
+                    return f"⚠️ Uncertain Zone ({K}): Flow is heavily contested (BR_K: {br_k:.2f}). Market directional skew: {bias}."
                 elif gex_oi > 0:
-                    return "🔵 Positive Gamma Zone: Dealer hedging creates mean-reverting price action."
+                    return "🔵 Positive Gamma Zone: Dealer hedging creates mean-reverting price action and dampens volatility."
                 elif gex_oi < 0:
-                    return "🟠 Negative Gamma Zone: Dealer hedging amplifies price moves."
+                    return "🟠 Negative Gamma Zone: Dealer hedging amplifies price moves; thin liquidity zone."
                 else:
-                    return "⚪ Neutral Liquidity Zone: Balanced GEX exposure."
+                    return "⚪ Neutral Liquidity Zone: Balanced GEX exposure with standard transactional churn."
 
             df_chain["Market_Structure_Analysis"] = df_chain.apply(analyze_strike, axis=1)
 
@@ -1167,6 +1119,23 @@ def live_dashboard_fragment():
 
             analysis_df = df_chain[["Strike", "PCR_OI", "PCR_Vol", "Market_Structure_Analysis"]]
 
+            st.markdown(
+                """
+                <style>
+                [data-testid="stDataFrame"] td {
+                    white-space: normal !important;
+                    word-wrap: break-word !important;
+                    word-break: break-word !important;
+                }
+                [data-testid="stDataFrame"] div[role="gridcell"] {
+                    white-space: normal !important;
+                    word-wrap: break-wrap !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+
             st.dataframe(
                 analysis_df,
                 use_container_width=True,
@@ -1175,36 +1144,33 @@ def live_dashboard_fragment():
                     "Strike": st.column_config.NumberColumn("Strike", format="%d", width="small"),
                     "PCR_OI": st.column_config.NumberColumn("PCR (OI)", format="%.2f", width="small"),
                     "PCR_Vol": st.column_config.NumberColumn("PCR (Vol)", format="%.2f", width="small"),
-                    "Market_Structure_Analysis": st.column_config.TextColumn("Market Structure Analysis", width="large")
+                    "Market_Structure_Analysis": st.column_config.TextColumn(
+                        "Market Structure Analysis",
+                        width="large"
+                    )
                 }
             )
 
         st.subheader("Option Chain Data & Greeks (Δ, γ, θ, ν)")
 
-        chain_list = data.get("chain_results", [])
+        df_greeks_display = pd.DataFrame(data["chain_results"]).drop(columns=["C_IV_val", "P_IV_val", "Net_GEX_OI", "Net_GEX_Vol"], errors="ignore")
 
-        if chain_list:
-            df_greeks_display = pd.DataFrame(chain_list).drop(
-                columns=["C_IV_val", "P_IV_val", "Net_GEX_OI", "Net_GEX_Vol"], 
-                errors="ignore"
-            )
+        c_oi_max = df_greeks_display["C_OI"].max() if "C_OI" in df_greeks_display.columns else 1
+        p_oi_max = df_greeks_display["P_OI"].max() if "P_OI" in df_greeks_display.columns else 1
 
-            column_order = [
-                "C_Vol", "C_ΔOI", "C_OI", "C_Δ", "C_γ", "C_θ", "C_ν", "C_IV", "C_LTP",
-                "Strike",
-                "P_LTP", "P_IV", "P_Δ", "P_γ", "P_θ", "P_ν", "P_OI", "P_ΔOI", "P_Vol"
-            ]
-            
-            available_cols = [col for col in column_order if col in df_greeks_display.columns]
-            df_greeks_display = df_greeks_display[available_cols]
+        styled_greeks = df_greeks_display.style.background_gradient(
+            subset=["C_OI"],
+            cmap="Greens",
+            vmin=0,
+            vmax=c_oi_max
+        ).background_gradient(
+            subset=["P_OI"],
+            cmap="Reds",
+            vmin=0,
+            vmax=p_oi_max
+        )
 
-            st.dataframe(
-                df_greeks_display,
-                use_container_width=True,
-                hide_index=True,
-                height=450
-            )
-        else:
-            st.warning("⚠️ No option chain data available for the selected parameters.")
+        st.dataframe(styled_greeks, use_container_width=True)
 
+# Run the seamless fragment loop
 live_dashboard_fragment()
