@@ -45,22 +45,80 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS Styling
+# Custom CSS Styling (Includes anti-dimming and hidden spinner rules)
 custom_css = """
 <style>
-.stApp { opacity: 1 !important; }
-[data-testid="stStatusWidget"], .stSpinner { display: none !important; }
-div[data-testid="stFragment"] { opacity: 1 !important; }
-html, body, [data-testid="stAppViewContainer"] { background-color: #0E1117 !important; color: #FAFAFA !important; }
-section[data-testid="stSidebar"] { width: 310px !important; }
-.block-container { padding-top: 1.0rem !important; padding-bottom: 1rem !important; }
-header[data-testid="stHeader"] { background-color: rgba(0, 0, 0, 0) !important; }
-h1, h2, h3, .custom-heading { color: #00E676 !important; font-size: 20px !important; font-weight: 700 !important; margin-bottom: 0.2rem !important; }
-div[data-testid="stMetricValue"] { font-size: 18px !important; color: #00E676 !important; }
-.update-timestamp { font-size: 13px; color: #00E676; font-weight: 600; text-align: right; }
-div[data-baseweb="select"] > div { background-color: #1E222D !important; color: #FAFAFA !important; border-color: #363C4E !important; }
-.stButton>button { border-radius: 6px; font-weight: 600; }
-.status-badge { padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; display: inline-block; margin-right: 8px; }
+/* Disable Streamlit's default screen dimming/opacity reduction on rerun */
+.stApp {
+    opacity: 1 !important;
+}
+
+/* Hide the native running spinner / loading indicator overlay that causes flashes */
+[data-testid="stStatusWidget"], .stSpinner {
+    display: none !important;
+}
+
+/* Keep running fragments fully opaque */
+div[data-testid="stFragment"] {
+    opacity: 1 !important;
+}
+
+html, body, [data-testid="stAppViewContainer"] {
+    background-color: #0E1117 !important;
+    color: #FAFAFA !important;
+}
+
+section[data-testid="stSidebar"] {
+    width: 310px !important;
+}
+
+.block-container {
+    padding-top: 1.0rem !important;
+    padding-bottom: 1rem !important;
+}
+
+header[data-testid="stHeader"] {
+    background-color: rgba(0, 0, 0, 0) !important;
+}
+
+h1, h2, h3, .custom-heading {
+    color: #00E676 !important;
+    font-size: 20px !important;
+    font-weight: 700 !important;
+    margin-bottom: 0.2rem !important;
+}
+
+div[data-testid="stMetricValue"] {
+    font-size: 18px !important;
+    color: #00E676 !important;
+}
+
+.update-timestamp {
+    font-size: 13px;
+    color: #00E676;
+    font-weight: 600;
+    text-align: right;
+}
+
+div[data-baseweb="select"] > div {
+    background-color: #1E222D !important;
+    color: #FAFAFA !important;
+    border-color: #363C4E !important;
+}
+
+.stButton>button {
+    border-radius: 6px;
+    font-weight: 600;
+}
+
+.status-badge {
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-block;
+    margin-right: 8px;
+}
 .badge-bullish { background-color: rgba(0, 230, 118, 0.15); color: #00E676; border: 1px solid #00E676; }
 .badge-bearish { background-color: rgba(255, 82, 82, 0.15); color: #FF5252; border: 1px solid #FF5252; }
 .badge-neutral { background-color: rgba(255, 152, 0, 0.15); color: #FF9800; border: 1px solid #FF9800; }
@@ -113,7 +171,7 @@ class VolatilityEngine:
 
     @classmethod
     def calculate_greeks(cls, S: float, K: float, T: float, r: float, sigma: float, flag: str = "c") -> dict:
-        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        if T <= 0 or sigma <= 0:
             return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
 
         d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
@@ -134,7 +192,7 @@ class VolatilityEngine:
 
     @classmethod
     def calculate_iv(cls, market_price: float, S: float, K: float, T: float, r: float = 0.10, flag: str = "c") -> float:
-        if market_price <= 0.05 or T <= 0 or S <= 0 or K <= 0:
+        if market_price <= 0.05 or T <= 0:
             return 0.0
         df = math.exp(-r * T)
         intrinsic = max(0.0, S - K * df) if flag.lower() == "c" else max(0.0, K * df - S)
@@ -213,6 +271,9 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
     sup_df = df.sort_values(by="P_OI", ascending=False)
     s1 = sup_df.iloc[0]["Strike"] if len(sup_df) > 0 else spot_price
     s2 = sup_df.iloc[1]["Strike"] if len(sup_df) > 1 else s1
+
+    r1, r2 = min(r1, r2), max(r1, r2)
+    s1, s2 = max(s1, s2), min(s1, s2)
 
     df_sorted = df.sort_values(by="Strike").reset_index(drop=True)
 
@@ -317,7 +378,7 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
         pass
     return ""
 
-# --- HISTORICAL GEX & Z-SCORE ENGINE ---
+# --- GEX & TRADE VOLUME Z-SCORE COMPUTATION HELPERS ---
 def calculate_gamma_norm(S, K, T, r=0.07, sigma=0.15):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
@@ -325,7 +386,7 @@ def calculate_gamma_norm(S, K, T, r=0.07, sigma=0.15):
     gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
     return gamma
 
-def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_size, spot_token, progress_container=None):
+def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_size, progress_container=None):
     try:
         options_scrips = df_scrip_master[
             (df_scrip_master['exch_seg'] == 'NFO') & 
@@ -345,38 +406,21 @@ def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_s
         nearest_expiry = active_contracts['expiry_dt'].min()
         current_expiry_scrips = active_contracts[active_contracts['expiry_dt'] == nearest_expiry].copy()
 
-        from_date_dt = now - datetime.timedelta(days=int(days) + 30)
-        from_date = from_date_dt.strftime("%Y-%m-%d 09:15")
-        to_date = now.strftime("%Y-%m-%d 15:30")
-
-        # Fetch Historical Spot Close Prices
-        spot_candle_params = {
-            "exchange": "NSE",
-            "symboltoken": spot_token,
-            "interval": "ONE_DAY",
-            "fromdate": from_date,
-            "todate": to_date
-        }
-        spot_res = smart_api.getCandleData(spot_candle_params)
-        spot_daily_map = {}
-        if spot_res and spot_res.get('status') and spot_res.get('data'):
-            for item in spot_res['data']:
-                d_str = item[0].split('T')[0]
-                spot_daily_map[d_str] = float(item[4])
+        dte_days = max((nearest_expiry - now).days, 1)
+        T = dte_days / 365.0
 
         current_expiry_scrips['strike_num'] = pd.to_numeric(current_expiry_scrips['strike'], errors='coerce') / 100.0
         strikes = sorted(current_expiry_scrips['strike_num'].dropna().unique())
-        
-        # Focus on active strikes around historical mean spot
-        if spot_daily_map and strikes:
-            avg_spot = np.mean(list(spot_daily_map.values()))
-            atm_strike = min(strikes, key=lambda x: abs(x - avg_spot))
-            mid_idx = strikes.index(atm_strike)
-            selected_strikes = strikes[max(0, mid_idx - 5): min(len(strikes), mid_idx + 6)]
+        if len(strikes) > 10:
+            mid_idx = len(strikes) // 2
+            selected_strikes = strikes[max(0, mid_idx - 5): min(len(strikes), mid_idx + 5)]
             current_expiry_scrips = current_expiry_scrips[current_expiry_scrips['strike_num'].isin(selected_strikes)]
 
         calls = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('CE')]
         puts = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('PE')]
+
+        from_date = (now - datetime.timedelta(days=int(days) + 30)).strftime("%Y-%m-%d 09:15")
+        to_date = now.strftime("%Y-%m-%d 15:30")
 
         daily_call_gex, daily_call_vol = {}, {}
         daily_put_gex, daily_put_vol = {}, {}
@@ -384,20 +428,26 @@ def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_s
         total_tokens = len(calls) + len(puts)
         processed_count = 0
 
-        p_bar = progress_container.progress(0.0) if progress_container else None
-        p_status = progress_container.empty() if progress_container else None
+        p_bar = None
+        p_status = None
+        if progress_container is not None:
+            p_bar = progress_container.progress(0.0)
+            p_status = progress_container.empty()
 
         def process_options(df_tokens, target_gex, target_vol, is_call=True):
             nonlocal processed_count
             for _, row in df_tokens.iterrows():
                 processed_count += 1
-                if p_bar and total_tokens > 0:
-                    p_bar.progress(min(1.0, processed_count / total_tokens))
+                if p_bar is not None and total_tokens > 0:
+                    pct = min(1.0, processed_count / total_tokens)
+                    p_bar.progress(pct)
                     opt_label = "Calls" if is_call else "Puts"
-                    if p_status:
+                    if p_status is not None:
                         p_status.caption(f"⏳ Fetching historical data for {symbol} {opt_label} ({processed_count}/{total_tokens})...")
 
                 strike_price = float(row['strike_num'])
+                spot_price = strike_price
+                gamma = calculate_gamma_norm(S=spot_price, K=strike_price, T=T)
                 token_str = str(row['token'])
 
                 candle_params = {
@@ -430,15 +480,7 @@ def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_s
                         for item in oi_res['data']:
                             date_str = item.get('time', '').split('T')[0]
                             oi_val = float(item.get('oi', 0))
-
-                            hist_date = pd.to_datetime(date_str)
-                            dte_days = max((nearest_expiry - hist_date).days, 1)
-                            T_hist = dte_days / 365.0
-                            
-                            spot_hist = spot_daily_map.get(date_str, strike_price)
-                            gamma = calculate_gamma_norm(S=spot_hist, K=strike_price, T=T_hist)
-
-                            gex_val = gamma * oi_val * lot_size * (spot_hist ** 2) * 0.01
+                            gex_val = gamma * oi_val * lot_size * (spot_price ** 2) * 0.01
                             if not is_call:
                                 gex_val = -gex_val
                             target_gex[date_str] = target_gex.get(date_str, 0.0) + gex_val
@@ -448,7 +490,7 @@ def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_s
         process_options(calls, daily_call_gex, daily_call_vol, is_call=True)
         process_options(puts, daily_put_gex, daily_put_vol, is_call=False)
 
-        if p_status:
+        if p_status is not None:
             p_status.caption("✅ Calculating Z-Score rolling metrics...")
 
         df = pd.DataFrame({
@@ -467,12 +509,15 @@ def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_s
             z = (df[col] - mean) / std.replace(0, np.nan)
             df[f'{col}_Z'] = z.fillna(0.0)
 
-        if p_bar: p_bar.empty()
-        if p_status: p_status.empty()
+        if p_bar is not None:
+            p_bar.empty()
+        if p_status is not None:
+            p_status.empty()
 
         return df.fillna(0.0)
     except Exception:
-        if progress_container: progress_container.empty()
+        if progress_container is not None:
+            progress_container.empty()
         return pd.DataFrame()
 
 # --- SIDEBAR SETUP ---
@@ -554,7 +599,7 @@ interval_mapping = {
     "15 min": ("FIFTEEN_MINUTE", 30)
 }
 
-# --- SECURE SESSION HANDLER ---
+# --- SECURE SESSION HANDLER (PREVENTS RATE LIMIT BAN) ---
 def get_smart_api_client():
     if "smart_api_instance" in st.session_state and st.session_state["smart_api_instance"] is not None:
         return st.session_state["smart_api_instance"]
@@ -574,16 +619,22 @@ def get_smart_api_client():
         pass
     return None
 
+# Top ribbon container for initial dashboard execution progress
 main_top_progress_holder = st.container()
 
 # --- DATA FETCHING ENGINE ---
 def fetch_live_data(selected_interval_label="5 min", progress_container=None):
-    p_bar = progress_container.progress(0.0) if progress_container else None
-    p_status = progress_container.empty() if progress_container else None
+    p_bar = None
+    p_status = None
+    if progress_container is not None:
+        p_bar = progress_container.progress(0.0)
+        p_status = progress_container.empty()
 
     def update_p(pct, msg):
-        if p_bar: p_bar.progress(min(1.0, max(0.0, pct)))
-        if p_status: p_status.caption(f"⏳ {msg}")
+        if p_bar is not None:
+            p_bar.progress(min(1.0, max(0.0, pct)))
+        if p_status is not None:
+            p_status.caption(f"⏳ {msg}")
 
     update_p(0.10, "Authenticating SmartAPI Session...")
 
@@ -591,11 +642,11 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
     if not smart_api:
         if p_bar: p_bar.empty()
         if p_status: p_status.empty()
-        st.error("Missing credentials or failed to generate SmartAPI session!")
+        st.error("Missing credentials or failed to generate SmartAPI session! Check Render Environment Variables.")
         return None
 
     try:
-        update_p(0.20, f"Fetching Live Spot & Volatility for {Index_Name}...")
+        update_p(0.20, f"Fetching Live Spot & Historical Volatility for {Index_Name}...")
         index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
         spot_token = index_token_map.get(Index_Name, "99926000")
 
@@ -604,7 +655,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 
         index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, "NSE", days=hv_days)
 
-        update_p(0.35, "Fetching Historical Candle Data...")
+        update_p(0.35, "Fetching Historical Underlying Candle Data...")
         ist_tz = pytz.timezone("Asia/Kolkata")
         now_dt = datetime.datetime.now(ist_tz)
 
@@ -637,7 +688,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         tokens_to_fetch = set()
         strike_mapping = []
 
-        update_p(0.50, "Mapping Option Tokens...")
+        update_p(0.50, "Mapping Option Chain Tokens...")
         for strike in filtered_strikes:
             strike_int = int(strike)
             c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "CE")
@@ -663,7 +714,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 
         tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
 
-        update_p(0.65, "Fetching Live Market Depth...")
+        update_p(0.65, "Fetching Live Market Depth & Prices...")
         market_data = {}
         chunk_size = 40
         for i in range(0, len(tokens_to_fetch_list), chunk_size):
@@ -671,24 +722,30 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             res = smart_api.getMarketData("FULL", {Exchange: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
-                    vol_val = item.get("volume") or item.get("totTrdVol") or item.get("tradeVolume") or 0
+                    vol_val = (
+                        item.get("volume") or
+                        item.get("totTrdVol") or
+                        item.get("volumeTraded") or
+                        item.get("tradeVolume") or
+                        item.get("v") or 0
+                    )
+
                     market_data[str(item["symbolToken"])] = {
                         "ltp": float(item.get("ltp", 0.0)),
                         "oi": int(item.get("opnInterest", 0)),
                         "pnl_oi": int(item.get("netChange", 0)),
                         "volume": int(vol_val)
                     }
-            time.sleep(0.1)
+            time.sleep(0.1) # Prevents rate-limiting
 
-        update_p(0.85, "Calculating Option Greeks & Gamma Exposure...")
+        update_p(0.85, "Calculating Option Greeks & Gamma Exposure Profile...")
         atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
         atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
 
         atm_c_ltp = market_data.get(atm_c_tok, {}).get("ltp", 0.0)
         atm_p_ltp = market_data.get(atm_p_tok, {}).get("ltp", 0.0)
 
-        # Synthetic Future Calculation
-        F = spot_price * math.exp(rate_param * T) if (atm_c_ltp == 0 or atm_p_ltp == 0) else spot_price + math.exp(rate_param * T) * (atm_c_ltp - atm_p_ltp)
+        F = atm_strike + math.exp(rate_param * T) * (atm_c_ltp - atm_p_ltp) if (atm_c_ltp > 0 and atm_p_ltp > 0) else spot_price
 
         lot_size = LOT_SIZES.get(Index_Name, 25)
         chain_results = []
@@ -737,7 +794,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                 "P_OI": p_info["oi"], "P_ΔOI": p_info["pnl_oi"], "P_Vol": p_info["volume"]
             })
 
-        update_p(0.95, "Calculating Option Chain Key Levels...")
+        update_p(0.95, "Finalizing Level Calculations & Dashboard View...")
         pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
         iv_percentile = 0.0
         if all_ivs:
@@ -765,7 +822,9 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
     except Exception as e:
         if p_bar: p_bar.empty()
         if p_status: p_status.empty()
-        st.warning("API sync notice: Fetching standard data structure...")
+        if "exceeding access rate" in str(e).lower() or "access denied" in str(e).lower():
+            st.session_state["smart_api_instance"] = None
+        st.warning(f"API Rate limit / sync notice: Retrying on next cycle...")
         return None
 
 if run_btn or "data_store" not in st.session_state:
@@ -773,14 +832,14 @@ if run_btn or "data_store" not in st.session_state:
     if new_data:
         st.session_state["data_store"] = new_data
 
-# --- Z-SCORE FRAGMENT ENGINE ---
+# --- SEPARATE FRAGMENT FOR GEX & VOLUME Z-SCORE ENGINE (5-MIN REFRESH OPTION) ---
 @st.fragment(run_every=300 if st.session_state.get("enable_zscore_refresh", False) else None)
 def zscore_analysis_fragment():
     st.markdown("---")
     head_c1, head_c2 = st.columns([0.65, 0.35])
     with head_c1:
         st.subheader(f"⚡ GEX & Trade Volume Z-Scores Analysis ({Index_Name})")
-        st.caption(f"Lookback Window: **{hv_days} Days**")
+        st.caption(f"Lookback Window: **{hv_days} Days** (Uses HV Lookback setting from sidebar)")
     with head_c2:
         st.write("")
         enable_z_ref = st.checkbox("Enable Z-Score Auto-Refresh (5 min)", value=st.session_state["enable_zscore_refresh"], key="cb_zscore_refresh")
@@ -793,18 +852,16 @@ def zscore_analysis_fragment():
         calc_z_btn = st.button("🔄 Compute / Refresh Z-Scores", use_container_width=True)
 
     progress_holder = st.container()
+
     smart_api = get_smart_api_client()
 
     if calc_z_btn or st.session_state["zscore_data_store"].empty:
         if smart_api:
             lot_size = LOT_SIZES.get(Index_Name, 25)
-            index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
-            spot_token = index_token_map.get(Index_Name, "99926000")
-            
-            z_df = fetch_historical_gex_zscores(smart_api, Index_Name, hv_days, df_master, lot_size, spot_token, progress_container=progress_holder)
+            z_df = fetch_historical_gex_zscores(smart_api, Index_Name, hv_days, df_master, lot_size, progress_container=progress_holder)
             st.session_state["zscore_data_store"] = z_df
         else:
-            st.error("SmartAPI Session is uninitialized.")
+            st.error("SmartAPI Session is uninitialized. Cannot calculate Z-Scores.")
 
     z_df = st.session_state["zscore_data_store"]
 
@@ -812,7 +869,9 @@ def zscore_analysis_fragment():
         last_5 = z_df.tail(5).copy()
 
         def style_z(val):
-            if val >= 1.5 or val <= -1.5:
+            if val >= 1.5:
+                return 'background-color: #ff4d4d; color: white; font-weight: bold;'
+            elif val <= -1.5:
                 return 'background-color: #ff4d4d; color: white; font-weight: bold;'
             elif 0.5 <= val < 1.5:
                 return 'background-color: #ffea80; color: black;'
@@ -820,14 +879,25 @@ def zscore_analysis_fragment():
                 return 'background-color: #b3ffb3; color: black;'
 
         out_cols = ['Call_GEX_Z', 'Put_GEX_Z', 'Net_GEX_Z', 'Call_Vol_Z', 'Put_Vol_Z']
-        styled_z_df = last_5[out_cols].style.map(style_z, subset=out_cols).format({col: "{:.2f}" for col in out_cols})
+        
+        # Fixed Pandas Styler Deprecation Error: Replaced .applymap() with .map()
+        styled_z_df = last_5[out_cols].style.map(
+            style_z,
+            subset=out_cols
+        ).format({col: "{:.2f}" for col in out_cols})
+
         st.dataframe(styled_z_df, use_container_width=True)
 
-# --- LIVE DASHBOARD FRAGMENT ---
+        with st.expander("🔍 Inspect Raw Calculated Daily Totals (GEX & Volume)"):
+            st.dataframe(z_df[['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol']].tail(10), use_container_width=True)
+    else:
+        st.info("Click '🔄 Compute / Refresh Z-Scores' above to load historical Z-Score analysis.")
+
+# --- AUTO-REFRESHING FRAGMENT FOR MAIN DASHBOARD (5s REFRESH OPTION) ---
 @st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
 def live_dashboard_fragment():
     if "data_store" not in st.session_state:
-        st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar.")
+        st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
 
     if st.session_state.get("enable_main_refresh", False):
@@ -874,26 +944,373 @@ def live_dashboard_fragment():
 
     if not df_full.empty and len(df_full) >= 20:
         latest_row = df_full.iloc[-1]
+
         rsi_val = latest_row["rsi"]
-        macd_val, macd_sig = latest_row["macd"], latest_row["macd_signal"]
+        rsi_status = "Oversold" if rsi_val < 30 else ("Overbought" if rsi_val > 70 else "Neutral")
+        rsi_badge_cls = "badge-bearish" if rsi_val > 70 else ("badge-bullish" if rsi_val < 30 else "badge-neutral")
+
+        macd_val = latest_row["macd"]
+        macd_sig = latest_row["macd_signal"]
+        macd_status = "Bullish Crossover" if macd_val > macd_sig else "Bearish Crossover"
+        macd_badge_cls = "badge-bullish" if macd_val > macd_sig else "badge-bearish"
+
+        recent_bw = df_full["bb_bandwidth"].tail(20)
+        bw_threshold = recent_bw.quantile(0.20)
+        is_sqz = latest_row["bb_bandwidth"] <= bw_threshold
+        sqz_status = "Squeeze Active" if is_sqz else "Normal Expansion"
+        sqz_badge_cls = "badge-neutral" if is_sqz else "badge-bullish"
+
+        st.markdown(
+            f"""
+            <div style='margin-bottom: 8px;'>
+                <span class='status-badge {sqz_badge_cls}'>BB Squeeze: {sqz_status}</span>
+                <span class='status-badge {macd_badge_cls}'>MACD Status: {macd_status}</span>
+                <span class='status-badge {rsi_badge_cls}'>RSI (14): {rsi_val:.1f} ({rsi_status})</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        df_full["session_date"] = pd.to_datetime(df_full["time"]).dt.date
+        last_3_dates = sorted(df_full["session_date"].unique())[-3:]
+        df_chart = df_full[df_full["session_date"].isin(last_3_dates)].copy()
+        df_chart["time_str"] = pd.to_datetime(df_chart["time"]).dt.strftime("%d-%b %H:%M")
 
         fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.55, 0.25, 0.20])
-        fig.add_trace(plt_go.Scatter(x=df_full["time"], y=df_full["close"], mode="lines", name="Spot Price", line=dict(color="#00E676", width=2)), row=1, col=1)
-        fig.add_trace(plt_go.Scatter(x=df_full["time"], y=df_full["vwap"], mode="lines", name="VWAP", line=dict(color="#FF9800", width=2, dash="dot")), row=1, col=1)
 
-        fig.update_layout(template="plotly_dark", height=500, margin=dict(l=20, r=20, t=10, b=10), showlegend=True, hovermode="x unified")
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot Price", line=dict(color="#00E676", width=2)), row=1, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper (20, 2)", line=dict(color="rgba(33, 150, 243, 0.5)", width=1)), row=1, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_lower"], mode="lines", name="BB Lower (20, 2)", line=dict(color="rgba(33, 150, 243, 0.5)", width=1), fill='tonexty', fillcolor='rgba(33, 150, 243, 0.05)'), row=1, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["vwap"], mode="lines", name="VWAP (Intraday)", line=dict(color="#FF9800", width=2, dash="dot")), row=1, col=1)
+
+        colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
+        fig.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="MACD Hist", marker_color=colors_macd), row=2, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD (12, 26, 9) [{macd_val:.2f}]", line=dict(color="#2196F3", width=1.5)), row=2, col=1)
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Signal [{macd_sig:.2f}]", line=dict(color="#FF9800", width=1.5)), row=2, col=1)
+
+        fig.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name=f"RSI (14) [{rsi_val:.1f}]", line=dict(color="#E040FB", width=1.5)), row=3, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=3, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=3, col=1)
+
+        min_p = min(df_chart["close"].min(), df_chart["vwap"].min(), df_chart["bb_lower"].min())
+        max_p = max(df_chart["close"].max(), df_chart["vwap"].max(), df_chart["bb_upper"].max())
+        padding = (max_p - min_p) * 0.05
+
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#0E1117",
+            plot_bgcolor="#0E1117",
+            height=500,
+            margin=dict(l=20, r=20, t=10, b=10),
+            showlegend=True,
+            hovermode="x unified"
+        )
+        fig.update_yaxes(range=[min_p - padding, max_p + padding], tickformat="d", row=1, col=1)
+        fig.update_xaxes(type="category", nticks=12)
+        fig.update_traces(hovertemplate="%{y:.2f}", row=1, col=1)
+
         st.plotly_chart(fig, use_container_width=True)
 
-    # Key Levels
+    # --- STRATEGY BASKET DISPLAY SECTION ---
     st.markdown("---")
-    st.subheader("🎯 Option Chain Derived Key Levels")
+    st.subheader("🧺 Strategy Basket Analytics")
+
+    if st.session_state["basket_legs"]:
+        market_data_store = data.get("market_data", {})
+        basket_tokens_info = data.get("basket_tokens_info", {})
+        F_val = data.get("F", data["spot_price"])
+        T_val = data.get("T", 1e-5)
+        hv_val = data.get("index_hv", 0.15)
+
+        calculated_legs = []
+        tot_pnl = 0.0
+        tot_delta = 0.0
+        tot_gamma = 0.0
+        tot_theta = 0.0
+        tot_vega = 0.0
+
+        for leg in st.session_state["basket_legs"]:
+            k = leg["strike"]
+            t = leg["type"]
+            act = leg["action"]
+            qty = leg["qty"]
+
+            tok = basket_tokens_info.get(f"{k}_{t}", "")
+            ltp = market_data_store.get(tok, {}).get("ltp", 0.0) if tok else 0.0
+            entry_p = leg["entry_price"] if leg["entry_price"] > 0 else ltp
+
+            pricing_p = ltp if ltp > 0 else entry_p
+            leg_iv = VolatilityEngine.calculate_iv(pricing_p, F_val, k, T_val, rate_param, "c" if t == "CE" else "p")
+            if leg_iv == 0.0:
+                leg_iv = hv_val
+
+            greeks = VolatilityEngine.calculate_greeks(F_val, k, T_val, rate_param, leg_iv, "c" if t == "CE" else "p")
+
+            mult = 1.0 if act == "BUY" else -1.0
+
+            pnl_per_unit = (ltp - entry_p) if act == "BUY" else (entry_p - ltp)
+            leg_pnl = pnl_per_unit * qty if ltp > 0 else 0.0
+
+            pos_delta = greeks["delta"] * qty * mult
+            pos_gamma = greeks["gamma"] * qty * mult
+            pos_theta = greeks["theta"] * qty * mult
+            pos_vega = greeks["vega"] * qty * mult
+
+            tot_pnl += leg_pnl
+            tot_delta += pos_delta
+            tot_gamma += pos_gamma
+            tot_theta += pos_theta
+            tot_vega += pos_vega
+
+            calculated_legs.append({
+                "Action": act,
+                "Strike": k,
+                "Type": t,
+                "Qty": qty,
+                "Entry (₹)": round(entry_p, 2),
+                "LTP (₹)": round(ltp, 2),
+                "P&L (₹)": round(leg_pnl, 2),
+                "Delta (Δ)": round(pos_delta, 2),
+                "Gamma (γ)": round(pos_gamma, 4),
+                "Theta (θ)": round(pos_theta, 2),
+                "Vega (ν)": round(pos_vega, 2)
+            })
+
+        with st.container(border=True):
+            st.markdown("**Combined Basket Summary**")
+            b_m1, b_m2, b_m3, b_m4, b_m5 = st.columns(5)
+            b_m1.metric("Net P&L (₹)", f"₹{tot_pnl:,.2f}")
+            b_m2.metric("Net Delta (Δ)", f"{tot_delta:.2f}")
+            b_m3.metric("Net Gamma (γ)", f"{tot_gamma:.4f}")
+            b_m4.metric("Net Theta (θ)", f"{tot_theta:.2f}")
+            b_m5.metric("Net Vega (ν)", f"{tot_vega:.2f}")
+
+        df_basket_display = pd.DataFrame(calculated_legs)
+        st.markdown("**Individual Legs Breakdown**")
+        st.dataframe(df_basket_display, use_container_width=True)
+    else:
+        st.info("No legs added to strategy basket yet. Use sidebar **2. Build Strategy Basket** to add positions.")
+
+    # --- OPTION CHAIN DERIVED KEY LEVELS & TARGETS ---
+    st.markdown("---")
+    st.subheader("🎯 Option Chain Derived Key Levels & Targets")
+
     lvls = data.get("levels", {})
     if lvls:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("OI Resistance 1 (R1)", f"{lvls['R1']}")
-        c2.metric("OI Resistance 2 (R2)", f"{lvls['R2']}")
-        c3.metric("OI Support 1 (S1)", f"{lvls['S1']}")
-        c4.metric("OI Support 2 (S2)", f"{lvls['S2']}")
+        row1_col1, row1_col2, row1_col3, row1_col4 = st.columns(4)
+        row1_col1.metric("OI Resistance 1 (R1)", f"{lvls['R1']}")
+        row1_col2.metric("OI Resistance 2 (R2)", f"{lvls['R2']}")
+        row1_col3.metric("OI Support 1 (S1)", f"{lvls['S1']}")
+        row1_col4.metric("OI Support 2 (S2)", f"{lvls['S2']}")
 
+        row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
+        row2_col1.metric("GEX Support / Magnet", f"{lvls['GEX_Support']}")
+        row2_col2.metric("GEX Resistance / Magnet", f"{lvls['GEX_Resistance']}")
+        row2_col3.metric("Vol Accelerator (-GEX)", f"{lvls['GEX_Accelerator'] if lvls['GEX_Accelerator'] else 'None'}")
+        row2_col4.metric("Zero Gamma / Flip Point", f"{lvls['Zero_Gamma_Flip']}")
+
+        # --- NET GAMMA vs VOLUME & OI SEPARATE CHARTS ---
+        st.markdown("---")
+        df_chain = pd.DataFrame(data["chain_results"])
+
+        if not df_chain.empty:
+            df_chain["Total_Vol"] = df_chain["C_Vol"] + df_chain["P_Vol"]
+            df_chain["Total_OI"] = df_chain["C_OI"] + df_chain["P_OI"]
+
+            def calculate_synced_ranges(v1_pos, v1_neg, v2_pos, v2_neg):
+                y1_max = max(v1_pos.max(), 1.0)
+                y1_min = min(v1_neg.min(), -1.0)
+                y2_max = max(v2_pos.max(), 1.0)
+                y2_min = min(v2_neg.min(), -1.0)
+
+                ratio1 = abs(y1_min) / y1_max
+                ratio2 = abs(y2_min) / y2_max
+                max_ratio = max(ratio1, ratio2)
+
+                range1 = [-y1_max * max_ratio * 1.05, y1_max * 1.05]
+                range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
+                return range1, range2
+
+            # CHART 1: NET GAMMA EXPOSURE (VOLUME-BASED) vs VOLUME
+            st.subheader("📊 Volume-Based Net Gamma Exposure vs Trading Volume")
+
+            gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
+
+            fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
+
+            fig_vol.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["Net_GEX_Vol"],
+                    name="Net Gamma (Vol-Based)",
+                    marker_color=gex_vol_colors,
+                    opacity=0.85,
+                    width=25,
+                    hovertemplate="Strike: %{x}<br>Net GEX (Vol): ₹%{y:,.0f}<extra></extra>"
+                ),
+                secondary_y=True
+            )
+
+            fig_vol.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["C_Vol"],
+                    name="Call Volume",
+                    marker_color="#81C784",
+                    opacity=0.6,
+                    hovertemplate="Strike: %{x}<br>Call Vol: %{y:,}<extra></extra>"
+                ),
+                secondary_y=False
+            )
+
+            fig_vol.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=-df_chain["P_Vol"],
+                    name="Put Volume",
+                    marker_color="#FF8A80",
+                    opacity=0.6,
+                    hovertemplate="Strike: %{x}<br>Put Vol: %{customdata:,}<extra></extra>",
+                    customdata=df_chain["P_Vol"]
+                ),
+                secondary_y=False
+            )
+
+            fig_vol.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
+            fig_vol.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
+            fig_vol.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip Point")
+
+            v1_range, v2_range = calculate_synced_ranges(
+                df_chain["C_Vol"], -df_chain["P_Vol"],
+                df_chain["Net_GEX_Vol"], df_chain["Net_GEX_Vol"]
+            )
+
+            fig_vol.update_layout(
+                title="Strike-wise Volume-Based Net Gamma & Volume Profile (Call Vol Above / Put Vol Below)",
+                template="plotly_dark",
+                paper_bgcolor="#0E1117",
+                plot_bgcolor="#0E1117",
+                height=480,
+                barmode="overlay",
+                margin=dict(l=20, r=20, t=40, b=10),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            fig_vol.update_xaxes(type="linear", tickformat="d", dtick=100)
+            fig_vol.update_yaxes(
+                title_text="Put Vol (Below) | Call Vol (Above)",
+                range=v1_range,
+                secondary_y=False,
+                showgrid=True,
+                gridcolor="#262930",
+                zeroline=True,
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
+            )
+            fig_vol.update_yaxes(
+                title_text="Net GEX (Vol-Based ₹)",
+                range=v2_range,
+                secondary_y=True,
+                showgrid=False,
+                zeroline=True,
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
+            )
+
+            st.plotly_chart(fig_vol, use_container_width=True)
+
+            # CHART 2: NET GAMMA EXPOSURE (OI-BASED) vs OPEN INTEREST
+            st.subheader("📈 OI-Based Net Gamma Exposure vs Open Interest (OI)")
+
+            gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
+
+            fig_oi = make_subplots(specs=[[{"secondary_y": True}]])
+
+            fig_oi.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["Net_GEX_OI"],
+                    name="Net Gamma (OI-Based)",
+                    marker_color=gex_oi_colors,
+                    opacity=0.85,
+                    width=25,
+                    hovertemplate="Strike: %{x}<br>Net GEX (OI): ₹%{y:,.0f}<extra></extra>"
+                ),
+                secondary_y=True
+            )
+
+            fig_oi.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["C_OI"],
+                    name="Call OI",
+                    marker_color="#2E7D32",
+                    opacity=0.6,
+                    hovertemplate="Strike: %{x}<br>Call OI: %{y:,}<extra></extra>"
+                ),
+                secondary_y=False
+            )
+
+            fig_oi.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=-df_chain["P_OI"],
+                    name="Put OI",
+                    marker_color="#C62828",
+                    opacity=0.6,
+                    hovertemplate="Strike: %{x}<br>Put OI: %{customdata:,}<extra></extra>",
+                    customdata=df_chain["P_OI"]
+                ),
+                secondary_y=False
+            )
+
+            fig_oi.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
+            fig_oi.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
+            fig_oi.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip Point")
+
+            oi1_range, oi2_range = calculate_synced_ranges(
+                df_chain["C_OI"], -df_chain["P_OI"],
+                df_chain["Net_GEX_OI"], df_chain["Net_GEX_OI"]
+            )
+
+            fig_oi.update_layout(
+                title="Strike-wise OI-Based Net Gamma & Open Interest Profile (Call OI Above / Put OI Below)",
+                template="plotly_dark",
+                paper_bgcolor="#0E1117",
+                plot_bgcolor="#0E1117",
+                height=480,
+                barmode="overlay",
+                margin=dict(l=20, r=20, t=40, b=10),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            fig_oi.update_xaxes(type="linear", tickformat="d", dtick=100)
+            fig_oi.update_yaxes(
+                title_text="Put OI (Below) | Call OI (Above)",
+                range=oi1_range,
+                secondary_y=False,
+                showgrid=True,
+                gridcolor="#262930",
+                zeroline=True,
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
+            )
+            fig_oi.update_yaxes(
+                title_text="Net GEX (OI-Based ₹)",
+                range=oi2_range,
+                secondary_y=True,
+                showgrid=False,
+                zeroline=True,
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
+            )
+
+            st.plotly_chart(fig_oi, use_container_width=True)
+
+# Run main dashboard fragment
 live_dashboard_fragment()
+
+# Run separate isolated Z-Score engine fragment
 zscore_analysis_fragment()
