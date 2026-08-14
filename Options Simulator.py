@@ -1235,7 +1235,7 @@ def live_dashboard_fragment():
 
             st.plotly_chart(fig_oi, use_container_width=True)
 
-            # CHART 3: VEX & CEX EXPOSURE vs STRIKE PRICE (INSERTED RIGHT BELOW CHART 2)
+            # CHART 3: VEX & CEX EXPOSURE vs STRIKE PRICE (SYNCED BASELINE ALIGNMENT)
             st.subheader("⚡ VEX (Vega Exposure) and CEX (Charm Exposure) Profile")
 
             fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
@@ -1268,6 +1268,12 @@ def live_dashboard_fragment():
             fig_vex_cex.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
             fig_vex_cex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
 
+            # Zero-baseline alignment for primary (VEX) and secondary (CEX) axes
+            vex_range, cex_range = calculate_synced_ranges(
+                df_chain["VEX"].clip(lower=0), df_chain["VEX"].clip(upper=0),
+                df_chain["CEX"].clip(lower=0), df_chain["CEX"].clip(upper=0)
+            )
+
             fig_vex_cex.update_layout(
                 title="Strike-wise VEX & CEX Profile",
                 template="plotly_dark",
@@ -1282,18 +1288,22 @@ def live_dashboard_fragment():
             fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100)
             fig_vex_cex.update_yaxes(
                 title_text="VEX (Vega Exposure ₹)",
+                range=vex_range,
                 secondary_y=False,
                 showgrid=True,
                 gridcolor="#262930",
                 zeroline=True,
-                zerolinecolor="#FFFFFF"
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
             )
             fig_vex_cex.update_yaxes(
                 title_text="CEX (Charm Exposure ₹)",
+                range=cex_range,
                 secondary_y=True,
                 showgrid=False,
                 zeroline=True,
-                zerolinecolor="#FFFFFF"
+                zerolinecolor="#FFFFFF",
+                zerolinewidth=1.5
             )
 
             st.plotly_chart(fig_vex_cex, use_container_width=True)
