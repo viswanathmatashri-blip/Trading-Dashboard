@@ -16,7 +16,7 @@ from scipy.optimize import brentq
 from scipy.stats import norm
 from SmartApi import SmartConnect
 
-# Setup .streamlit/config.toml programmatically for forced dark theme
+# Setup .streamlit/config.toml programmatically for dark theme
 os.makedirs(".streamlit", exist_ok=True)
 config_path = os.path.join(".streamlit", "config.toml")
 if not os.path.exists(config_path):
@@ -45,7 +45,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS Styling
+# Custom Styling
 custom_css = """
 <style>
 .stApp { opacity: 1 !important; }
@@ -199,7 +199,7 @@ class VolatilityEngine:
 
         return min(losses, key=losses.get)
 
-# --- OPTION CHAIN & LEVEL CALCULATOR ---
+# --- OPTION CHAIN LEVEL CALCULATOR ---
 def calculate_support_resistance_targets(chain_data: list, spot_price: float, max_pain: int):
     if not chain_data:
         return {}
@@ -317,163 +317,117 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
         pass
     return ""
 
-# --- GEX & TRADE VOLUME Z-SCORE COMPUTATION HELPERS ---
-def calculate_gamma_norm(S, K, T, r=0.07, sigma=0.15):
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    return gamma
-
-def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, lot_size, progress_container=None):
+# --- METHOD 1: FUTURES VOLUME & PROXY Z-SCORE COMPUTATION ---
+def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, progress_container=None):
+    """
+    Fetches continuous historical spot index data and near-month futures volume,
+    calculates rolling Historical Volatility (HV) and Volume, computes Z-Scores,
+    and returns the entire historical dataset for complete transparency.
+    """
     try:
-        index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
+        if progress_container is not None:
+            progress_container.caption("⏳ Fetching continuous historical data for Z-score window...")
+
+        ist_now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+        
+        # 1. Map Symbol to Spot Index Token (Continuous data avoids futures contract expiry truncation)
+        index_token_map = {
+            "NIFTY": "99926000", 
+            "BANKNIFTY": "99926009", 
+            "FINNIFTY": "99926037", 
+            "MIDCPNIFTY": "99926074"
+        }
         spot_token = index_token_map.get(symbol, "99926000")
 
-        now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-        from_date = (now - datetime.timedelta(days=int(days) + 30)).strftime("%Y-%m-%d 09:15")
-        to_date = now.strftime("%Y-%m-%d 15:30")
+        # Request 3x calendar days buffer to ensure enough trading days for the rolling baseline
+        window_sz = int(days)
+        from_date = (ist_now - datetime.timedelta(days=window_sz * 3 + 30)).strftime("%Y-%m-%d 09:15")
+        to_date = ist_now.strftime("%Y-%m-%d 15:30")
 
-        spot_history_dict = {}
-        candle_params = {
+        # 2. Fetch Spot Daily Candles for Spot Index
+        spot_param = {
             "exchange": "NSE",
             "symboltoken": spot_token,
             "interval": "ONE_DAY",
             "fromdate": from_date,
             "todate": to_date
         }
-        c_res = smart_api.getCandleData(candle_params)
-        if c_res and c_res.get('status') and c_res.get('data'):
-            for c_item in c_res['data']:
-                date_str = c_item[0].split('T')[0]
-                spot_history_dict[date_str] = float(c_item[4])
-
-        options_scrips = df_scrip_master[
-            (df_scrip_master['exch_seg'] == 'NFO') & 
-            (df_scrip_master['name'] == symbol) & 
-            (df_scrip_master['instrumenttype'] == 'OPTIDX')
-        ].copy()
-
-        if options_scrips.empty:
+        s_res = smart_api.getCandleData(spot_param)
+        if not (s_res and s_res.get('status') and s_res.get('data')):
             return pd.DataFrame()
 
-        options_scrips['expiry_dt'] = pd.to_datetime(options_scrips['expiry'], format='%d%b%Y', errors='coerce')
-        today_date = now.date()
-        active_contracts = options_scrips[options_scrips['expiry_dt'].dt.date >= today_date].copy()
-        if active_contracts.empty:
-            active_contracts = options_scrips.copy()
+        df_spot = pd.DataFrame(s_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        df_spot['date'] = df_spot['time'].str.split('T').str[0]
+        df_spot['spot_close'] = df_spot['close'].astype(float)
+        df_spot = df_spot.set_index('date')
 
-        nearest_expiry = active_contracts['expiry_dt'].min()
-        current_expiry_scrips = active_contracts[active_contracts['expiry_dt'] == nearest_expiry].copy()
+        # Calculate annualized Historical Volatility (HV) strictly over the lookback window
+        df_spot['log_ret'] = np.log(df_spot['spot_close'] / df_spot['spot_close'].shift(1))
+        df_spot['HV_Lookback'] = df_spot['log_ret'].rolling(window=window_sz).std() * np.sqrt(252)
 
-        dte_days = max((nearest_expiry.date() - today_date).days, 1)
-        T = dte_days / 365.0
+        # 3. Fetch Near-Month Futures Volume
+        fut_scrips = df_scrip_master[
+            (df_scrip_master['exch_seg'] == 'NFO') & 
+            (df_scrip_master['name'] == symbol) & 
+            (df_scrip_master['instrumenttype'] == 'FUTIDX')
+        ].copy()
 
-        current_expiry_scrips['strike_num'] = pd.to_numeric(current_expiry_scrips['strike'], errors='coerce') / 100.0
-        strikes = sorted(current_expiry_scrips['strike_num'].dropna().unique())
-        if len(strikes) > 10:
-            mid_idx = len(strikes) // 2
-            selected_strikes = strikes[max(0, mid_idx - 5): min(len(strikes), mid_idx + 5)]
-            current_expiry_scrips = current_expiry_scrips[current_expiry_scrips['strike_num'].isin(selected_strikes)]
+        fut_scrips['expiry_dt'] = pd.to_datetime(fut_scrips['expiry'], format='%d%b%Y', errors='coerce')
+        active_futs = fut_scrips[fut_scrips['expiry_dt'].dt.date >= ist_now.date()].sort_values('expiry_dt')
+        
+        if not active_futs.empty:
+            near_fut_token = str(active_futs.iloc[0]['token'])
+            fut_param = {
+                "exchange": "NFO",
+                "symboltoken": near_fut_token,
+                "interval": "ONE_DAY",
+                "fromdate": from_date,
+                "todate": to_date
+            }
+            f_res = smart_api.getCandleData(fut_param)
+            if f_res and f_res.get('status') and f_res.get('data'):
+                df_fut = pd.DataFrame(f_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'fut_volume'])
+                df_fut['date'] = df_fut['time'].str.split('T').str[0]
+                df_fut['fut_volume'] = df_fut['fut_volume'].astype(float)
+                df_fut = df_fut.set_index('date')
+                df_spot = df_spot.join(df_fut['fut_volume'], how='left').fillna(0.0)
+            else:
+                df_spot['fut_volume'] = 0.0
+        else:
+            df_spot['fut_volume'] = 0.0
 
-        calls = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('CE')]
-        puts = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('PE')]
+        # 4. Calculate Rolling Mean, Standard Deviation, and Z-Scores Across All Available Dates
+        min_p = max(5, window_sz // 2)
+        
+        # Volume Statistics & Z-Score
+        df_spot['Vol_Mean'] = df_spot['fut_volume'].rolling(window=window_sz, min_periods=min_p).mean()
+        df_spot['Vol_Std'] = df_spot['fut_volume'].rolling(window=window_sz, min_periods=min_p).std()
+        df_spot['Futures_Volume_Z'] = (df_spot['fut_volume'] - df_spot['Vol_Mean']) / df_spot['Vol_Std'].replace(0, np.nan)
 
-        daily_call_gex, daily_call_vol = {}, {}
-        daily_put_gex, daily_put_vol = {}, {}
+        # Volatility Statistics & Z-Score
+        df_spot['HV_Mean'] = df_spot['HV_Lookback'].rolling(window=window_sz, min_periods=min_p).mean()
+        df_spot['HV_Std'] = df_spot['HV_Lookback'].rolling(window=window_sz, min_periods=min_p).std()
+        df_spot['Volatility_Proxy_Z'] = (df_spot['HV_Lookback'] - df_spot['HV_Mean']) / df_spot['HV_Std'].replace(0, np.nan)
 
-        total_tokens = len(calls) + len(puts)
-        processed_count = 0
+        # Consolidate Output DataFrame
+        df_res = pd.DataFrame({
+            'Futures_Volume': df_spot['fut_volume'],
+            'Futures_Close': df_spot['spot_close'],
+            'Volatility_Proxy': df_spot['HV_Lookback'],
+            'Vol_Mean': df_spot['Vol_Mean'],
+            'Vol_Std': df_spot['Vol_Std'],
+            'Futures_Volume_Z': df_spot['Futures_Volume_Z'],
+            'HV_Mean': df_spot['HV_Mean'],
+            'HV_Std': df_spot['HV_Std'],
+            'Volatility_Proxy_Z': df_spot['Volatility_Proxy_Z']
+        })
 
-        p_bar = None
-        p_status = None
         if progress_container is not None:
-            p_bar = progress_container.progress(0.0)
-            p_status = progress_container.empty()
+            progress_container.empty()
 
-        def process_options(df_tokens, target_gex, target_vol, is_call=True):
-            nonlocal processed_count
-            for _, row in df_tokens.iterrows():
-                processed_count += 1
-                if p_bar is not None and total_tokens > 0:
-                    pct = min(1.0, processed_count / total_tokens)
-                    p_bar.progress(pct)
-                    opt_label = "Calls" if is_call else "Puts"
-                    if p_status is not None:
-                        p_status.caption(f"⏳ Fetching historical data for {symbol} {opt_label} ({processed_count}/{total_tokens})...")
+        # Drop incomplete initial setup rows and return entire historical timeline
+        return df_res.dropna(subset=['Futures_Volume_Z', 'Volatility_Proxy_Z'])
 
-                strike_price = float(row['strike_num'])
-                token_str = str(row['token'])
-
-                candle_params_opt = {
-                    "exchange": "NFO",
-                    "symboltoken": token_str,
-                    "interval": "ONE_DAY",
-                    "fromdate": from_date,
-                    "todate": to_date
-                }
-                try:
-                    c_res_opt = smart_api.getCandleData(candle_params_opt)
-                    if c_res_opt and c_res_opt.get('status') and c_res_opt.get('data'):
-                        for c_item in c_res_opt['data']:
-                            date_str = c_item[0].split('T')[0]
-                            vol_val = float(c_item[5])
-                            target_vol[date_str] = target_vol.get(date_str, 0.0) + vol_val
-                except Exception:
-                    pass
-
-                oi_params = {
-                    "exchange": "NFO",
-                    "symboltoken": token_str,
-                    "interval": "ONE_DAY",
-                    "fromdate": from_date,
-                    "todate": to_date
-                }
-                try:
-                    oi_res = smart_api.getOIData(oi_params)
-                    if oi_res and oi_res.get('status') and oi_res.get('data'):
-                        for item in oi_res['data']:
-                            date_str = item.get('time', '').split('T')[0]
-                            oi_val = float(item.get('oi', 0))
-
-                            historical_spot = spot_history_dict.get(date_str, strike_price)
-                            gamma = calculate_gamma_norm(S=historical_spot, K=strike_price, T=T)
-
-                            gex_val = gamma * oi_val * lot_size * (historical_spot ** 2) * 0.01
-                            if not is_call:
-                                gex_val = -gex_val
-                            target_gex[date_str] = target_gex.get(date_str, 0.0) + gex_val
-                except Exception:
-                    pass
-
-        process_options(calls, daily_call_gex, daily_call_vol, is_call=True)
-        process_options(puts, daily_put_gex, daily_put_vol, is_call=False)
-
-        if p_status is not None:
-            p_status.caption("✅ Calculating Z-Score rolling metrics...")
-
-        df = pd.DataFrame({
-            'Call_GEX': daily_call_gex,
-            'Put_GEX': daily_put_gex,
-            'Call_Vol': daily_call_vol,
-            'Put_Vol': daily_put_vol
-        }).fillna(0.0).sort_index()
-
-        df['Net_GEX'] = df['Call_GEX'] + df['Put_GEX']
-
-        target_cols = ['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol']
-        for col in target_cols:
-            mean = df[col].rolling(window=int(days), min_periods=3).mean()
-            std = df[col].rolling(window=int(days), min_periods=3).std()
-            z = (df[col] - mean) / std.replace(0, np.nan)
-            df[f'{col}_Z'] = z.fillna(0.0)
-
-        if p_bar is not None:
-            p_bar.empty()
-        if p_status is not None:
-            p_status.empty()
-
-        return df.fillna(0.0)
     except Exception:
         if progress_container is not None:
             progress_container.empty()
@@ -602,7 +556,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
     if not smart_api:
         if p_bar: p_bar.empty()
         if p_status: p_status.empty()
-        st.error("Missing credentials or failed to generate SmartAPI session! Check Render Environment Variables.")
+        st.error("Missing credentials or failed to generate SmartAPI session!")
         return None
 
     try:
@@ -689,7 +643,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                         "oi": int(item.get("opnInterest", 0)),
                         "volume": int(vol_val)
                     }
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         update_p(0.85, "Calculating Option Greeks & Gamma Exposure Profile...")
         atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
@@ -772,12 +726,10 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST")
         }
 
-    except Exception as e:
+    except Exception:
         if p_bar: p_bar.empty()
         if p_status: p_status.empty()
-        if "exceeding access rate" in str(e).lower() or "access denied" in str(e).lower():
-            st.session_state["smart_api_instance"] = None
-        st.warning(f"API Rate limit / sync notice: Retrying on next cycle...")
+        st.warning("API Rate limit / sync notice: Retrying on next cycle...")
         return None
 
 if run_btn or "data_store" not in st.session_state:
@@ -785,14 +737,14 @@ if run_btn or "data_store" not in st.session_state:
     if new_data:
         st.session_state["data_store"] = new_data
 
-# --- Z-SCORE ANALYSIS FRAGMENT ---
+# --- Z-SCORE ANALYSIS FRAGMENT (METHOD 1 IMPLEMENTATION) ---
 @st.fragment(run_every=300 if st.session_state.get("enable_zscore_refresh", False) else None)
 def zscore_analysis_fragment():
     st.markdown("---")
     head_c1, head_c2 = st.columns([0.65, 0.35])
     with head_c1:
-        st.subheader(f"⚡ GEX & Trade Volume Z-Scores Analysis ({Index_Name})")
-        st.caption(f"Lookback Window: **{hv_days} Days** (Uses HV Lookback setting from sidebar)")
+        st.subheader(f"📊 Market Z-Scores for {Index_Name}")
+        st.caption("ℹ️ **Method 1 Active**: Evaluates continuous Spot Index Historical Volatility (HV) and Near-Month Futures Volume.")
     with head_c2:
         st.write("")
         enable_z_ref = st.checkbox("Enable Z-Score Auto-Refresh (5 min)", value=st.session_state["enable_zscore_refresh"], key="cb_zscore_refresh")
@@ -810,8 +762,7 @@ def zscore_analysis_fragment():
 
     if calc_z_btn or st.session_state["zscore_data_store"].empty:
         if smart_api:
-            lot_size = LOT_SIZES.get(Index_Name, 25)
-            z_df = fetch_historical_gex_zscores(smart_api, Index_Name, hv_days, df_master, lot_size, progress_container=progress_holder)
+            z_df = fetch_futures_zscores_method1(smart_api, Index_Name, hv_days, df_master, progress_container=progress_holder)
             st.session_state["zscore_data_store"] = z_df
         else:
             st.error("SmartAPI Session is uninitialized. Cannot calculate Z-Scores.")
@@ -819,6 +770,7 @@ def zscore_analysis_fragment():
     z_df = st.session_state["zscore_data_store"]
 
     if not z_df.empty:
+        st.markdown("### Recent Highlights (Last 5 Trading Days)")
         last_5 = z_df.tail(5).copy()
 
         def style_z(val):
@@ -829,19 +781,38 @@ def zscore_analysis_fragment():
             else:
                 return 'background-color: #b3ffb3; color: black;'
 
-        out_cols = ['Call_GEX_Z', 'Put_GEX_Z', 'Net_GEX_Z', 'Call_Vol_Z', 'Put_Vol_Z']
+        summary_cols = ['Futures_Volume_Z', 'Volatility_Proxy_Z']
         
-        styled_z_df = last_5[out_cols].style.map(
-            style_z,
-            subset=out_cols
-        ).format({col: "{:.2f}" for col in out_cols})
+        styled_z_df = last_5[summary_cols].sort_index(ascending=False).style.map(
+            style_z, subset=summary_cols
+        ).format({col: "{:.2f}" for col in summary_cols})
 
         st.dataframe(styled_z_df, use_container_width=True)
 
-        with st.expander("🔍 Inspect Raw Calculated Daily Totals (GEX & Volume)"):
-            st.dataframe(z_df[['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol']].tail(10), use_container_width=True)
+        with st.expander("🔍 Inspect Raw Calculated Daily Totals (All Evaluated Dates)", expanded=False):
+            st.info(f"Showing all **{len(z_df)}** trading days used in evaluating rolling averages and std dev.")
+            
+            display_cols = [
+                'Futures_Close', 'Futures_Volume', 'Vol_Mean', 'Vol_Std', 'Futures_Volume_Z',
+                'Volatility_Proxy', 'HV_Mean', 'HV_Std', 'Volatility_Proxy_Z'
+            ]
+            
+            st.dataframe(
+                z_df[display_cols].sort_index(ascending=False).style.format({
+                    'Futures_Close': "{:,.2f}",
+                    'Futures_Volume': "{:,.0f}",
+                    'Vol_Mean': "{:,.0f}",
+                    'Vol_Std': "{:,.0f}",
+                    'Futures_Volume_Z': "{:.2f}",
+                    'Volatility_Proxy': "{:.4f}",
+                    'HV_Mean': "{:.4f}",
+                    'HV_Std': "{:.4f}",
+                    'Volatility_Proxy_Z': "{:.2f}"
+                }),
+                use_container_width=True
+            )
     else:
-        st.info("Click '🔄 Compute / Refresh Z-Scores' above to load historical Z-Score analysis.")
+        st.info("Click '🔄 Compute / Refresh Z-Scores' above to load Futures volume Z-Score analysis.")
 
 # --- LIVE DASHBOARD FRAGMENT ---
 @st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
@@ -1067,14 +1038,15 @@ def live_dashboard_fragment():
             df_chain["Total_Vol"] = df_chain["C_Vol"] + df_chain["P_Vol"]
             df_chain["Total_OI"] = df_chain["C_OI"] + df_chain["P_OI"]
 
+            # ZERO DIVISION SAFE RANGE CALCULATOR
             def calculate_synced_ranges(v1_pos, v1_neg, v2_pos, v2_neg):
                 y1_max = max(v1_pos.max(), 1.0)
                 y1_min = min(v1_neg.min(), -1.0)
                 y2_max = max(v2_pos.max(), 1.0)
                 y2_min = min(v2_neg.min(), -1.0)
 
-                ratio1 = abs(y1_min) / y1_max
-                ratio2 = abs(y2_min) / y2_max
+                ratio1 = abs(y1_min) / max(y1_max, 1e-5)
+                ratio2 = abs(y2_min) / max(y2_max, 1e-5)
                 max_ratio = max(ratio1, ratio2)
 
                 range1 = [-y1_max * max_ratio * 1.05, y1_max * 1.05]
@@ -1132,7 +1104,7 @@ def live_dashboard_fragment():
 
             v1_range, v2_range = calculate_synced_ranges(
                 df_chain["C_Vol"], -df_chain["P_Vol"],
-                df_chain["Net_GEX_Vol"], df_chain["Net_GEX_Vol"]
+                df_chain["Net_GEX_Vol"].clip(lower=0), df_chain["Net_GEX_Vol"].clip(upper=0)
             )
 
             fig_vol.update_layout(
@@ -1221,7 +1193,7 @@ def live_dashboard_fragment():
 
             oi1_range, oi2_range = calculate_synced_ranges(
                 df_chain["C_OI"], -df_chain["P_OI"],
-                df_chain["Net_GEX_OI"], df_chain["Net_GEX_OI"]
+                df_chain["Net_GEX_OI"].clip(lower=0), df_chain["Net_GEX_OI"].clip(upper=0)
             )
 
             fig_oi.update_layout(
