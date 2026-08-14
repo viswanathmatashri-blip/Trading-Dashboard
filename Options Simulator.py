@@ -317,7 +317,7 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
         pass
     return ""
 
-# --- METHOD 1: FUTURES VOLUME & PROXY Z-SCORE COMPUTATION ---
+# --- METHOD 1 MODIFIED: FUTURES, CALL & PUT VOLUME Z-SCORE COMPUTATION ---
 def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, progress_container=None):
     try:
         if progress_container is not None:
@@ -356,6 +356,7 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
         df_spot['log_ret'] = np.log(df_spot['spot_close'] / df_spot['spot_close'].shift(1))
         df_spot['HV_Lookback'] = df_spot['log_ret'].rolling(window=window_sz).std() * np.sqrt(252)
 
+        # 1. Fetch Futures Volumes
         fut_scrips = df_scrip_master[
             (df_scrip_master['exch_seg'] == 'NFO') & 
             (df_scrip_master['name'] == symbol) & 
@@ -376,33 +377,99 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
             }
             f_res = smart_api.getCandleData(fut_param)
             if f_res and f_res.get('status') and f_res.get('data'):
-                df_fut = pd.DataFrame(f_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'fut_volume'])
+                df_fut = pd.DataFrame(f_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'tradeVolume'])
                 df_fut['date'] = df_fut['time'].str.split('T').str[0]
-                df_fut['fut_volume'] = df_fut['fut_volume'].astype(float)
+                df_fut['tradeVolume'] = df_fut['tradeVolume'].astype(float)
                 df_fut = df_fut.set_index('date')
-                df_spot = df_spot.join(df_fut['fut_volume'], how='left').fillna(0.0)
+                df_spot = df_spot.join(df_fut['tradeVolume'].rename('fut_volume'), how='left').fillna(0.0)
             else:
                 df_spot['fut_volume'] = 0.0
         else:
             df_spot['fut_volume'] = 0.0
 
+        # 2. Fetch Aggregated Near-Month CE & PE Option Volumes (using tradeVolume)
+        opt_scrips = df_scrip_master[
+            (df_scrip_master['exch_seg'] == 'NFO') & 
+            (df_scrip_master['name'] == symbol) & 
+            (df_scrip_master['instrumenttype'] == 'OPTIDX')
+        ].copy()
+        opt_scrips['expiry_dt'] = pd.to_datetime(opt_scrips['expiry'], format='%d%b%Y', errors='coerce')
+        active_opts = opt_scrips[opt_scrips['expiry_dt'].dt.date >= ist_now.date()].sort_values('expiry_dt')
+
+        call_vol_series = pd.Series(0.0, index=df_spot.index)
+        put_vol_series = pd.Series(0.0, index=df_spot.index)
+
+        if not active_opts.empty:
+            near_expiry = active_opts.iloc[0]['expiry_dt']
+            near_opts = active_opts[active_opts['expiry_dt'] == near_expiry]
+
+            # Fetch top near-ATM option contracts to aggregate volume
+            last_close = df_spot['spot_close'].iloc[-1]
+            near_opts['strike_num'] = pd.to_numeric(near_opts['strike'], errors='coerce') / 100.0
+            top_opts = near_opts.iloc[(near_opts['strike_num'] - last_close).abs().argsort()[:20]]
+
+            for _, opt_row in top_opts.iterrows():
+                o_tok = str(opt_row['token'])
+                o_symbol = str(opt_row['symbol'])
+                o_param = {
+                    "exchange": "NFO",
+                    "symboltoken": o_tok,
+                    "interval": "ONE_DAY",
+                    "fromdate": from_date,
+                    "todate": to_date
+                }
+                o_res = smart_api.getCandleData(o_param)
+                if o_res and o_res.get('status') and o_res.get('data'):
+                    df_o = pd.DataFrame(o_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'tradeVolume'])
+                    df_o['date'] = df_o['time'].str.split('T').str[0]
+                    df_o['tradeVolume'] = df_o['tradeVolume'].astype(float)
+                    df_o = df_o.set_index('date')
+
+                    if o_symbol.endswith("CE"):
+                        call_vol_series = call_vol_series.add(df_o['tradeVolume'], fill_value=0.0)
+                    elif o_symbol.endswith("PE"):
+                        put_vol_series = put_vol_series.add(df_o['tradeVolume'], fill_value=0.0)
+
+        df_spot['call_volume'] = call_vol_series.reindex(df_spot.index).fillna(0.0)
+        df_spot['put_volume'] = put_vol_series.reindex(df_spot.index).fillna(0.0)
+
         min_p = max(5, window_sz // 2)
-        
+
+        # Calculate Futures Vol Z-Score
         df_spot['Vol_Mean'] = df_spot['fut_volume'].rolling(window=window_sz, min_periods=min_p).mean()
         df_spot['Vol_Std'] = df_spot['fut_volume'].rolling(window=window_sz, min_periods=min_p).std()
         df_spot['Futures_Volume_Z'] = (df_spot['fut_volume'] - df_spot['Vol_Mean']) / df_spot['Vol_Std'].replace(0, np.nan)
 
+        # Calculate Call Vol Z-Score
+        df_spot['Call_Vol_Mean'] = df_spot['call_volume'].rolling(window=window_sz, min_periods=min_p).mean()
+        df_spot['Call_Vol_Std'] = df_spot['call_volume'].rolling(window=window_sz, min_periods=min_p).std()
+        df_spot['Call_Volume_Z'] = (df_spot['call_volume'] - df_spot['Call_Vol_Mean']) / df_spot['Call_Vol_Std'].replace(0, np.nan)
+
+        # Calculate Put Vol Z-Score
+        df_spot['Put_Vol_Mean'] = df_spot['put_volume'].rolling(window=window_sz, min_periods=min_p).mean()
+        df_spot['Put_Vol_Std'] = df_spot['put_volume'].rolling(window=window_sz, min_periods=min_p).std()
+        df_spot['Put_Volume_Z'] = (df_spot['put_volume'] - df_spot['Put_Vol_Mean']) / df_spot['Put_Vol_Std'].replace(0, np.nan)
+
+        # Calculate Volatility Proxy Z-Score
         df_spot['HV_Mean'] = df_spot['HV_Lookback'].rolling(window=window_sz, min_periods=min_p).mean()
         df_spot['HV_Std'] = df_spot['HV_Lookback'].rolling(window=window_sz, min_periods=min_p).std()
         df_spot['Volatility_Proxy_Z'] = (df_spot['HV_Lookback'] - df_spot['HV_Mean']) / df_spot['HV_Std'].replace(0, np.nan)
 
         df_res = pd.DataFrame({
             'Futures_Volume': df_spot['fut_volume'],
+            'Call_Volume': df_spot['call_volume'],
+            'Put_Volume': df_spot['put_volume'],
             'Futures_Close': df_spot['spot_close'],
             'Volatility_Proxy': df_spot['HV_Lookback'],
             'Vol_Mean': df_spot['Vol_Mean'],
             'Vol_Std': df_spot['Vol_Std'],
+            'Call_Vol_Mean': df_spot['Call_Vol_Mean'],
+            'Call_Vol_Std': df_spot['Call_Vol_Std'],
+            'Put_Vol_Mean': df_spot['Put_Vol_Mean'],
+            'Put_Vol_Std': df_spot['Put_Vol_Std'],
             'Futures_Volume_Z': df_spot['Futures_Volume_Z'],
+            'Call_Volume_Z': df_spot['Call_Volume_Z'],
+            'Put_Volume_Z': df_spot['Put_Volume_Z'],
             'HV_Mean': df_spot['HV_Mean'],
             'HV_Std': df_spot['HV_Std'],
             'Volatility_Proxy_Z': df_spot['Volatility_Proxy_Z']
@@ -411,7 +478,7 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
         if progress_container is not None:
             progress_container.empty()
 
-        return df_res.dropna(subset=['Futures_Volume_Z', 'Volatility_Proxy_Z'])
+        return df_res.dropna(subset=['Futures_Volume_Z', 'Call_Volume_Z', 'Put_Volume_Z', 'Volatility_Proxy_Z'])
 
     except Exception:
         if progress_container is not None:
@@ -621,7 +688,6 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             res = smart_api.getMarketData("FULL", {Exchange: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
-                    # Includes 'tradeVolume' for SmartAPI FULL packet support
                     vol_val = (
                         item.get("tradeVolume")
                         or item.get("volume")
@@ -730,14 +796,14 @@ if run_btn or "data_store" not in st.session_state:
     if new_data:
         st.session_state["data_store"] = new_data
 
-# --- Z-SCORE ANALYSIS FRAGMENT (METHOD 1 IMPLEMENTATION) ---
+# --- Z-SCORE ANALYSIS FRAGMENT (MODIFIED) ---
 @st.fragment(run_every=300 if st.session_state.get("enable_zscore_refresh", False) else None)
 def zscore_analysis_fragment():
     st.markdown("---")
     head_c1, head_c2 = st.columns([0.65, 0.35])
     with head_c1:
         st.subheader(f"📊 Market Z-Scores for {Index_Name}")
-        st.caption("ℹ️ **Method 1 Active**: Evaluates continuous Spot Index Historical Volatility (HV) and Near-Month Futures Volume.")
+        st.caption("ℹ️ **Method 1 Active**: Evaluates continuous Spot Index Historical Volatility (HV), Near-Month Futures Volume, and Call/Put Volumes.")
     with head_c2:
         st.write("")
         enable_z_ref = st.checkbox("Enable Z-Score Auto-Refresh (5 min)", value=st.session_state["enable_zscore_refresh"], key="cb_zscore_refresh")
@@ -774,7 +840,8 @@ def zscore_analysis_fragment():
             else:
                 return 'background-color: #b3ffb3; color: black;'
 
-        summary_cols = ['Futures_Volume_Z', 'Volatility_Proxy_Z']
+        # Table 1: Z-Scores for Futures, Call, and Put Volumes
+        summary_cols = ['Futures_Volume_Z', 'Call_Volume_Z', 'Put_Volume_Z', 'Volatility_Proxy_Z']
         
         styled_z_df = last_5[summary_cols].sort_index(ascending=False).style.map(
             style_z, subset=summary_cols
@@ -782,11 +849,15 @@ def zscore_analysis_fragment():
 
         st.dataframe(styled_z_df, use_container_width=True)
 
-        with st.expander("🔍 Inspect Raw Calculated Daily Totals (All Evaluated Dates)", expanded=False):
+        # Table 2: Raw Volumes Used for Calculating Z-Scores
+        with st.expander("🔍 Inspect Raw Calculated Daily Totals & Volumes Used (All Evaluated Dates)", expanded=True):
             st.info(f"Showing all **{len(z_df)}** trading days used in evaluating rolling averages and std dev.")
             
             display_cols = [
-                'Futures_Close', 'Futures_Volume', 'Vol_Mean', 'Vol_Std', 'Futures_Volume_Z',
+                'Futures_Close', 'Futures_Volume', 'Call_Volume', 'Put_Volume',
+                'Vol_Mean', 'Vol_Std', 'Futures_Volume_Z',
+                'Call_Vol_Mean', 'Call_Vol_Std', 'Call_Volume_Z',
+                'Put_Vol_Mean', 'Put_Vol_Std', 'Put_Volume_Z',
                 'Volatility_Proxy', 'HV_Mean', 'HV_Std', 'Volatility_Proxy_Z'
             ]
             
@@ -794,9 +865,17 @@ def zscore_analysis_fragment():
                 z_df[display_cols].sort_index(ascending=False).style.format({
                     'Futures_Close': "{:,.2f}",
                     'Futures_Volume': "{:,.0f}",
+                    'Call_Volume': "{:,.0f}",
+                    'Put_Volume': "{:,.0f}",
                     'Vol_Mean': "{:,.0f}",
                     'Vol_Std': "{:,.0f}",
+                    'Call_Vol_Mean': "{:,.0f}",
+                    'Call_Vol_Std': "{:,.0f}",
+                    'Put_Vol_Mean': "{:,.0f}",
+                    'Put_Vol_Std': "{:,.0f}",
                     'Futures_Volume_Z': "{:.2f}",
+                    'Call_Volume_Z': "{:.2f}",
+                    'Put_Volume_Z': "{:.2f}",
                     'Volatility_Proxy': "{:.4f}",
                     'HV_Mean': "{:.4f}",
                     'HV_Std': "{:.4f}",
@@ -805,7 +884,7 @@ def zscore_analysis_fragment():
                 use_container_width=True
             )
     else:
-        st.info("Click '🔄 Compute / Refresh Z-Scores' above to load Futures volume Z-Score analysis.")
+        st.info("Click '🔄 Compute / Refresh Z-Scores' above to load volume Z-Score analysis.")
 
 # --- LIVE DASHBOARD FRAGMENT ---
 @st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
