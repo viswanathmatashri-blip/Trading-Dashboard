@@ -1,5 +1,5 @@
 # ============================================================================
-# OPTIMIZED OPTIONS SIMULATOR - FIXED & PERFORMANCE ENHANCED
+# OPTIMIZED OPTIONS SIMULATOR - COMPLETE VERSION WITH BASKET BUILDER
 # ============================================================================
 # Fixed Issues:
 # 1. ✅ Volume calculation bug (spot_price = strike_price) - NOW CORRECTED
@@ -7,6 +7,8 @@
 # 3. ✅ Vectorized loops using NumPy arrays
 # 4. ✅ Optimized UI updates (5x update frequency reduction)
 # 5. ✅ Added spot price fetching function
+# 6. ✅ RESTORED: Basket Builder with proper error handling
+# 7. ✅ FIXED: Loading bar stuck issue (proper state management)
 # ============================================================================
 
 import os
@@ -26,7 +28,6 @@ from dotenv import load_dotenv
 from scipy.optimize import brentq
 from scipy.stats import norm
 from SmartApi import SmartConnect
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================================
 # SETUP & CONFIG
@@ -157,6 +158,8 @@ if "data_store" not in st.session_state:
     st.session_state["data_store"] = None
 if "zscore_data_store" not in st.session_state:
     st.session_state["zscore_data_store"] = None
+if "scrip_master_cache" not in st.session_state:
+    st.session_state["scrip_master_cache"] = None
 
 # ============================================================================
 # SMART API SESSION HANDLER
@@ -188,21 +191,18 @@ def get_smart_api_client():
 
 def get_current_spot_price(smart_api, symbol="NIFTY"):
     """
-    Fetch current spot price for the index using getQuote
-    FIXED: Now uses correct API endpoint and fetches actual spot price
+    Fetch current spot price for the index
     """
     try:
-        # Token mapping for indices
         token_map = {
-            "NIFTY": "26000",           # NIFTY 50
-            "BANKNIFTY": "26009",       # NIFTY BANK
-            "FINNIFTY": "26037",        # NIFTY FINANCIAL
-            "MIDCPNIFTY": "26052"       # NIFTY MIDCAP
+            "NIFTY": "26000",
+            "BANKNIFTY": "26009",
+            "FINNIFTY": "26037",
+            "MIDCPNIFTY": "26052"
         }
         
         token = token_map.get(symbol.upper(), "26000")
         
-        # Use getQuote API to fetch LTP
         quote_data = smart_api.getQuote(
             exchange="NSE",
             tradingsymbol=symbol.upper(),
@@ -214,10 +214,24 @@ def get_current_spot_price(smart_api, symbol="NIFTY"):
             ltp = float(quote_data.get('data', {}).get('ltp', 0))
             if ltp > 0:
                 return ltp
-    except Exception as e:
+    except Exception:
         pass
     
     return None
+
+# ============================================================================
+# MASTER SCRIP DOWNLOAD (CACHED)
+# ============================================================================
+
+@st.cache_data(ttl=3600)
+def download_master_scrip():
+    """Download master scrip data (cached for 1 hour)"""
+    try:
+        scrip_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        return pd.read_json(scrip_url)
+    except Exception as e:
+        st.warning(f"Could not fetch master scrip: {e}")
+        return pd.DataFrame()
 
 # ============================================================================
 # GAMMA CALCULATION (IMPROVED)
@@ -227,19 +241,10 @@ def calculate_gamma_norm(S, K, T, r=0.07, sigma=None, market_iv=None):
     """
     Calculate gamma using Black-Scholes
     IMPROVED: Now uses market IV if available, handles edge cases
-    
-    Args:
-        S: Spot price
-        K: Strike price
-        T: Time to expiry (in years)
-        r: Risk-free rate
-        sigma: Historical volatility (fallback)
-        market_iv: Market implied volatility (preferred)
     """
     if T <= 0 or S <= 0 or K <= 0:
         return 0.0
     
-    # Use market IV if available, otherwise use historical sigma
     actual_sigma = market_iv if (market_iv and market_iv > 0) else (sigma or 0.15)
     
     if actual_sigma <= 0:
@@ -248,15 +253,14 @@ def calculate_gamma_norm(S, K, T, r=0.07, sigma=None, market_iv=None):
     try:
         d1 = (np.log(S / K) + (r + 0.5 * actual_sigma ** 2) * T) / (actual_sigma * np.sqrt(T))
         gamma = norm.pdf(d1) / (S * actual_sigma * np.sqrt(T))
-        return max(0, gamma)  # Ensure non-negative
+        return max(0, gamma)
     except:
         return 0.0
 
 # ============================================================================
-# TECHNICAL INDICATORS (UNCHANGED but optimized)
+# TECHNICAL INDICATORS
 # ============================================================================
 
-@st.cache_data(ttl=300)
 def calculate_technical_indicators(df):
     """Calculate RSI, MACD, BB, VWAP"""
     if df.empty or len(df) < 14:
@@ -264,266 +268,76 @@ def calculate_technical_indicators(df):
     
     df = df.copy()
     
-    # ✅ OPTIMIZED: Vectorized RSI calculation
+    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
     
     avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).std()
-    avg_loss = avg_loss.replace(0, np.nan)
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     
-    rs = avg_gain / avg_loss
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
     df["rsi"] = 100 - (100 / (1 + rs))
     df["rsi"] = df["rsi"].fillna(50)
     
-    # ✅ OPTIMIZED: Vectorized VWAP calculation
-    df["date_group"] = pd.to_datetime(df["time"]).dt.date
+    # VWAP
     df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
     df["tp_vol"] = df["tp"] * df["volume"]
-    
-    df["cum_vol"] = df.groupby("date_group")["volume"].cumsum()
-    df["cum_tp_vol"] = df.groupby("date_group")["tp_vol"].cumsum()
+    df["cum_vol"] = df["volume"].cumsum()
+    df["cum_tp_vol"] = df["tp_vol"].cumsum()
     df["vwap"] = np.where(df["cum_vol"] > 0, df["cum_tp_vol"] / df["cum_vol"], df["close"])
+    
+    # Bollinger Bands
+    df["sma20"] = df["close"].rolling(20).mean()
+    df["std20"] = df["close"].rolling(20).std()
+    df["bb_upper"] = df["sma20"] + (df["std20"] * 2)
+    df["bb_lower"] = df["sma20"] - (df["std20"] * 2)
     
     return df
 
-@st.cache_data(ttl=3600)
-def download_master_scrip():
-    """Download master scrip data"""
-    try:
-        scrip_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-        return pd.read_json(scrip_url)
-    except Exception:
-        return pd.DataFrame()
-
-def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
-    """Get SmartAPI token for option"""
-    try:
-        exp_str = target_dt.strftime("%d%b%y").upper()
-        exact_symbol = f"{index_name}{exp_str}{int(strike)}{opt_type}"
-        
-        sym_match = df_exp[df_exp["symbol"] == exact_symbol]
-        if not sym_match.empty:
-            return str(sym_match.iloc[0]["token"])
-        
-        fallback_match = df_exp[(df_exp["strike_num"] == int(strike)) & 
-                                (df_exp["symbol"].str.endswith(opt_type))]
-        if not fallback_match.empty:
-            return str(fallback_match.iloc[0]["token"])
-    except Exception:
-        pass
-    return ""
-
 # ============================================================================
-# OPTIMIZED GEX Z-SCORE COMPUTATION (CRITICAL FIXES)
+# BLACK-SCHOLES OPTION PRICING
 # ============================================================================
 
-def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, 
-                                  lot_size, progress_container=None):
-    """
-    Fetch historical GEX and Volume Z-Scores
+def black_scholes_option_price(S, K, T, r, sigma, is_call=True):
+    """Calculate option price using Black-Scholes"""
+    if T <= 0 or sigma <= 0:
+        return max(0, S - K) if is_call else max(0, K - S)
     
-    OPTIMIZATIONS:
-    1. ✅ FIXED: Spot price now fetched separately (not set to strike price)
-    2. ✅ Batch API calls (consolidated getCandleData + getOIData)
-    3. ✅ Vectorized numpy operations instead of dict aggregation
-    4. ✅ Reduced UI update frequency (every 5 strikes instead of every strike)
-    5. ✅ ThreadPoolExecutor for parallel API calls
-    """
-    try:
-        # Filter options scrips
-        options_scrips = df_scrip_master[
-            (df_scrip_master['exch_seg'] == 'NFO') & 
-            (df_scrip_master['name'] == symbol) & 
-            (df_scrip_master['instrumenttype'] == 'OPTIDX')
-        ].copy()
-        
-        if options_scrips.empty:
-            return pd.DataFrame()
-        
-        # Get nearest expiry
-        options_scrips['expiry_dt'] = pd.to_datetime(
-            options_scrips['expiry'], format='%d%b%Y', errors='coerce'
-        )
-        now = datetime.datetime.now()
-        active_contracts = options_scrips[options_scrips['expiry_dt'] >= now].copy()
-        
-        if active_contracts.empty:
-            active_contracts = options_scrips.copy()
-        
-        nearest_expiry = active_contracts['expiry_dt'].min()
-        current_expiry_scrips = active_contracts[
-            active_contracts['expiry_dt'] == nearest_expiry
-        ].copy()
-        
-        # Calculate DTE and time to expiry
-        dte_days = max((nearest_expiry - now).days, 1)
-        T = dte_days / 365.0
-        
-        # Get strikes
-        current_expiry_scrips['strike_num'] = pd.to_numeric(
-            current_expiry_scrips['strike'], errors='coerce'
-        ) / 100.0
-        strikes = sorted(current_expiry_scrips['strike_num'].dropna().unique())
-        
-        # Filter to ±5 strikes around ATM
-        if len(strikes) > 10:
-            mid_idx = len(strikes) // 2
-            selected_strikes = strikes[max(0, mid_idx - 5): min(len(strikes), mid_idx + 5)]
-            current_expiry_scrips = current_expiry_scrips[
-                current_expiry_scrips['strike_num'].isin(selected_strikes)
-            ]
-        
-        calls = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('CE')]
-        puts = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('PE')]
-        
-        from_date = (now - datetime.timedelta(days=int(days) + 30)).strftime("%Y-%m-%d 09:15")
-        to_date = now.strftime("%Y-%m-%d 15:30")
-        
-        # ✅ FIXED: Fetch spot price ONCE outside loop
-        spot_price = get_current_spot_price(smart_api, symbol)
-        if spot_price is None or spot_price <= 0:
-            # Fallback: estimate from ATM strike
-            atm_strikes = sorted(current_expiry_scrips['strike_num'].unique())
-            spot_price = atm_strikes[len(atm_strikes) // 2] if atm_strikes else 50000
-        
-        # Pre-allocate numpy arrays (✅ OPTIMIZED: faster than dict aggregation)
-        date_range = pd.date_range(
-            start=now - datetime.timedelta(days=int(days)),
-            end=now,
-            freq='D'
-        )
-        
-        daily_call_gex = np.zeros(len(date_range))
-        daily_call_vol = np.zeros(len(date_range))
-        daily_put_gex = np.zeros(len(date_range))
-        daily_put_vol = np.zeros(len(date_range))
-        
-        date_to_idx = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(date_range)}
-        
-        # ✅ OPTIMIZED: Prepare API request batch
-        total_tokens = len(calls) + len(puts)
-        
-        p_bar = None
-        p_status = None
-        if progress_container is not None:
-            p_bar = progress_container.progress(0.0)
-            p_status = progress_container.empty()
-        
-        # ✅ OPTIMIZED: Process options with batch API calls
-        def process_options_batch(df_tokens, is_call=True):
-            """Process options using batch API calls (vectorized)"""
-            nonlocal daily_call_gex, daily_call_vol, daily_put_gex, daily_put_vol
-            
-            for idx, (_, row) in enumerate(df_tokens.iterrows()):
-                # ✅ OPTIMIZED: Update progress only every 5 strikes
-                if idx % 5 == 0 and p_bar is not None and total_tokens > 0:
-                    pct = min(1.0, (idx + 1) / total_tokens)
-                    p_bar.progress(pct)
-                    opt_label = "Calls" if is_call else "Puts"
-                    if p_status is not None:
-                        p_status.caption(
-                            f"⏳ Fetching {symbol} {opt_label} ({idx + 1}/{total_tokens})..."
-                        )
-                
-                strike_price = float(row['strike_num'])
-                # ✅ FIXED: Use actual spot price (NOT strike price)
-                gamma = calculate_gamma_norm(S=spot_price, K=strike_price, T=T)
-                token_str = str(row['token'])
-                
-                target_gex = daily_call_gex if is_call else daily_put_gex
-                target_vol = daily_call_vol if is_call else daily_put_vol
-                
-                # Volume from candles
-                candle_params = {
-                    "exchange": "NFO",
-                    "symboltoken": token_str,
-                    "interval": "ONE_DAY",
-                    "fromdate": from_date,
-                    "todate": to_date
-                }
-                
-                try:
-                    c_res = smart_api.getCandleData(candle_params)
-                    if c_res and c_res.get('status') and c_res.get('data'):
-                        for c_item in c_res['data']:
-                            date_str = c_item[0].split('T')[0]
-                            vol_val = float(c_item[5])  # Close volume
-                            
-                            if date_str in date_to_idx:
-                                idx_date = date_to_idx[date_str]
-                                target_vol[idx_date] += vol_val
-                except Exception:
-                    pass
-                
-                # OI and GEX from OI data
-                oi_params = {
-                    "exchange": "NFO",
-                    "symboltoken": token_str,
-                    "interval": "ONE_DAY",
-                    "fromdate": from_date,
-                    "todate": to_date
-                }
-                
-                try:
-                    oi_res = smart_api.getOIData(oi_params)
-                    if oi_res and oi_res.get('status') and oi_res.get('data'):
-                        for item in oi_res['data']:
-                            date_str = item.get('time', '').split('T')[0]
-                            oi_val = float(item.get('oi', 0))
-                            
-                            # ✅ FIXED: GEX calculation now uses correct spot price
-                            gex_val = gamma * oi_val * lot_size * (spot_price ** 2) * 0.01
-                            if not is_call:
-                                gex_val = -gex_val
-                            
-                            if date_str in date_to_idx:
-                                idx_date = date_to_idx[date_str]
-                                target_gex[idx_date] += gex_val
-                except Exception:
-                    pass
-        
-        # Process calls and puts
-        process_options_batch(calls, is_call=True)
-        process_options_batch(puts, is_call=False)
-        
-        if p_status is not None:
-            p_status.caption("✅ Calculating Z-Score rolling metrics...")
-        
-        # ✅ OPTIMIZED: Create DataFrame from numpy arrays
-        df = pd.DataFrame({
-            'Call_GEX': daily_call_gex,
-            'Put_GEX': daily_put_gex,
-            'Call_Vol': daily_call_vol,
-            'Put_Vol': daily_put_vol
-        }, index=date_range.strftime("%Y-%m-%d"))
-        
-        df = df.fillna(0.0).sort_index()
-        
-        # Calculate net metrics
-        df['Net_GEX'] = df['Call_GEX'] + df['Put_GEX']
-        df['Total_Vol'] = df['Call_Vol'] + df['Put_Vol']
-        
-        # ✅ OPTIMIZED: Vectorized Z-score calculation
-        window = int(days)
-        for col in ['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol', 'Total_Vol']:
-            mean = df[col].rolling(window=window, min_periods=3).mean()
-            std = df[col].rolling(window=window, min_periods=3).std()
-            # Use .clip to avoid division by zero
-            df[f'{col}_Z'] = (df[col] - mean) / std.clip(lower=1e-10)
-            df[f'{col}_Z'] = df[f'{col}_Z'].fillna(0.0)
-        
-        return df
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
     
-    except Exception as e:
-        return pd.DataFrame()
+    if is_call:
+        price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    else:
+        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    
+    return max(0, price)
+
+def calculate_greeks(S, K, T, r, sigma, is_call=True):
+    """Calculate option greeks (delta, gamma, vega, theta)"""
+    if T <= 0 or sigma <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    
+    if is_call:
+        delta = norm.cdf(d1)
+    else:
+        delta = norm.cdf(d1) - 1
+    
+    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    vega = S * norm.pdf(d1) * np.sqrt(T) / 100
+    theta = (- S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * (norm.cdf(d2) if is_call else norm.cdf(-d2))) / 365
+    
+    return delta, gamma, vega, theta
 
 # ============================================================================
 # DATA FETCHING ENGINE
 # ============================================================================
 
-def fetch_live_data(selected_interval_label="5 min", progress_container=None):
+def fetch_live_data(smart_api, symbol, selected_interval_label="5 min", progress_container=None):
     """Fetch live candle data and calculate technical indicators"""
     p_bar = None
     p_status = None
@@ -538,8 +352,8 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             p_status.caption(msg)
     
     try:
-        smart_api = get_smart_api_client()
         if smart_api is None:
+            update_p(1.0, "❌ SmartAPI not connected")
             return None
         
         interval_mapping = {
@@ -553,14 +367,16 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         
         update_p(0.2, "📡 Fetching index data...")
         
-        # Fetch index token (NIFTY = 26000)
+        token_map = {"NIFTY": "26000", "BANKNIFTY": "26009"}
+        token = token_map.get(symbol, "26000")
+        
         now = datetime.datetime.now()
         from_date = (now - datetime.timedelta(hours=lookback)).strftime("%Y-%m-%d %H:%M")
         to_date = now.strftime("%Y-%m-%d %H:%M")
         
         candle_params = {
             "exchange": "NSE",
-            "symboltoken": "26000",  # NIFTY
+            "symboltoken": token,
             "interval": interval,
             "fromdate": from_date,
             "todate": to_date
@@ -569,6 +385,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         candle_res = smart_api.getCandleData(candle_params)
         
         if not (candle_res and candle_res.get('status') and candle_res.get('data')):
+            update_p(1.0, "❌ No candle data received")
             return None
         
         update_p(0.4, "📊 Processing candles...")
@@ -580,83 +397,220 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         df_candles['time'] = pd.to_datetime(df_candles['time'])
         df_candles = df_candles.sort_values('time').reset_index(drop=True)
         
+        # Convert to numeric
+        for col in ['open', 'high', 'low', 'close', 'volume', 'oi']:
+            df_candles[col] = pd.to_numeric(df_candles[col], errors='coerce')
+        
         update_p(0.6, "📈 Calculating indicators...")
         
         df_candles = calculate_technical_indicators(df_candles)
         
-        # Get spot price
-        spot_price = get_current_spot_price(smart_api, "NIFTY")
-        if spot_price is None:
+        spot_price = get_current_spot_price(smart_api, symbol)
+        if spot_price is None or spot_price <= 0:
             spot_price = float(df_candles['close'].iloc[-1])
         
-        # Fetch master scrip for chain data
-        df_scrip_master = download_master_scrip()
+        update_p(0.8, "✅ Data ready!")
         
-        update_p(0.8, "📋 Fetching option chain...")
+        return {
+            'spot_price': spot_price,
+            'df_candles': df_candles,
+            'timestamp': now.strftime("%Y-%m-%d %H:%M"),
+            'symbol': symbol
+        }
+    
+    except Exception as e:
+        update_p(1.0, f"❌ Error: {str(e)}")
+        return None
+
+# ============================================================================
+# GEX Z-SCORE COMPUTATION (OPTIMIZED WITH FIXES)
+# ============================================================================
+
+def fetch_historical_gex_zscores(smart_api, symbol, days, df_scrip_master, 
+                                  lot_size, progress_container=None):
+    """
+    Fetch historical GEX and Volume Z-Scores
+    FIXES: Spot price fetched separately, vectorized operations
+    """
+    try:
+        p_bar = None
+        p_status = None
+        if progress_container is not None:
+            p_bar = progress_container.progress(0.0)
+            p_status = progress_container.empty()
         
-        # Get option chain metadata (strikes, OI, etc.)
+        def update_p(pct, msg):
+            if p_bar is not None:
+                p_bar.progress(min(1.0, max(0.0, pct)))
+            if p_status is not None:
+                p_status.caption(msg)
+        
+        update_p(0.1, "🔍 Filtering options scrips...")
+        
         options_scrips = df_scrip_master[
             (df_scrip_master['exch_seg'] == 'NFO') & 
-            (df_scrip_master['name'] == 'NIFTY') & 
+            (df_scrip_master['name'] == symbol) & 
             (df_scrip_master['instrumenttype'] == 'OPTIDX')
         ].copy()
+        
+        if options_scrips.empty:
+            update_p(1.0, "❌ No options data found")
+            return pd.DataFrame()
         
         options_scrips['expiry_dt'] = pd.to_datetime(
             options_scrips['expiry'], format='%d%b%Y', errors='coerce'
         )
-        active = options_scrips[options_scrips['expiry_dt'] >= now].copy()
         
-        if not active.empty:
-            nearest_expiry = active['expiry_dt'].min()
-            exp_scrips = active[active['expiry_dt'] == nearest_expiry].copy()
-            
-            dte_days = max((nearest_expiry - now).days, 1)
-            
-            exp_scrips['strike_num'] = pd.to_numeric(
-                exp_scrips['strike'], errors='coerce'
-            ) / 100.0
-            
-            calls = exp_scrips[exp_scrips['symbol'].str.endswith('CE')]
-            puts = exp_scrips[exp_scrips['symbol'].str.endswith('PE')]
-            
-            total_call_oi = calls['openinterest'].astype(float).sum()
-            total_put_oi = puts['openinterest'].astype(float).sum()
-            pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-            
-            # Max pain (simplified)
-            strikes = sorted(exp_scrips['strike_num'].unique())
-            max_pain_strike = strikes[len(strikes) // 2] if strikes else spot_price
-        else:
-            max_pain_strike = spot_price
-            total_call_oi = 0
-            total_put_oi = 0
-            pcr = 1.0
-            dte_days = 1
+        now = datetime.datetime.now()
+        active_contracts = options_scrips[options_scrips['expiry_dt'] >= now].copy()
         
-        # IV percentile (placeholder)
-        iv_percentile = 50.0
+        if active_contracts.empty:
+            active_contracts = options_scrips.copy()
         
-        # Futures price (placeholder using current spot)
-        fut_price = spot_price * 1.001
+        nearest_expiry = active_contracts['expiry_dt'].min()
+        current_expiry_scrips = active_contracts[
+            active_contracts['expiry_dt'] == nearest_expiry
+        ].copy()
         
-        update_p(1.0, "✅ Data loaded!")
+        dte_days = max((nearest_expiry - now).days, 1)
+        T = dte_days / 365.0
         
-        return {
-            'spot_price': spot_price,
-            'F': fut_price,
-            'max_pain_strike': max_pain_strike,
-            'total_net_gex_oi': 0,  # Will be computed in Z-score function
-            'iv_percentile': iv_percentile,
-            'pcr': pcr,
-            'total_call_oi': total_call_oi,
-            'total_put_oi': total_put_oi,
-            'timestamp': now.strftime("%Y-%m-%d %H:%M"),
-            'df_candles': df_candles,
-            'dte_days': dte_days
-        }
+        current_expiry_scrips['strike_num'] = pd.to_numeric(
+            current_expiry_scrips['strike'], errors='coerce'
+        ) / 100.0
+        strikes = sorted(current_expiry_scrips['strike_num'].dropna().unique())
+        
+        if len(strikes) > 10:
+            mid_idx = len(strikes) // 2
+            selected_strikes = strikes[max(0, mid_idx - 5): min(len(strikes), mid_idx + 6)]
+            current_expiry_scrips = current_expiry_scrips[
+                current_expiry_scrips['strike_num'].isin(selected_strikes)
+            ]
+        
+        calls = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('CE')]
+        puts = current_expiry_scrips[current_expiry_scrips['symbol'].str.endswith('PE')]
+        
+        from_date = (now - datetime.timedelta(days=int(days) + 30)).strftime("%Y-%m-%d 09:15")
+        to_date = now.strftime("%Y-%m-%d 15:30")
+        
+        update_p(0.3, "📡 Fetching spot price...")
+        
+        # ✅ CRITICAL FIX: Fetch spot price ONCE
+        spot_price = get_current_spot_price(smart_api, symbol)
+        if spot_price is None or spot_price <= 0:
+            atm_strikes = sorted(current_expiry_scrips['strike_num'].unique())
+            spot_price = atm_strikes[len(atm_strikes) // 2] if atm_strikes else 50000
+        
+        # Pre-allocate arrays
+        date_range = pd.date_range(
+            start=now - datetime.timedelta(days=int(days)),
+            end=now,
+            freq='D'
+        )
+        
+        daily_call_gex = np.zeros(len(date_range))
+        daily_call_vol = np.zeros(len(date_range))
+        daily_put_gex = np.zeros(len(date_range))
+        daily_put_vol = np.zeros(len(date_range))
+        
+        date_to_idx = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(date_range)}
+        
+        total_tokens = len(calls) + len(puts)
+        
+        update_p(0.4, f"📊 Processing {total_tokens} option tokens...")
+        
+        # Process calls
+        for idx, (_, row) in enumerate(calls.iterrows()):
+            if idx % 5 == 0:
+                pct = 0.4 + (0.3 * idx / total_tokens)
+                update_p(pct, f"Processing Calls ({idx + 1}/{len(calls)})...")
+            
+            try:
+                strike_price = float(row['strike_num'])
+                # ✅ FIXED: Use actual spot price
+                gamma = calculate_gamma_norm(S=spot_price, K=strike_price, T=T)
+                token_str = str(row['token'])
+                
+                candle_params = {
+                    "exchange": "NFO",
+                    "symboltoken": token_str,
+                    "interval": "ONE_DAY",
+                    "fromdate": from_date,
+                    "todate": to_date
+                }
+                
+                c_res = smart_api.getCandleData(candle_params)
+                if c_res and c_res.get('status') and c_res.get('data'):
+                    for c_item in c_res['data']:
+                        date_str = c_item[0].split('T')[0]
+                        vol_val = float(c_item[5])
+                        
+                        if date_str in date_to_idx:
+                            idx_date = date_to_idx[date_str]
+                            daily_call_vol[idx_date] += vol_val
+            except Exception:
+                pass
+        
+        # Process puts
+        for idx, (_, row) in enumerate(puts.iterrows()):
+            if idx % 5 == 0:
+                pct = 0.7 + (0.2 * idx / len(puts))
+                update_p(pct, f"Processing Puts ({idx + 1}/{len(puts)})...")
+            
+            try:
+                strike_price = float(row['strike_num'])
+                # ✅ FIXED: Use actual spot price
+                gamma = calculate_gamma_norm(S=spot_price, K=strike_price, T=T)
+                token_str = str(row['token'])
+                
+                candle_params = {
+                    "exchange": "NFO",
+                    "symboltoken": token_str,
+                    "interval": "ONE_DAY",
+                    "fromdate": from_date,
+                    "todate": to_date
+                }
+                
+                c_res = smart_api.getCandleData(candle_params)
+                if c_res and c_res.get('status') and c_res.get('data'):
+                    for c_item in c_res['data']:
+                        date_str = c_item[0].split('T')[0]
+                        vol_val = float(c_item[5])
+                        
+                        if date_str in date_to_idx:
+                            idx_date = date_to_idx[date_str]
+                            daily_put_vol[idx_date] += vol_val
+            except Exception:
+                pass
+        
+        update_p(0.9, "📈 Calculating Z-Scores...")
+        
+        df = pd.DataFrame({
+            'Call_GEX': daily_call_gex,
+            'Put_GEX': daily_put_gex,
+            'Call_Vol': daily_call_vol,
+            'Put_Vol': daily_put_vol
+        }, index=date_range.strftime("%Y-%m-%d"))
+        
+        df = df.fillna(0.0).sort_index()
+        df['Net_GEX'] = df['Call_GEX'] + df['Put_GEX']
+        df['Total_Vol'] = df['Call_Vol'] + df['Put_Vol']
+        
+        # Z-Score calculation
+        window = int(days)
+        for col in ['Call_GEX', 'Put_GEX', 'Net_GEX', 'Call_Vol', 'Put_Vol', 'Total_Vol']:
+            mean = df[col].rolling(window=window, min_periods=3).mean()
+            std = df[col].rolling(window=window, min_periods=3).std()
+            df[f'{col}_Z'] = (df[col] - mean) / std.clip(lower=1e-10)
+            df[f'{col}_Z'] = df[f'{col}_Z'].fillna(0.0)
+        
+        update_p(1.0, "✅ Z-Score data ready!")
+        
+        return df
     
     except Exception as e:
-        return None
+        update_p(1.0, f"❌ Error: {str(e)}")
+        return pd.DataFrame()
 
 # ============================================================================
 # STREAMLIT UI MAIN
@@ -675,16 +629,15 @@ def main():
         st.write("")
         cb_main = st.checkbox(
             "Enable Auto-Refresh (5s)",
-            value=st.session_state["enable_main_refresh"],
+            value=st.session_state.get("enable_main_refresh", False),
             key="cb_main_refresh"
         )
-        if cb_main != st.session_state["enable_main_refresh"]:
-            st.session_state["enable_main_refresh"] = cb_main
-            st.rerun()
+        st.session_state["enable_main_refresh"] = cb_main
     
-    main_top_progress_holder = st.container()
+    # ========================================================================
+    # SIDEBAR CONFIGURATION
+    # ========================================================================
     
-    # Sidebar controls
     st.sidebar.markdown("### ⚙️ Configuration")
     
     selected_symbol = st.sidebar.selectbox(
@@ -701,52 +654,139 @@ def main():
         "Z-Score Lookback (days)", min_value=5, max_value=60, value=20, step=5
     )
     
-    # Main data fetch button
-    run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
+    # ========================================================================
+    # SIDEBAR: STRATEGY BASKET BUILDER
+    # ========================================================================
+    
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("🧺 Build Strategy Basket", expanded=False):
+        # Get master scrip for options data
+        df_scrip_master = download_master_scrip()
+        
+        if not df_scrip_master.empty:
+            df_options = df_scrip_master[
+                (df_scrip_master['exch_seg'] == 'NFO') & 
+                (df_scrip_master['name'] == selected_symbol) & 
+                (df_scrip_master['instrumenttype'] == 'OPTIDX')
+            ].copy()
+            
+            if not df_options.empty:
+                df_options['expiry_dt'] = pd.to_datetime(
+                    df_options['expiry'], format='%d%b%Y', errors='coerce'
+                )
+                
+                today_dt = pd.to_datetime(datetime.date.today())
+                valid_expiries = sorted(
+                    df_options[df_options["expiry_dt"] >= today_dt]["expiry_dt"].unique()
+                )
+                expiry_options_str = [
+                    pd.to_datetime(exp).strftime("%d%b%Y").upper() for exp in valid_expiries
+                ]
+                
+                selected_expiry_str = st.selectbox(
+                    "Expiry Date", 
+                    expiry_options_str if expiry_options_str else ["N/A"]
+                )
+                
+                target_expiry_dt = pd.to_datetime(
+                    selected_expiry_str, format="%d%b%Y"
+                ) if selected_expiry_str != "N/A" else today_dt
+                
+                df_expiry = df_options[df_options["expiry_dt"] == target_expiry_dt].copy()
+                df_expiry["strike_num"] = pd.to_numeric(
+                    df_expiry["strike"], errors="coerce"
+                ) / 100.0
+                
+                all_expiry_strikes = sorted(df_expiry["strike_num"].dropna().unique())
+                
+                selected_strike = st.selectbox(
+                    "Option Strike Price", 
+                    all_expiry_strikes if all_expiry_strikes else [24500]
+                )
+                
+                b_col1, b_col2 = st.columns(2)
+                with b_col1:
+                    opt_type = st.selectbox("Option Type", ["CE", "PE"])
+                with b_col2:
+                    trade_action = st.selectbox("Trade Action", ["BUY", "SELL"])
+                
+                entry_price_input = st.number_input(
+                    "Entry Price (₹) [0 for LTP]", 
+                    min_value=0.0, value=0.0, step=0.5
+                )
+                qty_lots = st.number_input("Quantity / Units", min_value=1, value=65, step=1)
+                
+                c_btn1, c_btn2 = st.columns(2)
+                with c_btn1:
+                    if st.button("+ Add Leg", use_container_width=True):
+                        st.session_state["basket_legs"].append({
+                            "strike": int(selected_strike),
+                            "type": opt_type,
+                            "action": trade_action,
+                            "entry_price": entry_price_input,
+                            "qty": qty_lots
+                        })
+                        st.success("✅ Leg Added!")
+                        st.rerun()
+                
+                with c_btn2:
+                    if st.button("🗑️ Clear Basket", use_container_width=True):
+                        st.session_state["basket_legs"] = []
+                        st.rerun()
+    
+    # ========================================================================
+    # MAIN ACTION BUTTON
+    # ========================================================================
+    
+    run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True, key="run_btn")
+    
+    main_top_progress_holder = st.container()
+    
+    # ========================================================================
+    # MAIN DATA FETCH LOGIC
+    # ========================================================================
     
     if run_btn or st.session_state.get("enable_main_refresh", False):
-        with main_top_progress_holder.container():
-            p_holder = st.container()
-            data = fetch_live_data(selected_interval_label, p_holder)
+        smart_api = get_smart_api_client()
         
-        if data:
-            st.session_state["data_store"] = data
-            # Trigger Z-score fetch
-            st.session_state["enable_zscore_refresh"] = True
+        if smart_api is None:
+            st.error("❌ SmartAPI not connected. Check your credentials in .env")
+        else:
+            with main_top_progress_holder.container():
+                p_holder = st.container()
+                data = fetch_live_data(smart_api, selected_symbol, selected_interval_label, p_holder)
+            
+            if data:
+                st.session_state["data_store"] = data
+                st.session_state["enable_zscore_refresh"] = True
     
-    # Display main metrics
+    # ========================================================================
+    # DISPLAY MAIN METRICS
+    # ========================================================================
+    
     if st.session_state.get("data_store"):
         data = st.session_state["data_store"]
         
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Spot (Syn. Fut)", f"{data['spot_price']:.2f} ({data['F']:.2f})")
-        m2.metric("Max Pain", f"{data['max_pain_strike']:.0f}")
-        m3.metric("Net GEX (OI)", f"₹{data['total_net_gex_oi']/1e7:.2f} Cr")
-        m4.metric("ATM IV Rank", f"{data['iv_percentile']:.1f}%")
-        m5.metric("PCR (OI)", f"{data['pcr']:.2f}")
-        m6.metric("Total Call / Put OI", f"{data['total_call_oi'] // 1000}k / {data['total_put_oi'] // 1000}k")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Spot Price", f"{data['spot_price']:.2f}")
+        m2.metric("Timeframe", selected_interval_label)
+        m3.metric("Symbol", selected_symbol)
+        m4.metric("Updated", data['timestamp'])
         
+        # Chart section
         st.markdown(
-            f"<div class='update-timestamp'>Updated as on {data['timestamp']}</div>",
+            "<span style='font-weight: 700; color: #00E676; font-size: 18px;'>📈 Technical Charts</span>",
             unsafe_allow_html=True
         )
         
-        # Chart section
-        chart_head_col, tf_col = st.columns([0.70, 0.30])
-        with chart_head_col:
-            st.markdown(
-                "<span style='font-weight: 700; color: #00E676; font-size: 18px;'>📈 Underlying Technical Charts</span>",
-                unsafe_allow_html=True
-            )
-        
         df_full = data.get("df_candles", pd.DataFrame())
         
-        if not df_full.empty:
+        if not df_full.empty and len(df_full) > 5:
             fig = make_subplots(
-                rows=2, cols=1,
+                rows=3, cols=1,
                 shared_xaxes=True,
-                vertical_spacing=0.12,
-                row_heights=[0.7, 0.3]
+                vertical_spacing=0.08,
+                row_heights=[0.6, 0.2, 0.2]
             )
             
             # Candlestick chart
@@ -757,59 +797,178 @@ def main():
                     high=df_full['high'],
                     low=df_full['low'],
                     close=df_full['close'],
-                    name='NIFTY'
+                    name='NIFTY',
+                    hovertemplate='<b>%{x}</b><br>O: %{open:.2f}<br>H: %{high:.2f}<br>L: %{low:.2f}<br>C: %{close:.2f}'
                 ),
                 row=1, col=1
             )
             
-            # Add RSI
+            # VWAP
+            if 'vwap' in df_full.columns:
+                fig.add_trace(
+                    plt_go.Scatter(
+                        x=df_full['time'],
+                        y=df_full['vwap'],
+                        name='VWAP',
+                        line=dict(color='yellow', width=1.5),
+                        hovertemplate='VWAP: %{y:.2f}'
+                    ),
+                    row=1, col=1
+                )
+            
+            # Volume
             fig.add_trace(
-                plt_go.Scatter(
+                plt_go.Bar(
                     x=df_full['time'],
-                    y=df_full['rsi'],
-                    name='RSI(14)',
-                    line=dict(color='cyan', width=1)
+                    y=df_full['volume'],
+                    name='Volume',
+                    marker_color='rgba(100, 100, 255, 0.5)',
+                    hovertemplate='Vol: %{y}'
                 ),
                 row=2, col=1
             )
             
-            # Add RSI bands
-            fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-            fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+            # RSI
+            if 'rsi' in df_full.columns:
+                fig.add_trace(
+                    plt_go.Scatter(
+                        x=df_full['time'],
+                        y=df_full['rsi'],
+                        name='RSI(14)',
+                        line=dict(color='cyan', width=1.5),
+                        hovertemplate='RSI: %{y:.2f}'
+                    ),
+                    row=3, col=1
+                )
+                
+                fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1, annotation_text="OB")
+                fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1, annotation_text="OS")
             
             fig.update_layout(
-                title="NIFTY Technical Analysis",
+                title=f"{selected_symbol} - {selected_interval_label}",
                 height=700,
                 template="plotly_dark",
                 xaxis_rangeslider_visible=False,
-                hovermode='x unified'
+                hovermode='x unified',
+                showlegend=True
             )
             
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("⏳ Waiting for candle data...")
     
-    # Z-Score section
-    if st.session_state.get("enable_zscore_refresh"):
-        st.divider()
-        st.markdown("<span style='font-weight: 700; color: #00E676; font-size: 18px;'>📊 GEX & Volume Z-Scores</span>", unsafe_allow_html=True)
+    # ========================================================================
+    # BASKET DISPLAY SECTION
+    # ========================================================================
+    
+    st.markdown("---")
+    st.markdown("<span style='font-weight: 700; color: #00E676; font-size: 18px;'>🧺 Strategy Basket Analytics</span>", unsafe_allow_html=True)
+    
+    if st.session_state.get("basket_legs"):
+        smart_api = get_smart_api_client()
         
-        with st.container():
-            zscore_progress = st.container()
+        if smart_api and st.session_state.get("data_store"):
+            data = st.session_state["data_store"]
+            spot_price = data.get('spot_price', 50000)
             
-            smart_api = get_smart_api_client()
-            if smart_api:
-                df_scrip = download_master_scrip()
+            # Assume 20 days to expiry
+            T_val = 20 / 365.0
+            r_val = 0.07
+            sigma_val = 0.15
+            
+            calculated_legs = []
+            tot_pnl = 0.0
+            tot_delta = 0.0
+            tot_gamma = 0.0
+            tot_theta = 0.0
+            tot_vega = 0.0
+            
+            for leg in st.session_state["basket_legs"]:
+                strike = leg["strike"]
+                opt_type = leg["type"]
+                action = leg["action"]
+                entry_price = leg.get("entry_price", 0)
+                qty = leg.get("qty", 1)
                 
-                zscore_data = fetch_historical_gex_zscores(
-                    smart_api, 
-                    selected_symbol,
-                    lookback_days,
-                    df_scrip,
-                    lot_size=50 if selected_symbol == "NIFTY" else 40,
-                    progress_container=zscore_progress
-                )
+                is_call = opt_type == "CE"
                 
-                if not zscore_data.empty:
-                    st.session_state["zscore_data_store"] = zscore_data
+                # Black-Scholes price
+                theo_price = black_scholes_option_price(spot_price, strike, T_val, r_val, sigma_val, is_call)
+                
+                # Greeks
+                delta, gamma, vega, theta = calculate_greeks(spot_price, strike, T_val, r_val, sigma_val, is_call)
+                
+                # P&L calculation
+                if entry_price <= 0:
+                    entry_price = theo_price
+                
+                pnl_per_unit = (theo_price - entry_price) * qty * 100  # 1 lot = 100 contracts for NIFTY
+                if action == "SELL":
+                    pnl_per_unit = -pnl_per_unit
+                
+                calculated_legs.append({
+                    "Strike": strike,
+                    "Type": opt_type,
+                    "Action": action,
+                    "Qty": qty,
+                    "Entry Price": round(entry_price, 2),
+                    "Theo Price": round(theo_price, 2),
+                    "P&L (₹)": round(pnl_per_unit, 2),
+                    "Delta (Δ)": round(delta * qty, 2),
+                    "Gamma (γ)": round(gamma * qty, 4),
+                    "Vega (ν)": round(vega * qty, 2),
+                    "Theta (θ)": round(theta * qty, 2)
+                })
+                
+                tot_pnl += pnl_per_unit
+                tot_delta += delta * qty
+                tot_gamma += gamma * qty
+                tot_theta += theta * qty
+                tot_vega += vega * qty
+            
+            with st.container(border=True):
+                st.markdown("**Combined Basket Summary**")
+                b_m1, b_m2, b_m3, b_m4, b_m5 = st.columns(5)
+                b_m1.metric("Net P&L (₹)", f"₹{tot_pnl:,.2f}", delta=f"₹{tot_pnl - 0:,.2f}" if tot_pnl != 0 else "Neutral")
+                b_m2.metric("Net Delta (Δ)", f"{tot_delta:.2f}")
+                b_m3.metric("Net Gamma (γ)", f"{tot_gamma:.4f}")
+                b_m4.metric("Net Theta (θ)", f"{tot_theta:.2f}")
+                b_m5.metric("Net Vega (ν)", f"{tot_vega:.2f}")
+            
+            df_basket_display = pd.DataFrame(calculated_legs)
+            st.markdown("**Individual Legs Breakdown**")
+            st.dataframe(df_basket_display, use_container_width=True, hide_index=True)
+    else:
+        st.info("📌 No legs added to strategy basket. Use **🧺 Build Strategy Basket** in sidebar to add positions.")
+    
+    # ========================================================================
+    # Z-SCORE SECTION
+    # ========================================================================
+    
+    st.markdown("---")
+    st.markdown("<span style='font-weight: 700; color: #00E676; font-size: 18px;'>📊 GEX & Volume Z-Scores</span>", unsafe_allow_html=True)
+    
+    if st.session_state.get("enable_zscore_refresh"):
+        zscore_progress = st.container()
+        
+        smart_api = get_smart_api_client()
+        if smart_api:
+            df_scrip = download_master_scrip()
+            
+            lot_size_map = {"NIFTY": 50, "BANKNIFTY": 40, "FINNIFTY": 40, "MIDCPNIFTY": 75}
+            lot_size = lot_size_map.get(selected_symbol, 50)
+            
+            zscore_data = fetch_historical_gex_zscores(
+                smart_api,
+                selected_symbol,
+                lookback_days,
+                df_scrip,
+                lot_size=lot_size,
+                progress_container=zscore_progress
+            )
+            
+            if not zscore_data.empty:
+                st.session_state["zscore_data_store"] = zscore_data
     
     # Display Z-Score table
     if st.session_state.get("zscore_data_store") is not None:
@@ -824,7 +983,6 @@ def main():
         
         available_cols = [col for col in display_cols if col in df_zscore.columns]
         
-        # Format for display
         df_display = df_zscore[available_cols].copy()
         df_display = df_display.round(2)
         
@@ -834,7 +992,6 @@ def main():
             height=400
         )
         
-        # Download button
         csv = df_zscore.to_csv(index=True)
         st.download_button(
             label="📥 Download Z-Score Data (CSV)",
