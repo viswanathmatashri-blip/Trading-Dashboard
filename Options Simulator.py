@@ -114,7 +114,7 @@ class VolatilityEngine:
     @classmethod
     def calculate_greeks(cls, S: float, K: float, T: float, r: float, sigma: float, flag: str = "c") -> dict:
         if T <= 0 or sigma <= 0:
-            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "charm": 0.0}
 
         d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
         d2 = d1 - sigma * math.sqrt(T)
@@ -126,11 +126,13 @@ class VolatilityEngine:
         if flag.lower() == "c":
             delta = cls._norm_cdf(d1)
             theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * cls._norm_cdf(d2)) / 365.0
+            charm = (pdf_d1 * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))) / 365.0
         else:
             delta = cls._norm_cdf(d1) - 1.0
             theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * cls._norm_cdf(-d2)) / 365.0
+            charm = (-pdf_d1 * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))) / 365.0
 
-        return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
+        return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega, "charm": charm}
 
     @classmethod
     def calculate_iv(cls, market_price: float, S: float, K: float, T: float, r: float = 0.10, flag: str = "c") -> float:
@@ -680,6 +682,10 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             net_gex_vol = call_gex_vol - put_gex_vol
             total_net_gex_vol += net_gex_vol
 
+            # VEX and CEX Calculations
+            vex_val = (c_greeks["vega"] * c_info["oi"] - p_greeks["vega"] * p_info["oi"]) * lot_size * 0.01
+            cex_val = (c_greeks["charm"] * c_info["oi"] - p_greeks["charm"] * p_info["oi"]) * lot_size * spot_price * 0.01
+
             if iv > 0: all_ivs.append(iv)
             total_call_oi += c_info["oi"]
             total_put_oi += p_info["oi"]
@@ -692,6 +698,8 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                 "Strike": K,
                 "Net_GEX_OI": round(net_gex_oi, 2),
                 "Net_GEX_Vol": round(net_gex_vol, 2),
+                "VEX": round(vex_val, 2),
+                "CEX": round(cex_val, 2),
                 "P_LTP": p_info["ltp"], "P_IV_val": iv, "P_IV": f"{iv * 100:.1f}%",
                 "P_Δ": round(p_greeks["delta"], 2), "P_γ": round(p_greeks["gamma"], 4),
                 "P_θ": round(p_greeks["theta"], 2), "P_ν": round(p_greeks["vega"], 2),
@@ -734,7 +742,7 @@ if run_btn or "data_store" not in st.session_state:
     if new_data:
         st.session_state["data_store"] = new_data
 
-# --- Z-SCORE ANALYSIS FRAGMENT (HV RESTORED) ---
+# --- Z-SCORE ANALYSIS FRAGMENT ---
 @st.fragment(run_every=300 if st.session_state.get("enable_zscore_refresh", False) else None)
 def zscore_analysis_fragment():
     st.markdown("---")
@@ -789,7 +797,6 @@ def zscore_analysis_fragment():
         with st.expander("🔍 Inspect Raw Calculated Daily Totals & HV Details (All Evaluated Dates)", expanded=False):
             st.info(f"Showing all **{len(z_df)}** trading days used in evaluating rolling averages and std dev.")
             
-            # Re-added Volatility_Proxy (HV), HV_Mean, HV_Std, Vol_Mean, Vol_Std
             display_cols = [
                 'Futures_Close', 'Futures_Volume', 'Vol_Mean', 'Vol_Std', 'Futures_Volume_Z',
                 'Volatility_Proxy', 'HV_Mean', 'HV_Std', 'Volatility_Proxy_Z'
@@ -1227,6 +1234,69 @@ def live_dashboard_fragment():
             )
 
             st.plotly_chart(fig_oi, use_container_width=True)
+
+            # CHART 3: VEX & CEX EXPOSURE vs STRIKE PRICE (INSERTED RIGHT BELOW CHART 2)
+            st.subheader("⚡ VEX (Vega Exposure) and CEX (Charm Exposure) Profile")
+
+            fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
+
+            fig_vex_cex.add_trace(
+                plt_go.Bar(
+                    x=df_chain["Strike"],
+                    y=df_chain["VEX"],
+                    name="VEX (Vega Exposure)",
+                    marker_color="#00E676",
+                    opacity=0.75,
+                    width=20,
+                    hovertemplate="Strike: %{x}<br>VEX: ₹%{y:,.2f}<extra></extra>"
+                ),
+                secondary_y=False
+            )
+
+            fig_vex_cex.add_trace(
+                plt_go.Scatter(
+                    x=df_chain["Strike"],
+                    y=df_chain["CEX"],
+                    name="CEX (Charm Exposure)",
+                    line=dict(color="#2196F3", width=2.5),
+                    mode="lines+markers",
+                    hovertemplate="Strike: %{x}<br>CEX: ₹%{y:,.2f}<extra></extra>"
+                ),
+                secondary_y=True
+            )
+
+            fig_vex_cex.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
+            fig_vex_cex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
+
+            fig_vex_cex.update_layout(
+                title="Strike-wise VEX & CEX Profile",
+                template="plotly_dark",
+                paper_bgcolor="#0E1117",
+                plot_bgcolor="#0E1117",
+                height=450,
+                margin=dict(l=20, r=20, t=40, b=10),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+
+            fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100)
+            fig_vex_cex.update_yaxes(
+                title_text="VEX (Vega Exposure ₹)",
+                secondary_y=False,
+                showgrid=True,
+                gridcolor="#262930",
+                zeroline=True,
+                zerolinecolor="#FFFFFF"
+            )
+            fig_vex_cex.update_yaxes(
+                title_text="CEX (Charm Exposure ₹)",
+                secondary_y=True,
+                showgrid=False,
+                zeroline=True,
+                zerolinecolor="#FFFFFF"
+            )
+
+            st.plotly_chart(fig_vex_cex, use_container_width=True)
 
 # Run main dashboard fragment
 live_dashboard_fragment()
