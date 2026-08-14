@@ -319,18 +319,12 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
 
 # --- METHOD 1: FUTURES VOLUME & PROXY Z-SCORE COMPUTATION ---
 def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, progress_container=None):
-    """
-    Fetches continuous historical spot index data and near-month futures volume,
-    calculates rolling Historical Volatility (HV) and Volume, computes Z-Scores,
-    and returns the entire historical dataset for complete transparency.
-    """
     try:
         if progress_container is not None:
             progress_container.caption("⏳ Fetching continuous historical data for Z-score window...")
 
         ist_now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
         
-        # 1. Map Symbol to Spot Index Token (Continuous data avoids futures contract expiry truncation)
         index_token_map = {
             "NIFTY": "99926000", 
             "BANKNIFTY": "99926009", 
@@ -339,12 +333,10 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
         }
         spot_token = index_token_map.get(symbol, "99926000")
 
-        # Request 3x calendar days buffer to ensure enough trading days for the rolling baseline
         window_sz = int(days)
         from_date = (ist_now - datetime.timedelta(days=window_sz * 3 + 30)).strftime("%Y-%m-%d 09:15")
         to_date = ist_now.strftime("%Y-%m-%d 15:30")
 
-        # 2. Fetch Spot Daily Candles for Spot Index
         spot_param = {
             "exchange": "NSE",
             "symboltoken": spot_token,
@@ -361,11 +353,9 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
         df_spot['spot_close'] = df_spot['close'].astype(float)
         df_spot = df_spot.set_index('date')
 
-        # Calculate annualized Historical Volatility (HV) strictly over the lookback window
         df_spot['log_ret'] = np.log(df_spot['spot_close'] / df_spot['spot_close'].shift(1))
         df_spot['HV_Lookback'] = df_spot['log_ret'].rolling(window=window_sz).std() * np.sqrt(252)
 
-        # 3. Fetch Near-Month Futures Volume
         fut_scrips = df_scrip_master[
             (df_scrip_master['exch_seg'] == 'NFO') & 
             (df_scrip_master['name'] == symbol) & 
@@ -396,20 +386,16 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
         else:
             df_spot['fut_volume'] = 0.0
 
-        # 4. Calculate Rolling Mean, Standard Deviation, and Z-Scores Across All Available Dates
         min_p = max(5, window_sz // 2)
         
-        # Volume Statistics & Z-Score
         df_spot['Vol_Mean'] = df_spot['fut_volume'].rolling(window=window_sz, min_periods=min_p).mean()
         df_spot['Vol_Std'] = df_spot['fut_volume'].rolling(window=window_sz, min_periods=min_p).std()
         df_spot['Futures_Volume_Z'] = (df_spot['fut_volume'] - df_spot['Vol_Mean']) / df_spot['Vol_Std'].replace(0, np.nan)
 
-        # Volatility Statistics & Z-Score
         df_spot['HV_Mean'] = df_spot['HV_Lookback'].rolling(window=window_sz, min_periods=min_p).mean()
         df_spot['HV_Std'] = df_spot['HV_Lookback'].rolling(window=window_sz, min_periods=min_p).std()
         df_spot['Volatility_Proxy_Z'] = (df_spot['HV_Lookback'] - df_spot['HV_Mean']) / df_spot['HV_Std'].replace(0, np.nan)
 
-        # Consolidate Output DataFrame
         df_res = pd.DataFrame({
             'Futures_Volume': df_spot['fut_volume'],
             'Futures_Close': df_spot['spot_close'],
@@ -425,7 +411,6 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
         if progress_container is not None:
             progress_container.empty()
 
-        # Drop incomplete initial setup rows and return entire historical timeline
         return df_res.dropna(subset=['Futures_Volume_Z', 'Volatility_Proxy_Z'])
 
     except Exception:
@@ -636,7 +621,15 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             res = smart_api.getMarketData("FULL", {Exchange: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
-                    vol_val = item.get("v") if item.get("v") is not None else item.get("volume", 0)
+                    # Includes 'tradeVolume' for SmartAPI FULL packet support
+                    vol_val = (
+                        item.get("tradeVolume")
+                        or item.get("volume")
+                        or item.get("v")
+                        or item.get("vol")
+                        or item.get("volumeTraded")
+                        or 0
+                    )
 
                     market_data[str(item["symbolToken"])] = {
                         "ltp": float(item.get("ltp", 0.0)),
@@ -1038,7 +1031,6 @@ def live_dashboard_fragment():
             df_chain["Total_Vol"] = df_chain["C_Vol"] + df_chain["P_Vol"]
             df_chain["Total_OI"] = df_chain["C_OI"] + df_chain["P_OI"]
 
-            # ZERO DIVISION SAFE RANGE CALCULATOR
             def calculate_synced_ranges(v1_pos, v1_neg, v2_pos, v2_neg):
                 y1_max = max(v1_pos.max(), 1.0)
                 y1_min = min(v1_neg.min(), -1.0)
