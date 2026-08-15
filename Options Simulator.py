@@ -88,7 +88,16 @@ LOT_SIZES = {
     "NIFTY": 25,
     "BANKNIFTY": 15,
     "FINNIFTY": 25,
-    "MIDCPNIFTY": 50
+    "MIDCPNIFTY": 50,
+    "SENSEX": 10
+}
+
+INDEX_TOKEN_MAP = {
+    "NIFTY": ("99926000", "NSE", "NFO"),
+    "BANKNIFTY": ("99926009", "NSE", "NFO"),
+    "FINNIFTY": ("99926037", "NSE", "NFO"),
+    "MIDCPNIFTY": ("99926074", "NSE", "NFO"),
+    "SENSEX": ("99919000", "BSE", "BFO")
 }
 
 # --- VOLATILITY & GREEKS ENGINE ---
@@ -324,6 +333,34 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
         pass
     return ""
 
+# --- HOLIDAY / WEEKEND FALLBACK ENGINE FOR CANDLE CHARTS ---
+def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15):
+    """Checks for recent data and falls back to the latest available trading days if today is a holiday."""
+    ist_tz = pytz.timezone("Asia/Kolkata")
+    now_dt = datetime.datetime.now(ist_tz)
+    
+    # Check backwards up to 10 days to locate active trading data
+    for offset in range(0, 10):
+        target_to = now_dt - datetime.timedelta(days=offset)
+        target_from = target_to - datetime.timedelta(days=lookback_days)
+        
+        candle_param = {
+            "exchange": exchange,
+            "symboltoken": spot_token,
+            "interval": api_interval,
+            "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
+            "todate": target_to.strftime("%Y-%m-%d 15:30")
+        }
+        
+        candle_res = smart_api.getCandleData(candle_param)
+        if candle_res and candle_res.get("status") and candle_res.get("data"):
+            df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+            df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
+            if not df_candles.empty:
+                return compute_technical_indicators(df_candles), offset > 0
+
+    return pd.DataFrame(), False
+
 # --- METHOD 1: FUTURES VOLUME & PROXY Z-SCORE COMPUTATION ---
 def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, progress_container=None):
     try:
@@ -331,21 +368,14 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
             progress_container.caption("⏳ Fetching continuous historical data for Z-score window...")
 
         ist_now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-        
-        index_token_map = {
-            "NIFTY": "99926000", 
-            "BANKNIFTY": "99926009", 
-            "FINNIFTY": "99926037", 
-            "MIDCPNIFTY": "99926074"
-        }
-        spot_token = index_token_map.get(symbol, "99926000")
+        spot_token, spot_exch, fut_exch = INDEX_TOKEN_MAP.get(symbol, ("99926000", "NSE", "NFO"))
 
         window_sz = int(days)
         from_date = (ist_now - datetime.timedelta(days=window_sz * 3 + 30)).strftime("%Y-%m-%d 09:15")
         to_date = ist_now.strftime("%Y-%m-%d 15:30")
 
         spot_param = {
-            "exchange": "NSE",
+            "exchange": spot_exch,
             "symboltoken": spot_token,
             "interval": "ONE_DAY",
             "fromdate": from_date,
@@ -364,9 +394,9 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
         df_spot['HV_Lookback'] = df_spot['log_ret'].rolling(window=window_sz).std() * np.sqrt(252)
 
         fut_scrips = df_scrip_master[
-            (df_scrip_master['exch_seg'] == 'NFO') & 
+            (df_scrip_master['exch_seg'] == fut_exch) & 
             (df_scrip_master['name'] == symbol) & 
-            (df_scrip_master['instrumenttype'] == 'FUTIDX')
+            (df_scrip_master['instrumenttype'].isin(['FUTIDX', 'FUTSTK']))
         ].copy()
 
         fut_scrips['expiry_dt'] = pd.to_datetime(fut_scrips['expiry'], format='%d%b%Y', errors='coerce')
@@ -375,7 +405,7 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
         if not active_futs.empty:
             near_fut_token = str(active_futs.iloc[0]['token'])
             fut_param = {
-                "exchange": "NFO",
+                "exchange": fut_exch,
                 "symboltoken": near_fut_token,
                 "interval": "ONE_DAY",
                 "fromdate": from_date,
@@ -433,9 +463,13 @@ df_master = download_master_scrip()
 with st.sidebar.expander("1. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
-        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
+        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"])
+    
+    # Auto-select exchange based on Index selected
+    default_token, spot_exchange, Exchange = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
+    
     with c2:
-        Exchange = st.selectbox("Exchange", ["NFO", "BFO"])
+        st.text_input("Exchange", value=Exchange, disabled=True)
 
     rate_param = st.number_input("Risk Free Rate (r)", min_value=0.0, max_value=0.15, value=0.10, step=0.01)
 
@@ -464,7 +498,11 @@ with st.sidebar.expander("1. Market Parameters", expanded=True):
 
 target_expiry_dt = pd.to_datetime(selected_expiry_str, format="%d%b%Y") if selected_expiry_str != "N/A" else today_dt
 df_expiry = df_options[df_options["expiry_dt"] == target_expiry_dt].copy()
-df_expiry["strike_num"] = pd.to_numeric(df_expiry["strike"], errors="coerce") / 100.0
+
+# Fix BSE strike division factor if required
+df_expiry["strike_num"] = pd.to_numeric(df_expiry["strike"], errors="coerce") / (100.0 if Exchange == "NFO" else 1.0)
+if df_expiry["strike_num"].max() > 1000000:
+    df_expiry["strike_num"] = df_expiry["strike_num"] / 100.0
 
 all_expiry_strikes = sorted(df_expiry["strike_num"].dropna().unique())
 
@@ -478,7 +516,7 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
         trade_action = st.selectbox("Trade Action", ["BUY", "SELL"])
 
     entry_price_input = st.number_input("Entry Price (₹) [0 for LTP]", min_value=0.0, value=0.0, step=0.5)
-    qty_lots = st.number_input("Quantity / Units", min_value=1, value=65, step=1)
+    qty_lots = st.number_input("Quantity / Units", min_value=1, value=LOT_SIZES.get(Index_Name, 25), step=1)
 
     c_btn1, c_btn2 = st.columns(2)
     with c_btn1:
@@ -552,37 +590,22 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         return None
 
     try:
-        update_p(0.20, f"Fetching Live Spot & Historical Volatility for {Index_Name}...")
-        index_token_map = {"NIFTY": "99926000", "BANKNIFTY": "99926009", "FINNIFTY": "99926037", "MIDCPNIFTY": "99926074"}
-        spot_token = index_token_map.get(Index_Name, "99926000")
+        update_p(0.20, f"Fetching Live Spot & Volatility for {Index_Name}...")
+        spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
 
-        spot_resp = smart_api.ltpData(exchange="NSE", tradingsymbol=Index_Name, symboltoken=spot_token)
-        spot_price = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") and spot_resp.get("data") else 24500.0
+        spot_resp = smart_api.ltpData(exchange=spot_exch, tradingsymbol=Index_Name, symboltoken=spot_token)
+        spot_price = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") and spot_resp.get("data") else 80000.0 if Index_Name == "SENSEX" else 24500.0
 
-        index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, "NSE", days=hv_days)
+        index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, spot_exch, days=hv_days)
 
-        update_p(0.35, "Fetching Historical Underlying Candle Data...")
-        ist_tz = pytz.timezone("Asia/Kolkata")
-        now_dt = datetime.datetime.now(ist_tz)
-
+        update_p(0.35, "Fetching Historical Underlying Candles (with Holiday Fallback)...")
         api_interval, lookback_days = interval_mapping.get(selected_interval_label, ("FIVE_MINUTE", 15))
-        from_dt = now_dt - datetime.timedelta(days=lookback_days)
 
-        candle_param = {
-            "exchange": "NSE",
-            "symboltoken": spot_token,
-            "interval": api_interval,
-            "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
-            "todate": now_dt.strftime("%Y-%m-%d 15:30")
-        }
-        candle_res = smart_api.getCandleData(candle_param)
-        df_candles = pd.DataFrame()
+        df_candles, is_holiday_fallback = fetch_candles_with_holiday_fallback(
+            smart_api, spot_token, spot_exch, api_interval, lookback_days
+        )
 
-        if candle_res and candle_res.get("status") and candle_res.get("data"):
-            df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
-            df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
-            df_candles = compute_technical_indicators(df_candles)
-
+        now_dt = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
         expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
         time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
         T = max(time_diff_seconds / (365.0 * 24 * 3600), 1e-5)
@@ -625,7 +648,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         chunk_size = 40
         for i in range(0, len(tokens_to_fetch_list), chunk_size):
             chunk = tokens_to_fetch_list[i:i + chunk_size]
-            res = smart_api.getMarketData("FULL", {Exchange: chunk})
+            res = smart_api.getMarketData("FULL", {opt_exch: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
                     vol_val = (
@@ -728,6 +751,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             "total_net_gex_oi": total_net_gex_oi, "total_net_gex_vol": total_net_gex_vol,
             "max_pain_strike": max_pain_strike, "levels": levels, "df_candles": df_candles,
             "chain_results": chain_results, "market_data": market_data, "basket_tokens_info": basket_tokens_info,
+            "is_holiday_fallback": is_holiday_fallback,
             "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST")
         }
 
@@ -837,6 +861,8 @@ def live_dashboard_fragment():
         col_title, col_status = st.columns([0.65, 0.35])
         with col_title:
             st.markdown("<h1 class='custom-heading'>📊 Option Chain Technical Analysis</h1>", unsafe_allow_html=True)
+            if data.get("is_holiday_fallback", False):
+                st.warning("⚠️ Today is a non-trading day/holiday. Technical charts are displaying the latest available trading session.")
         with col_status:
             st.write("")
             cb_main = st.checkbox("Enable Auto-Refresh (5s)", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
