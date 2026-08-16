@@ -186,7 +186,9 @@ def fetch_history(api, token, days, spot_token="99926000", spot_exchange="NSE"):
         return df.sort_values('Date', ascending=True).reset_index(drop=True)
     return pd.DataFrame()
 
-def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r):
+def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r, progress_status=None):
+    if progress_status:
+        progress_status.caption(f"⏳ Filtering option contracts for expiry {expiry_str}...")
     df_expiry = df_nfo[df_nfo['expiry'] == expiry_str].copy()
     if df_expiry.empty:
         return pd.DataFrame()
@@ -204,7 +206,11 @@ def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r):
     from_date = to_date - datetime.timedelta(days=4)
 
     results = []
-    for _, row in df_filtered.iterrows():
+    total_rows = len(df_filtered)
+    for idx, (_, row) in enumerate(df_filtered.iterrows()):
+        if progress_status and idx % 5 == 0:
+            progress_status.caption(f"⏳ Processing Black-Scholes IV & Extrinsic values ({idx}/{total_rows} strikes)...")
+            
         opt_type = "CE" if str(row['symbol']).endswith("CE") else "PE"
         token = row['token']
         strike = row['strike_clean']
@@ -1295,12 +1301,20 @@ def live_dashboard_fragment():
 
     # --- INCORPORATED BETA MODULE SECTIONS ---
     st.markdown("---")
-    st.subheader(f"6️⃣ Market Volatility Skew Profile ({selected_expiry_str})")
+    head_skew_c1, head_skew_c2 = st.columns([0.65, 0.35])
+    with head_skew_c1:
+        st.subheader(f"6️⃣ Market Volatility Skew Profile ({selected_expiry_str})")
+    with head_skew_c2:
+        skew_ts = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S IST")
+        st.markdown(f"<div class='update-timestamp'>Last updated: {skew_ts}</div>", unsafe_allow_html=True)
     
+    skew_status_holder = st.empty()
+
     smart_api = get_smart_api_client()
     if smart_api and not df_master.empty:
         latest_spot = data['spot_price']
-        df_chain_iv = fetch_and_compute_full_chain_iv(smart_api, df_master, selected_expiry_str, latest_spot, rate_param)
+        df_chain_iv = fetch_and_compute_full_chain_iv(smart_api, df_master, selected_expiry_str, latest_spot, rate_param, progress_status=skew_status_holder)
+        skew_status_holder.empty()
 
         if not df_chain_iv.empty:
             tab1, tab2 = st.tabs(["Unsmoothed Market Skew (OTM Puts & Calls)", "Both Raw Curves (CE vs PE)"])
