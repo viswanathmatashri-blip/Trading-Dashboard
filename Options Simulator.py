@@ -1036,13 +1036,14 @@ def zscore_analysis_fragment():
 def institutional_order_flow_scanner_fragment():
     st.markdown("---")
     st.subheader(f"🏛️ Institutional Order Flow Scanner ({Index_Name})")
-    st.caption("Filters out retail noise to isolate high-conviction institutional trades based on premium thresholds, aggressive price execution, and unusual volume spikes.")
+    st.caption("Filters out retail noise to isolate high-conviction institutional trades based on premium thresholds and key support/resistance strike levels.")
 
     if "data_store" not in st.session_state or not st.session_state["data_store"].get("chain_results"):
         st.info("No option chain data available. Run the main fetch process to enable scanning.")
         return
 
     chain_data = st.session_state["data_store"]["chain_results"]
+    spot_price = st.session_state["data_store"].get("spot_price", 0.0)
     lot_size = LOT_SIZES.get(Index_Name, 25)
 
     scanned_trades = []
@@ -1061,19 +1062,11 @@ def institutional_order_flow_scanner_fragment():
         c_lots = c_vol
 
         if c_premium >= 1000000 or c_lots >= 500:
-            c_bid = row.get("C_Bid", 0.0)
-            c_ask = row.get("C_Ask", 0.0)
-
-            # Execution Sentiment Logic
-            if c_ask > 0 and c_ltp >= c_ask:
-                sentiment = "Aggressive Bullish (Sweep/Buy)"
-            elif c_bid > 0 and c_ltp <= c_bid:
-                sentiment = "Aggressive Bearish (Sell)"
-            else:
-                sentiment = "Neutral / Mid-Market Execution"
-
             vol_ratio = c_vol / avg_daily_vol if avg_daily_vol > 0 else 0.0
             unusual_flag = vol_ratio > 3.0
+            
+            # Strike Classification (Call Options)
+            strike_role = "Resistance Level" if strike >= spot_price else "Support / In-The-Money Level"
 
             scanned_trades.append({
                 "Strike": strike,
@@ -1081,7 +1074,7 @@ def institutional_order_flow_scanner_fragment():
                 "LTP (₹)": c_ltp,
                 "Volume (Lots)": c_lots,
                 "Total Premium (₹)": round(c_premium, 2),
-                "Sentiment / Execution": sentiment,
+                "Key Level Classification": strike_role,
                 "Volume Ratio": round(vol_ratio, 2),
                 "Unusual Vol Flag": "🚨 High Vol" if unusual_flag else "Normal"
             })
@@ -1093,19 +1086,11 @@ def institutional_order_flow_scanner_fragment():
         p_lots = p_vol
 
         if p_premium >= 1000000 or p_lots >= 500:
-            p_bid = row.get("P_Bid", 0.0)
-            p_ask = row.get("P_Ask", 0.0)
-
-            # Execution Sentiment Logic
-            if p_ask > 0 and p_ltp >= p_ask:
-                sentiment = "Aggressive Bullish (Sweep/Buy)"
-            elif p_bid > 0 and p_ltp <= p_bid:
-                sentiment = "Aggressive Bearish (Sell)"
-            else:
-                sentiment = "Neutral / Mid-Market Execution"
-
             vol_ratio = p_vol / avg_daily_vol if avg_daily_vol > 0 else 0.0
             unusual_flag = vol_ratio > 3.0
+            
+            # Strike Classification (Put Options)
+            strike_role = "Support Level" if strike <= spot_price else "Resistance / In-The-Money Level"
 
             scanned_trades.append({
                 "Strike": strike,
@@ -1113,7 +1098,7 @@ def institutional_order_flow_scanner_fragment():
                 "LTP (₹)": p_ltp,
                 "Volume (Lots)": p_lots,
                 "Total Premium (₹)": round(p_premium, 2),
-                "Sentiment / Execution": sentiment,
+                "Key Level Classification": strike_role,
                 "Volume Ratio": round(vol_ratio, 2),
                 "Unusual Vol Flag": "🚨 High Vol" if unusual_flag else "Normal"
             })
@@ -1121,11 +1106,11 @@ def institutional_order_flow_scanner_fragment():
     if scanned_trades:
         df_scanner = pd.DataFrame(scanned_trades)
 
-        def style_sentiment(val):
-            if "Bullish" in str(val):
-                return 'background-color: rgba(0, 230, 118, 0.2); color: #00E676; font-weight: bold;'
-            elif "Bearish" in str(val):
+        def style_classification(val):
+            if "Resistance" in str(val):
                 return 'background-color: rgba(255, 82, 82, 0.2); color: #FF5252; font-weight: bold;'
+            elif "Support" in str(val):
+                return 'background-color: rgba(0, 230, 118, 0.2); color: #00E676; font-weight: bold;'
             else:
                 return 'color: #FAFAFA;'
 
@@ -1135,7 +1120,7 @@ def institutional_order_flow_scanner_fragment():
             return 'color: #FAFAFA;'
 
         styled_df = df_scanner.style.map(
-            style_sentiment, subset=['Sentiment / Execution']
+            style_classification, subset=['Key Level Classification']
         ).map(
             style_unusual, subset=['Unusual Vol Flag']
         ).format({
