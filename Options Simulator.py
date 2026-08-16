@@ -4,6 +4,7 @@ import warnings
 import time
 import datetime
 import math
+import json
 import numpy as np
 import pandas as pd
 import scipy.stats as si
@@ -11,6 +12,7 @@ import pyotp
 import pytz
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.express as px
 import plotly.graph_objects as plt_go
 from plotly.subplots import make_subplots
@@ -76,6 +78,7 @@ CLIENT_CODE = os.getenv("CLIENT_CODE", "")
 PIN = os.getenv("PIN", "")
 TOTP_SECRET = os.getenv("TOTP_SECRET", "")
 
+# Initialise Session State Variables
 if "basket_legs" not in st.session_state:
     st.session_state["basket_legs"] = []
 if "selected_timeframe" not in st.session_state:
@@ -86,6 +89,29 @@ if "enable_zscore_refresh" not in st.session_state:
     st.session_state["enable_zscore_refresh"] = False
 if "zscore_data_store" not in st.session_state:
     st.session_state["zscore_data_store"] = pd.DataFrame()
+
+# Streamlit Cache Persistence Handlers
+@st.cache_data(ttl=86400)
+def get_cached_basket():
+    return []
+
+def save_basket_to_cache(basket):
+    get_cached_basket.clear()
+    @st.cache_data(ttl=86400)
+    def _inner():
+        return basket
+    _inner()
+
+# LocalStorage Sync via HTML/JS Fragment
+def sync_local_storage():
+    basket_json = json.dumps(st.session_state["basket_legs"])
+    js_code = f"""
+    <script>
+        // Save current basket state to browser localStorage
+        localStorage.setItem("streamlit_strategy_basket", '{basket_json}');
+    </script>
+    """
+    components.html(js_code, height=0, width=0)
 
 LOT_SIZES = {
     "NIFTY": 25,
@@ -709,12 +735,33 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
                 "entry_price": entry_price_input,
                 "qty": qty_lots
             })
+            sync_local_storage()
             st.success("Leg Added!")
             st.rerun()
     with c_btn2:
         if st.button("Clear Basket", use_container_width=True):
             st.session_state["basket_legs"] = []
+            sync_local_storage()
             st.rerun()
+
+    # Cache Control Panel
+    st.markdown("---")
+    st.caption("💾 **Cache Strategy Storage**")
+    cache_c1, cache_c2 = st.columns(2)
+    with cache_c1:
+        if st.button("Save to Cache", use_container_width=True):
+            save_basket_to_cache(st.session_state["basket_legs"])
+            st.success("Basket Cached!")
+    with cache_c2:
+        if st.button("Load Cache", use_container_width=True):
+            cached_legs = get_cached_basket()
+            if cached_legs:
+                st.session_state["basket_legs"] = cached_legs
+                sync_local_storage()
+                st.success("Basket Restored!")
+                st.rerun()
+            else:
+                st.info("Cache is empty.")
 
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
 
@@ -1095,8 +1142,7 @@ def institutional_order_flow_scanner_fragment():
             scanned_trades.append({
                 "Strike": strike,
                 "Option_Type": "PE",
-                "LTP (₹)": p_ltp,
-                "Volume (Lots)": p_lots,
+                "LTP (₹)": p_lots,
                 "Total Premium (₹)": round(p_premium, 2),
                 "Key Level Classification": strike_role,
                 "Volume Ratio": round(vol_ratio, 2),
@@ -1254,7 +1300,7 @@ def live_dashboard_fragment():
 
         st.plotly_chart(fig, use_container_width=True)
 
-    # --- STRATEGY BASKET DISPLAY SECTION ---
+    # --- STRATEGY BASKET DISPLAY & MANAGEMENT ---
     st.markdown("---")
     st.subheader("🧺 Strategy Basket Analytics")
 
@@ -1272,7 +1318,7 @@ def live_dashboard_fragment():
         tot_theta = 0.0
         tot_vega = 0.0
 
-        for leg in st.session_state["basket_legs"]:
+        for idx, leg in enumerate(st.session_state["basket_legs"]):
             k = leg["strike"]
             t = leg["type"]
             act = leg["action"]
@@ -1306,6 +1352,7 @@ def live_dashboard_fragment():
             tot_vega += pos_vega
 
             calculated_legs.append({
+                "Leg": idx + 1,
                 "Action": act,
                 "Strike": k,
                 "Type": t,
@@ -1330,7 +1377,18 @@ def live_dashboard_fragment():
 
         df_basket_display = pd.DataFrame(calculated_legs)
         st.markdown("**Individual Legs Breakdown**")
-        st.dataframe(df_basket_display, use_container_width=True)
+        
+        # Display Basket Legs Table with dynamic delete buttons
+        col_tbl, col_del = st.columns([0.85, 0.15])
+        with col_tbl:
+            st.dataframe(df_basket_display, use_container_width=True)
+        with col_del:
+            st.markdown("**Manage Legs**")
+            for idx in range(len(st.session_state["basket_legs"])):
+                if st.button(f"❌ Remove #{idx + 1}", key=f"del_leg_{idx}"):
+                    st.session_state["basket_legs"].pop(idx)
+                    sync_local_storage()
+                    st.rerun()
     else:
         st.info("No legs added to strategy basket yet. Use sidebar **2. Build Strategy Basket** to add positions.")
 
@@ -1378,7 +1436,7 @@ def live_dashboard_fragment():
                 range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
                 return range1, range2
 
-            # 1. GEX/OI CHART (Positioned Above GEX/Trade Volume)
+            # 1. GEX/OI CHART
             st.subheader("📈 OI-Based Net Gamma Exposure vs Open Interest (OI)")
             gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
             fig_oi = make_subplots(specs=[[{"secondary_y": True}]])
@@ -1412,7 +1470,7 @@ def live_dashboard_fragment():
             fig_vol.update_yaxes(title_text="Net GEX (Vol-Based ₹)", range=v2_range, secondary_y=True, showgrid=False, zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
             st.plotly_chart(fig_vol, use_container_width=True)
 
-            # 3. DELTA-ADJUSTED GEX CHART (Positioned Below GEX/Trade Volume & Above VEX/CEX)
+            # 3. DELTA-ADJUSTED GEX CHART
             st.subheader("🎯 Delta-Adjusted Net Gamma Exposure Profile")
             delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
             fig_delta_gex = make_subplots(specs=[[{"secondary_y": False}]])
@@ -1471,7 +1529,6 @@ def live_dashboard_fragment():
     if smart_api and not df_master.empty:
         latest_spot = data['spot_price']
         
-        # Pass strikes_below and strikes_above to fetch only requested strikes
         df_chain_iv = fetch_and_compute_full_chain_iv(
             smart_api, 
             df_master, 
@@ -1521,9 +1578,7 @@ def live_dashboard_fragment():
                 fig_raw.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20))
                 st.plotly_chart(fig_raw, use_container_width=True)
 
-            # HIDDEN BY DEFAULT: Collapsible Ribbon for Volatility Crash Table & Historic Detailed Breakdown Charts
             with st.expander("🔻 Volatility Crash Analysis & Historical Option Decay Details", expanded=False):
-                # Section 2: Raw data table with Volatility Crash Flagging
                 st.markdown("### Raw Volatility Values & Volatility Crash Signal")
                 df_table_display = df_chain_iv[['Strike', 'Option_Type', 'LTP', 'IV_%', 'Extrinsic_Val', 'Is_Pure_Intrinsic', 'Vol_Crash_Flag']].copy()
                 
@@ -1533,7 +1588,6 @@ def live_dashboard_fragment():
                 
                 st.dataframe(df_table_display.style.map(highlight_crash, subset=['Vol_Crash_Flag']), use_container_width=True)
 
-                # Section 3: Flagged strikes dropdown ribbon for historical breakdowns
                 flagged_rows = df_chain_iv[df_chain_iv['Vol_Crash_Flag'] == True]
                 st.markdown("### ⚠️ Volatility Crash Historic Detailed Analysis")
                 
@@ -1560,7 +1614,6 @@ def live_dashboard_fragment():
                             initial_premium = hist_df.iloc[0]['Close']
                             hist_df['Cumulative_Decay_%'] = ((initial_premium - hist_df['Close']) / initial_premium) * 100.0
                             
-                            # Charts breakdown for selected flagged strike
                             c1, c2 = st.columns(2)
                             with c1:
                                 st.plotly_chart(plot_line_chart(hist_df, 'Close', f'Option Strike LTP (₹{strike_sel} {opt_type_sel})', 'Option Price (₹)', color="#00bfff"), use_container_width=True)
