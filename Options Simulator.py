@@ -881,6 +881,10 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             net_gex_oi = call_gex_oi - put_gex_oi
             total_net_gex_oi += net_gex_oi
 
+            call_delta_gex_oi = call_gex_oi * c_greeks["delta"]
+            put_delta_gex_oi = put_gex_oi * abs(p_greeks["delta"])
+            net_delta_gex_oi = call_delta_gex_oi - put_delta_gex_oi
+
             call_gex_vol = c_greeks["gamma"] * c_info["volume"] * lot_size * (spot_price ** 2) * 0.01
             put_gex_vol = p_greeks["gamma"] * p_info["volume"] * lot_size * (spot_price ** 2) * 0.01
             net_gex_vol = call_gex_vol - put_gex_vol
@@ -900,6 +904,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                 "C_IV_val": iv, "C_IV": f"{iv * 100:.1f}%", "C_LTP": c_info["ltp"],
                 "Strike": K,
                 "Net_GEX_OI": round(net_gex_oi, 2),
+                "Net_Delta_GEX_OI": round(net_delta_gex_oi, 2),
                 "Net_GEX_Vol": round(net_gex_vol, 2),
                 "VEX": round(vex_val, 2),
                 "CEX": round(cex_val, 2),
@@ -1263,22 +1268,7 @@ def live_dashboard_fragment():
                 range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
                 return range1, range2
 
-            st.subheader("📊 Volume-Based Net Gamma Exposure vs Trading Volume")
-            gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
-            fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net Gamma (Vol-Based)", marker_color=gex_vol_colors, opacity=0.85, width=25, hovertemplate="Strike: %{x}<br>Net GEX (Vol): ₹%{y:,.0f}<extra></extra>"), secondary_y=True)
-            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_Vol"], name="Call Volume", marker_color="#81C784", opacity=0.6, hovertemplate="Strike: %{x}<br>Call Vol: %{y:,}<extra></extra>"), secondary_y=False)
-            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_Vol"], name="Put Volume", marker_color="#FF8A80", opacity=0.6, hovertemplate="Strike: %{x}<br>Put Vol: %{customdata:,}<extra></extra>", customdata=df_chain["P_Vol"]), secondary_y=False)
-            fig_vol.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
-            fig_vol.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
-            fig_vol.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip Point")
-            v1_range, v2_range = calculate_synced_ranges(df_chain["C_Vol"], -df_chain["P_Vol"], df_chain["Net_GEX_Vol"].clip(lower=0), df_chain["Net_GEX_Vol"].clip(upper=0))
-            fig_vol.update_layout(title="Strike-wise Volume-Based Net Gamma & Volume Profile (Call Vol Above / Put Vol Below)", template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=480, barmode="overlay", margin=dict(l=20, r=20, t=40, b=10), hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-            fig_vol.update_xaxes(type="linear", tickformat="d", dtick=100)
-            fig_vol.update_yaxes(title_text="Put Vol (Below) | Call Vol (Above)", range=v1_range, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
-            fig_vol.update_yaxes(title_text="Net GEX (Vol-Based ₹)", range=v2_range, secondary_y=True, showgrid=False, zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
-            st.plotly_chart(fig_vol, use_container_width=True)
-
+            # 1. GEX/OI CHART (Positioned Above GEX/Trade Volume)
             st.subheader("📈 OI-Based Net Gamma Exposure vs Open Interest (OI)")
             gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
             fig_oi = make_subplots(specs=[[{"secondary_y": True}]])
@@ -1295,6 +1285,54 @@ def live_dashboard_fragment():
             fig_oi.update_yaxes(title_text="Net GEX (OI-Based ₹)", range=oi2_range, secondary_y=True, showgrid=False, zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
             st.plotly_chart(fig_oi, use_container_width=True)
 
+            # 2. GEX/TRADE VOLUME CHART
+            st.subheader("📊 Volume-Based Net Gamma Exposure vs Trading Volume")
+            gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
+            fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net Gamma (Vol-Based)", marker_color=gex_vol_colors, opacity=0.85, width=25, hovertemplate="Strike: %{x}<br>Net GEX (Vol): ₹%{y:,.0f}<extra></extra>"), secondary_y=True)
+            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_Vol"], name="Call Volume", marker_color="#81C784", opacity=0.6, hovertemplate="Strike: %{x}<br>Call Vol: %{y:,}<extra></extra>"), secondary_y=False)
+            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_Vol"], name="Put Volume", marker_color="#FF8A80", opacity=0.6, hovertemplate="Strike: %{x}<br>Put Vol: %{customdata:,}<extra></extra>", customdata=df_chain["P_Vol"]), secondary_y=False)
+            fig_vol.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
+            fig_vol.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
+            fig_vol.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip Point")
+            v1_range, v2_range = calculate_synced_ranges(df_chain["C_Vol"], -df_chain["P_Vol"], df_chain["Net_GEX_Vol"].clip(lower=0), df_chain["Net_GEX_Vol"].clip(upper=0))
+            fig_vol.update_layout(title="Strike-wise Volume-Based Net Gamma & Volume Profile (Call Vol Above / Put Vol Below)", template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=480, barmode="overlay", margin=dict(l=20, r=20, t=40, b=10), hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            fig_vol.update_xaxes(type="linear", tickformat="d", dtick=100)
+            fig_vol.update_yaxes(title_text="Put Vol (Below) | Call Vol (Above)", range=v1_range, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
+            fig_vol.update_yaxes(title_text="Net GEX (Vol-Based ₹)", range=v2_range, secondary_y=True, showgrid=False, zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
+            st.plotly_chart(fig_vol, use_container_width=True)
+
+            # 3. DELTA-ADJUSTED GEX CHART (Positioned Below GEX/Trade Volume & Above VEX/CEX)
+            st.subheader("🎯 Delta-Adjusted Net Gamma Exposure Profile")
+            delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
+            fig_delta_gex = make_subplots(specs=[[{"secondary_y": False}]])
+            fig_delta_gex.add_trace(plt_go.Bar(
+                x=df_chain["Strike"], 
+                y=df_chain["Net_Delta_GEX_OI"], 
+                name="Delta-Adjusted Net GEX", 
+                marker_color=delta_gex_colors, 
+                opacity=0.85, 
+                width=25, 
+                hovertemplate="Strike: %{x}<br>Delta-Adjusted GEX: ₹%{y:,.0f}<extra></extra>"
+            ))
+            fig_delta_gex.add_hline(y=0, line_width=1.5, line_color="#FFFFFF")
+            fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot")
+            fig_delta_gex.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip Point")
+            fig_delta_gex.update_layout(
+                title="Strike-wise Delta-Adjusted Net Gamma Exposure Profile", 
+                template="plotly_dark", 
+                paper_bgcolor="#0E1117", 
+                plot_bgcolor="#0E1117", 
+                height=480, 
+                margin=dict(l=20, r=20, t=40, b=10), 
+                hovermode="x unified", 
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100)
+            fig_delta_gex.update_yaxes(title_text="Delta-Adjusted Net GEX (₹)", showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
+            st.plotly_chart(fig_delta_gex, use_container_width=True)
+
+            # 4. VEX & CEX CHART
             st.subheader("⚡ VEX (Vega Exposure) and CEX (Charm Exposure) Profile")
             fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
             fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX (Vega Exposure)", marker_color="#00E676", opacity=0.75, width=20, hovertemplate="Strike: %{x}<br>VEX: ₹%{y:,.2f}<extra></extra>"), secondary_y=False)
