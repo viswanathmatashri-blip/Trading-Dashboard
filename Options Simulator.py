@@ -186,7 +186,7 @@ def fetch_history(api, token, days, spot_token="99926000", spot_exchange="NSE"):
         return df.sort_values('Date', ascending=True).reset_index(drop=True)
     return pd.DataFrame()
 
-def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r, progress_status=None):
+def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r, strikes_below=10, strikes_above=10, progress_status=None):
     if progress_status:
         progress_status.caption(f"⏳ Filtering option contracts for expiry {expiry_str}...")
     df_expiry = df_nfo[df_nfo['expiry'] == expiry_str].copy()
@@ -198,9 +198,19 @@ def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r, pr
     dte = max((expiry_dt - today_dt).days, 0.001)
     T = dte / 365.0
 
-    min_strike = current_spot * 0.95
-    max_strike = current_spot * 1.05
-    df_filtered = df_expiry[(df_expiry['strike_clean'] >= min_strike) & (df_expiry['strike_clean'] <= max_strike)].copy()
+    # Filter strikes strictly based on Below ATM / Above ATM user inputs
+    all_strikes = sorted(df_expiry['strike_clean'].dropna().unique())
+    if not all_strikes:
+        return pd.DataFrame()
+
+    atm_strike = min(all_strikes, key=lambda x: abs(x - current_spot))
+    atm_idx = all_strikes.index(atm_strike)
+
+    start_idx = max(0, atm_idx - strikes_below)
+    end_idx = min(len(all_strikes), atm_idx + strikes_above + 1)
+    target_strikes = set(all_strikes[start_idx:end_idx])
+
+    df_filtered = df_expiry[df_expiry['strike_clean'].isin(target_strikes)].copy()
 
     to_date = datetime.datetime.now()
     from_date = to_date - datetime.timedelta(days=4)
@@ -1313,7 +1323,18 @@ def live_dashboard_fragment():
     smart_api = get_smart_api_client()
     if smart_api and not df_master.empty:
         latest_spot = data['spot_price']
-        df_chain_iv = fetch_and_compute_full_chain_iv(smart_api, df_master, selected_expiry_str, latest_spot, rate_param, progress_status=skew_status_holder)
+        
+        # Pass strikes_below and strikes_above to fetch only requested strikes
+        df_chain_iv = fetch_and_compute_full_chain_iv(
+            smart_api, 
+            df_master, 
+            selected_expiry_str, 
+            latest_spot, 
+            rate_param, 
+            strikes_below=strikes_below, 
+            strikes_above=strikes_above, 
+            progress_status=skew_status_holder
+        )
         skew_status_holder.empty()
 
         if not df_chain_iv.empty:
