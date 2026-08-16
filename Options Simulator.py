@@ -844,7 +844,9 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                     market_data[str(item["symbolToken"])] = {
                         "ltp": float(item.get("ltp", 0.0)),
                         "oi": int(item.get("opnInterest", 0)),
-                        "volume": int(vol_val)
+                        "volume": int(vol_val),
+                        "best_bid": float(item.get("bestBidPrice", item.get("ltp", 0.0))),
+                        "best_ask": float(item.get("bestAskPrice", item.get("ltp", 0.0)))
                     }
             time.sleep(0.05)
 
@@ -866,8 +868,8 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 
         for row in strike_mapping:
             K = row["strike"]
-            c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "volume": 0})
-            p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "volume": 0})
+            c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "volume": 0, "best_bid": 0.0, "best_ask": 0.0})
+            p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "volume": 0, "best_bid": 0.0, "best_ask": 0.0})
 
             iv = VolatilityEngine.calculate_iv(c_info["ltp"] if K >= F else p_info["ltp"], F, K, T, rate_param, "c" if K >= F else "p")
             if iv == 0.0:
@@ -902,6 +904,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                 "C_Δ": round(c_greeks["delta"], 2), "C_γ": round(c_greeks["gamma"], 4),
                 "C_θ": round(c_greeks["theta"], 2), "C_ν": round(c_greeks["vega"], 2),
                 "C_IV_val": iv, "C_IV": f"{iv * 100:.1f}%", "C_LTP": c_info["ltp"],
+                "C_Bid": c_info.get("best_bid", 0.0), "C_Ask": c_info.get("best_ask", 0.0),
                 "Strike": K,
                 "Net_GEX_OI": round(net_gex_oi, 2),
                 "Net_Delta_GEX_OI": round(net_delta_gex_oi, 2),
@@ -909,6 +912,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                 "VEX": round(vex_val, 2),
                 "CEX": round(cex_val, 2),
                 "P_LTP": p_info["ltp"], "P_IV_val": iv, "P_IV": f"{iv * 100:.1f}%",
+                "P_Bid": p_info.get("best_bid", 0.0), "P_Ask": p_info.get("best_ask", 0.0),
                 "P_Δ": round(p_greeks["delta"], 2), "P_γ": round(p_greeks["gamma"], 4),
                 "P_θ": round(p_greeks["theta"], 2), "P_ν": round(p_greeks["vega"], 2),
                 "P_OI": p_info["oi"], "P_Vol": p_info["volume"]
@@ -1027,6 +1031,123 @@ def zscore_analysis_fragment():
             )
     else:
         st.info("Click '🔄 Compute / Refresh Z-Scores' above to load Futures volume & HV Z-Score analysis.")
+
+# --- INSTITUTIONAL ORDER FLOW SCANNER MODULE ---
+def institutional_order_flow_scanner_fragment():
+    st.markdown("---")
+    st.subheader(f"🏛️ Institutional Order Flow Scanner ({Index_Name})")
+    st.caption("Filters out retail noise to isolate high-conviction institutional trades based on premium thresholds, aggressive price execution, and unusual volume spikes.")
+
+    if "data_store" not in st.session_state or not st.session_state["data_store"].get("chain_results"):
+        st.info("No option chain data available. Run the main fetch process to enable scanning.")
+        return
+
+    chain_data = st.session_state["data_store"]["chain_results"]
+    lot_size = LOT_SIZES.get(Index_Name, 25)
+
+    scanned_trades = []
+
+    # Calculate average volume across current chain strikes for unusual volume ratio calculation
+    all_volumes = [r["C_Vol"] for r in chain_data] + [r["P_Vol"] for r in chain_data]
+    avg_daily_vol = np.mean(all_volumes) if all_volumes and np.mean(all_volumes) > 0 else 1.0
+
+    for row in chain_data:
+        strike = row["Strike"]
+
+        # Evaluate Call Option
+        c_ltp = row["C_LTP"]
+        c_vol = row["C_Vol"]
+        c_premium = c_ltp * c_vol * lot_size
+        c_lots = c_vol
+
+        if c_premium >= 1000000 or c_lots >= 500:
+            c_bid = row.get("C_Bid", 0.0)
+            c_ask = row.get("C_Ask", 0.0)
+
+            # Execution Sentiment Logic
+            if c_ask > 0 and c_ltp >= c_ask:
+                sentiment = "Aggressive Bullish (Sweep/Buy)"
+            elif c_bid > 0 and c_ltp <= c_bid:
+                sentiment = "Aggressive Bearish (Sell)"
+            else:
+                sentiment = "Neutral / Mid-Market Execution"
+
+            vol_ratio = c_vol / avg_daily_vol if avg_daily_vol > 0 else 0.0
+            unusual_flag = vol_ratio > 3.0
+
+            scanned_trades.append({
+                "Strike": strike,
+                "Option_Type": "CE",
+                "LTP (₹)": c_ltp,
+                "Volume (Lots)": c_lots,
+                "Total Premium (₹)": round(c_premium, 2),
+                "Sentiment / Execution": sentiment,
+                "Volume Ratio": round(vol_ratio, 2),
+                "Unusual Vol Flag": "🚨 High Vol" if unusual_flag else "Normal"
+            })
+
+        # Evaluate Put Option
+        p_ltp = row["P_LTP"]
+        p_vol = row["P_Vol"]
+        p_premium = p_ltp * p_vol * lot_size
+        p_lots = p_vol
+
+        if p_premium >= 1000000 or p_lots >= 500:
+            p_bid = row.get("P_Bid", 0.0)
+            p_ask = row.get("P_Ask", 0.0)
+
+            # Execution Sentiment Logic
+            if p_ask > 0 and p_ltp >= p_ask:
+                sentiment = "Aggressive Bullish (Sweep/Buy)"
+            elif p_bid > 0 and p_ltp <= p_bid:
+                sentiment = "Aggressive Bearish (Sell)"
+            else:
+                sentiment = "Neutral / Mid-Market Execution"
+
+            vol_ratio = p_vol / avg_daily_vol if avg_daily_vol > 0 else 0.0
+            unusual_flag = vol_ratio > 3.0
+
+            scanned_trades.append({
+                "Strike": strike,
+                "Option_Type": "PE",
+                "LTP (₹)": p_ltp,
+                "Volume (Lots)": p_lots,
+                "Total Premium (₹)": round(p_premium, 2),
+                "Sentiment / Execution": sentiment,
+                "Volume Ratio": round(vol_ratio, 2),
+                "Unusual Vol Flag": "🚨 High Vol" if unusual_flag else "Normal"
+            })
+
+    if scanned_trades:
+        df_scanner = pd.DataFrame(scanned_trades)
+
+        def style_sentiment(val):
+            if "Bullish" in str(val):
+                return 'background-color: rgba(0, 230, 118, 0.2); color: #00E676; font-weight: bold;'
+            elif "Bearish" in str(val):
+                return 'background-color: rgba(255, 82, 82, 0.2); color: #FF5252; font-weight: bold;'
+            else:
+                return 'color: #FAFAFA;'
+
+        def style_unusual(val):
+            if "High Vol" in str(val):
+                return 'background-color: rgba(255, 152, 0, 0.25); color: #FF9800; font-weight: bold;'
+            return 'color: #FAFAFA;'
+
+        styled_df = df_scanner.style.map(
+            style_sentiment, subset=['Sentiment / Execution']
+        ).map(
+            style_unusual, subset=['Unusual Vol Flag']
+        ).format({
+            "LTP (₹)": "{:,.2f}",
+            "Volume (Lots)": "{:,.0f}",
+            "Total Premium (₹)": "₹{:,.2f}",
+            "Volume Ratio": "{:.2f}x"
+        })
+
+        st.dataframe(styled_df, use_container_width=True)
+    else:
+        st.info("No trades currently meeting the institutional threshold criteria (Premium ≥ ₹10 Lakhs or Volume ≥ 500 lots).")
 
 # --- LIVE DASHBOARD FRAGMENT ---
 @st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
@@ -1484,3 +1605,6 @@ live_dashboard_fragment()
 
 # Run separate isolated Z-Score engine fragment
 zscore_analysis_fragment()
+
+# Run Institutional Order Flow Scanner fragment
+institutional_order_flow_scanner_fragment()
