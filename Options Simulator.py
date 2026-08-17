@@ -212,9 +212,9 @@ def fetch_history(api, token, days, spot_token="99926000", spot_exchange="NSE"):
         return df.sort_values('Date', ascending=True).reset_index(drop=True)
     return pd.DataFrame()
 
-def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r, strikes_below=10, strikes_above=10, progress_status=None):
-    if progress_status:
-        progress_status.caption(f"⏳ Filtering option contracts for expiry {expiry_str}...")
+# OPTIMIZED: Cached & Paced to avoid Rate-Limit Exception
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_and_compute_full_chain_iv(_api, df_nfo, expiry_str, current_spot, r, strikes_below=10, strikes_above=10):
     df_expiry = df_nfo[df_nfo['expiry'] == expiry_str].copy()
     if df_expiry.empty:
         return pd.DataFrame()
@@ -241,11 +241,7 @@ def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r, st
     from_date = to_date - datetime.timedelta(days=4)
 
     results = []
-    total_rows = len(df_filtered)
     for idx, (_, row) in enumerate(df_filtered.iterrows()):
-        if progress_status and idx % 5 == 0:
-            progress_status.caption(f"⏳ Processing Black-Scholes IV & Extrinsic values ({idx}/{total_rows} strikes)...")
-            
         opt_type = "CE" if str(row['symbol']).endswith("CE") else "PE"
         token = row['token']
         strike = row['strike_clean']
@@ -257,7 +253,13 @@ def fetch_and_compute_full_chain_iv(api, df_nfo, expiry_str, current_spot, r, st
             "fromdate": from_date.strftime("%Y-%m-%d 09:15"), 
             "todate": to_date.strftime("%Y-%m-%d 15:30")
         }
-        res = api.getCandleData(opt_params)
+        
+        try:
+            res = _api.getCandleData(opt_params)
+            time.sleep(0.35)  # Enforce ~3 requests/sec rate limit to prevent SmartAPI rejection
+        except Exception:
+            res = None
+
         if res and res.get('data'):
             latest_ltp = res['data'][-1][4]
             if latest_ltp <= 1.0:
@@ -1522,8 +1524,6 @@ def live_dashboard_fragment():
     with head_skew_c2:
         skew_ts = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S IST")
         st.markdown(f"<div class='update-timestamp'>Last updated: {skew_ts}</div>", unsafe_allow_html=True)
-    
-    skew_status_holder = st.empty()
 
     smart_api = get_smart_api_client()
     if smart_api and not df_master.empty:
@@ -1536,10 +1536,8 @@ def live_dashboard_fragment():
             latest_spot, 
             rate_param, 
             strikes_below=strikes_below, 
-            strikes_above=strikes_above, 
-            progress_status=skew_status_holder
+            strikes_above=strikes_above
         )
-        skew_status_holder.empty()
 
         if not df_chain_iv.empty:
             tab1, tab2 = st.tabs(["Unsmoothed Market Skew (OTM Puts & Calls)", "Both Raw Curves (CE vs PE)"])
