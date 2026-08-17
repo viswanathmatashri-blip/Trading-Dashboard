@@ -195,10 +195,12 @@ def fetch_history(api, token, days, spot_token="99926000", spot_exchange="NSE"):
     opt_params = {"exchange": "NFO", "symboltoken": str(token), "interval": "ONE_DAY", 
                   "fromdate": from_date.strftime("%Y-%m-%d 09:15"), "todate": to_date.strftime("%Y-%m-%d 15:30")}
     opt_res = api.getCandleData(opt_params)
+    time.sleep(0.35)
     
     spot_params = {"exchange": spot_exchange, "symboltoken": str(spot_token), "interval": "ONE_DAY", 
                    "fromdate": from_date.strftime("%Y-%m-%d 09:15"), "todate": to_date.strftime("%Y-%m-%d 15:30")}
     spot_res = api.getCandleData(spot_params)
+    time.sleep(0.35)
     
     if opt_res and opt_res.get('data') and spot_res and spot_res.get('data'):
         df_opt = pd.DataFrame(opt_res['data'], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
@@ -212,7 +214,7 @@ def fetch_history(api, token, days, spot_token="99926000", spot_exchange="NSE"):
         return df.sort_values('Date', ascending=True).reset_index(drop=True)
     return pd.DataFrame()
 
-# OPTIMIZED: Cached & Paced to avoid Rate-Limit Exception
+# OPTIMIZED: Cached & Paced with BATCH API requests to prevent Rate Limit Exceeded
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_and_compute_full_chain_iv(_api, df_nfo, expiry_str, current_spot, r, strikes_below=10, strikes_above=10):
     df_expiry = df_nfo[df_nfo['expiry'] == expiry_str].copy()
@@ -237,54 +239,52 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, expiry_str, current_spot, r, s
 
     df_filtered = df_expiry[df_expiry['strike_clean'].isin(target_strikes)].copy()
 
-    to_date = datetime.datetime.now()
-    from_date = to_date - datetime.timedelta(days=4)
+    # Optimized Batch Fetch via getMarketData to avoid hundreds of separate candle requests
+    tokens = [str(t) for t in df_filtered['token'].dropna().unique() if str(t) != "nan"]
+    market_data = {}
+    chunk_size = 40
+
+    for i in range(0, len(tokens), chunk_size):
+        chunk = tokens[i:i + chunk_size]
+        try:
+            res = _api.getMarketData("FULL", {"NFO": chunk})
+            if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
+                for item in res["data"]["fetched"]:
+                    market_data[str(item["symbolToken"])] = float(item.get("ltp", 0.0))
+        except Exception:
+            pass
+        time.sleep(0.35)
 
     results = []
     for idx, (_, row) in enumerate(df_filtered.iterrows()):
         opt_type = "CE" if str(row['symbol']).endswith("CE") else "PE"
-        token = row['token']
+        token = str(row['token'])
         strike = row['strike_clean']
 
-        opt_params = {
-            "exchange": "NFO", 
-            "symboltoken": str(token), 
-            "interval": "ONE_DAY", 
-            "fromdate": from_date.strftime("%Y-%m-%d 09:15"), 
-            "todate": to_date.strftime("%Y-%m-%d 15:30")
-        }
-        
-        try:
-            res = _api.getCandleData(opt_params)
-            time.sleep(0.35)  # Enforce ~3 requests/sec rate limit to prevent SmartAPI rejection
-        except Exception:
-            res = None
-
-        if res and res.get('data'):
-            latest_ltp = res['data'][-1][4]
-            if latest_ltp <= 1.0:
-                continue
-                
-            iv = calculate_implied_volatility(latest_ltp, current_spot, strike, T, r, option_type=opt_type)
-            iv_pct = iv * 100.0
+        latest_ltp = market_data.get(token, 0.0)
+        if latest_ltp <= 1.0:
+            continue
             
-            discounted_K = strike * np.exp(-r * T)
-            intrinsic = max(0.0, current_spot - discounted_K) if opt_type == "CE" else max(0.0, discounted_K - current_spot)
-            extrinsic = max(0.0, latest_ltp - intrinsic)
-            is_pure_intrinsic = extrinsic <= 1.0
-            is_vol_crash = is_pure_intrinsic or (iv_pct <= 2.0)
+        iv = calculate_implied_volatility(latest_ltp, current_spot, strike, T, r, option_type=opt_type)
+        iv_pct = iv * 100.0
+        
+        discounted_K = strike * np.exp(-r * T)
+        intrinsic = max(0.0, current_spot - discounted_K) if opt_type == "CE" else max(0.0, discounted_K - current_spot)
+        extrinsic = max(0.0, latest_ltp - intrinsic)
+        is_pure_intrinsic = extrinsic <= 1.0
+        is_vol_crash = is_pure_intrinsic or (iv_pct <= 2.0)
 
-            if 2.0 <= iv_pct <= 80.0 or is_vol_crash:
-                results.append({
-                    'Strike': strike,
-                    'Option_Type': opt_type,
-                    'LTP': latest_ltp,
-                    'IV_%': iv_pct,
-                    'Extrinsic_Val': extrinsic,
-                    'Is_Pure_Intrinsic': is_pure_intrinsic,
-                    'Vol_Crash_Flag': is_vol_crash,
-                    'Token': token
-                })
+        if 2.0 <= iv_pct <= 80.0 or is_vol_crash:
+            results.append({
+                'Strike': strike,
+                'Option_Type': opt_type,
+                'LTP': latest_ltp,
+                'IV_%': iv_pct,
+                'Extrinsic_Val': extrinsic,
+                'Is_Pure_Intrinsic': is_pure_intrinsic,
+                'Vol_Crash_Flag': is_vol_crash,
+                'Token': token
+            })
 
     df_chain_iv = pd.DataFrame(results)
     if df_chain_iv.empty:
@@ -382,6 +382,7 @@ class VolatilityEngine:
                 "todate": to_date.strftime("%Y-%m-%d 15:30")
             }
             hist_data = smart_api.getCandleData(param)
+            time.sleep(0.35)
             if hist_data and hist_data.get("status") and hist_data.get("data"):
                 df_hist = pd.DataFrame(hist_data["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
                 df_hist["close"] = df_hist["close"].astype(float)
@@ -564,6 +565,7 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
         }
         
         candle_res = smart_api.getCandleData(candle_param)
+        time.sleep(0.35)
         if candle_res and candle_res.get("status") and candle_res.get("data"):
             df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
             df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
@@ -593,6 +595,7 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
             "todate": to_date
         }
         s_res = smart_api.getCandleData(spot_param)
+        time.sleep(0.35)
         if not (s_res and s_res.get('status') and s_res.get('data')):
             return pd.DataFrame()
 
@@ -623,6 +626,7 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
                 "todate": to_date
             }
             f_res = smart_api.getCandleData(fut_param)
+            time.sleep(0.35)
             if f_res and f_res.get('status') and f_res.get('data'):
                 df_fut = pd.DataFrame(f_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'fut_volume'])
                 df_fut['date'] = df_fut['time'].str.split('T').str[0]
@@ -774,11 +778,9 @@ interval_mapping = {
     "15 min": ("FIFTEEN_MINUTE", 30)
 }
 
-# --- SECURE SESSION HANDLER ---
+# --- SECURE SESSION HANDLER (CACHE PERSISTENT TO PREVENT RATE LIMITS) ---
+@st.cache_resource(ttl=3600, show_spinner=False)
 def get_smart_api_client():
-    if "smart_api_instance" in st.session_state and st.session_state["smart_api_instance"] is not None:
-        return st.session_state["smart_api_instance"]
-
     if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
         return None
 
@@ -788,7 +790,6 @@ def get_smart_api_client():
         session = smart_api.generateSession(CLIENT_CODE, PIN, totp_token)
 
         if session.get("status"):
-            st.session_state["smart_api_instance"] = smart_api
             return smart_api
     except Exception:
         pass
@@ -824,6 +825,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
 
         spot_resp = smart_api.ltpData(exchange=spot_exch, tradingsymbol=Index_Name, symboltoken=spot_token)
+        time.sleep(0.35)
         spot_price = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") and spot_resp.get("data") else 80000.0 if Index_Name == "SENSEX" else 24500.0
 
         index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, spot_exch, days=hv_days)
@@ -897,7 +899,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                         "best_bid": float(item.get("bestBidPrice", item.get("ltp", 0.0))),
                         "best_ask": float(item.get("bestAskPrice", item.get("ltp", 0.0)))
                     }
-            time.sleep(0.05)
+            time.sleep(0.35)
 
         update_p(0.85, "Calculating Option Greeks & Gamma Exposure Profile...")
         atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
@@ -1183,7 +1185,7 @@ def institutional_order_flow_scanner_fragment():
         st.info("No trades currently meeting the institutional threshold criteria (Premium ≥ ₹10 Lakhs or Volume ≥ 500 lots).")
 
 # --- LIVE DASHBOARD FRAGMENT ---
-@st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
+@st.fragment(run_every=15 if st.session_state.get("enable_main_refresh", False) else None)
 def live_dashboard_fragment():
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
@@ -1204,7 +1206,7 @@ def live_dashboard_fragment():
                 st.warning("⚠️ Today is a non-trading day/holiday. Technical charts are displaying the latest available trading session.")
         with col_status:
             st.write("")
-            cb_main = st.checkbox("Enable Auto-Refresh (5s)", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
+            cb_main = st.checkbox("Enable Auto-Refresh (15s)", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
             if cb_main != st.session_state["enable_main_refresh"]:
                 st.session_state["enable_main_refresh"] = cb_main
                 st.rerun()
