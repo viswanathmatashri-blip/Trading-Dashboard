@@ -5,6 +5,7 @@ import time
 import datetime
 import math
 import json
+import random
 import numpy as np
 import pandas as pd
 import scipy.stats as si
@@ -129,6 +130,28 @@ INDEX_TOKEN_MAP = {
     "SENSEX": ("99919000", "BSE", "BFO")
 }
 
+# --- RATE LIMIT SAFEGUARD WRAPPER ---
+def safe_api_call(func, *args, max_retries=4, base_delay=0.6, **kwargs):
+    """Executes SmartAPI calls with dynamic retry logic and exponential backoff for rate limits."""
+    for attempt in range(max_retries):
+        try:
+            res = func(*args, **kwargs)
+            if isinstance(res, dict) and not res.get("status"):
+                msg = str(res.get("message", "")).lower()
+                if "access denied" in msg or "rate" in msg or "exceeding" in msg:
+                    raise Exception(f"Rate Limit Hit: {res.get('message')}")
+            return res
+        except Exception as e:
+            err_str = str(e).lower()
+            if "access denied" in err_str or "rate" in err_str or "exceeding" in err_str:
+                if attempt == max_retries - 1:
+                    return None
+                sleep_time = base_delay * (2 ** attempt) + random.uniform(0.1, 0.4)
+                time.sleep(sleep_time)
+            else:
+                return None
+    return None
+
 # --- BETA MODULE HELPER FUNCTIONS ---
 def d1_d2(S, K, T, r, sigma):
     d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
@@ -188,19 +211,20 @@ def compute_greeks(row, K, r, option_type="CE"):
     
     return pd.Series([sigma * 100.0, theta, theta_decay_pct, gamma, vanna, charm, extrinsic, is_pure_intrinsic])
 
-def fetch_history(api, token, days, spot_token="99926000", spot_exchange="NSE"):
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_history(_api, token, days, spot_token="99926000", spot_exchange="NSE"):
     to_date = datetime.datetime.now()
     from_date = to_date - datetime.timedelta(days=days)
     
     opt_params = {"exchange": "NFO", "symboltoken": str(token), "interval": "ONE_DAY", 
                   "fromdate": from_date.strftime("%Y-%m-%d 09:15"), "todate": to_date.strftime("%Y-%m-%d 15:30")}
-    opt_res = api.getCandleData(opt_params)
-    time.sleep(0.35)
+    opt_res = safe_api_call(_api.getCandleData, opt_params)
+    time.sleep(0.40)
     
     spot_params = {"exchange": spot_exchange, "symboltoken": str(spot_token), "interval": "ONE_DAY", 
                    "fromdate": from_date.strftime("%Y-%m-%d 09:15"), "todate": to_date.strftime("%Y-%m-%d 15:30")}
-    spot_res = api.getCandleData(spot_params)
-    time.sleep(0.35)
+    spot_res = safe_api_call(_api.getCandleData, spot_params)
+    time.sleep(0.40)
     
     if opt_res and opt_res.get('data') and spot_res and spot_res.get('data'):
         df_opt = pd.DataFrame(opt_res['data'], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
@@ -246,14 +270,11 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, expiry_str, current_spot, r, s
 
     for i in range(0, len(tokens), chunk_size):
         chunk = tokens[i:i + chunk_size]
-        try:
-            res = _api.getMarketData("FULL", {"NFO": chunk})
-            if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
-                for item in res["data"]["fetched"]:
-                    market_data[str(item["symbolToken"])] = float(item.get("ltp", 0.0))
-        except Exception:
-            pass
-        time.sleep(0.35)
+        res = safe_api_call(_api.getMarketData, "FULL", {"NFO": chunk})
+        if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
+            for item in res["data"]["fetched"]:
+                market_data[str(item["symbolToken"])] = float(item.get("ltp", 0.0))
+        time.sleep(0.40)
 
     results = []
     for idx, (_, row) in enumerate(df_filtered.iterrows()):
@@ -381,8 +402,8 @@ class VolatilityEngine:
                 "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
                 "todate": to_date.strftime("%Y-%m-%d 15:30")
             }
-            hist_data = smart_api.getCandleData(param)
-            time.sleep(0.35)
+            hist_data = safe_api_call(smart_api.getCandleData, param)
+            time.sleep(0.40)
             if hist_data and hist_data.get("status") and hist_data.get("data"):
                 df_hist = pd.DataFrame(hist_data["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
                 df_hist["close"] = df_hist["close"].astype(float)
@@ -564,8 +585,8 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
             "todate": target_to.strftime("%Y-%m-%d 15:30")
         }
         
-        candle_res = smart_api.getCandleData(candle_param)
-        time.sleep(0.35)
+        candle_res = safe_api_call(smart_api.getCandleData, candle_param)
+        time.sleep(0.40)
         if candle_res and candle_res.get("status") and candle_res.get("data"):
             df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
             df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
@@ -594,8 +615,8 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
             "fromdate": from_date,
             "todate": to_date
         }
-        s_res = smart_api.getCandleData(spot_param)
-        time.sleep(0.35)
+        s_res = safe_api_call(smart_api.getCandleData, spot_param)
+        time.sleep(0.40)
         if not (s_res and s_res.get('status') and s_res.get('data')):
             return pd.DataFrame()
 
@@ -625,8 +646,8 @@ def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, prog
                 "fromdate": from_date,
                 "todate": to_date
             }
-            f_res = smart_api.getCandleData(fut_param)
-            time.sleep(0.35)
+            f_res = safe_api_call(smart_api.getCandleData, fut_param)
+            time.sleep(0.40)
             if f_res and f_res.get('status') and f_res.get('data'):
                 df_fut = pd.DataFrame(f_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'fut_volume'])
                 df_fut['date'] = df_fut['time'].str.split('T').str[0]
@@ -787,9 +808,9 @@ def get_smart_api_client():
     try:
         smart_api = SmartConnect(api_key=API_KEY)
         totp_token = pyotp.TOTP(TOTP_SECRET).now()
-        session = smart_api.generateSession(CLIENT_CODE, PIN, totp_token)
+        session = safe_api_call(smart_api.generateSession, CLIENT_CODE, PIN, totp_token)
 
-        if session.get("status"):
+        if session and session.get("status"):
             return smart_api
     except Exception:
         pass
@@ -824,8 +845,8 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         update_p(0.20, f"Fetching Live Spot & Volatility for {Index_Name}...")
         spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
 
-        spot_resp = smart_api.ltpData(exchange=spot_exch, tradingsymbol=Index_Name, symboltoken=spot_token)
-        time.sleep(0.35)
+        spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=Index_Name, symboltoken=spot_token)
+        time.sleep(0.40)
         spot_price = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") and spot_resp.get("data") else 80000.0 if Index_Name == "SENSEX" else 24500.0
 
         index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, spot_exch, days=hv_days)
@@ -880,7 +901,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         chunk_size = 40
         for i in range(0, len(tokens_to_fetch_list), chunk_size):
             chunk = tokens_to_fetch_list[i:i + chunk_size]
-            res = smart_api.getMarketData("FULL", {opt_exch: chunk})
+            res = safe_api_call(smart_api.getMarketData, "FULL", {opt_exch: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
                     vol_val = (
@@ -899,7 +920,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                         "best_bid": float(item.get("bestBidPrice", item.get("ltp", 0.0))),
                         "best_ask": float(item.get("bestAskPrice", item.get("ltp", 0.0)))
                     }
-            time.sleep(0.35)
+            time.sleep(0.40)
 
         update_p(0.85, "Calculating Option Greeks & Gamma Exposure Profile...")
         atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
