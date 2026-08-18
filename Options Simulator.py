@@ -1452,7 +1452,8 @@ def live_dashboard_fragment():
                         leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange)
                         if not leg_df.empty:
                             leg_df['Expiry_Date'] = target_expiry_dt.date()
-                            leg_df['DTE'] = (pd.to_datetime(leg_df['Expiry_Date']) - pd.to_datetime(leg_df['Raw_Timestamp']).dt.date).apply(lambda x: max(x.days, 0.001))
+                            leg_df['DTE'] = (pd.to_datetime(leg_df['Expiry_Date']) - pd.to_datetime(leg_df['Raw_Timestamp'])).dt.total_seconds() / (24 * 3600)
+                            leg_df['DTE'] = leg_df['DTE'].apply(lambda x: max(x, 0.001))
                             leg_df['T'] = leg_df['DTE'] / 365.0
                             
                             greeks_df = leg_df.apply(compute_greeks, axis=1, K=k, r=rate_param, option_type=t)
