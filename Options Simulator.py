@@ -334,10 +334,10 @@ def get_clean_otm_skew(df_chain_iv, current_spot):
     return df_skew
 
 def plot_line_chart(df, y_col, title, y_label, color="#1f77b4"):
-    fig = px.line(df, x='DTE', y=y_col, title=title, markers=True,
+    fig = px.line(df, x='Date', y=y_col, title=title, markers=True,
                   hover_data=['Date', 'Spot_Price', 'Close', 'Extrinsic_Val', 'Is_Pure_Intrinsic'])
     fig.update_traces(line_color=color)
-    fig.update_xaxes(autorange="reversed", title="Days to Expiry (DTE) [Oldest ➔ Today]")
+    fig.update_xaxes(autorange=True, title="Date (Oldest ➔ Present/Today)")
     fig.update_yaxes(title=y_label)
     fig.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20))
     return fig
@@ -752,10 +752,11 @@ df_expiry["strike_num"] = pd.to_numeric(df_expiry["strike"], errors="coerce") / 
 if df_expiry["strike_num"].max() > 1000000:
     df_expiry["strike_num"] = df_expiry["strike_num"] / 100.0
 
-all_expiry_strikes = sorted(df_expiry["strike_num"].dropna().unique())
+all_expiry_strikes = sorted([int(s) for s in df_expiry["strike_num"].dropna().unique()])
 
 with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
-    selected_strike = st.selectbox("Option Strike Price", all_expiry_strikes if all_expiry_strikes else [24500])
+    # Minor Improvement 1: Remove decimal from strike prices (i.e. 24500 not 24500.0)
+    selected_strike = st.selectbox("Option Strike Price", all_expiry_strikes if all_expiry_strikes else [24500], format_func=lambda x: f"{int(x)}")
 
     b_col1, b_col2 = st.columns(2)
     with b_col1:
@@ -764,7 +765,9 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
         trade_action = st.selectbox("Trade Action", ["BUY", "SELL"])
 
     entry_price_input = st.number_input("Entry Price (₹) [0 for LTP]", min_value=0.0, value=0.0, step=0.5)
-    qty_lots = st.number_input("Quantity / Units", min_value=1, value=LOT_SIZES.get(Index_Name, 25), step=1)
+    # Minor Improvement 2: Default Quantity/units to be as per index lot size / attached screenshot
+    default_qty = LOT_SIZES.get(Index_Name, 25)
+    qty_lots = st.number_input("Quantity / Units", min_value=1, value=default_qty, step=1)
 
     c_btn1, c_btn2 = st.columns(2)
     with c_btn1:
@@ -1428,6 +1431,77 @@ def live_dashboard_fragment():
                     st.session_state["basket_legs"].pop(idx)
                     sync_local_storage()
                     st.rerun()
+
+        # --- NEW MODULE: STRATEGY BASKET HISTORICAL ANALYTICS CHARTS ---
+        with st.expander("📊 Basket Historical Analytics (Cumulative Theta, Daily Theta, Vanna, Charm)", expanded=False):
+            st.caption("Visualizing combined strategy basket time-series decay and second-order greeks. Present time is anchored on the RIGHT.")
+            smart_api = get_smart_api_client()
+            if smart_api and not df_master.empty:
+                b_hist_dfs = []
+                for leg in st.session_state["basket_legs"]:
+                    k = leg["strike"]
+                    t = leg["type"]
+                    act = leg["action"]
+                    qty = leg["qty"]
+                    mult = 1.0 if act == "BUY" else -1.0
+
+                    tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
+                    if tok:
+                        leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange)
+                        if not leg_df.empty:
+                            leg_df['Expiry_Date'] = target_expiry_dt.date()
+                            leg_df['DTE'] = (leg_df['Expiry_Date'] - leg_df['Date']).apply(lambda x: max(x.days, 0.001))
+                            leg_df['T'] = leg_df['DTE'] / 365.0
+                            
+                            greeks_df = leg_df.apply(compute_greeks, axis=1, K=k, r=rate_param, option_type=t)
+                            greeks_df.columns = ['IV_%', 'Theta', 'Theta_Decay_Pct', 'Gamma', 'Vanna', 'Charm', 'Extrinsic_Val', 'Is_Pure_Intrinsic']
+                            
+                            init_p = leg_df.iloc[0]['Close']
+                            
+                            # Multiply by Qty / Units entered in sidebar
+                            leg_df['Theta_Scaled'] = greeks_df['Theta'] * qty * mult
+                            leg_df['Vanna_Scaled'] = greeks_df['Vanna'] * qty * mult
+                            leg_df['Charm_Scaled'] = greeks_df['Charm'] * qty * mult
+                            leg_df['Cumulative_Decay_Val'] = (init_p - leg_df['Close']) * qty * mult
+                            
+                            b_hist_dfs.append(leg_df[['Date', 'Theta_Scaled', 'Vanna_Scaled', 'Charm_Scaled', 'Cumulative_Decay_Val']])
+
+                if b_hist_dfs:
+                    combined_basket_df = b_hist_dfs[0].copy()
+                    for next_df in b_hist_dfs[1:]:
+                        combined_basket_df = pd.merge(combined_basket_df, next_df, on='Date', how='inner', suffixes=('', '_sub'))
+                        for c_col in ['Theta_Scaled', 'Vanna_Scaled', 'Charm_Scaled', 'Cumulative_Decay_Val']:
+                            combined_basket_df[c_col] = combined_basket_df[c_col] + combined_basket_df[f"{c_col}_sub"]
+                            combined_basket_df.drop(columns=[f"{c_col}_sub"], inplace=True)
+
+                    combined_basket_df = combined_basket_df.sort_values('Date', ascending=True).reset_index(drop=True)
+
+                    # Helper function to plot basket greeks with present time on the right
+                    def plot_basket_metric(df, y_col, title, y_label, color):
+                        fig_b = px.line(df, x='Date', y=y_col, title=title, markers=True)
+                        fig_b.update_traces(line_color=color)
+                        # Present time on right: linear x-axis order (oldest -> present)
+                        fig_b.update_xaxes(title="Date (Oldest ➔ Present/Today)", autorange=True)
+                        fig_b.update_yaxes(title=y_label)
+                        fig_b.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20))
+                        return fig_b
+
+                    bc1, bc2 = st.columns(2)
+                    with bc1:
+                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Cumulative_Decay_Val', '1. Cumulative Theta Decay of Basket (₹)', 'Cumulative Decay (₹)', '#00E676'), use_container_width=True)
+                    with bc2:
+                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Theta_Scaled', '2. Daily Theta Decay Expected (₹ / Day)', 'Daily Theta (₹)', '#FF9800'), use_container_width=True)
+
+                    bc3, bc4 = st.columns(2)
+                    with bc3:
+                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Vanna_Scaled', '3. Combined Basket Vanna (dGamma / dVol)', 'Vanna', '#00BFFF'), use_container_width=True)
+                    with bc4:
+                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Charm_Scaled', '4. Combined Basket Charm (Delta Decay / Day)', 'Charm', '#E040FB'), use_container_width=True)
+                else:
+                    st.info("Unable to fetch historical data for strategy basket contracts.")
+            else:
+                st.info("API session uninitialized. Cannot calculate strategy basket time-series charts.")
+
     else:
         st.info("No legs added to strategy basket yet. Use sidebar **2. Build Strategy Basket** to add positions.")
 
