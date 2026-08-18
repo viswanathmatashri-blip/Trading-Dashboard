@@ -238,14 +238,27 @@ def fetch_history(_api, token, days, spot_token="99926000", spot_exchange="NSE")
         return df.sort_values('Date', ascending=True).reset_index(drop=True)
     return pd.DataFrame()
 
-# OPTIMIZED: Strict Expiry Filtering & Single Expiry Calculation
+# OPTIMIZED: Cached & Paced with BATCH API requests to prevent Rate Limit Exceeded
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot, r, strikes_below=10, strikes_above=10):
-    df_expiry = df_nfo[df_nfo['expiry_dt'] == target_expiry_dt].copy()
+def fetch_and_compute_full_chain_iv(_api, df_master, index_name, exchange, expiry_str, current_spot, r, strikes_below=10, strikes_above=10):
+    target_dt = pd.to_datetime(expiry_str, format="%d%b%Y", errors='coerce')
+    
+    # Filter strictly by Index Name, Exchange, and Selected Expiry
+    df_expiry = df_master[
+        (df_master['name'] == index_name) & 
+        (df_master['exch_seg'] == exchange) & 
+        (df_master['expiry_dt'] == target_dt) &
+        (df_master['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))
+    ].copy()
+
     if df_expiry.empty:
         return pd.DataFrame()
 
-    expiry_dt = target_expiry_dt.date()
+    df_expiry['strike_clean'] = pd.to_numeric(df_expiry['strike'], errors='coerce') / (100.0 if exchange == "NFO" else 1.0)
+    if df_expiry['strike_clean'].max() > 1000000:
+        df_expiry['strike_clean'] = df_expiry['strike_clean'] / 100.0
+
+    expiry_dt = df_expiry.iloc[0]['expiry_dt'].date()
     today_dt = datetime.datetime.now().date()
     dte = max((expiry_dt - today_dt).days, 0.001)
     T = dte / 365.0
@@ -263,61 +276,26 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot
 
     df_filtered = df_expiry[df_expiry['strike_clean'].isin(target_strikes)].copy()
 
-    # DEBUG 1 : Check duplicate contracts in master file
-    st.markdown("### 🔍 DEBUG : Master Scrip Duplicate Check")
-
-    debug_master = (
-        df_filtered[
-            ["symbol", "token", "expiry", "strike_clean", "instrumenttype"]
-        ]
-        .sort_values(["strike_clean", "symbol"])
-    )
-
-    st.dataframe(debug_master, width="stretch")
-
-    dup_master = (
-        debug_master
-        .groupby(["strike_clean", "symbol"])
-        .size()
-        .reset_index(name="Count")
-    )
-
-    dup_master = dup_master[dup_master["Count"] > 1]
-
-    if dup_master.empty:
-        st.success("✅ No duplicate Strike + Symbol combinations found.")
-    else:
-        st.error("❌ Duplicate contracts detected in master file")
-        st.dataframe(dup_master, width="stretch")
-
-    # Batch Fetch via getMarketData
+    # Optimized Batch Fetch via getMarketData to avoid hundreds of separate candle requests
     tokens = [str(t) for t in df_filtered['token'].dropna().unique() if str(t) != "nan"]
     market_data = {}
     chunk_size = 40
 
-    fetch_time_str = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S IST")
-
     for i in range(0, len(tokens), chunk_size):
         chunk = tokens[i:i + chunk_size]
-        res = safe_api_call(_api.getMarketData, "FULL", {"NFO": chunk})
+        res = safe_api_call(_api.getMarketData, "FULL", {exchange: chunk})
         if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
             for item in res["data"]["fetched"]:
-                market_data[str(item["symbolToken"])] = {
-                    "ltp": float(item.get("ltp", 0.0)),
-                    "raw": item
-                }
+                market_data[str(item["symbolToken"])] = float(item.get("ltp", 0.0))
         time.sleep(0.40)
 
-    # DEBUG 2 : Every contract being processed
-    debug_rows = []
     results = []
     for idx, (_, row) in enumerate(df_filtered.iterrows()):
         opt_type = "CE" if str(row['symbol']).endswith("CE") else "PE"
         token = str(row['token'])
         strike = row['strike_clean']
 
-        latest_data = market_data.get(token, {})
-        latest_ltp = latest_data.get("ltp", 0.0)
+        latest_ltp = market_data.get(token, 0.0)
         if latest_ltp <= 1.0:
             continue
             
@@ -331,14 +309,6 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot
         is_vol_crash = is_pure_intrinsic or (iv_pct <= 2.0)
 
         if 2.0 <= iv_pct <= 80.0 or is_vol_crash:
-            debug_rows.append({
-                "Symbol": row["symbol"],
-                "Token": token,
-                "Strike": strike,
-                "OptionType": opt_type,
-                "Expiry": row["expiry"],
-                "LTP": latest_ltp
-            })
             results.append({
                 'Strike': strike,
                 'Option_Type': opt_type,
@@ -347,49 +317,12 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot
                 'Extrinsic_Val': extrinsic,
                 'Is_Pure_Intrinsic': is_pure_intrinsic,
                 'Vol_Crash_Flag': is_vol_crash,
-                'Token': token,
-                'Expiry': target_expiry_dt.strftime("%d-%b-%Y"),
-                'LTP_Timestamp': fetch_time_str
+                'Expiry': expiry_str,
+                'Token': token
             })
 
-    debug_df = pd.DataFrame(debug_rows)
-
-    st.markdown("### 🔍 DEBUG : Every Contract Processed")
-
-    if not debug_df.empty:
-        st.dataframe(
-            debug_df.sort_values(
-                ["Strike", "OptionType", "Token"]
-            ),
-            width="stretch"
-        )
-
-        duplicates = (
-            debug_df
-            .groupby(["Strike", "OptionType"])
-            .size()
-            .reset_index(name="Count")
-        )
-
-        duplicates = duplicates[duplicates["Count"] > 1]
-
-        if duplicates.empty:
-            st.success("✅ No duplicate Strike + OptionType processed.")
-        else:
-            st.error("❌ Duplicate Strike + OptionType processed")
-            st.dataframe(duplicates, width="stretch")
-
     df_chain_iv = pd.DataFrame(results)
-    st.markdown("### 🔍 DEBUG : Final IV Table")
-
-    if not df_chain_iv.empty:
-        st.dataframe(
-            df_chain_iv.sort_values(
-                ["Strike", "Option_Type", "Token"]
-            ),
-            width="stretch"
-        )
-    else:
+    if df_chain_iv.empty:
         return pd.DataFrame()
 
     return df_chain_iv.sort_values('Strike', ascending=True)
@@ -1636,7 +1569,9 @@ def live_dashboard_fragment():
         df_chain_iv = fetch_and_compute_full_chain_iv(
             smart_api, 
             df_master, 
-            target_expiry_dt, 
+            Index_Name,
+            Exchange,
+            selected_expiry_str, 
             latest_spot, 
             rate_param, 
             strikes_below=strikes_below, 
@@ -1682,7 +1617,7 @@ def live_dashboard_fragment():
 
             with st.expander("🔻 Volatility Crash Analysis & Historical Option Decay Details", expanded=False):
                 st.markdown("### Raw Volatility Values & Volatility Crash Signal")
-                df_table_display = df_chain_iv[['Strike', 'Option_Type', 'Expiry', 'LTP', 'LTP_Timestamp', 'IV_%', 'Extrinsic_Val', 'Is_Pure_Intrinsic', 'Vol_Crash_Flag']].copy()
+                df_table_display = df_chain_iv[['Strike', 'Option_Type', 'Expiry', 'LTP', 'IV_%', 'Extrinsic_Val', 'Is_Pure_Intrinsic', 'Vol_Crash_Flag']].copy()
                 
                 def highlight_crash(val):
                     color = '#ff4d4d' if val else 'transparent'
