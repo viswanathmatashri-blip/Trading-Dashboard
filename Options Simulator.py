@@ -263,7 +263,35 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot
     target_strikes = set(all_strikes[start_idx:end_idx])
 
     df_filtered = df_expiry[df_expiry['strike_clean'].isin(target_strikes)].copy()
+# ============================================================
+# DEBUG 1 : Check duplicate contracts in master file
+# ============================================================
 
+st.markdown("### 🔍 DEBUG : Master Scrip Duplicate Check")
+
+debug_master = (
+    df_filtered[
+        ["symbol", "token", "expiry", "strike_clean", "instrumenttype"]
+    ]
+    .sort_values(["strike_clean", "symbol"])
+)
+
+st.dataframe(debug_master, width="stretch")
+
+dup_master = (
+    debug_master
+    .groupby(["strike_clean", "symbol"])
+    .size()
+    .reset_index(name="Count")
+)
+
+dup_master = dup_master[dup_master["Count"] > 1]
+
+if dup_master.empty:
+    st.success("✅ No duplicate Strike + Symbol combinations found.")
+else:
+    st.error("❌ Duplicate contracts detected in master file")
+    st.dataframe(dup_master, width="stretch")
     # Batch Fetch via getMarketData
     tokens = [str(t) for t in df_filtered['token'].dropna().unique() if str(t) != "nan"]
     market_data = {}
@@ -276,16 +304,24 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot
         res = safe_api_call(_api.getMarketData, "FULL", {"NFO": chunk})
         if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
             for item in res["data"]["fetched"]:
-                market_data[str(item["symbolToken"])] = float(item.get("ltp", 0.0))
+                market_data[str(item["symbolToken"])] = {
+    "ltp": float(item.get("ltp", 0.0)),
+    "raw": item
+}
         time.sleep(0.40)
+# ============================================================
+# DEBUG 2 : Every contract being processed
+# ============================================================
 
+debug_rows = []
     results = []
     for idx, (_, row) in enumerate(df_filtered.iterrows()):
         opt_type = "CE" if str(row['symbol']).endswith("CE") else "PE"
         token = str(row['token'])
         strike = row['strike_clean']
 
-        latest_ltp = market_data.get(token, 0.0)
+        latest_data = market_data.get(token, {})
+latest_ltp = latest_data.get("ltp", 0.0)
         if latest_ltp <= 1.0:
             continue
             
@@ -299,6 +335,14 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot
         is_vol_crash = is_pure_intrinsic or (iv_pct <= 2.0)
 
         if 2.0 <= iv_pct <= 80.0 or is_vol_crash:
+            debug_rows.append({
+    "Symbol": row["symbol"],
+    "Token": token,
+    "Strike": strike,
+    "OptionType": opt_type,
+    "Expiry": row["expiry"],
+    "LTP": latest_ltp
+})
             results.append({
                 'Strike': strike,
                 'Option_Type': opt_type,
@@ -311,8 +355,40 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot
                 'Expiry': target_expiry_dt.strftime("%d-%b-%Y"),
                 'LTP_Timestamp': fetch_time_str
             })
+debug_df = pd.DataFrame(debug_rows)
 
+st.markdown("### 🔍 DEBUG : Every Contract Processed")
+
+st.dataframe(
+    debug_df.sort_values(
+        ["Strike", "OptionType", "Token"]
+    ),
+    width="stretch"
+)
+
+duplicates = (
+    debug_df
+    .groupby(["Strike", "OptionType"])
+    .size()
+    .reset_index(name="Count")
+)
+
+duplicates = duplicates[duplicates["Count"] > 1]
+
+if duplicates.empty:
+    st.success("✅ No duplicate Strike + OptionType processed.")
+else:
+    st.error("❌ Duplicate Strike + OptionType processed")
+    st.dataframe(duplicates, width="stretch")
     df_chain_iv = pd.DataFrame(results)
+    st.markdown("### 🔍 DEBUG : Final IV Table")
+
+st.dataframe(
+    df_chain_iv.sort_values(
+        ["Strike", "Option_Type", "Token"]
+    ),
+    width="stretch"
+)
     if df_chain_iv.empty:
         return pd.DataFrame()
 
