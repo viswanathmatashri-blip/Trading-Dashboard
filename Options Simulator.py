@@ -211,17 +211,18 @@ def compute_greeks(row, K, r, option_type="CE"):
     
     return pd.Series([sigma * 100.0, theta, theta_decay_pct, gamma, vanna, charm, extrinsic, is_pure_intrinsic])
 
+# MODIFIED: Updated to 1-hour interval for 1-hr data points while keeping daily greeks
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_history(_api, token, days, spot_token="99926000", spot_exchange="NSE", interval="ONE_HOUR"):
+def fetch_history(_api, token, days, spot_token="99926000", spot_exchange="NSE"):
     to_date = datetime.datetime.now()
     from_date = to_date - datetime.timedelta(days=days)
     
-    opt_params = {"exchange": "NFO", "symboltoken": str(token), "interval": interval, 
+    opt_params = {"exchange": "NFO", "symboltoken": str(token), "interval": "ONE_HOUR", 
                   "fromdate": from_date.strftime("%Y-%m-%d 09:15"), "todate": to_date.strftime("%Y-%m-%d 15:30")}
     opt_res = safe_api_call(_api.getCandleData, opt_params)
     time.sleep(0.40)
     
-    spot_params = {"exchange": spot_exchange, "symboltoken": str(spot_token), "interval": interval, 
+    spot_params = {"exchange": spot_exchange, "symboltoken": str(spot_token), "interval": "ONE_HOUR", 
                    "fromdate": from_date.strftime("%Y-%m-%d 09:15"), "todate": to_date.strftime("%Y-%m-%d 15:30")}
     spot_res = safe_api_call(_api.getCandleData, spot_params)
     time.sleep(0.40)
@@ -235,8 +236,9 @@ def fetch_history(_api, token, days, spot_token="99926000", spot_exchange="NSE",
         
         df = pd.merge(df_opt[['Timestamp', 'Close']], df_spot[['Timestamp', 'Close_Spot']], on='Timestamp', how='inner')
         df.rename(columns={'Close_Spot': 'Spot_Price'}, inplace=True)
-        df['Date'] = df['Timestamp'].dt.date
-        return df.sort_values('Timestamp', ascending=True).reset_index(drop=True)
+        df['Date'] = df['Timestamp'].dt.strftime('%d-%b %H:%M')
+        df['Raw_Timestamp'] = df['Timestamp']
+        return df.sort_values('Raw_Timestamp', ascending=True).reset_index(drop=True)
     return pd.DataFrame()
 
 # OPTIMIZED: Cached & Paced with BATCH API requests to prevent Rate Limit Exceeded
@@ -338,7 +340,7 @@ def plot_line_chart(df, y_col, title, y_label, color="#1f77b4"):
     fig = px.line(df, x='Date', y=y_col, title=title, markers=True,
                   hover_data=['Date', 'Spot_Price', 'Close', 'Extrinsic_Val', 'Is_Pure_Intrinsic'])
     fig.update_traces(line_color=color)
-    fig.update_xaxes(autorange=True, title="Date (Oldest ➔ Present/Today)")
+    fig.update_xaxes(type="category", autorange=True, title="Date (Oldest ➔ Present/Today)")
     fig.update_yaxes(title=y_label)
     fig.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20))
     return fig
@@ -756,7 +758,6 @@ if df_expiry["strike_num"].max() > 1000000:
 all_expiry_strikes = sorted([int(s) for s in df_expiry["strike_num"].dropna().unique()])
 
 with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
-    # Minor Improvement 1: Remove decimal from strike prices (i.e. 24500 not 24500.0)
     selected_strike = st.selectbox("Option Strike Price", all_expiry_strikes if all_expiry_strikes else [24500], format_func=lambda x: f"{int(x)}")
 
     b_col1, b_col2 = st.columns(2)
@@ -766,7 +767,6 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
         trade_action = st.selectbox("Trade Action", ["BUY", "SELL"])
 
     entry_price_input = st.number_input("Entry Price (₹) [0 for LTP]", min_value=0.0, value=0.0, step=0.5)
-    # Minor Improvement 2: Default Quantity/units to be as per index lot size / attached screenshot
     default_qty = LOT_SIZES.get(Index_Name, 65)
     qty_lots = st.number_input("Quantity / Units", min_value=1, value=default_qty, step=1)
 
@@ -1383,6 +1383,7 @@ def live_dashboard_fragment():
             pnl_per_unit = (ltp - entry_p) if act == "BUY" else (entry_p - ltp)
             leg_pnl = pnl_per_unit * qty if ltp > 0 else 0.0
 
+            # MODIFIED: Scaled by Units/Qty and Direction
             pos_delta = greeks["delta"] * qty * mult
             pos_gamma = greeks["gamma"] * qty * mult
             pos_theta = greeks["theta"] * qty * mult
@@ -1403,20 +1404,20 @@ def live_dashboard_fragment():
                 "Entry (₹)": round(entry_p, 2),
                 "LTP (₹)": round(ltp, 2),
                 "P&L (₹)": round(leg_pnl, 2),
-                "Delta (Δ)": round(pos_delta, 2),
+                "Delta (Δ ₹)": round(pos_delta, 2),
                 "Gamma (γ)": round(pos_gamma, 4),
-                "Theta (θ)": round(pos_theta, 2),
-                "Vega (ν)": round(pos_vega, 2)
+                "Theta (θ ₹/Day)": round(pos_theta, 2),
+                "Vega (ν ₹)": round(pos_vega, 2)
             })
 
         with st.container(border=True):
             st.markdown("**Combined Basket Summary**")
             b_m1, b_m2, b_m3, b_m4, b_m5 = st.columns(5)
             b_m1.metric("Net P&L (₹)", f"₹{tot_pnl:,.2f}")
-            b_m2.metric("Net Delta (Δ)", f"{tot_delta:.2f}")
+            b_m2.metric("Net Delta (Δ ₹)", f"₹{tot_delta:,.2f}")
             b_m3.metric("Net Gamma (γ)", f"{tot_gamma:.4f}")
-            b_m4.metric("Net Theta (θ)", f"{tot_theta:.2f}")
-            b_m5.metric("Net Vega (ν)", f"{tot_vega:.2f}")
+            b_m4.metric("Net Theta (θ ₹/Day)", f"₹{tot_theta:,.2f}")
+            b_m5.metric("Net Vega (ν ₹)", f"₹{tot_vega:,.2f}")
 
         df_basket_display = pd.DataFrame(calculated_legs)
         st.markdown("**Individual Legs Breakdown**")
@@ -1433,9 +1434,9 @@ def live_dashboard_fragment():
                     sync_local_storage()
                     st.rerun()
 
-        # --- NEW MODULE: STRATEGY BASKET HISTORICAL ANALYTICS CHARTS ---
-        with st.expander("📊 Basket Historical Analytics (Cumulative Theta, Daily Theta, Vanna, Charm)", expanded=False):
-            st.caption("Visualizing combined strategy basket time-series decay and second-order greeks. Present time is anchored on the RIGHT.")
+        # --- MODIFIED: STRATEGY BASKET HISTORICAL ANALYTICS CHARTS ---
+        with st.expander("📊 Basket Historical Analytics (Cumulative Theta Decay %, Daily Theta, Vanna, Charm)", expanded=False):
+            st.caption("Visualizing combined strategy basket time-series decay and second-order greeks at 1-hr interval sessions. Holidays excluded.")
             smart_api = get_smart_api_client()
             if smart_api and not df_master.empty:
                 b_hist_dfs = []
@@ -1448,57 +1449,54 @@ def live_dashboard_fragment():
 
                     tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
                     if tok:
-                        # MODIFICATION 3: Fetch history using 1 hour interval data points
-                        leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange, interval="ONE_HOUR")
+                        leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange)
                         if not leg_df.empty:
                             leg_df['Expiry_Date'] = target_expiry_dt.date()
-                            leg_df['DTE'] = leg_df.apply(lambda r: max((r['Expiry_Date'] - r['Timestamp'].date()).days, 0.001), axis=1)
+                            leg_df['DTE'] = (pd.to_datetime(leg_df['Expiry_Date']) - pd.to_datetime(leg_df['Raw_Timestamp']).dt.date).apply(lambda x: max(x.days, 0.001))
                             leg_df['T'] = leg_df['DTE'] / 365.0
                             
                             greeks_df = leg_df.apply(compute_greeks, axis=1, K=k, r=rate_param, option_type=t)
                             greeks_df.columns = ['IV_%', 'Theta', 'Theta_Decay_Pct', 'Gamma', 'Vanna', 'Charm', 'Extrinsic_Val', 'Is_Pure_Intrinsic']
                             
-                            # Multiply by Qty / Units entered in sidebar (Theta remains daily value as calculated by compute_greeks)
+                            init_p = leg_df.iloc[0]['Close']
+                            
+                            # Multiply by Qty / Units entered in sidebar
                             leg_df['Theta_Scaled'] = greeks_df['Theta'] * qty * mult
                             leg_df['Vanna_Scaled'] = greeks_df['Vanna'] * qty * mult
                             leg_df['Charm_Scaled'] = greeks_df['Charm'] * qty * mult
                             
-                            b_hist_dfs.append(leg_df[['Timestamp', 'Date', 'Theta_Scaled', 'Vanna_Scaled', 'Charm_Scaled']])
+                            # Theta Decay standalone computation (Absolute theta decay accrued)
+                            init_theta = abs(greeks_df.iloc[0]['Theta']) * qty
+                            cumulative_theta_loss = (init_p - leg_df['Close']) * qty if mult > 0 else (leg_df['Close'] - init_p) * qty
+                            
+                            leg_df['Theta_Accrued'] = cumulative_theta_loss
+                            leg_df['Total_Expected_Theta'] = init_theta if init_theta > 0 else 1.0
+                            
+                            b_hist_dfs.append(leg_df[['Date', 'Raw_Timestamp', 'Theta_Scaled', 'Vanna_Scaled', 'Charm_Scaled', 'Theta_Accrued', 'Total_Expected_Theta']])
 
                 if b_hist_dfs:
                     combined_basket_df = b_hist_dfs[0].copy()
                     for next_df in b_hist_dfs[1:]:
-                        combined_basket_df = pd.merge(combined_basket_df, next_df, on=['Timestamp', 'Date'], how='inner', suffixes=('', '_sub'))
-                        for c_col in ['Theta_Scaled', 'Vanna_Scaled', 'Charm_Scaled']:
+                        combined_basket_df = pd.merge(combined_basket_df, next_df, on=['Date', 'Raw_Timestamp'], how='inner', suffixes=('', '_sub'))
+                        for c_col in ['Theta_Scaled', 'Vanna_Scaled', 'Charm_Scaled', 'Theta_Accrued', 'Total_Expected_Theta']:
                             combined_basket_df[c_col] = combined_basket_df[c_col] + combined_basket_df[f"{c_col}_sub"]
                             combined_basket_df.drop(columns=[f"{c_col}_sub"], inplace=True)
 
-                    combined_basket_df = combined_basket_df.sort_values('Timestamp', ascending=True).reset_index(drop=True)
+                    combined_basket_df = combined_basket_df.sort_values('Raw_Timestamp', ascending=True).reset_index(drop=True)
 
-                    # MODIFICATION 2: Compute Cumulative Theta Decay % based on Theta Greek alone
-                    # Theta is negative for long positions; decay accumulation represents percentage of total initial theta decayed
-                    first_theta = combined_basket_df['Theta_Scaled'].iloc[0]
-                    if abs(first_theta) > 1e-5:
-                        cum_theta_decay = (combined_basket_df['Theta_Scaled'].iloc[0] - combined_basket_df['Theta_Scaled']).cumsum()
-                        combined_basket_df['Cum_Theta_Decay_Pct'] = (cum_theta_decay / abs(first_theta)) * 100.0
-                    else:
-                        combined_basket_df['Cum_Theta_Decay_Pct'] = 0.0
+                    # MODIFIED: Calculate Cumulative Theta Decay Percentage (Max 100%)
+                    total_init_exp_theta = max(abs(combined_basket_df.iloc[0]['Total_Expected_Theta']), 1e-5)
+                    combined_basket_df['Cumulative_Theta_Decay_Pct'] = (combined_basket_df['Theta_Accrued'] / total_init_exp_theta) * 100.0
+                    combined_basket_df['Cumulative_Theta_Decay_Pct'] = combined_basket_df['Cumulative_Theta_Decay_Pct'].clip(lower=0.0, upper=100.0)
 
-                    # MODIFICATION 1 & 3: Plot basket metrics hiding non-trading days/holidays and using 1 hr interval points
+                    # Helper function to plot basket greeks with non-trading days/holidays excluded using categorical x-axis
                     def plot_basket_metric(df, y_col, title, y_label, color, is_pct=False):
-                        fig_b = px.line(df, x='Timestamp', y=y_col, title=title, markers=True)
+                        fig_b = px.line(df, x='Date', y=y_col, title=title, markers=True)
                         fig_b.update_traces(line_color=color)
-                        # Remove non-trading days/holidays & weekends from x-axis display
-                        fig_b.update_xaxes(
-                            title="Date / Time (Oldest ➔ Present/Today)", 
-                            autorange=True,
-                            rangebreaks=[
-                                dict(bounds=["sat", "mon"]),  # Hide weekends
-                                dict(bounds=[15.5, 9.25], pattern="hour")  # Hide non-trading hours
-                            ]
-                        )
+                        # Hide non-trading days/holidays by setting x-axis type to "category"
+                        fig_b.update_xaxes(type="category", title="Trading Session Intervals (Oldest ➔ Present)", autorange=True)
                         if is_pct:
-                            fig_b.update_yaxes(title=y_label, ticksuffix="%")
+                            fig_b.update_yaxes(title=y_label, range=[0, 105], ticksuffix="%")
                         else:
                             fig_b.update_yaxes(title=y_label)
                         fig_b.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20))
@@ -1506,15 +1504,15 @@ def live_dashboard_fragment():
 
                     bc1, bc2 = st.columns(2)
                     with bc1:
-                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Cum_Theta_Decay_Pct', '1. Cumulative Theta Decay of Basket (%)', 'Cumulative Decay (%)', '#00E676', is_pct=True), use_container_width=True)
+                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Cumulative_Theta_Decay_Pct', '1. Cumulative Theta Decay of Basket (%)', 'Cumulative Decay (%)', '#00E676', is_pct=True), use_container_width=True)
                     with bc2:
-                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Theta_Scaled', '2. Daily Theta Decay Expected (₹ / Day)', 'Daily Theta (₹)', '#FF9800'), use_container_width=True)
+                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Theta_Scaled', '2. Daily Theta Decay Expected (₹ / Day)', 'Daily Theta (₹/Day)', '#FF9800'), use_container_width=True)
 
                     bc3, bc4 = st.columns(2)
                     with bc3:
-                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Vanna_Scaled', '3. Combined Basket Vanna (dGamma / dVol)', 'Vanna', '#00BFFF'), use_container_width=True)
+                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Vanna_Scaled', '3. Combined Basket Vanna (dGamma / dVol ₹)', 'Vanna (₹)', '#00BFFF'), use_container_width=True)
                     with bc4:
-                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Charm_Scaled', '4. Combined Basket Charm (Delta Decay / Day)', 'Charm', '#E040FB'), use_container_width=True)
+                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Charm_Scaled', '4. Combined Basket Charm (Delta Decay ₹ / Day)', 'Charm (₹/Day)', '#E040FB'), use_container_width=True)
                 else:
                     st.info("Unable to fetch historical data for strategy basket contracts.")
             else:
