@@ -1167,7 +1167,8 @@ def institutional_order_flow_scanner_fragment():
             scanned_trades.append({
                 "Strike": strike,
                 "Option_Type": "PE",
-                "LTP (₹)": p_lots,
+                "LTP (₹)": p_ltp,
+                "Volume (Lots)": p_lots,
                 "Total Premium (₹)": round(p_premium, 2),
                 "Key Level Classification": strike_role,
                 "Volume Ratio": round(vol_ratio, 2),
