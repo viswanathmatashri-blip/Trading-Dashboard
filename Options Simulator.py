@@ -240,8 +240,11 @@ def fetch_history(_api, token, days, spot_token="99926000", spot_exchange="NSE")
 
 # OPTIMIZED: Cached & Paced with BATCH API requests to prevent Rate Limit Exceeded
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_and_compute_full_chain_iv(_api, df_nfo, expiry_str, current_spot, r, strikes_below=10, strikes_above=10):
-    df_expiry = df_nfo[df_nfo['expiry'] == expiry_str].copy()
+def fetch_and_compute_full_chain_iv(_api, df_nfo, target_expiry_dt, current_spot, r, exchange="NFO", strikes_below=10, strikes_above=10):
+    # Filter strictly using normalized expiry_dt to avoid matching different expiries for the same strike
+    target_dt = pd.to_datetime(target_expiry_dt)
+    df_expiry = df_nfo[(df_nfo['exch_seg'] == exchange) & (df_nfo['expiry_dt'] == target_dt)].copy()
+    
     if df_expiry.empty:
         return pd.DataFrame()
 
@@ -270,12 +273,13 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, expiry_str, current_spot, r, s
 
     for i in range(0, len(tokens), chunk_size):
         chunk = tokens[i:i + chunk_size]
-        res = safe_api_call(_api.getMarketData, "FULL", {"NFO": chunk})
+        res = safe_api_call(_api.getMarketData, "FULL", {exchange: chunk})
         if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
             for item in res["data"]["fetched"]:
                 market_data[str(item["symbolToken"])] = float(item.get("ltp", 0.0))
         time.sleep(0.40)
 
+    expiry_str = target_dt.strftime("%d%b%Y").upper()
     results = []
     for idx, (_, row) in enumerate(df_filtered.iterrows()):
         opt_type = "CE" if str(row['symbol']).endswith("CE") else "PE"
@@ -299,6 +303,7 @@ def fetch_and_compute_full_chain_iv(_api, df_nfo, expiry_str, current_spot, r, s
             results.append({
                 'Strike': strike,
                 'Option_Type': opt_type,
+                'Expiry': expiry_str,
                 'LTP': latest_ltp,
                 'IV_%': iv_pct,
                 'Extrinsic_Val': extrinsic,
@@ -1167,8 +1172,7 @@ def institutional_order_flow_scanner_fragment():
             scanned_trades.append({
                 "Strike": strike,
                 "Option_Type": "PE",
-                "LTP (₹)": p_ltp,
-                "Volume (Lots)": p_lots,
+                "LTP (₹)": p_lots,
                 "Total Premium (₹)": round(p_premium, 2),
                 "Key Level Classification": strike_role,
                 "Volume Ratio": round(vol_ratio, 2),
@@ -1553,12 +1557,14 @@ def live_dashboard_fragment():
     if smart_api and not df_master.empty:
         latest_spot = data['spot_price']
         
+        # Enforce exact selected expiry date during chain IV calculation to prevent duplicate strikes
         df_chain_iv = fetch_and_compute_full_chain_iv(
             smart_api, 
             df_master, 
-            selected_expiry_str, 
+            target_expiry_dt, 
             latest_spot, 
             rate_param, 
+            exchange=Exchange,
             strikes_below=strikes_below, 
             strikes_above=strikes_above
         )
@@ -1602,7 +1608,8 @@ def live_dashboard_fragment():
 
             with st.expander("🔻 Volatility Crash Analysis & Historical Option Decay Details", expanded=False):
                 st.markdown("### Raw Volatility Values & Volatility Crash Signal")
-                df_table_display = df_chain_iv[['Strike', 'Option_Type', 'LTP', 'IV_%', 'Extrinsic_Val', 'Is_Pure_Intrinsic', 'Vol_Crash_Flag']].copy()
+                # Added 'Expiry' column directly into the Streamlit display dataframe
+                df_table_display = df_chain_iv[['Strike', 'Option_Type', 'Expiry', 'LTP', 'IV_%', 'Extrinsic_Val', 'Is_Pure_Intrinsic', 'Vol_Crash_Flag']].copy()
                 
                 def highlight_crash(val):
                     color = '#ff4d4d' if val else 'transparent'
