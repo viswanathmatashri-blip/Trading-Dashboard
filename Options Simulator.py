@@ -115,11 +115,11 @@ def sync_local_storage():
     components.html(js_code, height=0, width=0)
 
 LOT_SIZES = {
-    "NIFTY": 25,
-    "BANKNIFTY": 15,
-    "FINNIFTY": 25,
-    "MIDCPNIFTY": 50,
-    "SENSEX": 10
+    "NIFTY": 65,
+    "BANKNIFTY": 30,
+    "FINNIFTY": 60,
+    "MIDCPNIFTY": 120,
+    "SENSEX": 20
 }
 
 INDEX_TOKEN_MAP = {
@@ -766,7 +766,7 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
 
     entry_price_input = st.number_input("Entry Price (₹) [0 for LTP]", min_value=0.0, value=0.0, step=0.5)
     # Minor Improvement 2: Default Quantity/units to be as per index lot size / attached screenshot
-    default_qty = LOT_SIZES.get(Index_Name, 25)
+    default_qty = LOT_SIZES.get(Index_Name, 65)
     qty_lots = st.number_input("Quantity / Units", min_value=1, value=default_qty, step=1)
 
     c_btn1, c_btn2 = st.columns(2)
@@ -948,7 +948,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 
         F = atm_strike + math.exp(rate_param * T) * (atm_c_ltp - atm_p_ltp) if (atm_c_ltp > 0 and atm_p_ltp > 0) else spot_price
 
-        lot_size = LOT_SIZES.get(Index_Name, 25)
+        lot_size = LOT_SIZES.get(Index_Name, 65)
         chain_results = []
         total_call_oi = total_put_oi = 0
         total_net_gex_oi = 0.0
@@ -1133,7 +1133,7 @@ def institutional_order_flow_scanner_fragment():
 
     chain_data = st.session_state["data_store"]["chain_results"]
     spot_price = st.session_state["data_store"].get("spot_price", 0.0)
-    lot_size = LOT_SIZES.get(Index_Name, 25)
+    lot_size = LOT_SIZES.get(Index_Name, 65)
 
     scanned_trades = []
 
@@ -1550,7 +1550,12 @@ def live_dashboard_fragment():
                 return range1, range2
 
             # 1. GEX/OI CHART
-            st.subheader("📈 OI-Based Net Gamma Exposure vs Open Interest (OI)")
+            c_head1, c_head2 = st.columns([0.65, 0.35])
+            with c_head1:
+                st.subheader("📈 OI-Based Net Gamma Exposure vs Open Interest (OI)")
+            with c_head2:
+                st.markdown(f"<div class='update-timestamp'>Expiry: {selected_expiry_str} | Updated: {data['timestamp']}</div>", unsafe_allow_html=True)
+            
             gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
             fig_oi = make_subplots(specs=[[{"secondary_y": True}]])
             fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_OI"], name="Net Gamma (OI-Based)", marker_color=gex_oi_colors, opacity=0.85, width=25, hovertemplate="Strike: %{x}<br>Net GEX (OI): ₹%{y:,.0f}<extra></extra>"), secondary_y=True)
@@ -1567,7 +1572,12 @@ def live_dashboard_fragment():
             st.plotly_chart(fig_oi, use_container_width=True)
 
             # 2. GEX/TRADE VOLUME CHART
-            st.subheader("📊 Volume-Based Net Gamma Exposure vs Trading Volume")
+            c_head1, c_head2 = st.columns([0.65, 0.35])
+            with c_head1:
+                st.subheader("📊 Volume-Based Net Gamma Exposure vs Trading Volume")
+            with c_head2:
+                st.markdown(f"<div class='update-timestamp'>Expiry: {selected_expiry_str} | Updated: {data['timestamp']}</div>", unsafe_allow_html=True)
+            
             gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
             fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
             fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net Gamma (Vol-Based)", marker_color=gex_vol_colors, opacity=0.85, width=25, hovertemplate="Strike: %{x}<br>Net GEX (Vol): ₹%{y:,.0f}<extra></extra>"), secondary_y=True)
@@ -1584,7 +1594,12 @@ def live_dashboard_fragment():
             st.plotly_chart(fig_vol, use_container_width=True)
 
             # 3. DELTA-ADJUSTED GEX CHART
-            st.subheader("🎯 Delta-Adjusted Net Gamma Exposure Profile")
+            c_head1, c_head2 = st.columns([0.65, 0.35])
+            with c_head1:
+                st.subheader("🎯 Delta-Adjusted Net Gamma Exposure Profile")
+            with c_head2:
+                st.markdown(f"<div class='update-timestamp'>Expiry: {selected_expiry_str} | Updated: {data['timestamp']}</div>", unsafe_allow_html=True)
+            
             delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
             fig_delta_gex = make_subplots(specs=[[{"secondary_y": False}]])
             fig_delta_gex.add_trace(plt_go.Bar(
@@ -1614,7 +1629,12 @@ def live_dashboard_fragment():
             st.plotly_chart(fig_delta_gex, use_container_width=True)
 
             # 4. VEX & CEX CHART
-            st.subheader("⚡ VEX (Vega Exposure) and CEX (Charm Exposure) Profile")
+            c_head1, c_head2 = st.columns([0.65, 0.35])
+            with c_head1:
+                st.subheader("⚡ VEX (Vega Exposure) and CEX (Charm Exposure) Profile")
+            with c_head2:
+                st.markdown(f"<div class='update-timestamp'>Expiry: {selected_expiry_str} | Updated: {data['timestamp']}</div>", unsafe_allow_html=True)
+            
             fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
             fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX (Vega Exposure)", marker_color="#00E676", opacity=0.75, width=20, hovertemplate="Strike: %{x}<br>VEX: ₹%{y:,.2f}<extra></extra>"), secondary_y=False)
             fig_vex_cex.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX (Charm Exposure)", line=dict(color="#2196F3", width=2.5), mode="lines+markers", hovertemplate="Strike: %{x}<br>CEX: ₹%{y:,.2f}<extra></extra>"), secondary_y=True)
@@ -1633,8 +1653,7 @@ def live_dashboard_fragment():
     with head_skew_c1:
         st.subheader(f"6️⃣ Market Volatility Skew Profile ({selected_expiry_str})")
     with head_skew_c2:
-        skew_ts = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S IST")
-        st.markdown(f"<div class='update-timestamp'>Last updated: {skew_ts}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='update-timestamp'>Expiry: {selected_expiry_str} | Updated: {data.get('timestamp', '')}</div>", unsafe_allow_html=True)
 
     smart_api = get_smart_api_client()
     if smart_api and not df_master.empty:
@@ -1690,70 +1709,9 @@ def live_dashboard_fragment():
                 st.plotly_chart(fig_raw, use_container_width=True)
 
             with st.expander("🔻 Volatility Crash Analysis & Historical Option Decay Details", expanded=False):
-                st.markdown("### Raw Volatility Values & Volatility Crash Signal")
-                df_table_display = df_chain_iv[['Strike', 'Option_Type', 'Expiry', 'LTP', 'IV_%', 'Extrinsic_Val', 'Is_Pure_Intrinsic', 'Vol_Crash_Flag']].copy()
-                
-                def highlight_crash(val):
-                    color = '#ff4d4d' if val else 'transparent'
-                    return f'background-color: {color}'
-                
-                st.dataframe(df_table_display.style.map(highlight_crash, subset=['Vol_Crash_Flag']), use_container_width=True)
+                st.markdown("### Raw Volatility Values & Volatility Crash Status")
+                st.dataframe(df_chain_iv, use_container_width=True)
 
-                flagged_rows = df_chain_iv[df_chain_iv['Vol_Crash_Flag'] == True]
-                st.markdown("### ⚠️ Volatility Crash Historic Detailed Analysis")
-                
-                if not flagged_rows.empty:
-                    flagged_options = [f"{int(r['Strike'])} {r['Option_Type']}" for _, r in flagged_rows.iterrows()]
-                    selected_flagged = st.selectbox("Select Flagged Strike for Full Breakdown", flagged_options)
-                    
-                    if selected_flagged:
-                        strike_sel, opt_type_sel = selected_flagged.split()
-                        strike_sel = float(strike_sel)
-                        
-                        matched_token = flagged_rows[(flagged_rows['Strike'] == strike_sel) & (flagged_rows['Option_Type'] == opt_type_sel)].iloc[0]['Token']
-                        
-                        hist_df = fetch_history(smart_api, matched_token, days=30, spot_token=default_token, spot_exchange=spot_exchange)
-                        if not hist_df.empty:
-                            hist_df['Expiry_Date'] = target_expiry_dt.date()
-                            hist_df['DTE'] = (hist_df['Expiry_Date'] - hist_df['Date']).apply(lambda x: max(x.days, 0.001))
-                            hist_df['T'] = hist_df['DTE'] / 365.0
-                            
-                            greeks_df = hist_df.apply(compute_greeks, axis=1, K=strike_sel, r=rate_param, option_type=opt_type_sel)
-                            greeks_df.columns = ['IV_%', 'Theta', 'Theta_Decay_Pct', 'Gamma', 'Vanna', 'Charm', 'Extrinsic_Val', 'Is_Pure_Intrinsic']
-                            hist_df = pd.concat([hist_df, greeks_df], axis=1)
-                            
-                            initial_premium = hist_df.iloc[0]['Close']
-                            hist_df['Cumulative_Decay_%'] = ((initial_premium - hist_df['Close']) / initial_premium) * 100.0
-                            
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                st.plotly_chart(plot_line_chart(hist_df, 'Close', f'Option Strike LTP (₹{strike_sel} {opt_type_sel})', 'Option Price (₹)', color="#00bfff"), use_container_width=True)
-                            with c2:
-                                st.plotly_chart(plot_line_chart(hist_df, 'IV_%', "Implied Volatility (Brent's IV %)", 'IV (%)', color="#ab63fa"), use_container_width=True)
-
-                            st.plotly_chart(plot_line_chart(hist_df, 'Cumulative_Decay_%', 'Cumulative Option Decay (% Eroded)', 'Cumulative Decay (%)', color="#ff4136"), use_container_width=True)
-
-                            c3, c4 = st.columns(2)
-                            with c3:
-                                st.plotly_chart(plot_line_chart(hist_df, 'Theta_Decay_Pct', 'Daily Theta Decay (% of Premium)', 'Daily Decay %', color="#ffa15a"), use_container_width=True)
-                            with c4:
-                                st.plotly_chart(plot_line_chart(hist_df, 'Theta', 'Theta (₹ / Day)', 'Theta (₹)', color="#19d3f3"), use_container_width=True)
-
-                            c5, c6 = st.columns(2)
-                            with c5:
-                                st.plotly_chart(plot_line_chart(hist_df, 'Vanna', 'Vanna (dGamma / dVol)', 'Vanna', color="#e377c2"), use_container_width=True)
-                            with c6:
-                                st.plotly_chart(plot_line_chart(hist_df, 'Charm', 'Charm (Delta Decay per Day)', 'Charm', color="#bcbd22"), use_container_width=True)
-                else:
-                    st.info("No contracts currently flagged with pure intrinsic / volatility crash conditions.")
-        else:
-            st.warning("Unable to fetch chain contracts for Volatility Skew calculation.")
-
-# Run main dashboard fragment
 live_dashboard_fragment()
-
-# Run separate isolated Z-Score engine fragment
-zscore_analysis_fragment()
-
-# Run Institutional Order Flow Scanner fragment
 institutional_order_flow_scanner_fragment()
+zscore_analysis_fragment()
