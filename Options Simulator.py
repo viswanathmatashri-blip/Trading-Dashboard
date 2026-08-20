@@ -90,6 +90,8 @@ if "enable_zscore_refresh" not in st.session_state:
     st.session_state["enable_zscore_refresh"] = False
 if "zscore_data_store" not in st.session_state:
     st.session_state["zscore_data_store"] = pd.DataFrame()
+if "heatmap_timeframe" not in st.session_state:
+    st.session_state["heatmap_timeframe"] = "5 min"
 
 # Streamlit Cache Persistence Handlers
 @st.cache_data(ttl=86400)
@@ -747,6 +749,13 @@ with st.sidebar.expander("1. Market Parameters", expanded=True):
         strikes_above = st.number_input("Above ATM", min_value=1, max_value=50, value=10, step=1)
 
     hv_days = st.slider("HV Lookback (Days)", min_value=10, max_value=90, value=30, step=5)
+    heatmap_timeframe = st.selectbox(
+        "GEX Heatmap Timeframe",
+        ["3 min", "5 min", "10 min"],
+        index=["3 min", "5 min", "10 min"].index(st.session_state["heatmap_timeframe"])
+        if st.session_state.get("heatmap_timeframe") in ["3 min", "5 min", "10 min"] else 1
+    )
+    st.session_state["heatmap_timeframe"] = heatmap_timeframe
 
 target_expiry_dt = pd.to_datetime(selected_expiry_str, format="%d%b%Y") if selected_expiry_str != "N/A" else today_dt
 df_expiry = df_options[df_options["expiry_dt"] == target_expiry_dt].copy()
@@ -814,6 +823,7 @@ interval_mapping = {
     "1 min": ("ONE_MINUTE", 7),
     "3 min": ("THREE_MINUTE", 10),
     "5 min": ("FIVE_MINUTE", 15),
+    "10 min": ("TEN_MINUTE", 20),
     "15 min": ("FIFTEEN_MINUTE", 30)
 }
 
@@ -1222,6 +1232,157 @@ def institutional_order_flow_scanner_fragment():
         st.dataframe(styled_df, use_container_width=True)
     else:
         st.info("No trades currently meeting the institutional threshold criteria (Premium ≥ ₹10 Lakhs or Volume ≥ 500 lots).")
+
+# --- DELTA-ADJUSTED GEX HEATMAP (session-time vs strike) ---
+def _prepare_session_candles(df_candles: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the latest trading session between 09:15–15:30 IST."""
+    if df_candles is None or df_candles.empty:
+        return pd.DataFrame()
+
+    df = df_candles.copy()
+    time_col = "time" if "time" in df.columns else ("date" if "date" in df.columns else None)
+    if time_col is None:
+        return pd.DataFrame()
+
+    parsed = pd.to_datetime(df[time_col], errors="coerce")
+    df = df.loc[parsed.notna()].copy()
+    parsed = parsed.dropna()
+    if parsed.empty:
+        return pd.DataFrame()
+
+    ist_tz = pytz.timezone("Asia/Kolkata")
+    if getattr(parsed.dt, "tz", None) is None:
+        parsed = parsed.dt.tz_localize(ist_tz)
+    else:
+        parsed = parsed.dt.tz_convert(ist_tz)
+    df[time_col] = parsed
+    session_start = datetime.datetime.strptime("09:15", "%H:%M").time()
+    session_end = datetime.datetime.strptime("15:30", "%H:%M").time()
+    df = df[(df[time_col].dt.time >= session_start) & (df[time_col].dt.time <= session_end)]
+    if df.empty:
+        return pd.DataFrame()
+
+    latest_date = df[time_col].dt.date.max()
+    df = df[df[time_col].dt.date == latest_date].sort_values(time_col).reset_index(drop=True)
+    df.rename(columns={time_col: "time"}, inplace=True)
+    return df
+
+
+def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatmap_tf_label: str):
+    """Render strike × session-time Delta-Adjusted GEX heatmap for the selected index."""
+    chain_results = data.get("chain_results") or []
+    if not chain_results:
+        st.info("No option chain data available for GEX heatmap.")
+        return
+
+    df_chain = pd.DataFrame(chain_results)
+    if df_chain.empty or "Net_Delta_GEX_OI" not in df_chain.columns:
+        st.info("Delta-adjusted GEX is not available to build the heatmap.")
+        return
+
+    df_chain = df_chain.sort_values("Strike").reset_index(drop=True)
+    strikes = df_chain["Strike"].astype(float).tolist()
+    gex_cr = (df_chain["Net_Delta_GEX_OI"].astype(float) / 1e7).tolist()
+
+    heatmap_tf_label = heatmap_tf_label or st.session_state.get("heatmap_timeframe", "5 min")
+    chart_tf = st.session_state.get("selected_timeframe", "5 min")
+    df_session = pd.DataFrame()
+
+    if heatmap_tf_label == chart_tf:
+        df_session = _prepare_session_candles(data.get("df_candles", pd.DataFrame()))
+
+    if df_session.empty:
+        smart_api = get_smart_api_client()
+        spot_token, spot_exch, _ = INDEX_TOKEN_MAP.get(index_name, ("99926000", "NSE", "NFO"))
+        api_interval, lookback_days = interval_mapping.get(heatmap_tf_label, ("FIVE_MINUTE", 15))
+        if smart_api:
+            df_hm, _ = fetch_candles_with_holiday_fallback(
+                smart_api, spot_token, spot_exch, api_interval, lookback_days
+            )
+            df_session = _prepare_session_candles(df_hm)
+
+    if df_session.empty:
+        st.info("Unable to load session candles for the GEX heatmap.")
+        return
+
+    time_labels = pd.to_datetime(df_session["time"]).dt.strftime("%H:%M").tolist()
+    spot_path = df_session["close"].astype(float).tolist()
+    session_date_str = pd.to_datetime(df_session["time"].iloc[-1]).strftime("%d %B %Y")
+
+    n_strikes = len(strikes)
+    n_times = len(time_labels)
+    if n_strikes == 0 or n_times == 0:
+        st.info("Insufficient strike/time points for the GEX heatmap.")
+        return
+
+    # Current snapshot GEX with the same session-decay envelope used in the source module
+    decay_vector = np.linspace(0.85, 1.0, n_times)
+    gex_matrix = np.outer(np.array(gex_cr, dtype=float), decay_vector)
+
+    max_abs_gex = max(abs(np.nanmin(gex_matrix)), abs(np.nanmax(gex_matrix)), 0.01)
+    gex_colorscale = [
+        [0.0, "#d32f2f"],
+        [0.5, "#ffee58"],
+        [1.0, "#2e7d32"],
+    ]
+
+    hm_c1, hm_c2 = st.columns([0.65, 0.35])
+    with hm_c1:
+        st.subheader(f"🔥 Delta-Adjusted GEX Heatmap ({index_name})")
+    with hm_c2:
+        st.markdown(
+            f"<div class='update-timestamp'>Expiry: {expiry_str} | Session: {session_date_str} | {heatmap_tf_label}</div>",
+            unsafe_allow_html=True,
+        )
+    st.caption(
+        "Strike vs IST session time. Colour uses live Delta-Adjusted Net GEX (₹ Cr) from the selected expiry. "
+        "Time axis applies a 0.85→1.0 session envelope (same method as the source heatmap). "
+        "Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path."
+    )
+
+    fig_hm = plt_go.Figure()
+    fig_hm.add_trace(
+        plt_go.Heatmap(
+            z=gex_matrix,
+            x=time_labels,
+            y=strikes,
+            zmin=-max_abs_gex,
+            zmax=max_abs_gex,
+            zmid=0,
+            colorscale=gex_colorscale,
+            colorbar=dict(title="Net Δ-GEX (₹ Cr)"),
+            hovertemplate="Time: %{x}<br>Strike: %{y}<br>Net Δ-GEX: %{z:.2f} Cr<extra></extra>",
+        )
+    )
+    fig_hm.add_trace(
+        plt_go.Scatter(
+            x=time_labels,
+            y=spot_path,
+            mode="lines+markers",
+            name=f"{index_name} Spot",
+            line=dict(color="cyan", width=2),
+            marker=dict(size=4),
+            hovertemplate="Time: %{x}<br>Spot: %{y:,.2f}<extra></extra>",
+        )
+    )
+    fig_hm.update_layout(
+        title=dict(
+            text=f"<b>{index_name} Delta-Adjusted GEX Heatmap</b> ({heatmap_tf_label}) | Session: {session_date_str} | Expiry: {expiry_str}",
+            x=0.01,
+        ),
+        xaxis_title="IST Time",
+        yaxis_title="Strike Price",
+        height=680,
+        template="plotly_dark",
+        paper_bgcolor="#0E1117",
+        plot_bgcolor="#0E1117",
+        margin=dict(l=20, r=20, t=60, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig_hm.update_xaxes(type="category")
+    fig_hm.update_yaxes(tickformat="d")
+    st.plotly_chart(fig_hm, use_container_width=True)
+
 
 # --- LIVE DASHBOARD FRAGMENT ---
 @st.fragment(run_every=15 if st.session_state.get("enable_main_refresh", False) else None)
@@ -1646,6 +1807,15 @@ def live_dashboard_fragment():
             fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
             fig_delta_gex.update_yaxes(title_text="Delta-Adjusted Net GEX (₹)", showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
             st.plotly_chart(fig_delta_gex, use_container_width=True)
+
+            # 3b. DELTA-ADJUSTED GEX HEATMAP (selected index)
+            st.markdown("---")
+            render_delta_gex_heatmap(
+                data,
+                Index_Name,
+                selected_expiry_str,
+                st.session_state.get("heatmap_timeframe", "5 min"),
+            )
 
             # 4. VEX & CEX CHART
             c_head1, c_head2 = st.columns([0.65, 0.35])
