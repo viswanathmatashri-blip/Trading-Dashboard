@@ -971,19 +971,33 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "volume": 0, "best_bid": 0.0, "best_ask": 0.0})
             p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "volume": 0, "best_bid": 0.0, "best_ask": 0.0})
 
-            iv = VolatilityEngine.calculate_iv(c_info["ltp"] if K >= F else p_info["ltp"], F, K, T, rate_param, "c" if K >= F else "p")
-            if iv == 0.0:
-                iv = index_hv
+            # Solve CE and PE IV independently. Do NOT substitute HV into deep ITM
+            # options — that invents gamma on almost-intrinsic contracts and paints
+            # low strikes (ITM calls) as large positive / green GEX.
+            c_iv = VolatilityEngine.calculate_iv(c_info["ltp"], F, K, T, rate_param, "c")
+            p_iv = VolatilityEngine.calculate_iv(p_info["ltp"], F, K, T, rate_param, "p")
 
-            c_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, iv, "c")
-            p_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, iv, "p")
+            strike_step = 50.0
+            if len(all_expiry_strikes) >= 2:
+                strike_step = float(abs(all_expiry_strikes[1] - all_expiry_strikes[0]))
+            near_atm = abs(K - F) <= (2.0 * strike_step)
 
-            call_gex_oi = c_greeks["gamma"] * c_info["oi"] * lot_size * (spot_price ** 2) * 0.01
-            put_gex_oi = p_greeks["gamma"] * p_info["oi"] * lot_size * (spot_price ** 2) * 0.01
+            c_sigma = c_iv if c_iv > 0 else (index_hv if near_atm and c_info["ltp"] > 0 else 0.0)
+            p_sigma = p_iv if p_iv > 0 else (index_hv if near_atm and p_info["ltp"] > 0 else 0.0)
+
+            c_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, c_sigma, "c")
+            p_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, p_sigma, "p")
+
+            gex_scale = lot_size * (spot_price ** 2) * 0.01
+            call_gex_oi = c_greeks["gamma"] * c_info["oi"] * gex_scale
+            put_gex_oi = p_greeks["gamma"] * p_info["oi"] * gex_scale
             net_gex_oi = call_gex_oi - put_gex_oi
             total_net_gex_oi += net_gex_oi
 
-            call_delta_gex_oi = call_gex_oi * c_greeks["delta"]
+            # Delta-adjusted GEX: weight each wing by its own delta, keep put sign
+            # negative. After the ITM-IV fix this matches published GEX maps
+            # (red / short-gamma below spot, green / long-gamma above spot).
+            call_delta_gex_oi = call_gex_oi * max(c_greeks["delta"], 0.0)
             put_delta_gex_oi = put_gex_oi * abs(p_greeks["delta"])
             net_delta_gex_oi = call_delta_gex_oi - put_delta_gex_oi
 
@@ -995,15 +1009,21 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             vex_val = (c_greeks["vega"] * c_info["oi"] - p_greeks["vega"] * p_info["oi"]) * lot_size * 0.01
             cex_val = (c_greeks["charm"] * c_info["oi"] - p_greeks["charm"] * p_info["oi"]) * lot_size * spot_price * 0.01
 
-            if iv > 0: all_ivs.append(iv)
+            if c_iv > 0:
+                all_ivs.append(c_iv)
+            if p_iv > 0:
+                all_ivs.append(p_iv)
             total_call_oi += c_info["oi"]
             total_put_oi += p_info["oi"]
+
+            c_iv_disp = c_iv if c_iv > 0 else c_sigma
+            p_iv_disp = p_iv if p_iv > 0 else p_sigma
 
             chain_results.append({
                 "C_Vol": c_info["volume"], "C_OI": c_info["oi"],
                 "C_Δ": round(c_greeks["delta"], 2), "C_γ": round(c_greeks["gamma"], 4),
                 "C_θ": round(c_greeks["theta"], 2), "C_ν": round(c_greeks["vega"], 2),
-                "C_IV_val": iv, "C_IV": f"{iv * 100:.1f}%", "C_LTP": c_info["ltp"],
+                "C_IV_val": c_iv_disp, "C_IV": f"{c_iv_disp * 100:.1f}%", "C_LTP": c_info["ltp"],
                 "C_Bid": c_info.get("best_bid", 0.0), "C_Ask": c_info.get("best_ask", 0.0),
                 "Strike": K,
                 "Net_GEX_OI": round(net_gex_oi, 2),
@@ -1011,7 +1031,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                 "Net_GEX_Vol": round(net_gex_vol, 2),
                 "VEX": round(vex_val, 2),
                 "CEX": round(cex_val, 2),
-                "P_LTP": p_info["ltp"], "P_IV_val": iv, "P_IV": f"{iv * 100:.1f}%",
+                "P_LTP": p_info["ltp"], "P_IV_val": p_iv_disp, "P_IV": f"{p_iv_disp * 100:.1f}%",
                 "P_Bid": p_info.get("best_bid", 0.0), "P_Ask": p_info.get("best_ask", 0.0),
                 "P_Δ": round(p_greeks["delta"], 2), "P_γ": round(p_greeks["gamma"], 4),
                 "P_θ": round(p_greeks["theta"], 2), "P_ν": round(p_greeks["vega"], 2),
