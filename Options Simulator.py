@@ -1408,35 +1408,71 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         return
 
     # ---- evolving GEX matrix from history ----
-    gex_matrix = np.zeros((n_strikes, n_times), dtype=float)
+    # Place each live snapshot at its real wall-clock time so the same strike
+    # can show different intensity / colour across the session (like the reference).
+    gex_matrix = np.full((n_strikes, n_times), np.nan, dtype=float)
+    current_vec = np.array(gex_cr, dtype=float)
+
     if not gex_hist:
-        gex_matrix[:] = np.array(gex_cr, dtype=float)[:, None]
+        # First load – paint current profile; later refreshes will add variation
+        gex_matrix[:] = current_vec[:, None]
     else:
+        # Build a time-series of GEX vectors aligned to candle timestamps
+        hist_times = []
+        hist_vecs = []
+        for h in gex_hist:
+            ht = h["ts"]
+            if getattr(ht, "tzinfo", None) is None:
+                ht = pytz.timezone("Asia/Kolkata").localize(ht)
+            src_strikes = h["strikes"]
+            src_gex = np.array(h["gex_cr"], dtype=float)
+            if len(src_strikes) == n_strikes and abs(src_strikes[0] - strikes[0]) < 1:
+                vec = src_gex
+            else:
+                src_map = dict(zip(src_strikes, src_gex))
+                vec = np.array([src_map.get(min(src_strikes, key=lambda x: abs(x - s)), 0.0) for s in strikes])
+            hist_times.append(ht)
+            hist_vecs.append(vec)
+
         for t_idx, t in enumerate(session_times):
             if getattr(t, "tzinfo", None) is None:
                 t = pytz.timezone("Asia/Kolkata").localize(t)
-            chosen = None
-            for h in reversed(gex_hist):
-                if h["ts"] <= t:
-                    chosen = h
+            # nearest snapshot whose time is <= candle time
+            chosen_idx = None
+            for i in range(len(hist_times) - 1, -1, -1):
+                if hist_times[i] <= t:
+                    chosen_idx = i
                     break
-            if chosen is None:
-                chosen = gex_hist[0]
-            src_strikes = chosen["strikes"]
-            src_gex = chosen["gex_cr"]
-            if len(src_strikes) == n_strikes and abs(src_strikes[0] - strikes[0]) < 1:
-                gex_matrix[:, t_idx] = src_gex
+            if chosen_idx is None:
+                # before first snapshot – use first snapshot (will be overwritten as history grows)
+                gex_matrix[:, t_idx] = hist_vecs[0]
             else:
-                src_map = dict(zip(src_strikes, src_gex))
-                for s_idx, s in enumerate(strikes):
-                    nearest = min(src_strikes, key=lambda x: abs(x - s))
-                    gex_matrix[s_idx, t_idx] = src_map.get(nearest, 0.0)
+                gex_matrix[:, t_idx] = hist_vecs[chosen_idx]
 
-    max_abs_gex = max(abs(np.nanmin(gex_matrix)), abs(np.nanmax(gex_matrix)), 0.01)
+        # Forward-fill any remaining NaNs with the latest known vector
+        last_valid = current_vec
+        for t_idx in range(n_times):
+            if np.isnan(gex_matrix[0, t_idx]):
+                gex_matrix[:, t_idx] = last_valid
+            else:
+                last_valid = gex_matrix[:, t_idx]
+
+    # Symmetric colour scale centred at 0, but use a robust percentile so extreme
+    # single-strike spikes don't wash out the rest of the surface (matches ref look)
+    finite_vals = gex_matrix[np.isfinite(gex_matrix)]
+    if len(finite_vals) > 0:
+        p95 = float(np.nanpercentile(np.abs(finite_vals), 95))
+        max_abs_gex = max(p95, 0.05)
+    else:
+        max_abs_gex = 0.05
+
     gex_colorscale = [
-        [0.0, "#d32f2f"],
-        [0.5, "#ffee58"],
-        [1.0, "#2e7d32"],
+        [0.0, "#b71c1c"],   # deep red (strong short-gamma)
+        [0.25, "#e53935"],
+        [0.45, "#ffee58"],  # neutral / low GEX
+        [0.55, "#ffee58"],
+        [0.75, "#43a047"],
+        [1.0, "#1b5e20"],   # deep green (strong long-gamma)
     ]
 
     hm_c1, hm_c2 = st.columns([0.65, 0.35])
@@ -1448,8 +1484,10 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
             unsafe_allow_html=True,
         )
     st.caption(
-        "Strike vs IST session time. Colour = live Delta-Adjusted Net GEX (₹ Cr) accumulated from successive "
-        "SmartAPI refreshes. Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path."
+        "Strike vs IST session time. Colour = live Delta-Adjusted Net GEX (₹ Cr) from successive SmartAPI refreshes. "
+        "Same strike can change shade/intensity as new snapshots arrive (enable Auto-Refresh). "
+        "Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path. "
+        f"History snapshots collected: {len(gex_hist)}."
     )
 
     fig_hm = plt_go.Figure()
@@ -1562,30 +1600,44 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     long_alert = crit_a_long and crit_b_long and crit_c_long   # high-confirmation: all three required
 
     # ---------- Status ribbon (dropdowns) ----------
+    # NOTE: st.expander title does NOT support HTML – badges are rendered inside the body.
     st.markdown("---")
     st.markdown("### 🚨 Live Alert Status (below GEX Heatmap)")
 
-    def _badge(flag, yes_txt="YES", no_txt="NO"):
+    def _badge_html(flag, yes_txt="YES", no_txt="NO"):
         if flag:
-            return f"<span style='background:rgba(255,82,82,0.25);color:#FF5252;padding:2px 8px;border-radius:4px;font-weight:700;border:1px solid #FF5252'>{yes_txt}</span>"
-        return f"<span style='background:rgba(0,230,118,0.15);color:#00E676;padding:2px 8px;border-radius:4px;font-weight:700;border:1px solid #00E676'>{no_txt}</span>"
+            return (
+                f"<span style='background:rgba(255,82,82,0.25);color:#FF5252;"
+                f"padding:3px 10px;border-radius:4px;font-weight:700;"
+                f"border:1px solid #FF5252;font-size:13px'>{yes_txt}</span>"
+            )
+        return (
+            f"<span style='background:rgba(0,230,118,0.15);color:#00E676;"
+            f"padding:3px 10px;border-radius:4px;font-weight:700;"
+            f"border:1px solid #00E676;font-size:13px'>{no_txt}</span>"
+        )
 
-    def _sub(flag, label):
+    def _sub_html(flag, label):
         colour = "#FF5252" if flag else "#00E676"
         txt = "Yes" if flag else "No"
         return f"<span style='color:{colour};font-weight:600'>{label} – {txt}</span>"
 
-    # Situation 1 expander
+    # ---- Situation 1 ----
+    exit_label = "YES" if exit_alert else "NO"
     with st.expander(
-        f"Situation 1 · Non-Directional Exit / Risk-Off Alert  →  {_badge(exit_alert)}",
+        f"Situation 1 · Non-Directional Exit / Risk-Off Alert  →  {exit_label}",
         expanded=exit_alert,
     ):
         st.markdown(
+            f"<div style='margin-bottom:8px'>Overall: {_badge_html(exit_alert)}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
             f"""
-            <div style='line-height:1.8;font-size:14px'>
-            {_sub(crit_a_exit, 'Wall Collapse (≥25% pos-GEX drop / 10 min)')}<br>
-            {_sub(crit_b_exit, 'Vol Expansion (OTM IV ↑ ≥0.8% / 5 min)')}<br>
-            {_sub(crit_c_exit, 'GEX Flip (spot within 0.3% of flip or in –GEX zone)')}<br>
+            <div style='line-height:1.9;font-size:14px'>
+            {_sub_html(crit_a_exit, 'Wall Collapse (≥25% pos-GEX drop / 10 min)')}<br>
+            {_sub_html(crit_b_exit, 'Vol Expansion (OTM IV ↑ ≥0.8% / 5 min)')}<br>
+            {_sub_html(crit_c_exit, 'GEX Flip (spot within 0.3% of flip or in –GEX zone)')}<br>
             <br>
             <small style='color:#AAA'>
             Wall drop: {wall_drop:.1f}% &nbsp;|&nbsp;
@@ -1598,17 +1650,22 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
             unsafe_allow_html=True,
         )
 
-    # Situation 2 expander
+    # ---- Situation 2 ----
+    long_label = "YES" if long_alert else "NO"
     with st.expander(
-        f"Situation 2 · Long Position Entry (Directional Breakout)  →  {_badge(long_alert)}",
+        f"Situation 2 · Long Position Entry (Directional Breakout)  →  {long_label}",
         expanded=long_alert,
     ):
         st.markdown(
+            f"<div style='margin-bottom:8px'>Overall: {_badge_html(long_alert)}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
             f"""
-            <div style='line-height:1.8;font-size:14px'>
-            {_sub(crit_a_long, 'Gamma Fuel (neg-GEX above spot OR pos-GEX collapse ≥40%)')}<br>
-            {_sub(crit_b_long, 'Aggressive Demand (OTM Call IV ↑ ≥1.5% / 5 min)')}<br>
-            {_sub(crit_c_long, 'Volume Confirmation (5-min vol ≥ 1.5× 20-MA)')}<br>
+            <div style='line-height:1.9;font-size:14px'>
+            {_sub_html(crit_a_long, 'Gamma Fuel (neg-GEX above spot OR pos-GEX collapse ≥40%)')}<br>
+            {_sub_html(crit_b_long, 'Aggressive Demand (OTM Call IV ↑ ≥1.5% / 5 min)')}<br>
+            {_sub_html(crit_c_long, 'Volume Confirmation (5-min vol ≥ 1.5× 20-MA)')}<br>
             <br>
             <small style='color:#AAA'>
             Neg GEX above: {cur['neg_gex_above']:.2f} Cr &nbsp;|&nbsp;
