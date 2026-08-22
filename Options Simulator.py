@@ -1617,8 +1617,134 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     }
 
 
-def render_live_alert_ribbon():
-    """Full-width 3-column ribbon: Situation 1 | Situation 2 | Z-Scores."""
+def render_compact_basket(data: dict):
+    """Compact strategy basket for the alert-row left block."""
+    st.markdown("<span style='font-weight:700;color:#00E676;font-size:13px;'>🧺 Strategy Basket</span>", unsafe_allow_html=True)
+    if not st.session_state.get("basket_legs"):
+        st.caption("No legs – add from sidebar")
+        return
+
+    market_data_store = data.get("market_data", {})
+    basket_tokens_info = data.get("basket_tokens_info", {})
+    F_val = data.get("F", data["spot_price"])
+    T_val = data.get("T", 1e-5)
+    hv_val = data.get("index_hv", 0.15)
+
+    calculated_legs = []
+    tot_pnl = tot_delta = tot_gamma = tot_theta = tot_vega = 0.0
+
+    for idx, leg in enumerate(st.session_state["basket_legs"]):
+        k, t, act, qty = leg["strike"], leg["type"], leg["action"], leg["qty"]
+        tok = basket_tokens_info.get(f"{k}_{t}", "")
+        ltp = market_data_store.get(tok, {}).get("ltp", 0.0) if tok else 0.0
+        entry_p = leg["entry_price"] if leg["entry_price"] > 0 else ltp
+        pricing_p = ltp if ltp > 0 else entry_p
+        leg_iv = VolatilityEngine.calculate_iv(pricing_p, F_val, k, T_val, rate_param, "c" if t == "CE" else "p")
+        if leg_iv == 0.0:
+            leg_iv = hv_val
+        greeks = VolatilityEngine.calculate_greeks(F_val, k, T_val, rate_param, leg_iv, "c" if t == "CE" else "p")
+        mult = 1.0 if act == "BUY" else -1.0
+        pnl_per_unit = (ltp - entry_p) if act == "BUY" else (entry_p - ltp)
+        leg_pnl = pnl_per_unit * qty if ltp > 0 else 0.0
+        pos_delta = greeks["delta"] * qty * mult
+        pos_gamma = greeks["gamma"] * qty * mult
+        pos_theta = greeks["theta"] * qty * mult
+        pos_vega = greeks["vega"] * qty * mult
+        tot_pnl += leg_pnl
+        tot_delta += pos_delta
+        tot_gamma += pos_gamma
+        tot_theta += pos_theta
+        tot_vega += pos_vega
+        calculated_legs.append({
+            "L": idx + 1, "Act": act, "K": k, "T": t, "Qty": qty,
+            "Entry": round(entry_p, 1), "LTP": round(ltp, 1), "P&L": round(leg_pnl, 1),
+            "Δ": round(pos_delta, 1), "γ": round(pos_gamma, 4),
+            "θ": round(pos_theta, 1), "ν": round(pos_vega, 1),
+        })
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("P&L", f"₹{tot_pnl:,.0f}")
+    m2.metric("Δ", f"{tot_delta:,.1f}")
+    m3.metric("γ", f"{tot_gamma:.4f}")
+    m4.metric("θ/d", f"{tot_theta:,.1f}")
+    m5.metric("ν", f"{tot_vega:,.1f}")
+
+    df_b = pd.DataFrame(calculated_legs)
+    # Legs table + compact remove controls in same row height
+    tbl_c, del_c = st.columns([0.88, 0.12])
+    with tbl_c:
+        st.dataframe(df_b, use_container_width=True, hide_index=True, height=min(120, 38 + 28 * len(calculated_legs)))
+    with del_c:
+        st.caption("Del")
+        for idx in range(len(st.session_state["basket_legs"])):
+            if st.button("✕", key=f"del_leg_compact_{idx}", help=f"Remove leg #{idx+1}"):
+                st.session_state["basket_legs"].pop(idx)
+                sync_local_storage()
+                st.rerun()
+
+    with st.expander("📊 Basket Historical Analytics", expanded=False):
+        st.caption("Theta decay %, daily theta, Vanna, Charm (1-hr)")
+        smart_api = get_smart_api_client()
+        if smart_api and not df_master.empty and st.session_state["basket_legs"]:
+            b_hist_dfs = []
+            for leg in st.session_state["basket_legs"]:
+                k, t, act, qty = leg["strike"], leg["type"], leg["action"], leg["qty"]
+                mult = 1.0 if act == "BUY" else -1.0
+                tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
+                if not tok:
+                    continue
+                leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange)
+                if leg_df.empty:
+                    continue
+                leg_df["Expiry_Date"] = target_expiry_dt.date()
+                expiry = pd.to_datetime(leg_df["Expiry_Date"]).dt.tz_localize(None)
+                timestamp = pd.to_datetime(leg_df["Raw_Timestamp"]).dt.tz_localize(None)
+                leg_df["DTE"] = (expiry - timestamp).dt.total_seconds() / 86400
+                leg_df["DTE"] = leg_df["DTE"].apply(lambda x: max(x, 0.001))
+                leg_df["T"] = leg_df["DTE"] / 365.0
+                greeks_df = leg_df.apply(compute_greeks, axis=1, K=k, r=rate_param, option_type=t)
+                greeks_df.columns = ["IV_%", "Theta", "Theta_Decay_Pct", "Gamma", "Vanna", "Charm", "Extrinsic_Val", "Is_Pure_Intrinsic"]
+                init_p = leg_df.iloc[0]["Close"]
+                leg_df["Theta_Scaled"] = greeks_df["Theta"] * qty * mult
+                leg_df["Vanna_Scaled"] = greeks_df["Vanna"] * qty * mult
+                leg_df["Charm_Scaled"] = greeks_df["Charm"] * qty * mult
+                init_theta = abs(greeks_df.iloc[0]["Theta"]) * qty
+                cumulative_theta_loss = (init_p - leg_df["Close"]) * qty if mult > 0 else (leg_df["Close"] - init_p) * qty
+                leg_df["Theta_Accrued"] = cumulative_theta_loss
+                leg_df["Total_Expected_Theta"] = init_theta if init_theta > 0 else 1.0
+                b_hist_dfs.append(leg_df[["Date", "Raw_Timestamp", "Theta_Scaled", "Vanna_Scaled", "Charm_Scaled", "Theta_Accrued", "Total_Expected_Theta"]])
+            if b_hist_dfs:
+                combined = b_hist_dfs[0].copy()
+                for nxt in b_hist_dfs[1:]:
+                    combined = pd.merge(combined, nxt, on=["Date", "Raw_Timestamp"], how="inner", suffixes=("", "_sub"))
+                    for c_col in ["Theta_Scaled", "Vanna_Scaled", "Charm_Scaled", "Theta_Accrued", "Total_Expected_Theta"]:
+                        combined[c_col] = combined[c_col] + combined[f"{c_col}_sub"]
+                        combined.drop(columns=[f"{c_col}_sub"], inplace=True)
+                combined = combined.sort_values("Raw_Timestamp", ascending=True).reset_index(drop=True)
+                total_init = max(abs(combined.iloc[0]["Total_Expected_Theta"]), 1e-5)
+                combined["Cumulative_Theta_Decay_Pct"] = (combined["Theta_Accrued"] / total_init * 100.0).clip(0, 100)
+                def _plot_bm(df, y, title, color, is_pct=False):
+                    fig = px.line(df, x="Date", y=y, title=title, markers=True)
+                    fig.update_traces(line_color=color)
+                    fig.update_xaxes(type="category", title="")
+                    if is_pct:
+                        fig.update_yaxes(range=[0, 105], ticksuffix="%")
+                    fig.update_layout(template="plotly_dark", height=220, margin=dict(l=10, r=10, t=30, b=10))
+                    return fig
+                bc1, bc2 = st.columns(2)
+                with bc1:
+                    st.plotly_chart(_plot_bm(combined, "Cumulative_Theta_Decay_Pct", "Cum. Θ Decay %", "#00E676", True), use_container_width=True)
+                with bc2:
+                    st.plotly_chart(_plot_bm(combined, "Theta_Scaled", "Daily Θ (₹/Day)", "#FF9800"), use_container_width=True)
+                bc3, bc4 = st.columns(2)
+                with bc3:
+                    st.plotly_chart(_plot_bm(combined, "Vanna_Scaled", "Vanna", "#00BFFF"), use_container_width=True)
+                with bc4:
+                    st.plotly_chart(_plot_bm(combined, "Charm_Scaled", "Charm", "#E040FB"), use_container_width=True)
+
+
+def render_live_alert_ribbon(data: dict = None):
+    """Full-width layout: left = Sit1 + Sit2 + Basket | right = Z-Scores."""
     snap = st.session_state.get("_live_alert_snapshot")
     if not snap:
         return
@@ -1648,39 +1774,43 @@ def render_live_alert_ribbon():
     st.markdown("---")
     st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🚨 Live Alert Status</span>", unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
+    left_blk, right_blk = st.columns([0.66, 0.34])
 
-    with c1:
-        with st.expander(f"Sit. 1 · Exit / Risk-Off → {exit_label}", expanded=True):
-            st.markdown(f"Overall: {_badge_html(snap['exit_alert'])}", unsafe_allow_html=True)
-            st.markdown(
-                f"""
-                <div style='line-height:1.7;font-size:12px'>
-                {_sub_html(snap['crit_a_exit'], 'Wall Collapse (≥25% / 10m)')}<br>
-                {_sub_html(snap['crit_b_exit'], 'Vol Expansion (IV ↑ ≥0.8% / 5m)')}<br>
-                {_sub_html(snap['crit_c_exit'], 'GEX Flip (≤0.3% or –GEX zone)')}<br>
-                <small style='color:#AAA'>Drop {snap['wall_drop']:.1f}% | Call Δ {snap['call_iv_chg']:+.2f}% | Put Δ {snap['put_iv_chg']:+.2f}% | Flip dist {snap['dist_to_flip_pct']:.2f}%</small>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    with left_blk:
+        a1, a2 = st.columns(2)
+        with a1:
+            with st.expander(f"Sit. 1 · Exit / Risk-Off → {exit_label}", expanded=True):
+                st.markdown(f"Overall: {_badge_html(snap['exit_alert'])}", unsafe_allow_html=True)
+                st.markdown(
+                    f"""
+                    <div style='line-height:1.65;font-size:12px'>
+                    {_sub_html(snap['crit_a_exit'], 'Wall Collapse (≥25% / 10m)')}<br>
+                    {_sub_html(snap['crit_b_exit'], 'Vol Expansion (IV ↑ ≥0.8% / 5m)')}<br>
+                    {_sub_html(snap['crit_c_exit'], 'GEX Flip (≤0.3% or –GEX zone)')}<br>
+                    <small style='color:#AAA'>Drop {snap['wall_drop']:.1f}% | Call Δ {snap['call_iv_chg']:+.2f}% | Put Δ {snap['put_iv_chg']:+.2f}% | Flip {snap['dist_to_flip_pct']:.2f}%</small>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        with a2:
+            with st.expander(f"Sit. 2 · Long Entry → {long_label}", expanded=True):
+                st.markdown(f"Overall: {_badge_html(snap['long_alert'])}", unsafe_allow_html=True)
+                st.markdown(
+                    f"""
+                    <div style='line-height:1.65;font-size:12px'>
+                    {_sub_html(snap['crit_a_long'], 'Gamma Fuel (–GEX or collapse ≥40%)')}<br>
+                    {_sub_html(snap['crit_b_long'], 'Aggressive Demand (Call IV ↑ ≥1.5%)')}<br>
+                    {_sub_html(snap['crit_c_long'], 'Volume Confirm (≥1.5× 20-MA)')}<br>
+                    <small style='color:#AAA'>NegGEX {cur['neg_gex_above']:.1f} Cr | Collapse {snap['pos_collapse']:.1f}% | Call Δ {snap['call_iv_chg']:+.2f}% | Vol {cur['vol_ratio']:.2f}×</small>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        # Basket fills blank space under Sit1/Sit2, left of Z-Scores
+        if data is not None:
+            render_compact_basket(data)
 
-    with c2:
-        with st.expander(f"Sit. 2 · Long Entry → {long_label}", expanded=True):
-            st.markdown(f"Overall: {_badge_html(snap['long_alert'])}", unsafe_allow_html=True)
-            st.markdown(
-                f"""
-                <div style='line-height:1.7;font-size:12px'>
-                {_sub_html(snap['crit_a_long'], 'Gamma Fuel (–GEX or collapse ≥40%)')}<br>
-                {_sub_html(snap['crit_b_long'], 'Aggressive Demand (Call IV ↑ ≥1.5%)')}<br>
-                {_sub_html(snap['crit_c_long'], 'Volume Confirm (≥1.5× 20-MA)')}<br>
-                <small style='color:#AAA'>NegGEX {cur['neg_gex_above']:.1f} Cr | Collapse {snap['pos_collapse']:.1f}% | Call Δ {snap['call_iv_chg']:+.2f}% | Vol {cur['vol_ratio']:.2f}×</small>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    with c3:
+    with right_blk:
         zscore_analysis_fragment(mode="highlights")
 
 
@@ -1823,186 +1953,6 @@ def live_dashboard_fragment():
             fig_ind.update_xaxes(type="category", nticks=6)
             st.plotly_chart(fig_ind, use_container_width=True)
 
-    # --- STRATEGY BASKET DISPLAY & MANAGEMENT ---
-    st.markdown("---")
-    st.subheader("🧺 Strategy Basket Analytics")
-
-    if st.session_state["basket_legs"]:
-        market_data_store = data.get("market_data", {})
-        basket_tokens_info = data.get("basket_tokens_info", {})
-        F_val = data.get("F", data["spot_price"])
-        T_val = data.get("T", 1e-5)
-        hv_val = data.get("index_hv", 0.15)
-
-        calculated_legs = []
-        tot_pnl = 0.0
-        tot_delta = 0.0
-        tot_gamma = 0.0
-        tot_theta = 0.0
-        tot_vega = 0.0
-
-        for idx, leg in enumerate(st.session_state["basket_legs"]):
-            k = leg["strike"]
-            t = leg["type"]
-            act = leg["action"]
-            qty = leg["qty"]
-
-            tok = basket_tokens_info.get(f"{k}_{t}", "")
-            ltp = market_data_store.get(tok, {}).get("ltp", 0.0) if tok else 0.0
-            entry_p = leg["entry_price"] if leg["entry_price"] > 0 else ltp
-
-            pricing_p = ltp if ltp > 0 else entry_p
-            leg_iv = VolatilityEngine.calculate_iv(pricing_p, F_val, k, T_val, rate_param, "c" if t == "CE" else "p")
-            if leg_iv == 0.0:
-                leg_iv = hv_val
-
-            greeks = VolatilityEngine.calculate_greeks(F_val, k, T_val, rate_param, leg_iv, "c" if t == "CE" else "p")
-
-            mult = 1.0 if act == "BUY" else -1.0
-
-            pnl_per_unit = (ltp - entry_p) if act == "BUY" else (entry_p - ltp)
-            leg_pnl = pnl_per_unit * qty if ltp > 0 else 0.0
-
-            # MODIFIED: Scaled by Units/Qty and Direction
-            pos_delta = greeks["delta"] * qty * mult
-            pos_gamma = greeks["gamma"] * qty * mult
-            pos_theta = greeks["theta"] * qty * mult
-            pos_vega = greeks["vega"] * qty * mult
-
-            tot_pnl += leg_pnl
-            tot_delta += pos_delta
-            tot_gamma += pos_gamma
-            tot_theta += pos_theta
-            tot_vega += pos_vega
-
-            calculated_legs.append({
-                "Leg": idx + 1,
-                "Action": act,
-                "Strike": k,
-                "Type": t,
-                "Qty": qty,
-                "Entry (₹)": round(entry_p, 2),
-                "LTP (₹)": round(ltp, 2),
-                "P&L (₹)": round(leg_pnl, 2),
-                "Delta (Δ ₹)": round(pos_delta, 2),
-                "Gamma (γ)": round(pos_gamma, 4),
-                "Theta (θ ₹/Day)": round(pos_theta, 2),
-                "Vega (ν ₹)": round(pos_vega, 2)
-            })
-
-        with st.container(border=True):
-            st.markdown("**Combined Basket Summary**")
-            b_m1, b_m2, b_m3, b_m4, b_m5 = st.columns(5)
-            b_m1.metric("Net P&L (₹)", f"₹{tot_pnl:,.2f}")
-            b_m2.metric("Net Delta (Δ ₹)", f"₹{tot_delta:,.2f}")
-            b_m3.metric("Net Gamma (γ)", f"{tot_gamma:.4f}")
-            b_m4.metric("Net Theta (θ ₹/Day)", f"₹{tot_theta:,.2f}")
-            b_m5.metric("Net Vega (ν ₹)", f"₹{tot_vega:,.2f}")
-
-        df_basket_display = pd.DataFrame(calculated_legs)
-        st.markdown("**Individual Legs Breakdown**")
-        
-        # Display Basket Legs Table with dynamic delete buttons
-        col_tbl, col_del = st.columns([0.85, 0.15])
-        with col_tbl:
-            st.dataframe(df_basket_display, use_container_width=True)
-        with col_del:
-            st.markdown("**Manage Legs**")
-            for idx in range(len(st.session_state["basket_legs"])):
-                if st.button(f"❌ Remove #{idx + 1}", key=f"del_leg_{idx}"):
-                    st.session_state["basket_legs"].pop(idx)
-                    sync_local_storage()
-                    st.rerun()
-
-        # --- MODIFIED: STRATEGY BASKET HISTORICAL ANALYTICS CHARTS ---
-        with st.expander("📊 Basket Historical Analytics (Cumulative Theta Decay %, Daily Theta, Vanna, Charm)", expanded=False):
-            st.caption("Visualizing combined strategy basket time-series decay and second-order greeks at 1-hr interval sessions. Holidays excluded.")
-            smart_api = get_smart_api_client()
-            if smart_api and not df_master.empty:
-                b_hist_dfs = []
-                for leg in st.session_state["basket_legs"]:
-                    k = leg["strike"]
-                    t = leg["type"]
-                    act = leg["action"]
-                    qty = leg["qty"]
-                    mult = 1.0 if act == "BUY" else -1.0
-
-                    tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
-                    if tok:
-                        leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange)
-                        if not leg_df.empty:
-                            leg_df['Expiry_Date'] = target_expiry_dt.date()
-                            expiry = pd.to_datetime(leg_df['Expiry_Date']).dt.tz_localize(None)
-                            timestamp = pd.to_datetime(leg_df['Raw_Timestamp']).dt.tz_localize(None)
-                            leg_df['DTE'] = (expiry - timestamp).dt.total_seconds() / 86400
-                            leg_df['DTE'] = leg_df['DTE'].apply(lambda x: max(x, 0.001))
-                            leg_df['T'] = leg_df['DTE'] / 365.0
-                            
-                            greeks_df = leg_df.apply(compute_greeks, axis=1, K=k, r=rate_param, option_type=t)
-                            greeks_df.columns = ['IV_%', 'Theta', 'Theta_Decay_Pct', 'Gamma', 'Vanna', 'Charm', 'Extrinsic_Val', 'Is_Pure_Intrinsic']
-                            
-                            init_p = leg_df.iloc[0]['Close']
-                            
-                            # Multiply by Qty / Units entered in sidebar
-                            leg_df['Theta_Scaled'] = greeks_df['Theta'] * qty * mult
-                            leg_df['Vanna_Scaled'] = greeks_df['Vanna'] * qty * mult
-                            leg_df['Charm_Scaled'] = greeks_df['Charm'] * qty * mult
-                            
-                            # Theta Decay standalone computation (Absolute theta decay accrued)
-                            init_theta = abs(greeks_df.iloc[0]['Theta']) * qty
-                            cumulative_theta_loss = (init_p - leg_df['Close']) * qty if mult > 0 else (leg_df['Close'] - init_p) * qty
-                            
-                            leg_df['Theta_Accrued'] = cumulative_theta_loss
-                            leg_df['Total_Expected_Theta'] = init_theta if init_theta > 0 else 1.0
-                            
-                            b_hist_dfs.append(leg_df[['Date', 'Raw_Timestamp', 'Theta_Scaled', 'Vanna_Scaled', 'Charm_Scaled', 'Theta_Accrued', 'Total_Expected_Theta']])
-
-                if b_hist_dfs:
-                    combined_basket_df = b_hist_dfs[0].copy()
-                    for next_df in b_hist_dfs[1:]:
-                        combined_basket_df = pd.merge(combined_basket_df, next_df, on=['Date', 'Raw_Timestamp'], how='inner', suffixes=('', '_sub'))
-                        for c_col in ['Theta_Scaled', 'Vanna_Scaled', 'Charm_Scaled', 'Theta_Accrued', 'Total_Expected_Theta']:
-                            combined_basket_df[c_col] = combined_basket_df[c_col] + combined_basket_df[f"{c_col}_sub"]
-                            combined_basket_df.drop(columns=[f"{c_col}_sub"], inplace=True)
-
-                    combined_basket_df = combined_basket_df.sort_values('Raw_Timestamp', ascending=True).reset_index(drop=True)
-
-                    # MODIFIED: Calculate Cumulative Theta Decay Percentage (Max 100%)
-                    total_init_exp_theta = max(abs(combined_basket_df.iloc[0]['Total_Expected_Theta']), 1e-5)
-                    combined_basket_df['Cumulative_Theta_Decay_Pct'] = (combined_basket_df['Theta_Accrued'] / total_init_exp_theta) * 100.0
-                    combined_basket_df['Cumulative_Theta_Decay_Pct'] = combined_basket_df['Cumulative_Theta_Decay_Pct'].clip(lower=0.0, upper=100.0)
-
-                    # Helper function to plot basket greeks with non-trading days/holidays excluded using categorical x-axis
-                    def plot_basket_metric(df, y_col, title, y_label, color, is_pct=False):
-                        fig_b = px.line(df, x='Date', y=y_col, title=title, markers=True)
-                        fig_b.update_traces(line_color=color)
-                        # Hide non-trading days/holidays by setting x-axis type to "category"
-                        fig_b.update_xaxes(type="category", title="Trading Session Intervals (Oldest ➔ Present)", autorange=True)
-                        if is_pct:
-                            fig_b.update_yaxes(title=y_label, range=[0, 105], ticksuffix="%")
-                        else:
-                            fig_b.update_yaxes(title=y_label)
-                        fig_b.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20))
-                        return fig_b
-
-                    bc1, bc2 = st.columns(2)
-                    with bc1:
-                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Cumulative_Theta_Decay_Pct', '1. Cumulative Theta Decay of Basket (%)', 'Cumulative Decay (%)', '#00E676', is_pct=True), use_container_width=True)
-                    with bc2:
-                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Theta_Scaled', '2. Daily Theta Decay Expected (₹ / Day)', 'Daily Theta (₹/Day)', '#FF9800'), use_container_width=True)
-
-                    bc3, bc4 = st.columns(2)
-                    with bc3:
-                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Vanna_Scaled', '3. Combined Basket Vanna (dGamma / dVol ₹)', 'Vanna (₹)', '#00BFFF'), use_container_width=True)
-                    with bc4:
-                        st.plotly_chart(plot_basket_metric(combined_basket_df, 'Charm_Scaled', '4. Combined Basket Charm (Delta Decay ₹ / Day)', 'Charm (₹/Day)', '#E040FB'), use_container_width=True)
-                else:
-                    st.info("Unable to fetch historical data for strategy basket contracts.")
-            else:
-                st.info("API session uninitialized. Cannot calculate strategy basket time-series charts.")
-
-    else:
-        st.info("No legs added to strategy basket yet. Use sidebar **2. Build Strategy Basket** to add positions.")
 
     # --- GEX CHARTS (Key Levels already in sticky Market Summary) ---
     st.markdown("---")
@@ -2092,8 +2042,8 @@ def live_dashboard_fragment():
                 st.session_state.get("heatmap_timeframe", "5 min"),
             )
 
-        # Full-width 3-col alert ribbon (not nested inside heatmap column)
-        render_live_alert_ribbon()
+        # Full-width alert ribbon + compact basket (left of Z-Scores)
+        render_live_alert_ribbon(data)
 
         # 4. VEX/CEX (60%) + Skew (40%) prepared below – VEX chart first
         st.markdown("---")
