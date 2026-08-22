@@ -92,6 +92,10 @@ if "zscore_data_store" not in st.session_state:
     st.session_state["zscore_data_store"] = pd.DataFrame()
 if "heatmap_timeframe" not in st.session_state:
     st.session_state["heatmap_timeframe"] = "5 min"
+if "gex_heatmap_history" not in st.session_state:
+    st.session_state["gex_heatmap_history"] = []
+if "alert_metrics_history" not in st.session_state:
+    st.session_state["alert_metrics_history"] = []  # snapshots for Exit / Long alert criteria
 
 # Streamlit Cache Persistence Handlers
 @st.cache_data(ttl=86400)
@@ -1289,7 +1293,7 @@ def _prepare_session_candles(df_candles: pd.DataFrame) -> pd.DataFrame:
 
 
 def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatmap_tf_label: str):
-    """Render strike × session-time Delta-Adjusted GEX heatmap for the selected index."""
+    """Render strike × session-time Delta-Adjusted GEX heatmap + Exit / Long alert ribbon."""
     chain_results = data.get("chain_results") or []
     if not chain_results:
         st.info("No option chain data available for GEX heatmap.")
@@ -1303,7 +1307,74 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     df_chain = df_chain.sort_values("Strike").reset_index(drop=True)
     strikes = df_chain["Strike"].astype(float).tolist()
     gex_cr = (df_chain["Net_Delta_GEX_OI"].astype(float) / 1e7).tolist()
+    spot = float(data.get("spot_price", 0.0))
+    flip = float(data.get("levels", {}).get("Zero_Gamma_Flip", spot) or spot)
 
+    # ---- derive metrics needed by the two alert modules ----
+    pos_gex_above = float(df_chain.loc[
+        (df_chain["Strike"] >= spot) & (df_chain["Net_Delta_GEX_OI"] > 0), "Net_Delta_GEX_OI"
+    ].sum() / 1e7)
+    neg_gex_above = float(df_chain.loc[
+        (df_chain["Strike"] >= spot) & (df_chain["Net_Delta_GEX_OI"] < 0), "Net_Delta_GEX_OI"
+    ].sum() / 1e7)
+
+    # OTM Call IV (nearest OTM call) and OTM Put IV (nearest OTM put)
+    otm_calls = df_chain[(df_chain["Strike"] >= spot)].copy()
+    otm_puts = df_chain[(df_chain["Strike"] < spot)].copy()
+    otm_call_iv = 0.0
+    otm_put_iv = 0.0
+    if not otm_calls.empty and "C_IV_val" in otm_calls.columns:
+        nearest_c = otm_calls.iloc[(otm_calls["Strike"] - spot).abs().argsort()[:1]]
+        otm_call_iv = float(nearest_c["C_IV_val"].iloc[0]) * 100.0 if not nearest_c.empty else 0.0
+    if not otm_puts.empty and "P_IV_val" in otm_puts.columns:
+        nearest_p = otm_puts.iloc[(otm_puts["Strike"] - spot).abs().argsort()[:1]]
+        otm_put_iv = float(nearest_p["P_IV_val"].iloc[0]) * 100.0 if not nearest_p.empty else 0.0
+
+    # Volume from latest 5-min candle vs 20-period MA
+    df_candles = data.get("df_candles", pd.DataFrame())
+    vol_ratio = 0.0
+    if not df_candles.empty and "volume" in df_candles.columns and len(df_candles) >= 21:
+        recent_vol = float(df_candles["volume"].iloc[-1])
+        ma20 = float(df_candles["volume"].iloc[-21:-1].mean())
+        vol_ratio = recent_vol / ma20 if ma20 > 0 else 0.0
+
+    # ---- accumulate history for heatmap + alerts ----
+    now_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+    gex_hist = st.session_state.get("gex_heatmap_history", [])
+    alert_hist = st.session_state.get("alert_metrics_history", [])
+
+    # Reset histories if strike window changes significantly
+    if gex_hist and (len(gex_hist[-1]["strikes"]) != len(strikes) or
+                     abs(gex_hist[-1]["strikes"][0] - strikes[0]) > 1 or
+                     abs(gex_hist[-1]["strikes"][-1] - strikes[-1]) > 1):
+        gex_hist = []
+        alert_hist = []
+
+    should_append = True
+    if alert_hist:
+        last_ts = alert_hist[-1]["ts"]
+        if (now_ist - last_ts).total_seconds() < 25:
+            should_append = False
+
+    if should_append:
+        gex_hist.append({"ts": now_ist, "strikes": list(strikes), "gex_cr": list(gex_cr)})
+        alert_hist.append({
+            "ts": now_ist,
+            "spot": spot,
+            "flip": flip,
+            "pos_gex_above": pos_gex_above,
+            "neg_gex_above": neg_gex_above,
+            "otm_call_iv": otm_call_iv,
+            "otm_put_iv": otm_put_iv,
+            "vol_ratio": vol_ratio,
+        })
+        cutoff = now_ist - datetime.timedelta(hours=6)
+        gex_hist = [h for h in gex_hist if h["ts"] >= cutoff]
+        alert_hist = [h for h in alert_hist if h["ts"] >= cutoff]
+        st.session_state["gex_heatmap_history"] = gex_hist
+        st.session_state["alert_metrics_history"] = alert_hist
+
+    # ---- session candles ----
     heatmap_tf_label = heatmap_tf_label or st.session_state.get("heatmap_timeframe", "5 min")
     chart_tf = st.session_state.get("selected_timeframe", "5 min")
     df_session = pd.DataFrame()
@@ -1328,6 +1399,7 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     time_labels = pd.to_datetime(df_session["time"]).dt.strftime("%H:%M").tolist()
     spot_path = df_session["close"].astype(float).tolist()
     session_date_str = pd.to_datetime(df_session["time"].iloc[-1]).strftime("%d %B %Y")
+    session_times = pd.to_datetime(df_session["time"]).tolist()
 
     n_strikes = len(strikes)
     n_times = len(time_labels)
@@ -1335,9 +1407,30 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         st.info("Insufficient strike/time points for the GEX heatmap.")
         return
 
-    # Current snapshot GEX with the same session-decay envelope used in the source module
-    decay_vector = np.linspace(0.85, 1.0, n_times)
-    gex_matrix = np.outer(np.array(gex_cr, dtype=float), decay_vector)
+    # ---- evolving GEX matrix from history ----
+    gex_matrix = np.zeros((n_strikes, n_times), dtype=float)
+    if not gex_hist:
+        gex_matrix[:] = np.array(gex_cr, dtype=float)[:, None]
+    else:
+        for t_idx, t in enumerate(session_times):
+            if getattr(t, "tzinfo", None) is None:
+                t = pytz.timezone("Asia/Kolkata").localize(t)
+            chosen = None
+            for h in reversed(gex_hist):
+                if h["ts"] <= t:
+                    chosen = h
+                    break
+            if chosen is None:
+                chosen = gex_hist[0]
+            src_strikes = chosen["strikes"]
+            src_gex = chosen["gex_cr"]
+            if len(src_strikes) == n_strikes and abs(src_strikes[0] - strikes[0]) < 1:
+                gex_matrix[:, t_idx] = src_gex
+            else:
+                src_map = dict(zip(src_strikes, src_gex))
+                for s_idx, s in enumerate(strikes):
+                    nearest = min(src_strikes, key=lambda x: abs(x - s))
+                    gex_matrix[s_idx, t_idx] = src_map.get(nearest, 0.0)
 
     max_abs_gex = max(abs(np.nanmin(gex_matrix)), abs(np.nanmax(gex_matrix)), 0.01)
     gex_colorscale = [
@@ -1351,13 +1444,12 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         st.subheader(f"🔥 Delta-Adjusted GEX Heatmap ({index_name})")
     with hm_c2:
         st.markdown(
-            f"<div class='update-timestamp'>Expiry: {expiry_str} | Session: {session_date_str} | {heatmap_tf_label}</div>",
+            f"<div class='update-timestamp'>Expiry: {expiry_str} | Session: {session_date_str} | {heatmap_tf_label} | Snapshots: {len(gex_hist)}</div>",
             unsafe_allow_html=True,
         )
     st.caption(
-        "Strike vs IST session time. Colour uses live Delta-Adjusted Net GEX (₹ Cr) from the selected expiry. "
-        "Time axis applies a 0.85→1.0 session envelope (same method as the source heatmap). "
-        "Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path."
+        "Strike vs IST session time. Colour = live Delta-Adjusted Net GEX (₹ Cr) accumulated from successive "
+        "SmartAPI refreshes. Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path."
     )
 
     fig_hm = plt_go.Figure()
@@ -1402,6 +1494,132 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     fig_hm.update_xaxes(type="category")
     fig_hm.update_yaxes(tickformat="d")
     st.plotly_chart(fig_hm, use_container_width=True)
+
+    # =====================================================================
+    #  ALERT MODULES – Situation 1 (Exit / Risk-Off) & Situation 2 (Long Entry)
+    # =====================================================================
+    def _pct_drop(old, new):
+        if old is None or old <= 0:
+            return 0.0
+        return max(0.0, (old - new) / old * 100.0)
+
+    def _iv_change_bps(old_iv, new_iv):
+        if old_iv is None:
+            return 0.0
+        return (new_iv - old_iv)  # already in percentage points → ×100 for bps later if needed
+
+    # Look back ~10 min and ~5 min in the alert history
+    t_10 = now_ist - datetime.timedelta(minutes=10)
+    t_5 = now_ist - datetime.timedelta(minutes=5)
+
+    snap_10 = None
+    snap_5 = None
+    for h in alert_hist:
+        if h["ts"] <= t_10:
+            snap_10 = h
+        if h["ts"] <= t_5:
+            snap_5 = h
+
+    cur = alert_hist[-1] if alert_hist else {
+        "pos_gex_above": pos_gex_above,
+        "neg_gex_above": neg_gex_above,
+        "otm_call_iv": otm_call_iv,
+        "otm_put_iv": otm_put_iv,
+        "vol_ratio": vol_ratio,
+        "spot": spot,
+        "flip": flip,
+    }
+
+    # ---------- Situation 1: Non-Directional Exit / Risk-Off ----------
+    # A – Wall Collapse: cumulative positive GEX above spot drops ≥ 25% in 10 min
+    wall_drop = _pct_drop(snap_10["pos_gex_above"] if snap_10 else None, cur["pos_gex_above"])
+    crit_a_exit = wall_drop >= 25.0
+
+    # B – Vol Expansion: OTM Call IV or Put IV rises ≥ +0.8% (80 bps) in 5 min
+    call_iv_chg = _iv_change_bps(snap_5["otm_call_iv"] if snap_5 else None, cur["otm_call_iv"])
+    put_iv_chg = _iv_change_bps(snap_5["otm_put_iv"] if snap_5 else None, cur["otm_put_iv"])
+    crit_b_exit = (call_iv_chg >= 0.8) or (put_iv_chg >= 0.8)
+
+    # C – GEX Flip: spot within 0.3% of flip level OR already inside a negative-GEX strike zone
+    dist_to_flip_pct = abs(cur["spot"] - cur["flip"]) / cur["spot"] * 100.0 if cur["spot"] > 0 else 999.0
+    in_neg_zone = cur["neg_gex_above"] < 0 and abs(cur["neg_gex_above"]) > 0.01
+    crit_c_exit = (dist_to_flip_pct <= 0.3) or in_neg_zone
+
+    exit_alert = crit_a_exit or crit_b_exit or crit_c_exit
+
+    # ---------- Situation 2: Long Position Entry (Directional Breakout) ----------
+    # A – Gamma Fuel: negative GEX present directly above spot OR positive GEX collapsed ≥ 40% in 10 min
+    has_neg_above = cur["neg_gex_above"] < -0.01
+    pos_collapse = _pct_drop(snap_10["pos_gex_above"] if snap_10 else None, cur["pos_gex_above"])
+    crit_a_long = has_neg_above or (pos_collapse >= 40.0)
+
+    # B – Aggressive Demand: OTM Call IV spikes ≥ +1.5% (150 bps) in 5 min
+    crit_b_long = call_iv_chg >= 1.5
+
+    # C – Volume Confirmation: current 5-min volume ≥ 1.5× its 20-period MA
+    crit_c_long = cur["vol_ratio"] >= 1.5
+
+    long_alert = crit_a_long and crit_b_long and crit_c_long   # high-confirmation: all three required
+
+    # ---------- Status ribbon (dropdowns) ----------
+    st.markdown("---")
+    st.markdown("### 🚨 Live Alert Status (below GEX Heatmap)")
+
+    def _badge(flag, yes_txt="YES", no_txt="NO"):
+        if flag:
+            return f"<span style='background:rgba(255,82,82,0.25);color:#FF5252;padding:2px 8px;border-radius:4px;font-weight:700;border:1px solid #FF5252'>{yes_txt}</span>"
+        return f"<span style='background:rgba(0,230,118,0.15);color:#00E676;padding:2px 8px;border-radius:4px;font-weight:700;border:1px solid #00E676'>{no_txt}</span>"
+
+    def _sub(flag, label):
+        colour = "#FF5252" if flag else "#00E676"
+        txt = "Yes" if flag else "No"
+        return f"<span style='color:{colour};font-weight:600'>{label} – {txt}</span>"
+
+    # Situation 1 expander
+    with st.expander(
+        f"Situation 1 · Non-Directional Exit / Risk-Off Alert  →  {_badge(exit_alert)}",
+        expanded=exit_alert,
+    ):
+        st.markdown(
+            f"""
+            <div style='line-height:1.8;font-size:14px'>
+            {_sub(crit_a_exit, 'Wall Collapse (≥25% pos-GEX drop / 10 min)')}<br>
+            {_sub(crit_b_exit, 'Vol Expansion (OTM IV ↑ ≥0.8% / 5 min)')}<br>
+            {_sub(crit_c_exit, 'GEX Flip (spot within 0.3% of flip or in –GEX zone)')}<br>
+            <br>
+            <small style='color:#AAA'>
+            Wall drop: {wall_drop:.1f}% &nbsp;|&nbsp;
+            Call IV Δ: {call_iv_chg:+.2f}% &nbsp;|&nbsp;
+            Put IV Δ: {put_iv_chg:+.2f}% &nbsp;|&nbsp;
+            Dist to flip: {dist_to_flip_pct:.2f}%
+            </small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Situation 2 expander
+    with st.expander(
+        f"Situation 2 · Long Position Entry (Directional Breakout)  →  {_badge(long_alert)}",
+        expanded=long_alert,
+    ):
+        st.markdown(
+            f"""
+            <div style='line-height:1.8;font-size:14px'>
+            {_sub(crit_a_long, 'Gamma Fuel (neg-GEX above spot OR pos-GEX collapse ≥40%)')}<br>
+            {_sub(crit_b_long, 'Aggressive Demand (OTM Call IV ↑ ≥1.5% / 5 min)')}<br>
+            {_sub(crit_c_long, 'Volume Confirmation (5-min vol ≥ 1.5× 20-MA)')}<br>
+            <br>
+            <small style='color:#AAA'>
+            Neg GEX above: {cur['neg_gex_above']:.2f} Cr &nbsp;|&nbsp;
+            Pos collapse: {pos_collapse:.1f}% &nbsp;|&nbsp;
+            Call IV Δ: {call_iv_chg:+.2f}% &nbsp;|&nbsp;
+            Vol ratio: {cur['vol_ratio']:.2f}×
+            </small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 # --- LIVE DASHBOARD FRAGMENT ---
