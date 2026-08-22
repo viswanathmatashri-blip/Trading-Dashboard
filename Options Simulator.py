@@ -1091,80 +1091,69 @@ if run_btn or "data_store" not in st.session_state:
 
 # --- Z-SCORE ANALYSIS FRAGMENT ---
 @st.fragment(run_every=300 if st.session_state.get("enable_zscore_refresh", False) else None)
-def zscore_analysis_fragment():
-    st.markdown("---")
-    head_c1, head_c2 = st.columns([0.65, 0.35])
-    with head_c1:
+def zscore_analysis_fragment(mode="full"):
+    """mode: 'highlights' = compact table only | 'raw' = inspect expander only | 'full' = both"""
+    def _style_z(val):
+        if val >= 1.5 or val <= -1.5:
+            return 'background-color: #ff4d4d; color: white; font-weight: bold;'
+        elif 0.5 <= val < 1.5 or -1.5 < val <= -0.5:
+            return 'background-color: #ffea80; color: black;'
+        else:
+            return 'background-color: #b3ffb3; color: black;'
+
+    if mode in ("highlights", "full"):
         st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>📊 Z-Scores ({Index_Name})</span>", unsafe_allow_html=True)
         st.caption("HV + Futures Volume Z")
-    with head_c2:
-        st.write("")
-        enable_z_ref = st.checkbox("Enable Z-Score Auto-Refresh (5 min)", value=st.session_state["enable_zscore_refresh"], key="cb_zscore_refresh")
+        enable_z_ref = st.checkbox("Auto-Refresh 5 min", value=st.session_state["enable_zscore_refresh"], key="cb_zscore_refresh")
         if enable_z_ref != st.session_state["enable_zscore_refresh"]:
             st.session_state["enable_zscore_refresh"] = enable_z_ref
             st.rerun()
-
-    btn_c1, btn_c2 = st.columns([0.30, 0.70])
-    with btn_c1:
-        calc_z_btn = st.button("🔄 Compute / Refresh Z-Scores", use_container_width=True)
-
-    progress_holder = st.container()
-
-    smart_api = get_smart_api_client()
-
-    if calc_z_btn or st.session_state["zscore_data_store"].empty:
-        if smart_api:
-            z_df = fetch_futures_zscores_method1(smart_api, Index_Name, hv_days, df_master, progress_container=progress_holder)
-            st.session_state["zscore_data_store"] = z_df
-        else:
-            st.error("SmartAPI Session is uninitialized. Cannot calculate Z-Scores.")
-
-    z_df = st.session_state["zscore_data_store"]
-
-    if not z_df.empty:
-        st.markdown("### Recent Highlights (Last 5 Trading Days)")
-        last_5 = z_df.tail(5).copy()
-
-        def style_z(val):
-            if val >= 1.5 or val <= -1.5:
-                return 'background-color: #ff4d4d; color: white; font-weight: bold;'
-            elif 0.5 <= val < 1.5 or -1.5 < val <= -0.5:
-                return 'background-color: #ffea80; color: black;'
+        calc_z_btn = st.button("🔄 Compute / Refresh Z-Scores", use_container_width=True, key="btn_zscore_compute")
+        progress_holder = st.container()
+        smart_api = get_smart_api_client()
+        if calc_z_btn or st.session_state["zscore_data_store"].empty:
+            if smart_api:
+                z_df = fetch_futures_zscores_method1(smart_api, Index_Name, hv_days, df_master, progress_container=progress_holder)
+                st.session_state["zscore_data_store"] = z_df
             else:
-                return 'background-color: #b3ffb3; color: black;'
+                st.error("SmartAPI Session uninitialized.")
+        z_df = st.session_state["zscore_data_store"]
+        if not z_df.empty:
+            st.caption("Recent Highlights (Last 5 Days)")
+            last_5 = z_df.tail(5).copy()
+            summary_cols = ["Futures_Volume_Z", "Volatility_Proxy_Z"]
+            styled_z_df = last_5[summary_cols].sort_index(ascending=False).style.map(
+                _style_z, subset=summary_cols
+            ).format({col: "{:.2f}" for col in summary_cols})
+            st.dataframe(styled_z_df, use_container_width=True)
+        else:
+            st.info("Click Compute to load Z-Scores.")
 
-        summary_cols = ['Futures_Volume_Z', 'Volatility_Proxy_Z']
-        
-        styled_z_df = last_5[summary_cols].sort_index(ascending=False).style.map(
-            style_z, subset=summary_cols
-        ).format({col: "{:.2f}" for col in summary_cols})
-
-        st.dataframe(styled_z_df, use_container_width=True)
-
-        with st.expander("🔍 Inspect Raw Calculated Daily Totals & HV Details (All Evaluated Dates)", expanded=False):
-            st.info(f"Showing all **{len(z_df)}** trading days used in evaluating rolling averages and std dev.")
-            
-            display_cols = [
-                'Futures_Close', 'Futures_Volume', 'Vol_Mean', 'Vol_Std', 'Futures_Volume_Z',
-                'Volatility_Proxy', 'HV_Mean', 'HV_Std', 'Volatility_Proxy_Z'
-            ]
-            
-            st.dataframe(
-                z_df[display_cols].sort_index(ascending=False).style.format({
-                    'Futures_Close': "{:,.2f}",
-                    'Futures_Volume': "{:,.0f}",
-                    'Vol_Mean': "{:,.0f}",
-                    'Vol_Std': "{:,.0f}",
-                    'Futures_Volume_Z': "{:.2f}",
-                    'Volatility_Proxy': "{:.4f}",
-                    'HV_Mean': "{:.4f}",
-                    'HV_Std': "{:.4f}",
-                    'Volatility_Proxy_Z': "{:.2f}"
-                }),
-                use_container_width=True
-            )
-    else:
-        st.info("Click '🔄 Compute / Refresh Z-Scores' above to load Futures volume & HV Z-Score analysis.")
+    if mode in ("raw", "full"):
+        z_df = st.session_state.get("zscore_data_store", pd.DataFrame())
+        if not z_df.empty:
+            with st.expander("🔍 Inspect Raw Calculated Daily Totals & HV Details (All Evaluated Dates)", expanded=False):
+                st.info(f"Showing all **{len(z_df)}** trading days used in evaluating rolling averages and std dev.")
+                display_cols = [
+                    "Futures_Close", "Futures_Volume", "Vol_Mean", "Vol_Std", "Futures_Volume_Z",
+                    "Volatility_Proxy", "HV_Mean", "HV_Std", "Volatility_Proxy_Z",
+                ]
+                st.dataframe(
+                    z_df[display_cols].sort_index(ascending=False).style.format({
+                        "Futures_Close": "{:,.2f}",
+                        "Futures_Volume": "{:,.0f}",
+                        "Vol_Mean": "{:,.0f}",
+                        "Vol_Std": "{:,.0f}",
+                        "Futures_Volume_Z": "{:.2f}",
+                        "Volatility_Proxy": "{:.4f}",
+                        "HV_Mean": "{:.4f}",
+                        "HV_Std": "{:.4f}",
+                        "Volatility_Proxy_Z": "{:.2f}",
+                    }),
+                    use_container_width=True,
+                )
+        elif mode == "raw":
+            st.info("Compute Z-Scores first (from the panel above) to inspect raw daily totals.")
 
 # --- INSTITUTIONAL ORDER FLOW SCANNER MODULE ---
 def institutional_order_flow_scanner_fragment():
@@ -1643,61 +1632,55 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     exit_label = "YES" if exit_alert else "NO"
     long_label = "YES" if long_alert else "NO"
 
-    col_left, col_right = st.columns(2)
+    # Left: both alert situations stacked | Right: Z-Score highlights table
+    alert_col, zscore_col = st.columns([0.62, 0.38])
 
-    with col_left:
+    with alert_col:
         with st.expander(
             f"Situation 1 · Exit / Risk-Off  →  {exit_label}",
             expanded=True,
         ):
             st.markdown(
-                f"<div style='margin-bottom:8px'>Overall: {_badge_html(exit_alert)}</div>",
+                f"<div style='margin-bottom:6px'>Overall: {_badge_html(exit_alert)}</div>",
                 unsafe_allow_html=True,
             )
             st.markdown(
                 f"""
-                <div style='line-height:1.9;font-size:13px'>
+                <div style='line-height:1.8;font-size:13px'>
                 {_sub_html(crit_a_exit, 'Wall Collapse (≥25% pos-GEX drop / 10 min)')}<br>
                 {_sub_html(crit_b_exit, 'Vol Expansion (OTM IV ↑ ≥0.8% / 5 min)')}<br>
                 {_sub_html(crit_c_exit, 'GEX Flip (spot within 0.3% of flip or in –GEX zone)')}<br>
-                <br>
                 <small style='color:#AAA'>
-                Wall drop: {wall_drop:.1f}% &nbsp;|&nbsp;
-                Call IV Δ: {call_iv_chg:+.2f}% &nbsp;|&nbsp;
-                Put IV Δ: {put_iv_chg:+.2f}% &nbsp;|&nbsp;
-                Dist to flip: {dist_to_flip_pct:.2f}%
+                Wall drop: {wall_drop:.1f}% | Call IV Δ: {call_iv_chg:+.2f}% | Put IV Δ: {put_iv_chg:+.2f}% | Dist to flip: {dist_to_flip_pct:.2f}%
+                </small>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with st.expander(
+            f"Situation 2 · Long Entry  →  {long_label}",
+            expanded=True,
+        ):
+            st.markdown(
+                f"<div style='margin-bottom:6px'>Overall: {_badge_html(long_alert)}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""
+                <div style='line-height:1.8;font-size:13px'>
+                {_sub_html(crit_a_long, 'Gamma Fuel (neg-GEX above spot OR pos-GEX collapse ≥40%)')}<br>
+                {_sub_html(crit_b_long, 'Aggressive Demand (OTM Call IV ↑ ≥1.5% / 5 min)')}<br>
+                {_sub_html(crit_c_long, 'Volume Confirmation (5-min vol ≥ 1.5× 20-MA)')}<br>
+                <small style='color:#AAA'>
+                Neg GEX above: {cur['neg_gex_above']:.2f} Cr | Pos collapse: {pos_collapse:.1f}% | Call IV Δ: {call_iv_chg:+.2f}% | Vol ratio: {cur['vol_ratio']:.2f}×
                 </small>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-    with col_right:
-        with st.expander(
-            f"Situation 2 · Long Entry  →  {long_label}",
-            expanded=True,
-        ):
-            st.markdown(
-                f"<div style='margin-bottom:8px'>Overall: {_badge_html(long_alert)}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"""
-                <div style='line-height:1.9;font-size:13px'>
-                {_sub_html(crit_a_long, 'Gamma Fuel (neg-GEX above spot OR pos-GEX collapse ≥40%)')}<br>
-                {_sub_html(crit_b_long, 'Aggressive Demand (OTM Call IV ↑ ≥1.5% / 5 min)')}<br>
-                {_sub_html(crit_c_long, 'Volume Confirmation (5-min vol ≥ 1.5× 20-MA)')}<br>
-                <br>
-                <small style='color:#AAA'>
-                Neg GEX above: {cur['neg_gex_above']:.2f} Cr &nbsp;|&nbsp;
-                Pos collapse: {pos_collapse:.1f}% &nbsp;|&nbsp;
-                Call IV Δ: {call_iv_chg:+.2f}% &nbsp;|&nbsp;
-                Vol ratio: {cur['vol_ratio']:.2f}×
-                </small>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    with zscore_col:
+        zscore_analysis_fragment(mode="highlights")
 
 
 # --- LIVE DASHBOARD FRAGMENT ---
@@ -2135,13 +2118,35 @@ def live_dashboard_fragment():
                     latest_spot, rate_param, strikes_below=strikes_below, strikes_above=strikes_above,
                 )
                 if not df_chain_iv.empty:
-                    df_skew = get_clean_otm_skew(df_chain_iv, latest_spot)
-                    fig_skew = px.line(df_skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"])
-                    fig_skew.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
-                    fig_skew.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=400, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
-                    fig_skew.update_xaxes(title="")
-                    fig_skew.update_yaxes(title="IV %")
-                    st.plotly_chart(fig_skew, use_container_width=True)
+                    tab1, tab2 = st.tabs(["OTM Skew (Puts & Calls)", "Both Raw Curves (CE vs PE)"])
+                    with tab1:
+                        df_skew = get_clean_otm_skew(df_chain_iv, latest_spot)
+                        fig_skew = px.line(
+                            df_skew, x="Strike", y="IV_%", markers=True,
+                            color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"],
+                        )
+                        fig_skew.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
+                        fig_skew.update_layout(
+                            template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                            height=360, margin=dict(l=10, r=10, t=20, b=10), showlegend=False,
+                        )
+                        fig_skew.update_xaxes(title="")
+                        fig_skew.update_yaxes(title="IV %")
+                        st.plotly_chart(fig_skew, use_container_width=True)
+                    with tab2:
+                        fig_raw = px.line(
+                            df_chain_iv, x="Strike", y="IV_%", color="Option_Type", markers=True,
+                            color_discrete_map={"CE": "#00cc96", "PE": "#ff4136"}, hover_data=["LTP"],
+                        )
+                        fig_raw.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
+                        fig_raw.update_layout(
+                            template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                            height=360, margin=dict(l=10, r=10, t=20, b=10),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+                        )
+                        fig_raw.update_xaxes(title="")
+                        fig_raw.update_yaxes(title="IV %")
+                        st.plotly_chart(fig_raw, use_container_width=True)
                 else:
                     st.info("Skew data unavailable.")
             else:
@@ -2151,10 +2156,8 @@ def live_dashboard_fragment():
 
 live_dashboard_fragment()
 
-# --- Bottom row: Institutional Scanner (75%) + Z-Score Highlights (25%) ---
+# --- Full-width: Institutional Order Flow, then Raw Z-Score details ---
 st.markdown("---")
-bot_l, bot_r = st.columns([0.75, 0.25])
-with bot_l:
-    institutional_order_flow_scanner_fragment()
-with bot_r:
-    zscore_analysis_fragment()
+institutional_order_flow_scanner_fragment()
+st.markdown("---")
+zscore_analysis_fragment(mode="raw")
