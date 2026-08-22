@@ -32,6 +32,13 @@ st.markdown("""
     .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; }
     div[data-testid="stHorizontalBlock"] { gap: 0.5rem !important; }
     .js-plotly-plot .plotly .gtitle { font-size: 13px !important; }
+    .status-badge {
+        padding: 3px 8px; border-radius: 4px; font-size: 11px;
+        font-weight: 600; display: inline-block; margin-right: 6px;
+    }
+    .badge-bullish { background-color: rgba(0,230,118,0.15); color: #00E676; border: 1px solid #00E676; }
+    .badge-bearish { background-color: rgba(255,82,82,0.15); color: #FF5252; border: 1px solid #FF5252; }
+    .badge-neutral { background-color: rgba(255,152,0,0.15); color: #FF9800; border: 1px solid #FF9800; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -49,7 +56,7 @@ def ist_str(fmt="%d-%b-%Y %H:%M:%S"):
     return now_ist().strftime(fmt)
 
 # ----------------------------------------------------------------------
-# Credentials from Render Environment Variables
+# Credentials
 # ----------------------------------------------------------------------
 API_KEY      = os.getenv("API_KEY")
 CLIENT_CODE  = os.getenv("CLIENT_CODE")
@@ -58,8 +65,7 @@ TOTP_SECRET  = os.getenv("TOTP_SECRET")
 
 def get_smart_api_client():
     if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-        st.error("Missing one or more required environment variables: "
-                 "API_KEY, CLIENT_CODE, PIN, TOTP_SECRET")
+        st.error("Missing environment variables: API_KEY, CLIENT_CODE, PIN, TOTP_SECRET")
         return None
     try:
         smart_api = SmartConnect(api_key=API_KEY)
@@ -236,7 +242,9 @@ def compute_gex_chain(stock_data, smart_api, exchange="NFO"):
             "vol": vol,
             "delta": delta,
             "gamma": gamma,
-            "iv": sigma
+            "iv": sigma,
+            "ltp": op_ltp,
+            "symbol": row['symbol']
         })
 
     df_gex = pd.DataFrame(strikes_gex)
@@ -250,18 +258,17 @@ def compute_gex_chain(stock_data, smart_api, exchange="NFO"):
 
     df_merged_strikes = pd.merge(
         df_pivot,
-        df_ce[['strike', 'oi', 'vol', 'iv']].rename(columns={'oi': 'ce_oi', 'vol': 'ce_vol', 'iv': 'ce_iv'}),
+        df_ce[['strike', 'oi', 'vol', 'iv', 'ltp']].rename(columns={'oi': 'ce_oi', 'vol': 'ce_vol', 'iv': 'ce_iv', 'ltp': 'ce_ltp'}),
         on='strike', how='left'
     )
     df_merged_strikes = pd.merge(
         df_merged_strikes,
-        df_pe[['strike', 'oi', 'vol', 'iv']].rename(columns={'oi': 'pe_oi', 'vol': 'pe_vol', 'iv': 'pe_iv'}),
+        df_pe[['strike', 'oi', 'vol', 'iv', 'ltp']].rename(columns={'oi': 'pe_oi', 'vol': 'pe_vol', 'iv': 'pe_iv', 'ltp': 'pe_ltp'}),
         on='strike', how='left'
     ).fillna(0)
 
     df_merged_strikes = df_merged_strikes.sort_values('strike').reset_index(drop=True)
 
-    # Zero-Crossing Detection for GEX Flip Point
     df_merged_strikes['gex_sign_change'] = np.sign(df_merged_strikes['gex']).diff().ne(0)
     flip_strikes = df_merged_strikes[df_merged_strikes['gex_sign_change'] & (df_merged_strikes.index > 0)]
 
@@ -276,9 +283,11 @@ def compute_gex_chain(stock_data, smart_api, exchange="NFO"):
         "gex_flip_price": gex_flip_price,
         "df_candles": df_candles,
         "df_merged_strikes": df_merged_strikes,
+        "df_gex_raw": df_gex,
         "tech_ribbon": tech_ribbon,
         "expiry": stock_data['Expiry'],
-        "timestamp": ist_str()
+        "timestamp": ist_str(),
+        "lot_size": lot_size
     }
 
 # ----------------------------------------------------------------------
@@ -294,7 +303,7 @@ def filter_strikes_around_spot(df, spot, n=10):
     return df.iloc[start:end].copy()
 
 # ----------------------------------------------------------------------
-# GEX Heatmap (MCX 09:00-23:30 / Equity 09:15-15:30)
+# GEX Heatmap – updated colours to match attached Nifty image
 # ----------------------------------------------------------------------
 def render_timeseries_gex_heatmap(stock, expiry, spot_ltp, df_merged_strikes):
     is_mcx = stock.upper() in {"GOLDM", "SILVERM", "GOLD", "SILVER", "CRUDEOIL", "NATURALGAS"}
@@ -315,20 +324,37 @@ def render_timeseries_gex_heatmap(stock, expiry, spot_ltp, df_merged_strikes):
     noise = np.random.normal(1.0, 0.08, size=(len(strikes), len(times)))
     matrix_gex = np.outer(base_gex, np.ones(len(times))) * noise
 
+    # Clip extreme values for better colour mapping (same idea as attached file)
+    finite_vals = matrix_gex[np.isfinite(matrix_gex)]
+    if len(finite_vals) > 0:
+        p95 = float(np.nanpercentile(np.abs(finite_vals), 95))
+        max_abs = max(p95, 1.0)
+    else:
+        max_abs = 1.0
+
     spot_drift = spot_ltp + np.cumsum(np.random.normal(0, spot_ltp * 0.0008, size=len(times)))
+
+    # Exact colour scale from the attached Nifty heatmap image
+    gex_colorscale = [
+        [0.0, "#b71c1c"],   # deep red
+        [0.25, "#e53935"],
+        [0.45, "#ffee58"],  # yellow/neutral
+        [0.55, "#ffee58"],
+        [0.75, "#43a047"],
+        [1.0, "#1b5e20"],   # deep green
+    ]
 
     fig_hm = go.Figure()
     fig_hm.add_trace(go.Heatmap(
         z=matrix_gex,
         x=times,
         y=strikes,
-        colorscale=[
-            [0.0, '#ef5350'],
-            [0.5, '#1e1e1e'],
-            [1.0, '#00E676']
-        ],
+        zmin=-max_abs,
+        zmax=max_abs,
         zmid=0,
-        showscale=False,
+        colorscale=gex_colorscale,
+        showscale=True,
+        colorbar=dict(title="Net Δ-GEX", thickness=12),
         hoverongaps=False
     ))
     fig_hm.add_trace(go.Scatter(
@@ -347,7 +373,7 @@ def render_timeseries_gex_heatmap(stock, expiry, spot_ltp, df_merged_strikes):
         ),
         xaxis_title="IST Time",
         yaxis_title="Strike",
-        height=320,
+        height=340,
         margin=dict(l=5, r=5, t=35, b=5),
         xaxis=dict(type='category', tickangle=-45, tickfont=dict(size=8)),
         yaxis=dict(tickfont=dict(size=9)),
@@ -356,9 +382,149 @@ def render_timeseries_gex_heatmap(stock, expiry, spot_ltp, df_merged_strikes):
     st.plotly_chart(fig_hm, use_container_width=True)
 
 # ----------------------------------------------------------------------
-# Render single symbol profile
+# Live Alert Status (simplified – works on current snapshot)
 # ----------------------------------------------------------------------
-def render_stock_profile(item, delta_gex_only=False):
+def render_live_alert_status(item):
+    st.markdown("---")
+    st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🚨 Live Alert Status</span>", unsafe_allow_html=True)
+
+    spot = item['spot_ltp']
+    flip = item['gex_flip_price']
+    df = item['df_merged_strikes']
+
+    # Positive GEX above spot
+    pos_gex_above = df[(df['strike'] > spot) & (df['gex'] > 0)]['gex'].sum()
+    neg_gex_above = df[(df['strike'] > spot) & (df['gex'] < 0)]['gex'].sum()
+
+    # Simple proxies (no multi-snapshot history available)
+    dist_to_flip_pct = abs(spot - flip) / spot * 100 if spot > 0 else 999
+    in_neg_zone = neg_gex_above < -1e5
+
+    # Situation 1 criteria (snapshot approximation)
+    crit_c_exit = (dist_to_flip_pct <= 0.3) or in_neg_zone
+    exit_alert = crit_c_exit          # wall / vol need history → only Flip criterion active
+
+    # Situation 2
+    has_neg_above = neg_gex_above < -1e5
+    crit_a_long = has_neg_above
+    long_alert = crit_a_long          # other criteria need history
+
+    def badge(flag, yes="YES", no="NO"):
+        if flag:
+            return f"<span style='background:rgba(255,82,82,0.25);color:#FF5252;padding:2px 8px;border-radius:4px;font-weight:700;border:1px solid #FF5252;font-size:12px'>{yes}</span>"
+        return f"<span style='background:rgba(0,230,118,0.15);color:#00E676;padding:2px 8px;border-radius:4px;font-weight:700;border:1px solid #00E676;font-size:12px'>{no}</span>"
+
+    def sub(flag, label):
+        colour = "#FF5252" if flag else "#00E676"
+        txt = "Yes" if flag else "No"
+        return f"<span style='color:{colour};font-weight:600;font-size:12px'>{label} – {txt}</span>"
+
+    c1, c2 = st.columns(2)
+    with c1:
+        with st.expander(f"Sit. 1 · Exit / Risk-Off → {'YES' if exit_alert else 'NO'}", expanded=True):
+            st.markdown(f"Overall: {badge(exit_alert)}", unsafe_allow_html=True)
+            st.markdown(
+                f"""
+                <div style='line-height:1.65;font-size:12px'>
+                {sub(False, 'Wall Collapse (≥25% / 10m) – needs history')}<br>
+                {sub(False, 'Vol Expansion (IV ↑ ≥0.8% / 5m) – needs history')}<br>
+                {sub(crit_c_exit, 'GEX Flip (≤0.3% or –GEX zone)')}<br>
+                <small style='color:#AAA'>Dist to Flip {dist_to_flip_pct:.2f}% | NegGEX above {neg_gex_above/1e7:.2f} Cr</small>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    with c2:
+        with st.expander(f"Sit. 2 · Long Entry → {'YES' if long_alert else 'NO'}", expanded=True):
+            st.markdown(f"Overall: {badge(long_alert)}", unsafe_allow_html=True)
+            st.markdown(
+                f"""
+                <div style='line-height:1.65;font-size:12px'>
+                {sub(crit_a_long, 'Gamma Fuel (–GEX above spot)')}<br>
+                {sub(False, 'Aggressive Demand (Call IV ↑ ≥1.5%) – needs history')}<br>
+                {sub(False, 'Volume Confirm (≥1.5× 20-MA) – needs history')}<br>
+                <small style='color:#AAA'>NegGEX above {neg_gex_above/1e7:.2f} Cr</small>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+# ----------------------------------------------------------------------
+# Institutional Order Flow Scanner
+# ----------------------------------------------------------------------
+def render_institutional_flow(item):
+    st.markdown("---")
+    st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>🏛️ Institutional Order Flow ({item['stock']})</span>", unsafe_allow_html=True)
+    st.caption("High-conviction flow · Premium ≥ ₹10 Lakh or Volume ≥ 500 lots")
+
+    df_raw = item.get('df_gex_raw')
+    if df_raw is None or df_raw.empty:
+        st.info("No option chain data available.")
+        return
+
+    lot = item.get('lot_size', 1)
+    scanned = []
+    for _, row in df_raw.iterrows():
+        premium = row['ltp'] * row['vol'] * lot
+        if premium >= 10_00_000 or row['vol'] >= 500:
+            scanned.append({
+                "Symbol": row['symbol'],
+                "Strike": row['strike'],
+                "Type": row['type'],
+                "LTP": round(row['ltp'], 2),
+                "Volume": int(row['vol']),
+                "OI": int(row['oi']),
+                "Premium (₹)": round(premium, 0),
+                "IV %": round(row['iv'] * 100, 1)
+            })
+
+    if not scanned:
+        st.info("No high-conviction institutional legs found (threshold: ₹10 Lakh premium or 500+ lots).")
+        return
+
+    df_scan = pd.DataFrame(scanned).sort_values("Premium (₹)", ascending=False)
+    st.dataframe(df_scan, use_container_width=True, height=220)
+
+# ----------------------------------------------------------------------
+# Market Z-Score (simplified on available candles)
+# ----------------------------------------------------------------------
+def render_market_zscore(item):
+    st.markdown("---")
+    st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>📊 Market Z-Score ({item['stock']})</span>", unsafe_allow_html=True)
+
+    df = item.get('df_candles')
+    if df is None or len(df) < 30:
+        st.info("Insufficient candle history for Z-Score.")
+        return
+
+    close = df['close'].astype(float)
+    vol = df['volume'].astype(float) if 'volume' in df.columns else pd.Series([0]*len(df))
+
+    # Realised volatility proxy (20-day)
+    log_ret = np.log(close / close.shift(1))
+    hv = log_ret.rolling(20).std() * np.sqrt(252) * 100
+    hv_z = (hv - hv.rolling(60).mean()) / hv.rolling(60).std()
+
+    # Volume Z
+    vol_z = (vol - vol.rolling(20).mean()) / vol.rolling(20).std()
+
+    latest = {
+        "HV %": round(hv.iloc[-1], 2) if not np.isnan(hv.iloc[-1]) else None,
+        "HV Z-Score": round(hv_z.iloc[-1], 2) if not np.isnan(hv_z.iloc[-1]) else None,
+        "Volume Z-Score": round(vol_z.iloc[-1], 2) if not np.isnan(vol_z.iloc[-1]) else None,
+    }
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Realised Vol (20d)", f"{latest['HV %']}%" if latest['HV %'] else "–")
+    c2.metric("HV Z-Score", f"{latest['HV Z-Score']}" if latest['HV Z-Score'] is not None else "–")
+    c3.metric("Volume Z-Score", f"{latest['Volume Z-Score']}" if latest['Volume Z-Score'] is not None else "–")
+
+    st.caption("Z > +1.5 or < –1.5 = extreme | Yellow zone = elevated")
+
+# ----------------------------------------------------------------------
+# Render profile
+# ----------------------------------------------------------------------
+def render_stock_profile(item, delta_gex_only=False, feed_token=None):
     stock = item['stock']
     spot_ltp = item['spot_ltp']
     gex_flip_price = item['gex_flip_price']
@@ -371,11 +537,13 @@ def render_stock_profile(item, delta_gex_only=False):
     df_plot = filter_strikes_around_spot(df_merged_strikes, spot_ltp, n=10)
     strikes_arr = df_plot['strike'].values
 
+    token_str = f" | Token: `{feed_token}`" if feed_token else ""
+
     with st.expander(
-        f"🟢 **{stock}** | Spot: {spot_ltp} | Flip: {gex_flip_price} | Exp: {expiry} | 🕒 {ts}",
+        f"🟢 **{stock}** | Spot: {spot_ltp} | Flip: {gex_flip_price} | Exp: {expiry} | 🕒 {ts}{token_str}",
         expanded=True
     ):
-        st.caption(f"**{stock}** · {expiry} · Last: `{ts}` (IST)")
+        st.caption(f"**{stock}** · {expiry} · Last: `{ts}` (IST){token_str}")
 
         if ribbon:
             r1, r2, r3 = st.columns(3)
@@ -435,8 +603,7 @@ def render_stock_profile(item, delta_gex_only=False):
 
                 fig_tech.update_xaxes(type='category', tickfont=dict(size=9))
                 fig_tech.update_layout(
-                    height=380,
-                    showlegend=False,
+                    height=380, showlegend=False,
                     xaxis_rangeslider_visible=False,
                     margin=dict(l=5, r=5, t=5, b=5),
                     template="plotly_dark"
@@ -472,8 +639,17 @@ def render_stock_profile(item, delta_gex_only=False):
         with st.spinner("Loading GEX Heatmap..."):
             render_timeseries_gex_heatmap(stock, expiry, spot_ltp, df_merged_strikes)
 
+        # 3. Live Alert Status (directly below heatmap)
+        render_live_alert_status(item)
+
+        # 4. Institutional Flow
+        render_institutional_flow(item)
+
+        # 5. Market Z-Score
+        render_market_zscore(item)
+
         if not delta_gex_only:
-            # 3. OI vs GEX
+            # OI vs GEX
             with st.spinner("Loading OI Profile..."):
                 fig_oi_gex = make_subplots(specs=[[{"secondary_y": True}]])
                 fig_oi_gex.add_trace(go.Bar(
@@ -497,7 +673,7 @@ def render_stock_profile(item, delta_gex_only=False):
                 )
                 st.plotly_chart(fig_oi_gex, use_container_width=True)
 
-            # 4. VEX
+            # VEX
             with st.spinner("Loading VEX Profile..."):
                 fig_vex = go.Figure()
                 fig_vex.add_trace(go.Bar(
@@ -514,48 +690,32 @@ def render_stock_profile(item, delta_gex_only=False):
                 )
                 st.plotly_chart(fig_vex, use_container_width=True)
 
-            # 5. Volatility Skew (cleaned)
+            # Volatility Skew
             with st.spinner("Loading Volatility Skew..."):
                 df_skew = df_plot[
-                    (df_plot['ce_iv'] > 0.01) &
-                    (df_plot['pe_iv'] > 0.01)
+                    (df_plot['ce_iv'] > 0.01) & (df_plot['pe_iv'] > 0.01)
                 ].copy()
 
                 if not df_skew.empty:
                     fig_skew = go.Figure()
                     fig_skew.add_trace(go.Scatter(
-                        x=df_skew['strike'],
-                        y=df_skew['ce_iv'] * 100,
-                        name='CE IV',
-                        mode='lines+markers',
-                        line=dict(color='#00E676', width=2),
-                        marker=dict(size=5)
+                        x=df_skew['strike'], y=df_skew['ce_iv'] * 100,
+                        name='CE IV', mode='lines+markers',
+                        line=dict(color='#00E676', width=2), marker=dict(size=5)
                     ))
                     fig_skew.add_trace(go.Scatter(
-                        x=df_skew['strike'],
-                        y=df_skew['pe_iv'] * 100,
-                        name='PE IV',
-                        mode='lines+markers',
-                        line=dict(color='#FF5252', width=2),
-                        marker=dict(size=5)
+                        x=df_skew['strike'], y=df_skew['pe_iv'] * 100,
+                        name='PE IV', mode='lines+markers',
+                        line=dict(color='#FF5252', width=2), marker=dict(size=5)
                     ))
-                    fig_skew.add_vline(
-                        x=gex_flip_price, line_dash="dash", line_color="orange",
-                        annotation_text="Flip", annotation_position="top left"
-                    )
-                    fig_skew.add_vline(
-                        x=spot_ltp, line_dash="dash", line_color="cyan",
-                        annotation_text="Spot", annotation_position="bottom right"
-                    )
+                    fig_skew.add_vline(x=gex_flip_price, line_dash="dash", line_color="orange",
+                                      annotation_text="Flip", annotation_position="top left")
+                    fig_skew.add_vline(x=spot_ltp, line_dash="dash", line_color="cyan",
+                                      annotation_text="Spot", annotation_position="bottom right")
                     fig_skew.update_layout(
-                        title=dict(
-                            text=f"🌀 Volatility Skew (±10) | {ts}",
-                            font=dict(size=12)
-                        ),
-                        xaxis_title="Strike",
-                        yaxis_title="IV %",
-                        height=280,
-                        margin=dict(l=5, r=5, t=30, b=5),
+                        title=dict(text=f"🌀 Volatility Skew (±10) | {ts}", font=dict(size=12)),
+                        xaxis_title="Strike", yaxis_title="IV %",
+                        height=280, margin=dict(l=5, r=5, t=30, b=5),
                         legend=dict(orientation="h", y=1.12, x=0.5, xanchor="center"),
                         template="plotly_dark"
                     )
@@ -637,6 +797,11 @@ def load_commodity_data(comm_symbol, master_df, smart_api):
 # ----------------------------------------------------------------------
 smart_api = init_smart_api()
 
+feed_token = None
+if smart_api:
+    # Try to surface the feed / jwt token
+    feed_token = getattr(smart_api, "feed_token", None) or getattr(smart_api, "jwt_token", None) or "N/A"
+
 if smart_api:
     master_df = get_instrument_master()
 
@@ -649,6 +814,8 @@ if smart_api:
     total_available = len(all_stock_symbols)
 
     st.sidebar.markdown(f"**Total Available Stock Options:** {total_available}")
+    if feed_token and feed_token != "N/A":
+        st.sidebar.caption(f"API Token: `{str(feed_token)[:18]}…`")
 
     scan_limit = st.sidebar.number_input(
         "Number of Stocks to Scan", min_value=1, max_value=total_available, value=10, step=5
@@ -683,7 +850,7 @@ if smart_api:
             if comm_item:
                 target_col = c1 if (idx % 2 == 0) else c2
                 with target_col:
-                    render_stock_profile(comm_item, delta_gex_only)
+                    render_stock_profile(comm_item, delta_gex_only, feed_token)
 
     else:
         if st.button("🚀 Run Level 1 Live Screener"):
@@ -847,7 +1014,7 @@ if smart_api:
                     if item:
                         target_col = c1 if (idx % 2 == 0) else c2
                         with target_col:
-                            render_stock_profile(item, delta_gex_only)
+                            render_stock_profile(item, delta_gex_only, feed_token)
 
         if st.session_state['passed_stocks_data']:
             st.markdown("### 🎯 Stocks Passing Level 1 Criteria")
@@ -874,7 +1041,7 @@ if smart_api:
                     for idx, item in enumerate(lvl2_passed_stocks):
                         target_col = col1 if (idx % 2 == 0) else col2
                         with target_col:
-                            render_stock_profile(item, delta_gex_only)
+                            render_stock_profile(item, delta_gex_only, feed_token)
 
     if enable_autorefresh:
         time.sleep(5)
