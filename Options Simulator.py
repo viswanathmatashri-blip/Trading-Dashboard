@@ -1617,22 +1617,17 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     }
 
 
-def render_compact_basket(data: dict):
-    """Compact strategy basket for the alert-row left block."""
-    st.markdown("<span style='font-weight:700;color:#00E676;font-size:13px;'>🧺 Strategy Basket</span>", unsafe_allow_html=True)
+def _compute_basket_live_totals(data: dict):
+    """Return (totals_dict, legs_list) for current basket."""
     if not st.session_state.get("basket_legs"):
-        st.caption("No legs – add from sidebar")
-        return
-
+        return None, []
     market_data_store = data.get("market_data", {})
     basket_tokens_info = data.get("basket_tokens_info", {})
     F_val = data.get("F", data["spot_price"])
     T_val = data.get("T", 1e-5)
     hv_val = data.get("index_hv", 0.15)
-
     calculated_legs = []
     tot_pnl = tot_delta = tot_gamma = tot_theta = tot_vega = 0.0
-
     for idx, leg in enumerate(st.session_state["basket_legs"]):
         k, t, act, qty = leg["strike"], leg["type"], leg["action"], leg["qty"]
         tok = basket_tokens_info.get(f"{k}_{t}", "")
@@ -1656,91 +1651,181 @@ def render_compact_basket(data: dict):
         tot_theta += pos_theta
         tot_vega += pos_vega
         calculated_legs.append({
-            "L": idx + 1, "Act": act, "K": k, "T": t, "Qty": qty,
-            "Entry": round(entry_p, 1), "LTP": round(ltp, 1), "P&L": round(leg_pnl, 1),
-            "Δ": round(pos_delta, 1), "γ": round(pos_gamma, 4),
-            "θ": round(pos_theta, 1), "ν": round(pos_vega, 1),
+            "Leg": idx + 1, "Action": act, "Strike": k, "Type": t, "Qty": qty,
+            "Entry (₹)": round(entry_p, 2), "LTP (₹)": round(ltp, 2), "P&L (₹)": round(leg_pnl, 2),
+            "Delta (Δ)": round(pos_delta, 2), "Gamma (γ)": round(pos_gamma, 4),
+            "Theta (θ/Day)": round(pos_theta, 2), "Vega (ν)": round(pos_vega, 2),
         })
+    totals = {"pnl": tot_pnl, "delta": tot_delta, "gamma": tot_gamma, "theta": tot_theta, "vega": tot_vega}
+    return totals, calculated_legs
 
+
+def render_basket_metrics_block(data: dict):
+    """Compact P&L / Greeks metrics only (for left of Z-Scores under alerts)."""
+    st.markdown("<span style='font-weight:700;color:#00E676;font-size:13px;'>🧺 Basket Greeks</span>", unsafe_allow_html=True)
+    totals, _ = _compute_basket_live_totals(data)
+    if totals is None:
+        st.caption("No legs – add from sidebar")
+        return
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("P&L", f"₹{tot_pnl:,.0f}")
-    m2.metric("Δ", f"{tot_delta:,.1f}")
-    m3.metric("γ", f"{tot_gamma:.4f}")
-    m4.metric("θ/d", f"{tot_theta:,.1f}")
-    m5.metric("ν", f"{tot_vega:,.1f}")
+    m1.metric("P&L", f"₹{totals['pnl']:,.0f}")
+    m2.metric("Δ", f"{totals['delta']:,.1f}")
+    m3.metric("γ", f"{totals['gamma']:.4f}")
+    m4.metric("θ/d", f"{totals['theta']:,.1f}")
+    m5.metric("ν", f"{totals['vega']:,.1f}")
 
+
+def render_basket_table_fullwidth(data: dict):
+    """Full-width legs table + remove buttons + fixed historical analytics."""
+    totals, calculated_legs = _compute_basket_live_totals(data)
+    if totals is None:
+        return
+
+    st.markdown("---")
+    st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🧺 Strategy Basket – Legs</span>", unsafe_allow_html=True)
     df_b = pd.DataFrame(calculated_legs)
-    # Legs table + compact remove controls in same row height
-    tbl_c, del_c = st.columns([0.88, 0.12])
+    tbl_c, del_c = st.columns([0.92, 0.08])
     with tbl_c:
-        st.dataframe(df_b, use_container_width=True, hide_index=True, height=min(120, 38 + 28 * len(calculated_legs)))
+        st.dataframe(df_b, use_container_width=True, hide_index=True)
     with del_c:
         st.caption("Del")
         for idx in range(len(st.session_state["basket_legs"])):
-            if st.button("✕", key=f"del_leg_compact_{idx}", help=f"Remove leg #{idx+1}"):
+            if st.button("✕", key=f"del_leg_full_{idx}", help=f"Remove leg #{idx+1}"):
                 st.session_state["basket_legs"].pop(idx)
                 sync_local_storage()
                 st.rerun()
 
-    with st.expander("📊 Basket Historical Analytics", expanded=False):
-        st.caption("Theta decay %, daily theta, Vanna, Charm (1-hr)")
+    with st.expander("📊 Basket Historical Analytics (Cum. Θ Decay %, Daily Θ, Vanna, Charm)", expanded=False):
+        st.caption(
+            "Cum. Θ Decay % = time-integrated |θ| as % of initial extrinsic (smooth accrual). "
+            "Daily Θ = signed position theta (long options are negative by design). "
+            "Deep-ITM bars use HV fallback to avoid IV-solver spikes."
+        )
         smart_api = get_smart_api_client()
-        if smart_api and not df_master.empty and st.session_state["basket_legs"]:
-            b_hist_dfs = []
-            for leg in st.session_state["basket_legs"]:
-                k, t, act, qty = leg["strike"], leg["type"], leg["action"], leg["qty"]
-                mult = 1.0 if act == "BUY" else -1.0
-                tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
-                if not tok:
-                    continue
-                leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange)
-                if leg_df.empty:
-                    continue
-                leg_df["Expiry_Date"] = target_expiry_dt.date()
-                expiry = pd.to_datetime(leg_df["Expiry_Date"]).dt.tz_localize(None)
-                timestamp = pd.to_datetime(leg_df["Raw_Timestamp"]).dt.tz_localize(None)
-                leg_df["DTE"] = (expiry - timestamp).dt.total_seconds() / 86400
-                leg_df["DTE"] = leg_df["DTE"].apply(lambda x: max(x, 0.001))
-                leg_df["T"] = leg_df["DTE"] / 365.0
-                greeks_df = leg_df.apply(compute_greeks, axis=1, K=k, r=rate_param, option_type=t)
-                greeks_df.columns = ["IV_%", "Theta", "Theta_Decay_Pct", "Gamma", "Vanna", "Charm", "Extrinsic_Val", "Is_Pure_Intrinsic"]
-                init_p = leg_df.iloc[0]["Close"]
-                leg_df["Theta_Scaled"] = greeks_df["Theta"] * qty * mult
-                leg_df["Vanna_Scaled"] = greeks_df["Vanna"] * qty * mult
-                leg_df["Charm_Scaled"] = greeks_df["Charm"] * qty * mult
-                init_theta = abs(greeks_df.iloc[0]["Theta"]) * qty
-                cumulative_theta_loss = (init_p - leg_df["Close"]) * qty if mult > 0 else (leg_df["Close"] - init_p) * qty
-                leg_df["Theta_Accrued"] = cumulative_theta_loss
-                leg_df["Total_Expected_Theta"] = init_theta if init_theta > 0 else 1.0
-                b_hist_dfs.append(leg_df[["Date", "Raw_Timestamp", "Theta_Scaled", "Vanna_Scaled", "Charm_Scaled", "Theta_Accrued", "Total_Expected_Theta"]])
-            if b_hist_dfs:
-                combined = b_hist_dfs[0].copy()
-                for nxt in b_hist_dfs[1:]:
-                    combined = pd.merge(combined, nxt, on=["Date", "Raw_Timestamp"], how="inner", suffixes=("", "_sub"))
-                    for c_col in ["Theta_Scaled", "Vanna_Scaled", "Charm_Scaled", "Theta_Accrued", "Total_Expected_Theta"]:
-                        combined[c_col] = combined[c_col] + combined[f"{c_col}_sub"]
-                        combined.drop(columns=[f"{c_col}_sub"], inplace=True)
-                combined = combined.sort_values("Raw_Timestamp", ascending=True).reset_index(drop=True)
-                total_init = max(abs(combined.iloc[0]["Total_Expected_Theta"]), 1e-5)
-                combined["Cumulative_Theta_Decay_Pct"] = (combined["Theta_Accrued"] / total_init * 100.0).clip(0, 100)
-                def _plot_bm(df, y, title, color, is_pct=False):
-                    fig = px.line(df, x="Date", y=y, title=title, markers=True)
-                    fig.update_traces(line_color=color)
-                    fig.update_xaxes(type="category", title="")
-                    if is_pct:
-                        fig.update_yaxes(range=[0, 105], ticksuffix="%")
-                    fig.update_layout(template="plotly_dark", height=220, margin=dict(l=10, r=10, t=30, b=10))
-                    return fig
-                bc1, bc2 = st.columns(2)
-                with bc1:
-                    st.plotly_chart(_plot_bm(combined, "Cumulative_Theta_Decay_Pct", "Cum. Θ Decay %", "#00E676", True), use_container_width=True)
-                with bc2:
-                    st.plotly_chart(_plot_bm(combined, "Theta_Scaled", "Daily Θ (₹/Day)", "#FF9800"), use_container_width=True)
-                bc3, bc4 = st.columns(2)
-                with bc3:
-                    st.plotly_chart(_plot_bm(combined, "Vanna_Scaled", "Vanna", "#00BFFF"), use_container_width=True)
-                with bc4:
-                    st.plotly_chart(_plot_bm(combined, "Charm_Scaled", "Charm", "#E040FB"), use_container_width=True)
+        if not (smart_api and not df_master.empty and st.session_state["basket_legs"]):
+            st.info("API session needed for historical basket charts.")
+            return
+
+        hv_val = data.get("index_hv", 0.15)
+        b_hist_dfs = []
+        for leg in st.session_state["basket_legs"]:
+            k, t, act, qty = leg["strike"], leg["type"], leg["action"], leg["qty"]
+            mult = 1.0 if act == "BUY" else -1.0
+            tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
+            if not tok:
+                continue
+            leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange)
+            if leg_df.empty or len(leg_df) < 3:
+                continue
+
+            leg_df = leg_df.copy()
+            leg_df["Expiry_Date"] = target_expiry_dt.date()
+            expiry = pd.to_datetime(leg_df["Expiry_Date"])
+            timestamp = pd.to_datetime(leg_df["Raw_Timestamp"])
+            try:
+                if timestamp.dt.tz is not None:
+                    timestamp = timestamp.dt.tz_localize(None)
+            except Exception:
+                pass
+            try:
+                if getattr(expiry.dt, "tz", None) is not None:
+                    expiry = expiry.dt.tz_localize(None)
+            except Exception:
+                pass
+            leg_df["DTE"] = ((expiry - timestamp).dt.total_seconds() / 86400.0).clip(lower=0.001)
+            leg_df["T"] = leg_df["DTE"] / 365.0
+
+            greeks_df = leg_df.apply(compute_greeks, axis=1, K=k, r=rate_param, option_type=t)
+            greeks_df.columns = ["IV_%", "Theta", "Theta_Decay_Pct", "Gamma", "Vanna", "Charm", "Extrinsic_Val", "Is_Pure_Intrinsic"]
+
+            # Fallback pure-intrinsic / failed IV → HV-based greeks
+            for i in range(len(greeks_df)):
+                if bool(greeks_df.iloc[i]["Is_Pure_Intrinsic"]) or float(greeks_df.iloc[i]["IV_%"]) <= 0.5:
+                    S = float(leg_df.iloc[i]["Spot_Price"])
+                    T = float(leg_df.iloc[i]["T"])
+                    if T > 1e-5 and S > 0:
+                        g = VolatilityEngine.calculate_greeks(S, k, T, rate_param, hv_val, "c" if t == "CE" else "p")
+                        greeks_df.iat[i, 1] = g["theta"]
+                        greeks_df.iat[i, 3] = g["gamma"]
+                        # keep vanna/charm from BS if available; else 0
+                        if "vanna" in g:
+                            greeks_df.iat[i, 4] = g["vanna"]
+                        if "charm" in g:
+                            greeks_df.iat[i, 5] = g["charm"]
+
+            leg_df["Theta_Scaled"] = greeks_df["Theta"].values * qty * mult
+            leg_df["Vanna_Scaled"] = greeks_df["Vanna"].values * qty * mult
+            leg_df["Charm_Scaled"] = greeks_df["Charm"].values * qty * mult
+            leg_df["Extrinsic"] = greeks_df["Extrinsic_Val"].values * qty
+
+            ts = pd.to_datetime(leg_df["Raw_Timestamp"])
+            try:
+                if ts.dt.tz is not None:
+                    ts = ts.dt.tz_localize(None)
+            except Exception:
+                pass
+            dt_days = ts.diff().dt.total_seconds().fillna(0.0) / 86400.0
+            dt_days = dt_days.clip(lower=0.0, upper=3.0)
+
+            # Midpoint integration of signed theta over each bar
+            theta_mid = (leg_df["Theta_Scaled"] + leg_df["Theta_Scaled"].shift(1).fillna(leg_df["Theta_Scaled"].iloc[0])) / 2.0
+            bar_theta_pnl = theta_mid * dt_days
+            # Decay cost: positive when time hurts the position (longs)
+            bar_decay_cost = (-bar_theta_pnl).clip(lower=0.0)
+            leg_df["Bar_Decay_Cost"] = bar_decay_cost
+            leg_df["Cum_Decay_Cost"] = leg_df["Bar_Decay_Cost"].cumsum()
+
+            init_extrinsic = max(
+                float(leg_df["Extrinsic"].iloc[0]),
+                abs(float(leg_df["Theta_Scaled"].iloc[0])) * max(float(leg_df["DTE"].iloc[0]), 1.0),
+                1.0,
+            )
+            leg_df["Init_Extrinsic"] = init_extrinsic
+
+            b_hist_dfs.append(leg_df[["Date", "Raw_Timestamp", "Theta_Scaled", "Vanna_Scaled", "Charm_Scaled", "Cum_Decay_Cost", "Init_Extrinsic"]])
+
+        if not b_hist_dfs:
+            st.info("Unable to fetch historical data for strategy basket contracts.")
+            return
+
+        combined = b_hist_dfs[0].copy()
+        for nxt in b_hist_dfs[1:]:
+            combined = pd.merge(combined, nxt, on=["Date", "Raw_Timestamp"], how="inner", suffixes=("", "_sub"))
+            for c_col in ["Theta_Scaled", "Vanna_Scaled", "Charm_Scaled", "Cum_Decay_Cost", "Init_Extrinsic"]:
+                combined[c_col] = combined[c_col] + combined[f"{c_col}_sub"]
+                combined.drop(columns=[f"{c_col}_sub"], inplace=True)
+        combined = combined.sort_values("Raw_Timestamp", ascending=True).reset_index(drop=True)
+
+        init_ext = max(float(combined["Init_Extrinsic"].iloc[0]), 1.0)
+        combined["Cum_Theta_Decay_Pct"] = (combined["Cum_Decay_Cost"] / init_ext * 100.0).clip(0, 100)
+
+        # Clip single-bar IV-solver spikes on higher-order greeks
+        for col in ["Vanna_Scaled", "Charm_Scaled", "Theta_Scaled"]:
+            s = combined[col]
+            mu, sd = float(s.median()), float(s.std()) if len(s) > 2 else 0.0
+            if sd and sd > 0:
+                combined[col] = s.clip(mu - 4 * sd, mu + 4 * sd)
+
+        def _plot_bm(df, y, title, color, is_pct=False):
+            fig = px.line(df, x="Date", y=y, title=title, markers=True)
+            fig.update_traces(line_color=color, marker=dict(size=4))
+            fig.update_xaxes(type="category", title="", nticks=10)
+            if is_pct:
+                ymax = max(5.0, float(df[y].max()) * 1.15)
+                fig.update_yaxes(range=[0, ymax], ticksuffix="%")
+            fig.update_layout(template="plotly_dark", height=240, margin=dict(l=10, r=10, t=30, b=10))
+            return fig
+
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            st.plotly_chart(_plot_bm(combined, "Cum_Theta_Decay_Pct", "Cum. Θ Decay % (time-integrated)", "#00E676", True), use_container_width=True)
+        with bc2:
+            st.plotly_chart(_plot_bm(combined, "Theta_Scaled", "Daily Θ P&L (₹/Day, signed)", "#FF9800"), use_container_width=True)
+        bc3, bc4 = st.columns(2)
+        with bc3:
+            st.plotly_chart(_plot_bm(combined, "Vanna_Scaled", "Vanna (scaled)", "#00BFFF"), use_container_width=True)
+        with bc4:
+            st.plotly_chart(_plot_bm(combined, "Charm_Scaled", "Charm (scaled)", "#E040FB"), use_container_width=True)
 
 
 def render_live_alert_ribbon(data: dict = None):
@@ -1806,9 +1891,9 @@ def render_live_alert_ribbon(data: dict = None):
                     """,
                     unsafe_allow_html=True,
                 )
-        # Basket fills blank space under Sit1/Sit2, left of Z-Scores
+        # Basket metrics under Sit1/Sit2, left of Z-Scores
         if data is not None:
-            render_compact_basket(data)
+            render_basket_metrics_block(data)
 
     with right_blk:
         zscore_analysis_fragment(mode="highlights")
@@ -2042,8 +2127,10 @@ def live_dashboard_fragment():
                 st.session_state.get("heatmap_timeframe", "5 min"),
             )
 
-        # Full-width alert ribbon + compact basket (left of Z-Scores)
+        # Full-width alert ribbon + basket metrics (left of Z-Scores)
         render_live_alert_ribbon(data)
+        # Full-width legs table + historical analytics
+        render_basket_table_fullwidth(data)
 
         # 4. VEX/CEX (60%) + Skew (40%) prepared below – VEX chart first
         st.markdown("---")
