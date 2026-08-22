@@ -1607,79 +1607,80 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
 
     long_alert = crit_a_long and crit_b_long and crit_c_long   # high-confirmation: all three required
 
-    # ---------- Status ribbon – side-by-side (left / right) ----------
-    st.markdown("---")
-    st.markdown("### 🚨 Live Alert Status (below GEX Heatmap)")
+    # Alert criteria computed above; store for full-width 3-col ribbon rendered outside this column
+    st.session_state["_live_alert_snapshot"] = {
+        "exit_alert": exit_alert, "long_alert": long_alert,
+        "crit_a_exit": crit_a_exit, "crit_b_exit": crit_b_exit, "crit_c_exit": crit_c_exit,
+        "crit_a_long": crit_a_long, "crit_b_long": crit_b_long, "crit_c_long": crit_c_long,
+        "wall_drop": wall_drop, "call_iv_chg": call_iv_chg, "put_iv_chg": put_iv_chg,
+        "dist_to_flip_pct": dist_to_flip_pct, "pos_collapse": pos_collapse, "cur": cur,
+    }
+
+
+def render_live_alert_ribbon():
+    """Full-width 3-column ribbon: Situation 1 | Situation 2 | Z-Scores."""
+    snap = st.session_state.get("_live_alert_snapshot")
+    if not snap:
+        return
 
     def _badge_html(flag, yes_txt="YES", no_txt="NO"):
         if flag:
             return (
                 f"<span style='background:rgba(255,82,82,0.25);color:#FF5252;"
-                f"padding:3px 10px;border-radius:4px;font-weight:700;"
-                f"border:1px solid #FF5252;font-size:13px'>{yes_txt}</span>"
+                f"padding:2px 8px;border-radius:4px;font-weight:700;"
+                f"border:1px solid #FF5252;font-size:12px'>{yes_txt}</span>"
             )
         return (
             f"<span style='background:rgba(0,230,118,0.15);color:#00E676;"
-            f"padding:3px 10px;border-radius:4px;font-weight:700;"
-            f"border:1px solid #00E676;font-size:13px'>{no_txt}</span>"
+            f"padding:2px 8px;border-radius:4px;font-weight:700;"
+            f"border:1px solid #00E676;font-size:12px'>{no_txt}</span>"
         )
 
     def _sub_html(flag, label):
         colour = "#FF5252" if flag else "#00E676"
         txt = "Yes" if flag else "No"
-        return f"<span style='color:{colour};font-weight:600'>{label} – {txt}</span>"
+        return f"<span style='color:{colour};font-weight:600;font-size:12px'>{label} – {txt}</span>"
 
-    exit_label = "YES" if exit_alert else "NO"
-    long_label = "YES" if long_alert else "NO"
+    exit_label = "YES" if snap["exit_alert"] else "NO"
+    long_label = "YES" if snap["long_alert"] else "NO"
+    cur = snap["cur"]
 
-    # Left: both alert situations stacked | Right: Z-Score highlights table
-    alert_col, zscore_col = st.columns([0.62, 0.38])
+    st.markdown("---")
+    st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🚨 Live Alert Status</span>", unsafe_allow_html=True)
 
-    with alert_col:
-        with st.expander(
-            f"Situation 1 · Exit / Risk-Off  →  {exit_label}",
-            expanded=True,
-        ):
-            st.markdown(
-                f"<div style='margin-bottom:6px'>Overall: {_badge_html(exit_alert)}</div>",
-                unsafe_allow_html=True,
-            )
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        with st.expander(f"Sit. 1 · Exit / Risk-Off → {exit_label}", expanded=True):
+            st.markdown(f"Overall: {_badge_html(snap['exit_alert'])}", unsafe_allow_html=True)
             st.markdown(
                 f"""
-                <div style='line-height:1.8;font-size:13px'>
-                {_sub_html(crit_a_exit, 'Wall Collapse (≥25% pos-GEX drop / 10 min)')}<br>
-                {_sub_html(crit_b_exit, 'Vol Expansion (OTM IV ↑ ≥0.8% / 5 min)')}<br>
-                {_sub_html(crit_c_exit, 'GEX Flip (spot within 0.3% of flip or in –GEX zone)')}<br>
-                <small style='color:#AAA'>
-                Wall drop: {wall_drop:.1f}% | Call IV Δ: {call_iv_chg:+.2f}% | Put IV Δ: {put_iv_chg:+.2f}% | Dist to flip: {dist_to_flip_pct:.2f}%
-                </small>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with st.expander(
-            f"Situation 2 · Long Entry  →  {long_label}",
-            expanded=True,
-        ):
-            st.markdown(
-                f"<div style='margin-bottom:6px'>Overall: {_badge_html(long_alert)}</div>",
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f"""
-                <div style='line-height:1.8;font-size:13px'>
-                {_sub_html(crit_a_long, 'Gamma Fuel (neg-GEX above spot OR pos-GEX collapse ≥40%)')}<br>
-                {_sub_html(crit_b_long, 'Aggressive Demand (OTM Call IV ↑ ≥1.5% / 5 min)')}<br>
-                {_sub_html(crit_c_long, 'Volume Confirmation (5-min vol ≥ 1.5× 20-MA)')}<br>
-                <small style='color:#AAA'>
-                Neg GEX above: {cur['neg_gex_above']:.2f} Cr | Pos collapse: {pos_collapse:.1f}% | Call IV Δ: {call_iv_chg:+.2f}% | Vol ratio: {cur['vol_ratio']:.2f}×
-                </small>
+                <div style='line-height:1.7;font-size:12px'>
+                {_sub_html(snap['crit_a_exit'], 'Wall Collapse (≥25% / 10m)')}<br>
+                {_sub_html(snap['crit_b_exit'], 'Vol Expansion (IV ↑ ≥0.8% / 5m)')}<br>
+                {_sub_html(snap['crit_c_exit'], 'GEX Flip (≤0.3% or –GEX zone)')}<br>
+                <small style='color:#AAA'>Drop {snap['wall_drop']:.1f}% | Call Δ {snap['call_iv_chg']:+.2f}% | Put Δ {snap['put_iv_chg']:+.2f}% | Flip dist {snap['dist_to_flip_pct']:.2f}%</small>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-    with zscore_col:
+    with c2:
+        with st.expander(f"Sit. 2 · Long Entry → {long_label}", expanded=True):
+            st.markdown(f"Overall: {_badge_html(snap['long_alert'])}", unsafe_allow_html=True)
+            st.markdown(
+                f"""
+                <div style='line-height:1.7;font-size:12px'>
+                {_sub_html(snap['crit_a_long'], 'Gamma Fuel (–GEX or collapse ≥40%)')}<br>
+                {_sub_html(snap['crit_b_long'], 'Aggressive Demand (Call IV ↑ ≥1.5%)')}<br>
+                {_sub_html(snap['crit_c_long'], 'Volume Confirm (≥1.5× 20-MA)')}<br>
+                <small style='color:#AAA'>NegGEX {cur['neg_gex_above']:.1f} Cr | Collapse {snap['pos_collapse']:.1f}% | Call Δ {snap['call_iv_chg']:+.2f}% | Vol {cur['vol_ratio']:.2f}×</small>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with c3:
         zscore_analysis_fragment(mode="highlights")
 
 
@@ -2090,6 +2091,9 @@ def live_dashboard_fragment():
                 data, Index_Name, selected_expiry_str,
                 st.session_state.get("heatmap_timeframe", "5 min"),
             )
+
+        # Full-width 3-col alert ribbon (not nested inside heatmap column)
+        render_live_alert_ribbon()
 
         # 4. VEX/CEX (60%) + Skew (40%) prepared below – VEX chart first
         st.markdown("---")
