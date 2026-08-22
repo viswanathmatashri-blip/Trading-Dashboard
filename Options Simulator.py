@@ -1483,12 +1483,21 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
             f"<div class='update-timestamp'>Expiry: {expiry_str} | Session: {session_date_str} | {heatmap_tf_label} | Snapshots: {len(gex_hist)}</div>",
             unsafe_allow_html=True,
         )
-    st.caption(
-        "Strike vs IST session time. Colour = live Delta-Adjusted Net GEX (₹ Cr) from successive SmartAPI refreshes. "
-        "Same strike can change shade/intensity as new snapshots arrive (enable Auto-Refresh). "
-        "Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path. "
-        f"History snapshots collected: {len(gex_hist)}."
-    )
+    n_snap = len(gex_hist)
+    if n_snap <= 1:
+        st.caption(
+            "Strike vs IST session time. Currently showing the **latest live GEX snapshot** painted across the session "
+            "(single snapshot → uniform bands per strike). This is expected for the last trading session or on first load. "
+            "Enable **Auto-Refresh** during a live market day and let it run – new snapshots will make the same strike "
+            "change shade/intensity over time (like a true GEX surface). "
+            "Green = long-gamma; red = short-gamma. Cyan = spot path."
+        )
+    else:
+        st.caption(
+            f"Strike vs IST session time. Colour = live Delta-Adjusted Net GEX (₹ Cr) from {n_snap} successive SmartAPI snapshots. "
+            "Same strike can change shade/intensity as GEX evolves. "
+            "Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path."
+        )
 
     fig_hm = plt_go.Figure()
     fig_hm.add_trace(
@@ -1599,8 +1608,7 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
 
     long_alert = crit_a_long and crit_b_long and crit_c_long   # high-confirmation: all three required
 
-    # ---------- Status ribbon (dropdowns) ----------
-    # NOTE: st.expander title does NOT support HTML – badges are rendered inside the body.
+    # ---------- Status ribbon – side-by-side (left / right) ----------
     st.markdown("---")
     st.markdown("### 🚨 Live Alert Status (below GEX Heatmap)")
 
@@ -1622,61 +1630,64 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         txt = "Yes" if flag else "No"
         return f"<span style='color:{colour};font-weight:600'>{label} – {txt}</span>"
 
-    # ---- Situation 1 ----
     exit_label = "YES" if exit_alert else "NO"
-    with st.expander(
-        f"Situation 1 · Non-Directional Exit / Risk-Off Alert  →  {exit_label}",
-        expanded=exit_alert,
-    ):
-        st.markdown(
-            f"<div style='margin-bottom:8px'>Overall: {_badge_html(exit_alert)}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""
-            <div style='line-height:1.9;font-size:14px'>
-            {_sub_html(crit_a_exit, 'Wall Collapse (≥25% pos-GEX drop / 10 min)')}<br>
-            {_sub_html(crit_b_exit, 'Vol Expansion (OTM IV ↑ ≥0.8% / 5 min)')}<br>
-            {_sub_html(crit_c_exit, 'GEX Flip (spot within 0.3% of flip or in –GEX zone)')}<br>
-            <br>
-            <small style='color:#AAA'>
-            Wall drop: {wall_drop:.1f}% &nbsp;|&nbsp;
-            Call IV Δ: {call_iv_chg:+.2f}% &nbsp;|&nbsp;
-            Put IV Δ: {put_iv_chg:+.2f}% &nbsp;|&nbsp;
-            Dist to flip: {dist_to_flip_pct:.2f}%
-            </small>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    # ---- Situation 2 ----
     long_label = "YES" if long_alert else "NO"
-    with st.expander(
-        f"Situation 2 · Long Position Entry (Directional Breakout)  →  {long_label}",
-        expanded=long_alert,
-    ):
-        st.markdown(
-            f"<div style='margin-bottom:8px'>Overall: {_badge_html(long_alert)}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""
-            <div style='line-height:1.9;font-size:14px'>
-            {_sub_html(crit_a_long, 'Gamma Fuel (neg-GEX above spot OR pos-GEX collapse ≥40%)')}<br>
-            {_sub_html(crit_b_long, 'Aggressive Demand (OTM Call IV ↑ ≥1.5% / 5 min)')}<br>
-            {_sub_html(crit_c_long, 'Volume Confirmation (5-min vol ≥ 1.5× 20-MA)')}<br>
-            <br>
-            <small style='color:#AAA'>
-            Neg GEX above: {cur['neg_gex_above']:.2f} Cr &nbsp;|&nbsp;
-            Pos collapse: {pos_collapse:.1f}% &nbsp;|&nbsp;
-            Call IV Δ: {call_iv_chg:+.2f}% &nbsp;|&nbsp;
-            Vol ratio: {cur['vol_ratio']:.2f}×
-            </small>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        with st.expander(
+            f"Situation 1 · Exit / Risk-Off  →  {exit_label}",
+            expanded=True,
+        ):
+            st.markdown(
+                f"<div style='margin-bottom:8px'>Overall: {_badge_html(exit_alert)}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""
+                <div style='line-height:1.9;font-size:13px'>
+                {_sub_html(crit_a_exit, 'Wall Collapse (≥25% pos-GEX drop / 10 min)')}<br>
+                {_sub_html(crit_b_exit, 'Vol Expansion (OTM IV ↑ ≥0.8% / 5 min)')}<br>
+                {_sub_html(crit_c_exit, 'GEX Flip (spot within 0.3% of flip or in –GEX zone)')}<br>
+                <br>
+                <small style='color:#AAA'>
+                Wall drop: {wall_drop:.1f}% &nbsp;|&nbsp;
+                Call IV Δ: {call_iv_chg:+.2f}% &nbsp;|&nbsp;
+                Put IV Δ: {put_iv_chg:+.2f}% &nbsp;|&nbsp;
+                Dist to flip: {dist_to_flip_pct:.2f}%
+                </small>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with col_right:
+        with st.expander(
+            f"Situation 2 · Long Entry  →  {long_label}",
+            expanded=True,
+        ):
+            st.markdown(
+                f"<div style='margin-bottom:8px'>Overall: {_badge_html(long_alert)}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"""
+                <div style='line-height:1.9;font-size:13px'>
+                {_sub_html(crit_a_long, 'Gamma Fuel (neg-GEX above spot OR pos-GEX collapse ≥40%)')}<br>
+                {_sub_html(crit_b_long, 'Aggressive Demand (OTM Call IV ↑ ≥1.5% / 5 min)')}<br>
+                {_sub_html(crit_c_long, 'Volume Confirmation (5-min vol ≥ 1.5× 20-MA)')}<br>
+                <br>
+                <small style='color:#AAA'>
+                Neg GEX above: {cur['neg_gex_above']:.2f} Cr &nbsp;|&nbsp;
+                Pos collapse: {pos_collapse:.1f}% &nbsp;|&nbsp;
+                Call IV Δ: {call_iv_chg:+.2f}% &nbsp;|&nbsp;
+                Vol ratio: {cur['vol_ratio']:.2f}×
+                </small>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
 # --- LIVE DASHBOARD FRAGMENT ---
