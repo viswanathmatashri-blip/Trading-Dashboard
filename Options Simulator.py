@@ -2389,7 +2389,7 @@ def live_dashboard_fragment():
 
         # ---------- FUTURES CHART + REAL VWAP ----------
         st.markdown("---")
-        fut_header_col, basis_col = st.columns([0.68, 0.32])
+        fut_header_col, basis_col, band_col = st.columns([0.55, 0.25, 0.20])
         with fut_header_col:
             expiry_txt = basis.get("fut_expiry", "N/A")
             st.markdown(
@@ -2401,12 +2401,22 @@ def live_dashboard_fragment():
             if basis.get("basis") is not None:
                 basis_color = "#00E676" if basis["basis"] >= 0 else "#FF5252"
                 st.markdown(
-                    f"<div style='text-align:right;font-size:13px;'>"
+                    f"<div style='text-align:right;font-size:13px;padding-top:4px;'>"
                     f"Basis: <span style='color:{basis_color};font-weight:700;'>"
                     f"{basis['basis']:+.1f}</span> pts</div>",
                     unsafe_allow_html=True
                 )
+        with band_col:
+            sigma_mult = st.selectbox(
+                "VWAP Bands",
+                options=[1.0, 1.5, 2.0],
+                index=1,                    # default 1.5σ
+                format_func=lambda x: f"±{x}σ",
+                key="vwap_sigma_select",
+                label_visibility="collapsed"
+            )
 
+        # Fallback / market-closed banner
         fut_msg = data.get("fut_fallback_msg", "")
         if data.get("fut_is_fallback") or "closed" in str(fut_msg).lower():
             st.warning(fut_msg)
@@ -2420,44 +2430,89 @@ def live_dashboard_fragment():
             df_fchart = df_fut[df_fut["session_date"].isin(last_3_fut)].copy()
             df_fchart["time_str"] = pd.to_datetime(df_fchart["time"]).dt.strftime("%d-%b %H:%M")
 
+            # ----- Calculate VWAP Standard Deviation Bands -----
+            # Typical price already used for VWAP; we compute rolling std of (close - vwap)
+            # or more correctly the volume-weighted variance. Simple practical version:
+            df_fchart["vwap_dev"] = df_fchart["close"] - df_fchart["vwap"]
+            # Expanding std (resets conceptually with session, but we use expanding for simplicity)
+            df_fchart["vwap_std"] = df_fchart.groupby("session_date")["vwap_dev"].transform(
+                lambda x: x.expanding(min_periods=5).std()
+            )
+            df_fchart["vwap_upper"] = df_fchart["vwap"] + sigma_mult * df_fchart["vwap_std"]
+            df_fchart["vwap_lower"] = df_fchart["vwap"] - sigma_mult * df_fchart["vwap_std"]
+
             latest_vwap = df_fchart["vwap"].iloc[-1] if "vwap" in df_fchart.columns else None
             latest_fut  = df_fchart["close"].iloc[-1]
 
-            fmin = min(df_fchart["close"].min(), df_fchart["vwap"].min())
-            fmax = max(df_fchart["close"].max(), df_fchart["vwap"].max())
-            fpad = (fmax - fmin) * 0.05
+            fmin = min(df_fchart["close"].min(), df_fchart["vwap_lower"].min())
+            fmax = max(df_fchart["close"].max(), df_fchart["vwap_upper"].max())
+            fpad = (fmax - fmin) * 0.06
 
             fig_fut = plt_go.Figure()
+
+            # Upper band
             fig_fut.add_trace(plt_go.Scatter(
-                x=df_fchart["time_str"], y=df_fchart["close"],
-                mode="lines", name="Futures", line=dict(color="#2196F3", width=2)
+                x=df_fchart["time_str"], y=df_fchart["vwap_upper"],
+                mode="lines", name=f"+{sigma_mult}σ",
+                line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                showlegend=True
             ))
+            # Lower band (fills to upper)
+            fig_fut.add_trace(plt_go.Scatter(
+                x=df_fchart["time_str"], y=df_fchart["vwap_lower"],
+                mode="lines", name=f"−{sigma_mult}σ",
+                line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                fill="tonexty",
+                fillcolor="rgba(255,152,0,0.08)",
+                showlegend=True
+            ))
+            # VWAP line
             fig_fut.add_trace(plt_go.Scatter(
                 x=df_fchart["time_str"], y=df_fchart["vwap"],
-                mode="lines", name="Futures VWAP (real vol)",
-                line=dict(color="#FF9800", width=2, dash="dot")
+                mode="lines", name="VWAP",
+                line=dict(color="#FF9800", width=2.2, dash="dot")
             ))
+            # Futures price
+            fig_fut.add_trace(plt_go.Scatter(
+                x=df_fchart["time_str"], y=df_fchart["close"],
+                mode="lines", name="Futures",
+                line=dict(color="#2196F3", width=2)
+            ))
+
             fig_fut.update_layout(
-                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=340, margin=dict(l=10, r=10, t=30, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
+                template="plotly_dark",
+                paper_bgcolor="#0E1117",
+                plot_bgcolor="#0E1117",
+                height=380,
+                margin=dict(l=10, r=10, t=40, b=10),
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="left",
+                    x=0,
+                    font=dict(size=11),
+                    bgcolor="rgba(0,0,0,0)",
+                    borderwidth=0
+                ),
                 hovermode="x unified",
                 yaxis=dict(range=[fmin - fpad, fmax + fpad], tickformat="d"),
                 xaxis=dict(type="category", nticks=8),
                 title=dict(
-                    text=f"Futures: {latest_fut:,.1f}  |  VWAP: {latest_vwap:,.1f}" if latest_vwap else "",
-                    x=0.01, font=dict(size=12)
+                    text=f"Futures: {latest_fut:,.1f}  |  VWAP: {latest_vwap:,.1f}  |  Bands: ±{sigma_mult}σ",
+                    x=0.01,
+                    font=dict(size=12)
                 )
             )
             st.plotly_chart(fig_fut, use_container_width=True)
 
             st.caption(
-                "Orange dotted line = true Volume-Weighted Average Price calculated on **near-month futures volume**. "
+                f"Orange dotted line = VWAP (real futures volume). "
+                f"Shaded area = ±{sigma_mult}σ deviation from VWAP. "
                 "This is the institutional benchmark."
             )
         else:
             st.info("Futures candles / VWAP not available. " + (str(fut_msg) if fut_msg else "Click Fetch or wait for next refresh."))
-
     # --- GEX CHARTS ---
     st.markdown("---")
     df_chain = pd.DataFrame(data.get("chain_results") or [])
