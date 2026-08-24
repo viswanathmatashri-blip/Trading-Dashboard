@@ -2255,32 +2255,48 @@ def live_dashboard_fragment():
             st.caption(scores["action"])
 
         # Expandable details
-        with st.expander("▼ Score Breakdown & Details", expanded=False):
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("Gamma Regime", f"{scores['gamma_regime_score']:+.0f}",
-                      help="Positive = Long Gamma (pinning). Negative = Short Gamma (acceleration)")
-            s2.metric("Expected vs Realised", f"{scores['move_score']:+.0f}",
-                      help="Positive = Straddle rich (sell premium). Negative = Straddle cheap")
-            s3.metric("Charm / Vanna Flow", f"{scores['flow_score']:+.0f}",
-                      help="Combined dealer re-hedging pressure from time & vol")
-            s4.metric("OR vs GEX Walls", f"{scores['or_score']:+.0f}",
-                      help="Opening Range interaction with gamma walls")
+with st.expander("▼ Score Breakdown & Details", expanded=False):
+    s1, s2, s3, s4 = st.columns(4)
 
-            st.markdown("---")
-            st.markdown(
-                f"""
-                <div style='font-size:12px;line-height:1.7;color:#CCC;'>
-                <b>Expected Move</b>: {scores['expected_move_pct']:.2f}% &nbsp;|&nbsp;
-                <b>Realised Range so far</b>: {scores['realised_range_pct']:.2f}% &nbsp;|&nbsp;
-                <b>ATM Straddle</b>: ₹{scores['straddle']:.0f}<br>
-                <b>Net Δ-GEX</b>: ₹{scores['total_delta_gex_cr']:.1f} Cr<br>
-                <b>Opening Range</b>: {scores['or_low']:.0f} – {scores['or_high']:.0f} 
-                (if available)
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+    with s1:
+        st.metric("Gamma Regime", f"{scores['gamma_regime_score']:+.0f}")
+        st.caption("Range: −100 → +100")
+        st.caption("＋ = Long Gamma → **Non-directional**")
+        st.caption("− = Short Gamma → **Directional**")
 
+    with s2:
+        st.metric("Expected vs Realised", f"{scores['move_score']:+.0f}")
+        st.caption("Range: −100 → +100")
+        st.caption("＋ = Straddle rich / quiet day → **Non-directional**")
+        st.caption("− = Straddle cheap / big move → **Directional**")
+
+    with s3:
+        st.metric("Charm / Vanna Flow", f"{scores['flow_score']:+.0f}")
+        st.caption("Range: −100 → +100")
+        st.caption("＋ = Flow supports pinning → **Non-directional**")
+        st.caption("− = Flow supports acceleration → **Directional**")
+
+    with s4:
+        st.metric("OR vs GEX Walls", f"{scores['or_score']:+.0f}")
+        st.caption("Range: −100 → +100")
+        st.caption("＋ = Range inside walls → **Non-directional**")
+        st.caption("− = Break of walls → **Directional**")
+
+    st.markdown("---")
+    st.markdown(
+        f"""
+        <div style='font-size:12px;line-height:1.7;color:#CCC;'>
+        <b>Context</b>: {scores.get('move_context', '')}<br>
+        <b>Expected Move</b>: {scores['expected_move_pct']:.2f}% &nbsp;|&nbsp;
+        <b>Realised Range</b>: {scores['realised_range_pct']:.2f}% &nbsp;|&nbsp;
+        <b>ATM Straddle</b>: ₹{scores['straddle']:.0f}<br>
+        <b>Net Δ-GEX</b>: ₹{scores['total_delta_gex_cr']:.1f} Cr<br>
+        <b>Opening Range (latest session)</b>: 
+        {f"{scores['or_low']:.0f} – {scores['or_high']:.0f}" if scores.get('or_low') else "N/A"}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
             st.markdown(
                 """
                 **Interpretation Guide**
