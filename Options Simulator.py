@@ -2431,16 +2431,47 @@ def live_dashboard_fragment():
             df_fchart["time_str"] = pd.to_datetime(df_fchart["time"]).dt.strftime("%d-%b %H:%M")
 
             # ----- Calculate VWAP Standard Deviation Bands -----
-            # Typical price already used for VWAP; we compute rolling std of (close - vwap)
-            # or more correctly the volume-weighted variance. Simple practical version:
-            df_fchart["vwap_dev"] = df_fchart["close"] - df_fchart["vwap"]
-            # Expanding std (resets conceptually with session, but we use expanding for simplicity)
-            df_fchart["vwap_std"] = df_fchart.groupby("session_date")["vwap_dev"].transform(
-                lambda x: x.expanding(min_periods=5).std()
+            # ----- Correct Volume-Weighted VWAP Standard Deviation Bands (causal, resets daily) -----
+            df_fchart = df_fchart.copy()
+            df_fchart["tp"] = (df_fchart["high"] + df_fchart["low"] + df_fchart["close"]) / 3.0
+            
+            def _calc_session_vwap_bands(group, k):
+                group = group.copy().reset_index(drop=True)
+                
+                cum_vol = 0.0
+                cum_tp_vol = 0.0
+                cum_sq_dev = 0.0
+                
+                vwaps = []
+                stds = []
+                
+                for i in range(len(group)):
+                    vol = float(group.loc[i, "volume"])
+                    tp  = float(group.loc[i, "tp"])
+                    
+                    cum_vol += vol
+                    cum_tp_vol += tp * vol
+                    
+                    vwap = cum_tp_vol / cum_vol if cum_vol > 0 else tp
+                    
+                    # Volume-weighted variance (using current VWAP)
+                    # Approximate but widely used method
+                    cum_sq_dev += vol * (tp - vwap) ** 2
+                    variance = cum_sq_dev / cum_vol if cum_vol > 0 else 0.0
+                    sigma = np.sqrt(max(variance, 0.0))
+                    
+                    vwaps.append(vwap)
+                    stds.append(sigma)
+                
+                group["vwap"] = vwaps
+                group["vwap_std"] = stds
+                group["vwap_upper"] = group["vwap"] + k * group["vwap_std"]
+                group["vwap_lower"] = group["vwap"] - k * group["vwap_std"]
+                return group
+            
+            df_fchart = df_fchart.groupby("session_date", group_keys=False).apply(
+                lambda g: _calc_session_vwap_bands(g, sigma_mult)
             )
-            df_fchart["vwap_upper"] = df_fchart["vwap"] + sigma_mult * df_fchart["vwap_std"]
-            df_fchart["vwap_lower"] = df_fchart["vwap"] - sigma_mult * df_fchart["vwap_std"]
-
             latest_vwap = df_fchart["vwap"].iloc[-1] if "vwap" in df_fchart.columns else None
             latest_fut  = df_fchart["close"].iloc[-1]
 
