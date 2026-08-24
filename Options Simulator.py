@@ -532,76 +532,130 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
 # ============================================================
 # SUPERHUMAN DECISION ENGINE – SCORING FUNCTIONS
 # ============================================================
-
 def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     """
-    Returns a dictionary with all scores and the final bias recommendation.
-    All scores are in range [-100, +100].
+    Superhuman Decision Engine scoring module.
+    All individual scores and the composite are in range [-100, +100].
+
+    Positive composite → PIN / MEAN-REVERSION (prefer non-directional premium selling)
+    Negative composite → ACCELERATION / BREAKOUT (prefer directional)
     """
-    levels = data.get("levels", {})
-    chain  = data.get("chain_results", [])
+    import datetime
+    import numpy as np
+    import pytz
+
+    levels = data.get("levels", {}) or {}
+    chain  = data.get("chain_results", []) or []
     spot   = float(data.get("spot_price", 0) or 0)
+
     if spot <= 0 or not chain:
-        return {"error": "Insufficient data"}
+        return {"error": "Insufficient data for scoring"}
 
-    # ---------- A. Gamma Regime Score ----------
-    total_delta_gex = float(data.get("total_net_gex_oi", 0)) / 1e7   # in ₹ Cr
-    # Normalise roughly against magnitude
-    gamma_regime_score = float(np.clip(total_delta_gex / max(abs(total_delta_gex), 1.5) * 55, -100, 100))
+    # ------------------------------------------------------------------
+    # Time-of-day detection (IST)
+    # ------------------------------------------------------------------
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.datetime.now(ist)
+    market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    is_weekday = now.weekday() < 5
+    is_market_hours = is_weekday and (market_open <= now <= market_close)
 
-    # ---------- B. Expected vs Realised Move ----------
+    # ------------------------------------------------------------------
+    # A. Gamma Regime Score  (−100 = strong short-gamma, +100 = strong long-gamma)
+    # ------------------------------------------------------------------
+    total_delta_gex_cr = float(data.get("total_net_gex_oi", 0) or 0) / 1e7
+    # Soft normalisation so extreme days still stay inside [-100, 100]
+    gamma_regime_score = float(np.clip(
+        total_delta_gex_cr / max(abs(total_delta_gex_cr), 1.8) * 58, -100, 100
+    ))
+
+    # ------------------------------------------------------------------
+    # B. Expected vs Realised Move
+    # ------------------------------------------------------------------
     straddle = float(levels.get("Straddle_Cost", 0) or 0)
-    expected_move_pct = (straddle / spot * 100) if spot > 0 else 0.0
+    expected_move_pct = (straddle / spot * 100.0) if spot > 0 else 0.0
 
     realised_range_pct = 0.0
-    if df_candles is not None and not df_candles.empty and len(df_candles) > 5:
-        day_high = float(df_candles["high"].max())
-        day_low  = float(df_candles["low"].min())
-        day_open = float(df_candles["open"].iloc[0])
-        if day_open > 0:
-            realised_range_pct = (day_high - day_low) / day_open * 100.0
+    day_high = day_low = day_open = None
+    if df_candles is not None and not df_candles.empty and len(df_candles) > 3:
+        try:
+            day_high = float(df_candles["high"].max())
+            day_low  = float(df_candles["low"].min())
+            day_open = float(df_candles["open"].iloc[0])
+            if day_open > 0:
+                realised_range_pct = (day_high - day_low) / day_open * 100.0
+        except Exception:
+            realised_range_pct = 0.0
 
-    # Positive = straddle rich → sell premium
-    # Negative = straddle cheap → buy premium / directional
-    if expected_move_pct > 0.15:
-        move_score = float(np.clip(
-            (expected_move_pct - realised_range_pct * 1.25) / expected_move_pct * 85, -100, 100
-        ))
+    if is_market_hours:
+        # Live session: compare remaining expected move vs realised so far
+        # Positive score = straddle still rich relative to what has already happened
+        if expected_move_pct > 0.12:
+            move_score = float(np.clip(
+                (expected_move_pct - realised_range_pct * 1.20) / expected_move_pct * 85,
+                -100, 100
+            ))
+        else:
+            move_score = 0.0
+        move_context = "Live session (Expected vs Realised-so-far)"
     else:
-        move_score = 0.0
+        # Market closed / weekend / holiday
+        # Full day has already played out.
+        # Positive score = day was MORE volatile than the straddle priced
+        # (directional moves were rewarded). Negative = day was quieter than priced.
+        if expected_move_pct > 0.10:
+            move_score = float(np.clip(
+                (realised_range_pct - expected_move_pct * 1.15) / max(expected_move_pct, 0.15) * 70,
+                -100, 100
+            ))
+        else:
+            move_score = 0.0
+        move_context = "Post-market (Full-day Realised vs Priced Expected)"
 
-    # ---------- C. Charm / Vanna Flow ----------
+    # ------------------------------------------------------------------
+    # C. Charm / Vanna Flow Score
+    # ------------------------------------------------------------------
     total_vex = sum(float(r.get("VEX", 0) or 0) for r in chain)
     total_cex = sum(float(r.get("CEX", 0) or 0) for r in chain)
 
-    vanna_component = float(np.clip(total_vex / 8e5 * 45, -60, 60))
-    charm_component = float(np.clip(total_cex / 1.5e6 * 45, -60, 60))
+    vanna_component = float(np.clip(total_vex / 8.0e5 * 42, -55, 55))
+    charm_component = float(np.clip(total_cex / 1.6e6 * 42, -55, 55))
     flow_score = float(np.clip(vanna_component + charm_component, -100, 100))
 
-    # ---------- D. Opening Range vs GEX Walls ----------
+    # ------------------------------------------------------------------
+    # D. Opening Range vs GEX Walls
+    # ------------------------------------------------------------------
     or_score = 0.0
     or_high = or_low = None
+    gex_sup = float(levels.get("GEX_Support") or spot)
+    gex_res = float(levels.get("GEX_Resistance") or spot)
+
     if df_candles is not None and not df_candles.empty and len(df_candles) >= 6:
-        # First ~30-45 min (first 6-9 bars of 5-min)
-        or_bars = df_candles.head(min(9, len(df_candles)))
-        or_high = float(or_bars["high"].max())
-        or_low  = float(or_bars["low"].min())
+        try:
+            # First ~30-45 minutes (first 6-9 bars depending on timeframe)
+            n_or = min(9, max(6, len(df_candles) // 8))
+            or_bars = df_candles.head(n_or)
+            or_high = float(or_bars["high"].max())
+            or_low  = float(or_bars["low"].min())
 
-        gex_sup = float(levels.get("GEX_Support") or spot)
-        gex_res = float(levels.get("GEX_Resistance") or spot)
+            if spot > or_high and spot > gex_res:
+                or_score = 72.0          # Clean breakout above wall
+            elif spot < or_low and spot < gex_sup:
+                or_score = -72.0         # Clean breakdown below wall
+            elif (or_high is not None and or_low is not None and
+                  or_high < gex_res and or_low > gex_sup):
+                or_score = 48.0          # Opening range contained inside walls
+            elif spot > gex_res or spot < gex_sup:
+                or_score = -28.0         # Already outside major walls
+            else:
+                or_score = 8.0
+        except Exception:
+            or_score = 0.0
 
-        if spot > or_high and spot > gex_res:
-            or_score = 70.0          # Breakout above wall
-        elif spot < or_low and spot < gex_sup:
-            or_score = -70.0         # Breakdown below wall
-        elif or_high < gex_res and or_low > gex_sup:
-            or_score = 45.0          # Clean range inside walls
-        elif spot > gex_res or spot < gex_sup:
-            or_score = -25.0         # Already outside walls
-        else:
-            or_score = 10.0
-
-    # ---------- E. Composite & Final Bias ----------
+    # ------------------------------------------------------------------
+    # E. Composite Score & Final Bias
+    # ------------------------------------------------------------------
     composite = (
         0.30 * gamma_regime_score +
         0.25 * move_score +
@@ -611,39 +665,48 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     composite = float(np.clip(composite, -100, 100))
 
     if composite >= 48:
-        bias = "PIN / MEAN-REVERSION"
+        bias   = "PIN / MEAN-REVERSION"
         action = "Non-directional → Iron Condor / Short Straddle / Iron Fly"
         colour = "#00E676"
     elif composite <= -48:
-        bias = "ACCELERATION / BREAKOUT"
+        bias   = "ACCELERATION / BREAKOUT"
         action = "Directional → Debit spreads / Futures / Naked options"
         colour = "#FF5252"
     elif abs(composite) <= 18:
-        bias = "NEUTRAL / CHOP"
+        bias   = "NEUTRAL / CHOP"
         action = "Avoid or very tight range strategies only"
         colour = "#FF9800"
     else:
-        bias = "CONTROLLED TREND"
+        bias   = "CONTROLLED TREND"
         action = "Mild directional → Credit spreads / Calendars"
         colour = "#2196F3"
 
     return {
+        # Core scores
         "gamma_regime_score": round(gamma_regime_score, 1),
-        "move_score": round(move_score, 1),
-        "flow_score": round(flow_score, 1),
-        "or_score": round(or_score, 1),
-        "composite": round(composite, 1),
-        "bias": bias,
+        "move_score":         round(move_score, 1),
+        "flow_score":         round(flow_score, 1),
+        "or_score":           round(or_score, 1),
+        "composite":          round(composite, 1),
+
+        # Decision
+        "bias":   bias,
         "action": action,
         "colour": colour,
-        "expected_move_pct": round(expected_move_pct, 2),
-        "realised_range_pct": round(realised_range_pct, 2),
-        "straddle": round(straddle, 1),
-        "or_high": or_high,
-        "or_low": or_low,
-        "total_delta_gex_cr": round(total_delta_gex, 1),
-    }
 
+        # Context / debug
+        "is_market_hours":     is_market_hours,
+        "move_context":        move_context,
+        "expected_move_pct":   round(expected_move_pct, 2),
+        "realised_range_pct":  round(realised_range_pct, 2),
+        "straddle":            round(straddle, 1),
+        "total_delta_gex_cr":  round(total_delta_gex_cr, 1),
+        "or_high":             or_high,
+        "or_low":              or_low,
+        "gex_support":         gex_sup,
+        "gex_resistance":      gex_res,
+        "timestamp_ist":       now.strftime("%d-%b-%Y %H:%M:%S IST"),
+    }
 # --- TECHNICAL INDICATOR ENGINE ---
 def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
     df = df_candles.copy()
