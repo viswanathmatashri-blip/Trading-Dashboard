@@ -2296,15 +2296,15 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
         """,
         unsafe_allow_html=True
     )
-            st.markdown(
-                """
-                **Interpretation Guide**
-                - **PIN / MEAN-REVERSION** → Dealers are long gamma, walls are strong, straddle is rich → sell premium
-                - **ACCELERATION / BREAKOUT** → Short gamma + cheap options + OR break of walls → directional
-                - **CONTROLLED TREND** → Mild directional bias, prefer defined-risk structures
-                - **NEUTRAL / CHOP** → No clear edge, stay flat or very tight ranges
-                """
-            )
+    st.markdown(
+        """
+        **Interpretation Guide**
+        - **PIN / MEAN-REVERSION** → Dealers are long gamma, walls are strong, straddle is rich → sell premium
+        - **ACCELERATION / BREAKOUT** → Short gamma + cheap options + OR break of walls → directional
+        - **CONTROLLED TREND** → Mild directional bias, prefer defined-risk structures
+        - **NEUTRAL / CHOP** → No clear edge, stay flat or very tight ranges
+        """
+    )
     # ========== UNDERLYING TECHNICALS – SPOT + FUTURES VWAP ==========
     df_full = data.get("df_candles", pd.DataFrame())
     df_fut  = data.get("df_futures", pd.DataFrame())
