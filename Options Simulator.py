@@ -627,6 +627,8 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
                 return compute_technical_indicators(df_candles), offset > 0
 
     return pd.DataFrame(), False
+
+
 def get_near_month_futures_token(df_scrip_master, index_name, fut_exch):
     """Return token of the nearest active futures contract."""
     try:
@@ -647,60 +649,95 @@ def get_near_month_futures_token(df_scrip_master, index_name, fut_exch):
 
 def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15):
     """
-    Fetch near-month futures candles and compute proper VWAP (real volume).
-    Returns (df_futures_with_indicators, is_holiday_fallback, basis_info)
+    Fetch near-month futures candles + real VWAP.
+    Outside market hours → falls back to the most recent trading session and flags it.
+    Returns: (df, is_fallback, basis_info, fallback_msg)
     """
     spot_token, spot_exch, fut_exch = INDEX_TOKEN_MAP.get(index_name, ("99926000", "NSE", "NFO"))
     fut_token, fut_expiry = get_near_month_futures_token(df_scrip_master, index_name, fut_exch)
 
     if not fut_token:
-        return pd.DataFrame(), False, {}
+        return pd.DataFrame(), False, {}, "No active futures contract found"
 
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
 
-    for offset in range(0, 10):
+    market_open = now_dt.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now_dt.replace(hour=15, minute=30, second=0, microsecond=0)
+    is_weekday = now_dt.weekday() < 5
+    currently_closed = (not is_weekday) or (now_dt < market_open or now_dt > market_close)
+
+    best_df = pd.DataFrame()
+    best_offset = 0
+
+    for offset in range(0, 12):
         target_to = now_dt - datetime.timedelta(days=offset)
         target_from = target_to - datetime.timedelta(days=lookback_days)
 
         candle_param = {
             "exchange": fut_exch,
-            "symboltoken": fut_token,
+            "symboltoken": str(fut_token),
             "interval": api_interval,
             "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
             "todate": target_to.strftime("%Y-%m-%d 15:30")
         }
 
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
-        time.sleep(0.40)
+        time.sleep(0.35)
 
-        if candle_res and candle_res.get("status") and candle_res.get("data"):
-            df = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
-            df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+        if not (candle_res and candle_res.get("status") and candle_res.get("data")):
+            continue
 
-            if df.empty:
-                continue
+        df = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
 
-            # Compute indicators (VWAP will now be correct because volume is real)
-            df = compute_technical_indicators(df)
+        if df.empty or len(df) < 5:
+            continue
 
-            # Also fetch latest spot for basis
-            spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=index_name, symboltoken=spot_token)
-            time.sleep(0.30)
-            spot_ltp = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") else None
-            fut_ltp = float(df["close"].iloc[-1]) if not df.empty else None
+        df = compute_technical_indicators(df)
+        best_df = df
+        best_offset = offset
+        break
 
-            basis_info = {
-                "fut_token": fut_token,
-                "fut_expiry": str(fut_expiry) if fut_expiry is not None else "N/A",
-                "spot_ltp": spot_ltp,
-                "fut_ltp": fut_ltp,
-                "basis": round(fut_ltp - spot_ltp, 2) if (spot_ltp and fut_ltp) else None
-            }
+    if best_df.empty:
+        return pd.DataFrame(), False, {}, "Could not fetch futures candles"
 
-            return df, offset > 0, basis_info
+    fut_ltp = float(best_df["close"].iloc[-1])
 
-    return pd.DataFrame(), False, {}
+    spot_ltp = None
+    try:
+        spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch,
+                                  tradingsymbol=index_name, symboltoken=spot_token)
+        time.sleep(0.25)
+        if spot_resp and spot_resp.get("status") and spot_resp.get("data"):
+            spot_ltp = float(spot_resp["data"]["ltp"])
+    except Exception:
+        pass
+
+    basis_info = {
+        "fut_token": fut_token,
+        "fut_expiry": str(fut_expiry) if fut_expiry is not None else "N/A",
+        "spot_ltp": spot_ltp,
+        "fut_ltp": fut_ltp,
+        "basis": round(fut_ltp - spot_ltp, 2) if (spot_ltp and fut_ltp) else None
+    }
+
+    last_bar_time = pd.to_datetime(best_df["time"].iloc[-1])
+    session_date_str = last_bar_time.strftime("%d-%b-%Y")
+
+    if currently_closed or best_offset > 0:
+        fallback_msg = (
+            f"⚠️ Market is currently closed. Showing last available session: "
+            f"**{session_date_str}** (fallback)"
+        )
+        is_fallback = True
+    else:
+        fallback_msg = f"Live session • {session_date_str}"
+        is_fallback = False
+
+    return best_df, is_fallback, basis_info, fallback_msg
+
+
 # --- METHOD 1: FUTURES VOLUME & PROXY Z-SCORE COMPUTATION ---
 def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, progress_container=None):
     try:
@@ -973,6 +1010,12 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             smart_api, spot_token, spot_exch, api_interval, lookback_days
         )
 
+        # ----- Near-month Futures candles + real VWAP -----
+        update_p(0.42, "Fetching Near-Month Futures candles for VWAP...")
+        df_futures, fut_is_fallback, basis_info, fut_fallback_msg = fetch_futures_candles_with_vwap(
+            smart_api, Index_Name, df_master, api_interval, lookback_days
+        )
+
         now_dt = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
         expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
         time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
@@ -1146,6 +1189,10 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             "pcr": pcr, "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
             "total_net_gex_oi": total_net_gex_oi, "total_net_gex_vol": total_net_gex_vol,
             "max_pain_strike": max_pain_strike, "levels": levels, "df_candles": df_candles,
+            "df_futures": df_futures,
+            "basis_info": basis_info,
+            "fut_is_fallback": fut_is_fallback,
+            "fut_fallback_msg": fut_fallback_msg,
             "chain_results": chain_results, "market_data": market_data, "basket_tokens_info": basket_tokens_info,
             "is_holiday_fallback": is_holiday_fallback,
             "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST")
@@ -2023,6 +2070,7 @@ def live_dashboard_fragment():
 
     st.markdown(f"<div class='update-timestamp' style='margin-top:2px'>Updated {data['timestamp']}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
+
     # ========== UNDERLYING TECHNICALS – SPOT + FUTURES VWAP ==========
     df_full = data.get("df_candles", pd.DataFrame())
     df_fut  = data.get("df_futures", pd.DataFrame())
@@ -2066,7 +2114,7 @@ def live_dashboard_fragment():
             unsafe_allow_html=True,
         )
 
-        # ---------- SPOT CHART (no VWAP – volume is invalid) ----------
+        # ---------- SPOT CHART (no VWAP – volume is invalid on index) ----------
         df_full["session_date"] = pd.to_datetime(df_full["time"]).dt.date
         last_3_dates = sorted(df_full["session_date"].unique())[-3:]
         df_chart = df_full[df_full["session_date"].isin(last_3_dates)].copy()
@@ -2113,11 +2161,12 @@ def live_dashboard_fragment():
 
         # ---------- FUTURES CHART + REAL VWAP ----------
         st.markdown("---")
-        fut_header_col, basis_col = st.columns([0.70, 0.30])
+        fut_header_col, basis_col = st.columns([0.68, 0.32])
         with fut_header_col:
+            expiry_txt = basis.get("fut_expiry", "N/A")
             st.markdown(
                 f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
-                f"📉 Near-Month Futures + Real VWAP ({basis.get('fut_expiry', 'N/A')})</span>",
+                f"📉 Near-Month Futures + Real VWAP ({expiry_txt})</span>",
                 unsafe_allow_html=True
             )
         with basis_col:
@@ -2130,13 +2179,20 @@ def live_dashboard_fragment():
                     unsafe_allow_html=True
                 )
 
+        # Fallback / market-closed banner
+        fut_msg = data.get("fut_fallback_msg", "")
+        if data.get("fut_is_fallback") or "closed" in str(fut_msg).lower():
+            st.warning(fut_msg)
+        elif fut_msg:
+            st.caption(fut_msg)
+
         if not df_fut.empty and len(df_fut) >= 5:
+            df_fut = df_fut.copy()
             df_fut["session_date"] = pd.to_datetime(df_fut["time"]).dt.date
             last_3_fut = sorted(df_fut["session_date"].unique())[-3:]
             df_fchart = df_fut[df_fut["session_date"].isin(last_3_fut)].copy()
             df_fchart["time_str"] = pd.to_datetime(df_fchart["time"]).dt.strftime("%d-%b %H:%M")
 
-            # Latest VWAP value for caption
             latest_vwap = df_fchart["vwap"].iloc[-1] if "vwap" in df_fchart.columns else None
             latest_fut  = df_fchart["close"].iloc[-1]
 
@@ -2173,26 +2229,7 @@ def live_dashboard_fragment():
                 "This is the institutional benchmark. Spot chart above has no valid volume, so VWAP is shown only here."
             )
         else:
-            st.info("Futures candles / VWAP not available yet. Click Fetch or wait for next refresh.")
-        # RIGHT – MACD + RSI stacked
-        with tech_right:
-            fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.55, 0.45])
-            colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
-            fig_ind.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="Hist", marker_color=colors_macd, showlegend=False), row=1, col=1)
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD [{macd_val:.1f}]", line=dict(color="#2196F3", width=1.3)), row=1, col=1)
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Sig [{macd_sig:.1f}]", line=dict(color="#FF9800", width=1.3)), row=1, col=1)
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name=f"RSI [{rsi_val:.0f}]", line=dict(color="#E040FB", width=1.3)), row=2, col=1)
-            fig_ind.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=2, col=1)
-            fig_ind.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=2, col=1)
-            fig_ind.update_layout(
-                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=340, margin=dict(l=10, r=10, t=28, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
-                hovermode="x unified",
-            )
-            fig_ind.update_xaxes(type="category", nticks=6)
-            st.plotly_chart(fig_ind, use_container_width=True)
-
+            st.info("Futures candles / VWAP not available. " + (str(fut_msg) if fut_msg else "Click Fetch or wait for next refresh."))
 
     # --- GEX CHARTS (Key Levels already in sticky Market Summary) ---
     st.markdown("---")
