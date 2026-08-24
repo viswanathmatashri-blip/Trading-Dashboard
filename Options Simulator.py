@@ -529,6 +529,120 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
         "Target_Down": target_downside,
         "Straddle_Cost": round(atm_straddle_cost, 2)
     }
+# ============================================================
+# SUPERHUMAN DECISION ENGINE – SCORING FUNCTIONS
+# ============================================================
+
+def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
+    """
+    Returns a dictionary with all scores and the final bias recommendation.
+    All scores are in range [-100, +100].
+    """
+    levels = data.get("levels", {})
+    chain  = data.get("chain_results", [])
+    spot   = float(data.get("spot_price", 0) or 0)
+    if spot <= 0 or not chain:
+        return {"error": "Insufficient data"}
+
+    # ---------- A. Gamma Regime Score ----------
+    total_delta_gex = float(data.get("total_net_gex_oi", 0)) / 1e7   # in ₹ Cr
+    # Normalise roughly against magnitude
+    gamma_regime_score = float(np.clip(total_delta_gex / max(abs(total_delta_gex), 1.5) * 55, -100, 100))
+
+    # ---------- B. Expected vs Realised Move ----------
+    straddle = float(levels.get("Straddle_Cost", 0) or 0)
+    expected_move_pct = (straddle / spot * 100) if spot > 0 else 0.0
+
+    realised_range_pct = 0.0
+    if df_candles is not None and not df_candles.empty and len(df_candles) > 5:
+        day_high = float(df_candles["high"].max())
+        day_low  = float(df_candles["low"].min())
+        day_open = float(df_candles["open"].iloc[0])
+        if day_open > 0:
+            realised_range_pct = (day_high - day_low) / day_open * 100.0
+
+    # Positive = straddle rich → sell premium
+    # Negative = straddle cheap → buy premium / directional
+    if expected_move_pct > 0.15:
+        move_score = float(np.clip(
+            (expected_move_pct - realised_range_pct * 1.25) / expected_move_pct * 85, -100, 100
+        ))
+    else:
+        move_score = 0.0
+
+    # ---------- C. Charm / Vanna Flow ----------
+    total_vex = sum(float(r.get("VEX", 0) or 0) for r in chain)
+    total_cex = sum(float(r.get("CEX", 0) or 0) for r in chain)
+
+    vanna_component = float(np.clip(total_vex / 8e5 * 45, -60, 60))
+    charm_component = float(np.clip(total_cex / 1.5e6 * 45, -60, 60))
+    flow_score = float(np.clip(vanna_component + charm_component, -100, 100))
+
+    # ---------- D. Opening Range vs GEX Walls ----------
+    or_score = 0.0
+    or_high = or_low = None
+    if df_candles is not None and not df_candles.empty and len(df_candles) >= 6:
+        # First ~30-45 min (first 6-9 bars of 5-min)
+        or_bars = df_candles.head(min(9, len(df_candles)))
+        or_high = float(or_bars["high"].max())
+        or_low  = float(or_bars["low"].min())
+
+        gex_sup = float(levels.get("GEX_Support") or spot)
+        gex_res = float(levels.get("GEX_Resistance") or spot)
+
+        if spot > or_high and spot > gex_res:
+            or_score = 70.0          # Breakout above wall
+        elif spot < or_low and spot < gex_sup:
+            or_score = -70.0         # Breakdown below wall
+        elif or_high < gex_res and or_low > gex_sup:
+            or_score = 45.0          # Clean range inside walls
+        elif spot > gex_res or spot < gex_sup:
+            or_score = -25.0         # Already outside walls
+        else:
+            or_score = 10.0
+
+    # ---------- E. Composite & Final Bias ----------
+    composite = (
+        0.30 * gamma_regime_score +
+        0.25 * move_score +
+        0.20 * flow_score +
+        0.25 * or_score
+    )
+    composite = float(np.clip(composite, -100, 100))
+
+    if composite >= 48:
+        bias = "PIN / MEAN-REVERSION"
+        action = "Non-directional → Iron Condor / Short Straddle / Iron Fly"
+        colour = "#00E676"
+    elif composite <= -48:
+        bias = "ACCELERATION / BREAKOUT"
+        action = "Directional → Debit spreads / Futures / Naked options"
+        colour = "#FF5252"
+    elif abs(composite) <= 18:
+        bias = "NEUTRAL / CHOP"
+        action = "Avoid or very tight range strategies only"
+        colour = "#FF9800"
+    else:
+        bias = "CONTROLLED TREND"
+        action = "Mild directional → Credit spreads / Calendars"
+        colour = "#2196F3"
+
+    return {
+        "gamma_regime_score": round(gamma_regime_score, 1),
+        "move_score": round(move_score, 1),
+        "flow_score": round(flow_score, 1),
+        "or_score": round(or_score, 1),
+        "composite": round(composite, 1),
+        "bias": bias,
+        "action": action,
+        "colour": colour,
+        "expected_move_pct": round(expected_move_pct, 2),
+        "realised_range_pct": round(realised_range_pct, 2),
+        "straddle": round(straddle, 1),
+        "or_high": or_high,
+        "or_low": or_low,
+        "total_delta_gex_cr": round(total_delta_gex, 1),
+    }
 
 # --- TECHNICAL INDICATOR ENGINE ---
 def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
@@ -2034,7 +2148,7 @@ def live_dashboard_fragment():
     data = st.session_state["data_store"]
     lvls = data.get("levels", {})
 
-    # ========== STICKY COMPACT MARKET SUMMARY (includes Key Levels) ==========
+       # ========== STICKY COMPACT MARKET SUMMARY (cleaned) ==========
     st.markdown("<div class='sticky-summary'>", unsafe_allow_html=True)
     head_l, head_r = st.columns([0.72, 0.28])
     with head_l:
@@ -2047,30 +2161,81 @@ def live_dashboard_fragment():
             st.session_state["enable_main_refresh"] = cb_main
             st.rerun()
 
-    # Row 1 – core metrics
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    # Core metrics only (removed R1/R2/S1/S2/GEX Sup/Res/Accel – visible on charts)
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Spot (Fut)", f"{data['spot_price']:.0f} ({data['F']:.0f})")
     c2.metric("Max Pain", f"{data['max_pain_strike']}")
-    c3.metric("Net GEX", f"₹{data['total_net_gex_oi']/1e7:.1f} Cr")
+    c3.metric("Net Δ-GEX", f"₹{data['total_net_gex_oi']/1e7:.1f} Cr")
     c4.metric("ATM IV Rank", f"{data['iv_percentile']:.0f}%")
     c5.metric("PCR", f"{data['pcr']:.2f}")
     c6.metric("C/P OI", f"{data['total_call_oi']//1000}k/{data['total_put_oi']//1000}k")
-
-    # Row 2 – Key Levels (clubbed into same sticky ribbon)
-    if lvls:
-        k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
-        k1.metric("R1", f"{lvls.get('R1', '–')}")
-        k2.metric("R2", f"{lvls.get('R2', '–')}")
-        k3.metric("S1", f"{lvls.get('S1', '–')}")
-        k4.metric("S2", f"{lvls.get('S2', '–')}")
-        k5.metric("GEX Sup", f"{lvls.get('GEX_Support', '–')}")
-        k6.metric("GEX Res", f"{lvls.get('GEX_Resistance', '–')}")
-        k7.metric("Accel", f"{lvls.get('GEX_Accelerator') or '–'}")
-        k8.metric("Flip", f"{lvls.get('Zero_Gamma_Flip', '–')}")
+    c7.metric("Flip", f"{lvls.get('Zero_Gamma_Flip', '–')}")
+    straddle_val = lvls.get("Straddle_Cost", 0)
+    c8.metric("Straddle", f"₹{straddle_val:.0f}" if straddle_val else "–")
 
     st.markdown(f"<div class='update-timestamp' style='margin-top:2px'>Updated {data['timestamp']}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
+    # ========== SUPERHUMAN DECISION ENGINE ==========
+    scores = compute_superhuman_scores(data, data.get("df_candles", pd.DataFrame()))
 
+    if "error" not in scores:
+        st.markdown("---")
+        st.markdown(
+            f"<div style='background:#1A1F2B;border:1px solid #2A2F3A;border-radius:8px;padding:10px 14px;margin-bottom:8px;'>"
+            f"<span style='font-weight:700;color:#00E676;font-size:14px;'>🧠 Superhuman Decision Engine</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        # Top-level bias
+        bias_col, score_col, action_col = st.columns([0.28, 0.18, 0.54])
+        with bias_col:
+            st.markdown(
+                f"<div style='font-size:15px;font-weight:700;color:{scores['colour']};'>"
+                f"{scores['bias']}</div>",
+                unsafe_allow_html=True
+            )
+        with score_col:
+            st.metric("Composite", f"{scores['composite']:+.0f}")
+        with action_col:
+            st.caption(scores["action"])
+
+        # Expandable details
+        with st.expander("▼ Score Breakdown & Details", expanded=False):
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Gamma Regime", f"{scores['gamma_regime_score']:+.0f}",
+                      help="Positive = Long Gamma (pinning). Negative = Short Gamma (acceleration)")
+            s2.metric("Expected vs Realised", f"{scores['move_score']:+.0f}",
+                      help="Positive = Straddle rich (sell premium). Negative = Straddle cheap")
+            s3.metric("Charm / Vanna Flow", f"{scores['flow_score']:+.0f}",
+                      help="Combined dealer re-hedging pressure from time & vol")
+            s4.metric("OR vs GEX Walls", f"{scores['or_score']:+.0f}",
+                      help="Opening Range interaction with gamma walls")
+
+            st.markdown("---")
+            st.markdown(
+                f"""
+                <div style='font-size:12px;line-height:1.7;color:#CCC;'>
+                <b>Expected Move</b>: {scores['expected_move_pct']:.2f}% &nbsp;|&nbsp;
+                <b>Realised Range so far</b>: {scores['realised_range_pct']:.2f}% &nbsp;|&nbsp;
+                <b>ATM Straddle</b>: ₹{scores['straddle']:.0f}<br>
+                <b>Net Δ-GEX</b>: ₹{scores['total_delta_gex_cr']:.1f} Cr<br>
+                <b>Opening Range</b>: {scores['or_low']:.0f} – {scores['or_high']:.0f} 
+                (if available)
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            st.markdown(
+                """
+                **Interpretation Guide**
+                - **PIN / MEAN-REVERSION** → Dealers are long gamma, walls are strong, straddle is rich → sell premium
+                - **ACCELERATION / BREAKOUT** → Short gamma + cheap options + OR break of walls → directional
+                - **CONTROLLED TREND** → Mild directional bias, prefer defined-risk structures
+                - **NEUTRAL / CHOP** → No clear edge, stay flat or very tight ranges
+                """
+            )
     # ========== UNDERLYING TECHNICALS – SPOT + FUTURES VWAP ==========
     df_full = data.get("df_candles", pd.DataFrame())
     df_fut  = data.get("df_futures", pd.DataFrame())
