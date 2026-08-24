@@ -2023,9 +2023,10 @@ def live_dashboard_fragment():
 
     st.markdown(f"<div class='update-timestamp' style='margin-top:2px'>Updated {data['timestamp']}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
-
-    # ========== UNDERLYING TECHNICALS – SPLIT VIEW ==========
+    # ========== UNDERLYING TECHNICALS – SPOT + FUTURES VWAP ==========
     df_full = data.get("df_candles", pd.DataFrame())
+    df_fut  = data.get("df_futures", pd.DataFrame())
+    basis   = data.get("basis_info", {})
 
     chart_head_col, tf_col = st.columns([0.75, 0.25])
     with chart_head_col:
@@ -2065,33 +2066,114 @@ def live_dashboard_fragment():
             unsafe_allow_html=True,
         )
 
+        # ---------- SPOT CHART (no VWAP – volume is invalid) ----------
         df_full["session_date"] = pd.to_datetime(df_full["time"]).dt.date
         last_3_dates = sorted(df_full["session_date"].unique())[-3:]
         df_chart = df_full[df_full["session_date"].isin(last_3_dates)].copy()
         df_chart["time_str"] = pd.to_datetime(df_chart["time"]).dt.strftime("%d-%b %H:%M")
 
-        min_p = min(df_chart["close"].min(), df_chart["vwap"].min(), df_chart["bb_lower"].min())
-        max_p = max(df_chart["close"].max(), df_chart["vwap"].max(), df_chart["bb_upper"].max())
+        min_p = min(df_chart["close"].min(), df_chart["bb_lower"].min())
+        max_p = max(df_chart["close"].max(), df_chart["bb_upper"].max())
         padding = (max_p - min_p) * 0.05
 
         tech_left, tech_right = st.columns([0.58, 0.42])
 
-        # LEFT – Price + BB + VWAP
         with tech_left:
+            st.caption("Spot Price + Bollinger (VWAP moved to Futures chart below)")
             fig_px = plt_go.Figure()
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot", line=dict(color="#00E676", width=2)))
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper", line=dict(color="rgba(33,150,243,0.5)", width=1)))
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_lower"], mode="lines", name="BB Lower", line=dict(color="rgba(33,150,243,0.5)", width=1), fill="tonexty", fillcolor="rgba(33,150,243,0.05)"))
-            fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["vwap"], mode="lines", name="VWAP", line=dict(color="#FF9800", width=1.5, dash="dot")))
             fig_px.update_layout(
                 template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=340, margin=dict(l=10, r=10, t=28, b=10),
+                height=320, margin=dict(l=10, r=10, t=20, b=10),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
                 hovermode="x unified", yaxis=dict(range=[min_p - padding, max_p + padding], tickformat="d"),
                 xaxis=dict(type="category", nticks=8),
             )
             st.plotly_chart(fig_px, use_container_width=True)
 
+        with tech_right:
+            fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.55, 0.45])
+            colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
+            fig_ind.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="Hist", marker_color=colors_macd, showlegend=False), row=1, col=1)
+            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD [{macd_val:.1f}]", line=dict(color="#2196F3", width=1.3)), row=1, col=1)
+            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Sig [{macd_sig:.1f}]", line=dict(color="#FF9800", width=1.3)), row=1, col=1)
+            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name=f"RSI [{rsi_val:.0f}]", line=dict(color="#E040FB", width=1.3)), row=2, col=1)
+            fig_ind.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=2, col=1)
+            fig_ind.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=2, col=1)
+            fig_ind.update_layout(
+                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                height=320, margin=dict(l=10, r=10, t=20, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
+                hovermode="x unified",
+            )
+            fig_ind.update_xaxes(type="category", nticks=6)
+            st.plotly_chart(fig_ind, use_container_width=True)
+
+        # ---------- FUTURES CHART + REAL VWAP ----------
+        st.markdown("---")
+        fut_header_col, basis_col = st.columns([0.70, 0.30])
+        with fut_header_col:
+            st.markdown(
+                f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
+                f"📉 Near-Month Futures + Real VWAP ({basis.get('fut_expiry', 'N/A')})</span>",
+                unsafe_allow_html=True
+            )
+        with basis_col:
+            if basis.get("basis") is not None:
+                basis_color = "#00E676" if basis["basis"] >= 0 else "#FF5252"
+                st.markdown(
+                    f"<div style='text-align:right;font-size:13px;'>"
+                    f"Basis: <span style='color:{basis_color};font-weight:700;'>"
+                    f"{basis['basis']:+.1f}</span> pts</div>",
+                    unsafe_allow_html=True
+                )
+
+        if not df_fut.empty and len(df_fut) >= 5:
+            df_fut["session_date"] = pd.to_datetime(df_fut["time"]).dt.date
+            last_3_fut = sorted(df_fut["session_date"].unique())[-3:]
+            df_fchart = df_fut[df_fut["session_date"].isin(last_3_fut)].copy()
+            df_fchart["time_str"] = pd.to_datetime(df_fchart["time"]).dt.strftime("%d-%b %H:%M")
+
+            # Latest VWAP value for caption
+            latest_vwap = df_fchart["vwap"].iloc[-1] if "vwap" in df_fchart.columns else None
+            latest_fut  = df_fchart["close"].iloc[-1]
+
+            fmin = min(df_fchart["close"].min(), df_fchart["vwap"].min())
+            fmax = max(df_fchart["close"].max(), df_fchart["vwap"].max())
+            fpad = (fmax - fmin) * 0.05
+
+            fig_fut = plt_go.Figure()
+            fig_fut.add_trace(plt_go.Scatter(
+                x=df_fchart["time_str"], y=df_fchart["close"],
+                mode="lines", name="Futures", line=dict(color="#2196F3", width=2)
+            ))
+            fig_fut.add_trace(plt_go.Scatter(
+                x=df_fchart["time_str"], y=df_fchart["vwap"],
+                mode="lines", name="Futures VWAP (real vol)",
+                line=dict(color="#FF9800", width=2, dash="dot")
+            ))
+            fig_fut.update_layout(
+                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                height=340, margin=dict(l=10, r=10, t=30, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
+                hovermode="x unified",
+                yaxis=dict(range=[fmin - fpad, fmax + fpad], tickformat="d"),
+                xaxis=dict(type="category", nticks=8),
+                title=dict(
+                    text=f"Futures: {latest_fut:,.1f}  |  VWAP: {latest_vwap:,.1f}" if latest_vwap else "",
+                    x=0.01, font=dict(size=12)
+                )
+            )
+            st.plotly_chart(fig_fut, use_container_width=True)
+
+            st.caption(
+                "Orange dotted line = true Volume-Weighted Average Price calculated on **near-month futures volume**. "
+                "This is the institutional benchmark. Spot chart above has no valid volume, so VWAP is shown only here."
+            )
+        else:
+            st.info("Futures candles / VWAP not available yet. Click Fetch or wait for next refresh.")
         # RIGHT – MACD + RSI stacked
         with tech_right:
             fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.55, 0.45])
