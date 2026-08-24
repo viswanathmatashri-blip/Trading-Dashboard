@@ -2202,7 +2202,7 @@ def live_dashboard_fragment():
     data = st.session_state["data_store"]
     lvls = data.get("levels", {})
 
-       # ========== STICKY COMPACT MARKET SUMMARY (cleaned) ==========
+    # ========== STICKY COMPACT MARKET SUMMARY (cleaned) ==========
     st.markdown("<div class='sticky-summary'>", unsafe_allow_html=True)
     head_l, head_r = st.columns([0.72, 0.28])
     with head_l:
@@ -2215,7 +2215,7 @@ def live_dashboard_fragment():
             st.session_state["enable_main_refresh"] = cb_main
             st.rerun()
 
-    # Core metrics only (removed R1/R2/S1/S2/GEX Sup/Res/Accel – visible on charts)
+    # Core metrics only
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Spot (Fut)", f"{data['spot_price']:.0f} ({data['F']:.0f})")
     c2.metric("Max Pain", f"{data['max_pain_strike']}")
@@ -2226,8 +2226,10 @@ def live_dashboard_fragment():
     c7.metric("Flip", f"{lvls.get('Zero_Gamma_Flip', '–')}")
     straddle_val = lvls.get("Straddle_Cost", 0)
     c8.metric("Straddle", f"₹{straddle_val:.0f}" if straddle_val else "–")
+
     st.markdown(f"<div class='update-timestamp' style='margin-top:2px'>Updated {data['timestamp']}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
+
     # ========== SUPERHUMAN DECISION ENGINE ==========
     scores = compute_superhuman_scores(data, data.get("df_candles", pd.DataFrame()))
 
@@ -2240,7 +2242,6 @@ def live_dashboard_fragment():
             unsafe_allow_html=True
         )
 
-        # Top-level bias
         bias_col, score_col, action_col = st.columns([0.28, 0.18, 0.54])
         with bias_col:
             st.markdown(
@@ -2253,58 +2254,51 @@ def live_dashboard_fragment():
         with action_col:
             st.caption(scores["action"])
 
-        # Expandable details
-with st.expander("▼ Score Breakdown & Details", expanded=False):
-    s1, s2, s3, s4 = st.columns(4)
+        with st.expander("▼ Score Breakdown & Details", expanded=False):
+            s1, s2, s3, s4 = st.columns(4)
 
-    with s1:
-        st.metric("Gamma Regime", f"{scores['gamma_regime_score']:+.0f}")
-        st.caption("Range: −100 → +100")
-        st.caption("＋ = Long Gamma → **Non-directional**")
-        st.caption("− = Short Gamma → **Directional**")
+            with s1:
+                st.metric("Gamma Regime", f"{scores['gamma_regime_score']:+.0f}")
+                st.caption("Range: −100 → +100")
+                st.caption("＋ = Long Gamma → **Non-directional**")
+                st.caption("− = Short Gamma → **Directional**")
 
-    with s2:
-        st.metric("Expected vs Realised", f"{scores['move_score']:+.0f}")
-        st.caption("Range: −100 → +100")
-        st.caption("＋ = Straddle rich / quiet day → **Non-directional**")
-        st.caption("− = Straddle cheap / big move → **Directional**")
+            with s2:
+                st.metric("Expected vs Realised", f"{scores['move_score']:+.0f}")
+                st.caption("Range: −100 → +100")
+                st.caption("＋ = Straddle rich / quiet → **Non-directional**")
+                st.caption("− = Straddle cheap / big move → **Directional**")
 
-    with s3:
-        st.metric("Charm / Vanna Flow", f"{scores['flow_score']:+.0f}")
-        st.caption("Range: −100 → +100")
-        st.caption("＋ = Flow supports pinning → **Non-directional**")
-        st.caption("− = Flow supports acceleration → **Directional**")
+            with s3:
+                st.metric("Charm / Vanna Flow", f"{scores['flow_score']:+.0f}")
+                st.caption("Range: −100 → +100")
+                st.caption("＋ = Supports pinning → **Non-directional**")
+                st.caption("− = Supports acceleration → **Directional**")
 
-    with s4:
-        st.metric("OR vs GEX Walls", f"{scores['or_score']:+.0f}")
-        st.caption("Range: −100 → +100")
-        st.caption("＋ = Range inside walls → **Non-directional**")
-        st.caption("− = Break of walls → **Directional**")
+            with s4:
+                st.metric("OR vs GEX Walls", f"{scores['or_score']:+.0f}")
+                st.caption("Range: −100 → +100")
+                st.caption("＋ = Range inside walls → **Non-directional**")
+                st.caption("− = Break of walls → **Directional**")
 
-    st.markdown("---")
-    st.markdown(
-        f"""
-        <div style='font-size:12px;line-height:1.7;color:#CCC;'>
-        <b>Context</b>: {scores.get('move_context', '')}<br>
-        <b>Expected Move</b>: {scores['expected_move_pct']:.2f}% &nbsp;|&nbsp;
-        <b>Realised Range</b>: {scores['realised_range_pct']:.2f}% &nbsp;|&nbsp;
-        <b>ATM Straddle</b>: ₹{scores['straddle']:.0f}<br>
-        <b>Net Δ-GEX</b>: ₹{scores['total_delta_gex_cr']:.1f} Cr<br>
-        <b>Opening Range (latest session)</b>: 
-        {f"{scores['or_low']:.0f} – {scores['or_high']:.0f}" if scores.get('or_low') else "N/A"}
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        """
-        **Interpretation Guide**
-        - **PIN / MEAN-REVERSION** → Dealers are long gamma, walls are strong, straddle is rich → sell premium
-        - **ACCELERATION / BREAKOUT** → Short gamma + cheap options + OR break of walls → directional
-        - **CONTROLLED TREND** → Mild directional bias, prefer defined-risk structures
-        - **NEUTRAL / CHOP** → No clear edge, stay flat or very tight ranges
-        """
-    )
+            st.markdown("---")
+            st.markdown(
+                f"""
+                <div style='font-size:12px;line-height:1.7;color:#CCC;'>
+                <b>Context</b>: {scores.get('move_context', '')}<br>
+                <b>Expected Move</b>: {scores['expected_move_pct']:.2f}% &nbsp;|&nbsp;
+                <b>Realised Range</b>: {scores['realised_range_pct']:.2f}% &nbsp;|&nbsp;
+                <b>ATM Straddle</b>: ₹{scores['straddle']:.0f}<br>
+                <b>Net Δ-GEX</b>: ₹{scores['total_delta_gex_cr']:.1f} Cr<br>
+                <b>Opening Range (latest session)</b>: 
+                {f"{scores['or_low']:.0f} – {scores['or_high']:.0f}" if scores.get('or_low') is not None else "N/A"}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    else:
+        st.warning("Could not compute Superhuman scores – insufficient data.")
+
     # ========== UNDERLYING TECHNICALS – SPOT + FUTURES VWAP ==========
     df_full = data.get("df_candles", pd.DataFrame())
     df_fut  = data.get("df_futures", pd.DataFrame())
@@ -2348,7 +2342,7 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
             unsafe_allow_html=True,
         )
 
-        # ---------- SPOT CHART (no VWAP – volume is invalid on index) ----------
+        # Spot chart (no VWAP)
         df_full["session_date"] = pd.to_datetime(df_full["time"]).dt.date
         last_3_dates = sorted(df_full["session_date"].unique())[-3:]
         df_chart = df_full[df_full["session_date"].isin(last_3_dates)].copy()
@@ -2413,7 +2407,6 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
                     unsafe_allow_html=True
                 )
 
-        # Fallback / market-closed banner
         fut_msg = data.get("fut_fallback_msg", "")
         if data.get("fut_is_fallback") or "closed" in str(fut_msg).lower():
             st.warning(fut_msg)
@@ -2460,12 +2453,12 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
 
             st.caption(
                 "Orange dotted line = true Volume-Weighted Average Price calculated on **near-month futures volume**. "
-                "This is the institutional benchmark. Spot chart above has no valid volume, so VWAP is shown only here."
+                "This is the institutional benchmark."
             )
         else:
             st.info("Futures candles / VWAP not available. " + (str(fut_msg) if fut_msg else "Click Fetch or wait for next refresh."))
 
-    # --- GEX CHARTS (Key Levels already in sticky Market Summary) ---
+    # --- GEX CHARTS ---
     st.markdown("---")
     df_chain = pd.DataFrame(data.get("chain_results") or [])
 
@@ -2487,15 +2480,15 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
             range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
             return range1, range2
 
-        # 1+2. GEX-OI (left) & GEX-Volume (right) – split view
+        # GEX vs OI + GEX vs Volume
         gex_l, gex_r = st.columns(2)
         with gex_l:
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📈 GEX vs OI</span>", unsafe_allow_html=True)
             gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
             fig_oi = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_OI"], name="Net GEX", marker_color=gex_oi_colors, opacity=0.85, width=25, hovertemplate="Strike: %{x}<br>Net GEX: ₹%{y:,.0f}<extra></extra>"), secondary_y=True)
-            fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_OI"], name="Call OI", marker_color="#2E7D32", opacity=0.55, hovertemplate="Call OI: %{y:,}<extra></extra>"), secondary_y=False)
-            fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_OI"], name="Put OI", marker_color="#C62828", opacity=0.55, hovertemplate="Put OI: %{customdata:,}<extra></extra>", customdata=df_chain["P_OI"]), secondary_y=False)
+            fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_OI"], name="Net GEX", marker_color=gex_oi_colors, opacity=0.85, width=25), secondary_y=True)
+            fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_OI"], name="Call OI", marker_color="#2E7D32", opacity=0.55), secondary_y=False)
+            fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_OI"], name="Put OI", marker_color="#C62828", opacity=0.55), secondary_y=False)
             fig_oi.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
             fig_oi.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
             fig_oi.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
@@ -2510,9 +2503,9 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📊 GEX vs Volume</span>", unsafe_allow_html=True)
             gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
             fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net GEX", marker_color=gex_vol_colors, opacity=0.85, width=25, hovertemplate="Net GEX: ₹%{y:,.0f}<extra></extra>"), secondary_y=True)
-            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_Vol"], name="Call Vol", marker_color="#81C784", opacity=0.55, hovertemplate="Call Vol: %{y:,}<extra></extra>"), secondary_y=False)
-            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_Vol"], name="Put Vol", marker_color="#FF8A80", opacity=0.55, hovertemplate="Put Vol: %{customdata:,}<extra></extra>", customdata=df_chain["P_Vol"]), secondary_y=False)
+            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net GEX", marker_color=gex_vol_colors, opacity=0.85, width=25), secondary_y=True)
+            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_Vol"], name="Call Vol", marker_color="#81C784", opacity=0.55), secondary_y=False)
+            fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_Vol"], name="Put Vol", marker_color="#FF8A80", opacity=0.55), secondary_y=False)
             fig_vol.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
             fig_vol.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
             fig_vol.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
@@ -2523,7 +2516,7 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
             fig_vol.update_yaxes(range=v2_range, secondary_y=True, showgrid=False)
             st.plotly_chart(fig_vol, use_container_width=True)
 
-        # 3. Delta-GEX (40%) + Heatmap (60%)
+        # Delta-GEX + Heatmap
         st.markdown("---")
         d_left, d_right = st.columns([0.40, 0.60])
         with d_left:
@@ -2533,7 +2526,6 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
             fig_delta_gex.add_trace(plt_go.Bar(
                 x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], name="Δ-GEX",
                 marker_color=delta_gex_colors, opacity=0.85, width=25,
-                hovertemplate="Strike: %{x}<br>Δ-GEX: ₹%{y:,.0f}<extra></extra>",
             ))
             fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
             fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
@@ -2553,19 +2545,17 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
                 st.session_state.get("heatmap_timeframe", "5 min"),
             )
 
-        # Full-width alert ribbon + basket metrics (left of Z-Scores)
         render_live_alert_ribbon(data)
-        # Full-width legs table + historical analytics
         render_basket_table_fullwidth(data)
 
-        # 4. VEX/CEX (60%) + Skew (40%) prepared below – VEX chart first
+        # VEX/CEX + Skew
         st.markdown("---")
         vex_col, skew_col = st.columns([0.60, 0.40])
         with vex_col:
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>⚡ VEX / CEX Profile</span>", unsafe_allow_html=True)
             fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20, hovertemplate="VEX: ₹%{y:,.2f}<extra></extra>"), secondary_y=False)
-            fig_vex_cex.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4), hovertemplate="CEX: ₹%{y:,.2f}<extra></extra>"), secondary_y=True)
+            fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20), secondary_y=False)
+            fig_vex_cex.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4)), secondary_y=True)
             fig_vex_cex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
             fig_vex_cex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
             vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].clip(lower=0), df_chain["VEX"].clip(upper=0), df_chain["CEX"].clip(lower=0), df_chain["CEX"].clip(upper=0))
@@ -2588,31 +2578,14 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
                     tab1, tab2 = st.tabs(["OTM Skew (Puts & Calls)", "Both Raw Curves (CE vs PE)"])
                     with tab1:
                         df_skew = get_clean_otm_skew(df_chain_iv, latest_spot)
-                        fig_skew = px.line(
-                            df_skew, x="Strike", y="IV_%", markers=True,
-                            color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"],
-                        )
+                        fig_skew = px.line(df_skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"])
                         fig_skew.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
-                        fig_skew.update_layout(
-                            template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                            height=360, margin=dict(l=10, r=10, t=20, b=10), showlegend=False,
-                        )
-                        fig_skew.update_xaxes(title="")
-                        fig_skew.update_yaxes(title="IV %")
+                        fig_skew.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
                         st.plotly_chart(fig_skew, use_container_width=True)
                     with tab2:
-                        fig_raw = px.line(
-                            df_chain_iv, x="Strike", y="IV_%", color="Option_Type", markers=True,
-                            color_discrete_map={"CE": "#00cc96", "PE": "#ff4136"}, hover_data=["LTP"],
-                        )
+                        fig_raw = px.line(df_chain_iv, x="Strike", y="IV_%", color="Option_Type", markers=True, color_discrete_map={"CE": "#00cc96", "PE": "#ff4136"}, hover_data=["LTP"])
                         fig_raw.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
-                        fig_raw.update_layout(
-                            template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                            height=360, margin=dict(l=10, r=10, t=20, b=10),
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
-                        )
-                        fig_raw.update_xaxes(title="")
-                        fig_raw.update_yaxes(title="IV %")
+                        fig_raw.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
                         st.plotly_chart(fig_raw, use_container_width=True)
                 else:
                     st.info("Skew data unavailable.")
@@ -2620,7 +2593,6 @@ with st.expander("▼ Score Breakdown & Details", expanded=False):
                 st.info("API session needed for skew.")
     elif not df_chain.empty:
         st.info("Key levels not available – GEX charts skipped.")
-
 live_dashboard_fragment()
 
 # --- Full-width: Institutional Order Flow, then Raw Z-Score details ---
