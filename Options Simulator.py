@@ -529,20 +529,15 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
         "Target_Down": target_downside,
         "Straddle_Cost": round(atm_straddle_cost, 2)
     }
-# ============================================================
-# SUPERHUMAN DECISION ENGINE – SCORING FUNCTIONS
-# ============================================================
 def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     """
     Superhuman Decision Engine scoring module.
     All individual scores and the composite are in range [-100, +100].
-
-    Positive composite → PIN / MEAN-REVERSION (prefer non-directional premium selling)
-    Negative composite → ACCELERATION / BREAKOUT (prefer directional)
     """
     import datetime
     import numpy as np
     import pytz
+    import pandas as pd
 
     levels = data.get("levels", {}) or {}
     chain  = data.get("chain_results", []) or []
@@ -562,10 +557,9 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     is_market_hours = is_weekday and (market_open <= now <= market_close)
 
     # ------------------------------------------------------------------
-    # A. Gamma Regime Score  (−100 = strong short-gamma, +100 = strong long-gamma)
+    # A. Gamma Regime Score
     # ------------------------------------------------------------------
     total_delta_gex_cr = float(data.get("total_net_gex_oi", 0) or 0) / 1e7
-    # Soft normalisation so extreme days still stay inside [-100, 100]
     gamma_regime_score = float(np.clip(
         total_delta_gex_cr / max(abs(total_delta_gex_cr), 1.8) * 58, -100, 100
     ))
@@ -578,19 +572,26 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
 
     realised_range_pct = 0.0
     day_high = day_low = day_open = None
-    if df_candles is not None and not df_candles.empty and len(df_candles) > 3:
-        try:
-            day_high = float(df_candles["high"].max())
-            day_low  = float(df_candles["low"].min())
-            day_open = float(df_candles["open"].iloc[0])
-            if day_open > 0:
-                realised_range_pct = (day_high - day_low) / day_open * 100.0
-        except Exception:
-            realised_range_pct = 0.0
+
+    # Keep only the latest session for realised range & opening range
+    df_session = pd.DataFrame()
+    if df_candles is not None and not df_candles.empty:
+        df_tmp = df_candles.copy()
+        df_tmp["time"] = pd.to_datetime(df_tmp["time"])
+        latest_date = df_tmp["time"].dt.date.max()
+        df_session = df_tmp[df_tmp["time"].dt.date == latest_date].sort_values("time").reset_index(drop=True)
+
+        if not df_session.empty:
+            try:
+                day_high = float(df_session["high"].max())
+                day_low  = float(df_session["low"].min())
+                day_open = float(df_session["open"].iloc[0])
+                if day_open > 0:
+                    realised_range_pct = (day_high - day_low) / day_open * 100.0
+            except Exception:
+                pass
 
     if is_market_hours:
-        # Live session: compare remaining expected move vs realised so far
-        # Positive score = straddle still rich relative to what has already happened
         if expected_move_pct > 0.12:
             move_score = float(np.clip(
                 (expected_move_pct - realised_range_pct * 1.20) / expected_move_pct * 85,
@@ -600,10 +601,6 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
             move_score = 0.0
         move_context = "Live session (Expected vs Realised-so-far)"
     else:
-        # Market closed / weekend / holiday
-        # Full day has already played out.
-        # Positive score = day was MORE volatile than the straddle priced
-        # (directional moves were rewarded). Negative = day was quieter than priced.
         if expected_move_pct > 0.10:
             move_score = float(np.clip(
                 (realised_range_pct - expected_move_pct * 1.15) / max(expected_move_pct, 0.15) * 70,
@@ -624,37 +621,36 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     flow_score = float(np.clip(vanna_component + charm_component, -100, 100))
 
     # ------------------------------------------------------------------
-    # D. Opening Range vs GEX Walls
+    # D. Opening Range vs GEX Walls  (FIXED – latest session only)
     # ------------------------------------------------------------------
     or_score = 0.0
     or_high = or_low = None
     gex_sup = float(levels.get("GEX_Support") or spot)
     gex_res = float(levels.get("GEX_Resistance") or spot)
 
-    if df_candles is not None and not df_candles.empty and len(df_candles) >= 6:
+    if not df_session.empty and len(df_session) >= 5:
         try:
-            # First ~30-45 minutes (first 6-9 bars depending on timeframe)
-            n_or = min(9, max(6, len(df_candles) // 8))
-            or_bars = df_candles.head(n_or)
+            # First 30-45 minutes of the LATEST session
+            n_or = min(9, max(5, len(df_session) // 6))
+            or_bars = df_session.head(n_or)
             or_high = float(or_bars["high"].max())
             or_low  = float(or_bars["low"].min())
 
             if spot > or_high and spot > gex_res:
-                or_score = 72.0          # Clean breakout above wall
+                or_score = 72.0
             elif spot < or_low and spot < gex_sup:
-                or_score = -72.0         # Clean breakdown below wall
-            elif (or_high is not None and or_low is not None and
-                  or_high < gex_res and or_low > gex_sup):
-                or_score = 48.0          # Opening range contained inside walls
+                or_score = -72.0
+            elif or_high < gex_res and or_low > gex_sup:
+                or_score = 48.0
             elif spot > gex_res or spot < gex_sup:
-                or_score = -28.0         # Already outside major walls
+                or_score = -28.0
             else:
                 or_score = 8.0
         except Exception:
             or_score = 0.0
 
     # ------------------------------------------------------------------
-    # E. Composite Score & Final Bias
+    # E. Composite & Final Bias
     # ------------------------------------------------------------------
     composite = (
         0.30 * gamma_regime_score +
@@ -682,30 +678,25 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         colour = "#2196F3"
 
     return {
-        # Core scores
         "gamma_regime_score": round(gamma_regime_score, 1),
         "move_score":         round(move_score, 1),
         "flow_score":         round(flow_score, 1),
         "or_score":           round(or_score, 1),
         "composite":          round(composite, 1),
-
-        # Decision
         "bias":   bias,
         "action": action,
         "colour": colour,
-
-        # Context / debug
-        "is_market_hours":     is_market_hours,
-        "move_context":        move_context,
-        "expected_move_pct":   round(expected_move_pct, 2),
-        "realised_range_pct":  round(realised_range_pct, 2),
-        "straddle":            round(straddle, 1),
-        "total_delta_gex_cr":  round(total_delta_gex_cr, 1),
-        "or_high":             or_high,
-        "or_low":              or_low,
-        "gex_support":         gex_sup,
-        "gex_resistance":      gex_res,
-        "timestamp_ist":       now.strftime("%d-%b-%Y %H:%M:%S IST"),
+        "is_market_hours":    is_market_hours,
+        "move_context":       move_context,
+        "expected_move_pct":  round(expected_move_pct, 2),
+        "realised_range_pct": round(realised_range_pct, 2),
+        "straddle":           round(straddle, 1),
+        "total_delta_gex_cr": round(total_delta_gex_cr, 1),
+        "or_high":            or_high,
+        "or_low":             or_low,
+        "gex_support":        gex_sup,
+        "gex_resistance":     gex_res,
+        "timestamp_ist":      now.strftime("%d-%b-%Y %H:%M:%S IST"),
     }
 # --- TECHNICAL INDICATOR ENGINE ---
 def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
