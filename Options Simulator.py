@@ -2226,7 +2226,6 @@ def live_dashboard_fragment():
     c7.metric("Flip", f"{lvls.get('Zero_Gamma_Flip', '–')}")
     straddle_val = lvls.get("Straddle_Cost", 0)
     c8.metric("Straddle", f"₹{straddle_val:.0f}" if straddle_val else "–")
-
     st.markdown(f"<div class='update-timestamp' style='margin-top:2px'>Updated {data['timestamp']}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
     # ========== SUPERHUMAN DECISION ENGINE ==========
