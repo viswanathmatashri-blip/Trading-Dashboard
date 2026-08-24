@@ -627,7 +627,80 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
                 return compute_technical_indicators(df_candles), offset > 0
 
     return pd.DataFrame(), False
+def get_near_month_futures_token(df_scrip_master, index_name, fut_exch):
+    """Return token of the nearest active futures contract."""
+    try:
+        ist_now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+        fut_scrips = df_scrip_master[
+            (df_scrip_master["exch_seg"] == fut_exch) &
+            (df_scrip_master["name"] == index_name) &
+            (df_scrip_master["instrumenttype"].isin(["FUTIDX", "FUTSTK"]))
+        ].copy()
+        fut_scrips["expiry_dt"] = pd.to_datetime(fut_scrips["expiry"], format="%d%b%Y", errors="coerce")
+        active = fut_scrips[fut_scrips["expiry_dt"].dt.date >= ist_now.date()].sort_values("expiry_dt")
+        if not active.empty:
+            return str(active.iloc[0]["token"]), active.iloc[0]["expiry"]
+    except Exception:
+        pass
+    return None, None
 
+
+def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15):
+    """
+    Fetch near-month futures candles and compute proper VWAP (real volume).
+    Returns (df_futures_with_indicators, is_holiday_fallback, basis_info)
+    """
+    spot_token, spot_exch, fut_exch = INDEX_TOKEN_MAP.get(index_name, ("99926000", "NSE", "NFO"))
+    fut_token, fut_expiry = get_near_month_futures_token(df_scrip_master, index_name, fut_exch)
+
+    if not fut_token:
+        return pd.DataFrame(), False, {}
+
+    ist_tz = pytz.timezone("Asia/Kolkata")
+    now_dt = datetime.datetime.now(ist_tz)
+
+    for offset in range(0, 10):
+        target_to = now_dt - datetime.timedelta(days=offset)
+        target_from = target_to - datetime.timedelta(days=lookback_days)
+
+        candle_param = {
+            "exchange": fut_exch,
+            "symboltoken": fut_token,
+            "interval": api_interval,
+            "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
+            "todate": target_to.strftime("%Y-%m-%d 15:30")
+        }
+
+        candle_res = safe_api_call(smart_api.getCandleData, candle_param)
+        time.sleep(0.40)
+
+        if candle_res and candle_res.get("status") and candle_res.get("data"):
+            df = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+            df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+
+            if df.empty:
+                continue
+
+            # Compute indicators (VWAP will now be correct because volume is real)
+            df = compute_technical_indicators(df)
+
+            # Also fetch latest spot for basis
+            spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=index_name, symboltoken=spot_token)
+            time.sleep(0.30)
+            spot_ltp = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") else None
+            fut_ltp = float(df["close"].iloc[-1]) if not df.empty else None
+
+            basis_info = {
+                "fut_token": fut_token,
+                "fut_expiry": str(fut_expiry) if fut_expiry is not None else "N/A",
+                "spot_ltp": spot_ltp,
+                "fut_ltp": fut_ltp,
+                "basis": round(fut_ltp - spot_ltp, 2) if (spot_ltp and fut_ltp) else None
+            }
+
+            return df, offset > 0, basis_info
+
+    return pd.DataFrame(), False, {}
 # --- METHOD 1: FUTURES VOLUME & PROXY Z-SCORE COMPUTATION ---
 def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, progress_container=None):
     try:
