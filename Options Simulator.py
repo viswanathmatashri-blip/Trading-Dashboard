@@ -2895,6 +2895,14 @@ def live_dashboard_fragment():
             )
         else:
             st.info("Futures candles / VWAP not available. " + (str(fut_msg) if fut_msg else "Click Fetch or wait for next refresh."))
+
+        # ---------- FUTURES CVD (directly under Futures VWAP chart) ----------
+        st.markdown("---")
+        render_futures_cvd_chart(data)
+
+    # --- GEX CHARTS ---
+    st.markdown("---")
+    df_chain = pd.DataFrame(data.get("chain_results") or [])
     # --- GEX CHARTS ---
     st.markdown("---")
     df_chain = pd.DataFrame(data.get("chain_results") or [])
@@ -2982,9 +2990,7 @@ def live_dashboard_fragment():
                 st.session_state.get("heatmap_timeframe", "5 min"),
             )
 
-        # CVD chart (futures volume proxy)
-        st.markdown("---")
-        render_futures_cvd_chart(data)
+     
 
         render_live_alert_ribbon(data)
         render_basket_table_fullwidth(data)
