@@ -1725,7 +1725,7 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
             if (now_ist - last_ts).total_seconds() >= 240:
                 should_append = True
 
-       should_append = False
+    should_append = False
     if is_market_hours:
         if not gex_hist:
             should_append = True
