@@ -1770,15 +1770,8 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
     is_market_hours = (now_ist.weekday() < 5) and (market_open <= now_ist <= market_close)
 
-    should_append = False
-    if is_market_hours:
-        if not gex_hist:
-            should_append = True
-        else:
-            last_ts = gex_hist[-1]["ts"]
-            # Append roughly every 4–5 minutes for a 5-min heatmap
-            if (now_ist - last_ts).total_seconds() >= 240:
-                should_append = True
+    # Always define cutoff so it is in scope
+    cutoff = now_ist - datetime.timedelta(hours=8)
 
     should_append = False
     if is_market_hours:
@@ -1786,12 +1779,17 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
             should_append = True
         else:
             last_ts = gex_hist[-1]["ts"]
-            if (now_ist - last_ts).total_seconds() >= 150:   # every ~2.5 min
+            if (now_ist - last_ts).total_seconds() >= 150:
                 should_append = True
     else:
-        # Outside market hours still keep at least one snapshot so the chart is never blank
         if not gex_hist:
             should_append = True
+
+    if should_append:
+        gex_hist.append({"ts": now_ist, "strikes": list(strikes), "gex_cr": list(gex_cr)})
+        gex_hist = [h for h in gex_hist if h["ts"] >= cutoff]
+        _save_gex_history(gex_hist, index_name, expiry_str)
+
         alert_hist.append({
             "ts": now_ist,
             "spot": spot,
@@ -1805,9 +1803,8 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         alert_hist = [h for h in alert_hist if h["ts"] >= cutoff]
         st.session_state["alert_metrics_history"] = alert_hist
 
-    # Also keep a copy in session_state for the rest of the app
+    # Always keep a clean copy in session_state
     st.session_state["gex_heatmap_history"] = gex_hist
-
     # ---- session candles ----
     heatmap_tf_label = heatmap_tf_label or st.session_state.get("heatmap_timeframe", "5 min")
     chart_tf = st.session_state.get("selected_timeframe", "5 min")
