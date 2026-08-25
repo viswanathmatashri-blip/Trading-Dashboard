@@ -2363,8 +2363,9 @@ def render_basket_table_fullwidth(data: dict):
 
 def render_futures_cvd_chart(data: dict):
     """Cumulative Volume Delta proxy from near-month futures candles.
-    SmartAPI does not provide buy/sell volume for index futures, so we use a
-    standard directional proxy: +volume when close >= open (up bar), -volume otherwise.
+    Uses volume-location formula (not true buy/sell prints):
+        delta = volume * ((close - low) / (high - low) * 2 - 1)
+    SmartAPI does not provide aggressor-side volume for index futures.
     """
     df_fut = data.get("df_futures", pd.DataFrame())
     if df_fut is None or df_fut.empty or len(df_fut) < 5:
@@ -2374,15 +2375,18 @@ def render_futures_cvd_chart(data: dict):
     df = df_fut.copy()
     df["time"] = pd.to_datetime(df["time"])
     df["session_date"] = df["time"].dt.date
-    # Latest session only for a clean CVD
     latest = sorted(df["session_date"].unique())[-1]
     df = df[df["session_date"] == latest].sort_values("time").reset_index(drop=True)
     if df.empty or "volume" not in df.columns:
         st.info("No volume on futures candles for CVD.")
         return
 
-    # Directional volume proxy
-    df["signed_vol"] = np.where(df["close"] >= df["open"], df["volume"], -df["volume"])
+    # ----- Method 1: Volume-location formula -----
+    hl = (df["high"] - df["low"]).replace(0, np.nan)
+    loc = ((df["close"] - df["low"]) / hl * 2.0 - 1.0).fillna(0.0)
+    # Clamp to [-1, +1] for safety
+    loc = loc.clip(-1.0, 1.0)
+    df["signed_vol"] = df["volume"] * loc
     df["cvd"] = df["signed_vol"].cumsum()
     df["time_str"] = df["time"].dt.strftime("%H:%M")
 
@@ -2391,14 +2395,13 @@ def render_futures_cvd_chart(data: dict):
 
     st.markdown(
         f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
-        f"📉 Futures CVD (proxy) — latest session {latest}</span>",
+        f"📉 Futures CVD (volume-location proxy) — {latest}</span>",
         unsafe_allow_html=True
     )
     st.caption(
-        "Cumulative Volume Delta from near-month futures. "
-        "SmartAPI does not supply buy/sell side volume for index futures, "
-        "so each bar’s volume is signed + if close≥open, − otherwise. "
-        "This is a widely used institutional proxy."
+        "CVD = cumulative [volume × ((close−low)/(high−low)×2 − 1)]. "
+        "Close at high → full +volume; close at low → full −volume; mid-range → near 0. "
+        "Proxy only — SmartAPI does not supply buy/sell side volume for index futures."
     )
 
     fig = plt_go.Figure()
@@ -2420,7 +2423,6 @@ def render_futures_cvd_chart(data: dict):
         hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True)
-
 
 def render_live_alert_ribbon(data: dict = None):
     """Compact layout: left = Basket Greeks | right = Z-Scores. (Live alerts removed)"""
