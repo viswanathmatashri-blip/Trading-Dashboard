@@ -776,7 +776,7 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         "quiet_range":        quiet_range,
         "timestamp_ist":      now.strftime("%d-%b-%Y %H:%M:%S IST"),
     }
-    }# --- TECHNICAL INDICATOR ENGINE ---
+    # --- TECHNICAL INDICATOR ENGINE ---
 def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
     df = df_candles.copy()
     if df.empty or len(df) < 20:
