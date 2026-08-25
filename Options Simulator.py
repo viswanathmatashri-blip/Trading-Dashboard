@@ -532,7 +532,8 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
 def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     """
     Superhuman Decision Engine – v2
-    Incorporates DTE, time-of-day, Flip distance, softened flow, and clean realised range.
+    Clear labels: QUIET PIN / GAMMA REVERSION / TREND-BREAKOUT / MILD DIRECTIONAL / NO EDGE
+    Incorporates DTE, time-of-day, Flip distance, softened flow, clean realised range.
     """
     import datetime
     import numpy as np
@@ -556,37 +557,30 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     is_weekday = now.weekday() < 5
     is_market_hours = is_weekday and (market_open <= now <= market_close)
 
-    # DTE from levels or approximate from expiry if available
-    # We try to read it from the data; fallback to 3 (typical weekly)
     dte = 3.0
     try:
-        # Many versions store T (year fraction) in data
         T = float(data.get("T", 0) or 0)
         if T > 0:
             dte = max(T * 365.0, 0.05)
     except Exception:
         pass
-    dte = max(min(dte, 30.0), 0.05)          # clamp
+    dte = max(min(dte, 30.0), 0.05)
 
-    # Time-of-day factor (1.0 at open → 0.25 after 14:00)
     minutes_since_open = max((now - market_open).total_seconds() / 60.0, 0)
     tod_factor = 1.0
     if is_market_hours:
-        if minutes_since_open > 150:          # after ~11:45
+        if minutes_since_open > 150:
             tod_factor = max(1.0 - (minutes_since_open - 150) / 240.0, 0.25)
     else:
-        tod_factor = 0.3                       # post-market – OR matters less
+        tod_factor = 0.3
 
     # ------------------------------------------------------------------
-    # A. Gamma Regime (highest weight)
+    # A. Gamma Regime
     # ------------------------------------------------------------------
     total_delta_gex_cr = float(data.get("total_net_gex_oi", 0) or 0) / 1e7
-
-    # Soft normalisation
     gamma_raw = total_delta_gex_cr / max(abs(total_delta_gex_cr), 2.5) * 70
     gamma_regime_score = float(np.clip(gamma_raw, -100, 100))
 
-    # DTE adjustment: on expiry day long-gamma is even more pinning
     if dte <= 1.0:
         gamma_regime_score = float(np.clip(gamma_regime_score * 1.25, -100, 100))
     elif dte >= 7.0:
@@ -598,7 +592,6 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     straddle = float(levels.get("Straddle_Cost", 0) or 0)
     expected_move_pct = (straddle / spot * 100.0) if spot > 0 else 0.0
 
-    # Strictly latest session only
     realised_range_pct = 0.0
     day_high = day_low = day_open = None
     df_session = pd.DataFrame()
@@ -608,7 +601,6 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         df_tmp["time"] = pd.to_datetime(df_tmp["time"])
         latest_date = df_tmp["time"].dt.date.max()
         df_session = df_tmp[df_tmp["time"].dt.date == latest_date].sort_values("time").reset_index(drop=True)
-
         if not df_session.empty:
             day_high = float(df_session["high"].max())
             day_low  = float(df_session["low"].min())
@@ -616,27 +608,20 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
             if day_open > 0:
                 realised_range_pct = (day_high - day_low) / day_open * 100.0
 
-    # DTE-aware expected move (straddle already contains DTE, but we dampen on far DTE)
     if dte > 5:
         expected_move_pct *= 0.85
 
     if is_market_hours:
-        # Live: is the remaining expected move still rich vs what has already happened?
         if expected_move_pct > 0.12:
             move_score = float(np.clip(
-                (expected_move_pct - realised_range_pct * 1.15) / expected_move_pct * 80,
-                -100, 100
-            ))
+                (expected_move_pct - realised_range_pct * 1.15) / expected_move_pct * 80, -100, 100))
         else:
             move_score = 0.0
         move_context = "Live session (Expected vs Realised-so-far)"
     else:
-        # Post-market: was the day quieter or louder than the straddle priced?
         if expected_move_pct > 0.10:
             move_score = float(np.clip(
-                (expected_move_pct - realised_range_pct) / max(expected_move_pct, 0.15) * 60,
-                -100, 100
-            ))
+                (expected_move_pct - realised_range_pct) / max(expected_move_pct, 0.15) * 60, -100, 100))
         else:
             move_score = 0.0
         move_context = "Post-market (Priced Expected vs Full-day Realised)"
@@ -646,15 +631,13 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     # ------------------------------------------------------------------
     total_vex = sum(float(r.get("VEX", 0) or 0) for r in chain)
     total_cex = sum(float(r.get("CEX", 0) or 0) for r in chain)
-
-    # Soft tanh-style scaling so we rarely hit ±100
     vanna_raw = total_vex / 1.2e6
     charm_raw = total_cex / 2.5e6
     flow_raw  = vanna_raw + charm_raw
     flow_score = float(np.clip(np.tanh(flow_raw) * 85, -100, 100))
 
     # ------------------------------------------------------------------
-    # D. Opening Range vs GEX Walls (time-decayed)
+    # D. Opening Range vs GEX Walls
     # ------------------------------------------------------------------
     or_score = 0.0
     or_high = or_low = None
@@ -666,7 +649,6 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         or_bars = df_session.head(n_or)
         or_high = float(or_bars["high"].max())
         or_low  = float(or_bars["low"].min())
-
         if spot > or_high and spot > gex_res:
             or_score = 70.0
         elif spot < or_low and spot < gex_sup:
@@ -677,27 +659,22 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
             or_score = -25.0
         else:
             or_score = 8.0
-
-    # Decay OR importance as the day progresses
     or_score *= tod_factor
 
     # ------------------------------------------------------------------
-    # E. Distance from Zero-Gamma Flip (new component)
+    # E. Distance from Zero-Gamma Flip
     # ------------------------------------------------------------------
     flip = float(levels.get("Zero_Gamma_Flip") or spot)
     dist_pct = abs(spot - flip) / spot * 100.0 if spot > 0 else 0.0
-
-    # Close to flip + long gamma → extra pinning bias
-    # Far from flip + short gamma → extra acceleration bias
     if gamma_regime_score > 20 and dist_pct < 0.35:
-        flip_score = 40.0          # strong pin
+        flip_score = 40.0
     elif gamma_regime_score < -20 and dist_pct > 0.6:
-        flip_score = -40.0         # acceleration fuel
+        flip_score = -40.0
     else:
         flip_score = float(np.clip((0.4 - dist_pct) * 50, -30, 30))
 
     # ------------------------------------------------------------------
-    # F. Composite (new weights)
+    # F. Composite
     # ------------------------------------------------------------------
     composite = (
         0.38 * gamma_regime_score +
@@ -708,37 +685,34 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     )
     composite = float(np.clip(composite, -100, 100))
 
+    # ------------------------------------------------------------------
     # Final Decision – Super Clear Labels
     # ------------------------------------------------------------------
     strong_long_gamma  = gamma_regime_score >= 55
     strong_short_gamma = gamma_regime_score <= -55
-    big_range          = realised_range_pct > expected_move_pct * 1.5 if expected_move_pct > 0.1 else realised_range_pct > 1.2
-    quiet_range        = realised_range_pct < expected_move_pct * 0.85 if expected_move_pct > 0.1 else realised_range_pct < 0.7
+    big_range   = realised_range_pct > expected_move_pct * 1.5 if expected_move_pct > 0.1 else realised_range_pct > 1.2
+    quiet_range = realised_range_pct < expected_move_pct * 0.85 if expected_move_pct > 0.1 else realised_range_pct < 0.7
 
     if composite >= 42 and strong_long_gamma and quiet_range:
         bias   = "QUIET PIN"
         action = "Non-directional → Iron Condor / Short Straddle / Iron Fly (high confidence)"
         colour = "#00E676"
         clarity = "Strong long-gamma + quiet range. Classic pinning day."
-
     elif composite >= 35 and strong_long_gamma and big_range:
         bias   = "GAMMA REVERSION"
         action = "Fade extended moves → fade breakouts, buy dips / sell rallies into close"
         colour = "#26A69A"
         clarity = "Strong long-gamma but price already travelled far. Expect mean-reversion after the trend."
-
     elif composite <= -42 or (strong_short_gamma and big_range):
         bias   = "TREND / BREAKOUT"
         action = "Directional → Debit spreads / Futures / Naked options"
         colour = "#FF5252"
         clarity = "Short-gamma or clean wall break. Directional follow-through favoured."
-
     elif abs(composite) <= 15:
         bias   = "NO EDGE"
         action = "Stay out or very tight range strategies only"
         colour = "#FF9800"
         clarity = "No clear dealer positioning or range edge."
-
     else:
         bias   = "MILD DIRECTIONAL"
         action = "Mild directional → Credit spreads / Calendars with defined risk"
@@ -755,7 +729,7 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         "bias":   bias,
         "action": action,
         "colour": colour,
-        "clarity": clarity,                    # ← new field
+        "clarity": clarity,
         "is_market_hours":    is_market_hours,
         "move_context":       move_context,
         "expected_move_pct":  round(expected_move_pct, 2),
@@ -776,7 +750,9 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         "quiet_range":        quiet_range,
         "timestamp_ist":      now.strftime("%d-%b-%Y %H:%M:%S IST"),
     }
-    # --- TECHNICAL INDICATOR ENGINE ---
+
+
+
 def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
     df = df_candles.copy()
     if df.empty or len(df) < 20:
@@ -1658,6 +1634,71 @@ def _prepare_session_candles(df_candles: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # GEX Heatmap History – Disk Persistence
 # ============================================================
+
+# ============================================================
+# Superhuman Decision Log – Disk Persistence
+# ============================================================
+DECISION_LOG_FILE = "superhuman_decision_log.json"
+
+def _load_decision_log(index_name: str) -> list:
+    if not os.path.exists(DECISION_LOG_FILE):
+        return []
+    try:
+        with open(DECISION_LOG_FILE, "r") as f:
+            raw = json.load(f)
+        ist = pytz.timezone("Asia/Kolkata")
+        today = datetime.datetime.now(ist).date()
+        log = []
+        for e in raw:
+            if e.get("index") != index_name:
+                continue
+            ts = pd.to_datetime(e["ts"])
+            if ts.tzinfo is None:
+                ts = ist.localize(ts)
+            if ts.date() != today:
+                continue
+            log.append({
+                "ts": ts,
+                "bias": e["bias"],
+                "composite": e["composite"],
+                "clarity": e.get("clarity", ""),
+            })
+        log.sort(key=lambda x: x["ts"])
+        return log
+    except Exception:
+        return []
+
+
+def _save_decision_log(log: list, index_name: str):
+    try:
+        existing = []
+        if os.path.exists(DECISION_LOG_FILE):
+            with open(DECISION_LOG_FILE, "r") as f:
+                existing = json.load(f)
+        existing = [e for e in existing if e.get("index") != index_name]
+        for e in log:
+            existing.append({
+                "index": index_name,
+                "ts": e["ts"].isoformat(),
+                "bias": e["bias"],
+                "composite": e["composite"],
+                "clarity": e.get("clarity", ""),
+            })
+        ist = pytz.timezone("Asia/Kolkata")
+        cutoff = datetime.datetime.now(ist) - datetime.timedelta(days=2)
+        cleaned = []
+        for e in existing:
+            ts = pd.to_datetime(e["ts"])
+            if ts.tzinfo is None:
+                ts = ist.localize(ts)
+            if ts >= cutoff:
+                cleaned.append(e)
+        with open(DECISION_LOG_FILE, "w") as f:
+            json.dump(cleaned, f)
+    except Exception:
+        pass
+
+
 GEX_HISTORY_FILE = "gex_heatmap_history.json"
 
 def _load_gex_history(index_name: str, expiry_str: str) -> list:
@@ -1788,7 +1829,7 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         gex_hist = []
         alert_hist = []
 
-    # ---- Append new snapshot (only during market hours + enough time gap) ----
+    # ---- Append new snapshot ----
     market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
     is_market_hours = (now_ist.weekday() < 5) and (market_open <= now_ist <= market_close)
@@ -1826,8 +1867,9 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         alert_hist = [h for h in alert_hist if h["ts"] >= cutoff]
         st.session_state["alert_metrics_history"] = alert_hist
 
-    # Always keep a clean copy in session_state
+    # Also keep a copy in session_state for the rest of the app
     st.session_state["gex_heatmap_history"] = gex_hist
+
     # ---- session candles ----
     heatmap_tf_label = heatmap_tf_label or st.session_state.get("heatmap_timeframe", "5 min")
     chart_tf = st.session_state.get("selected_timeframe", "5 min")
@@ -2414,6 +2456,27 @@ def live_dashboard_fragment():
     scores = compute_superhuman_scores(data, data.get("df_candles", pd.DataFrame()))
 
     if "error" not in scores:
+        # ----- Decision Log (persist bias changes during the day) -----
+        decision_log = _load_decision_log(Index_Name)
+        now_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+        should_log = False
+        if not decision_log:
+            should_log = True
+        else:
+            last = decision_log[-1]
+            if last["bias"] != scores["bias"] or (now_ist - last["ts"]).total_seconds() >= 900:
+                should_log = True
+        if should_log:
+            decision_log.append({
+                "ts": now_ist,
+                "bias": scores["bias"],
+                "composite": scores["composite"],
+                "clarity": scores.get("clarity", ""),
+            })
+            day_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+            decision_log = [e for e in decision_log if e["ts"] >= day_start]
+            _save_decision_log(decision_log, Index_Name)
+
         st.markdown("---")
         st.markdown(
             f"<div style='background:#1A1F2B;border:1px solid #2A2F3A;border-radius:8px;padding:10px 14px;margin-bottom:8px;'>"
@@ -2433,55 +2496,67 @@ def live_dashboard_fragment():
             st.metric("Composite", f"{scores['composite']:+.0f}")
         with action_col:
             st.caption(scores["action"])
+
+        # Clarity message
         st.caption(f"📌 {scores.get('clarity', '')}")
-        with st.expander("▼ Decision Tree – How this judgement was reached", expanded=False):
+
+        # Decision Tree + Intraday Log
+        with st.expander("▼ Decision Tree & Intraday Log", expanded=False):
             st.markdown(
-                    f"""
-            **Composite Score = {scores['composite']:+.0f}**
-            
-            | Component | Score | Weight | Contribution | Prefers |
-            |-----------|-------|--------|--------------|---------|
-            | Gamma Regime | {scores['gamma_regime_score']:+.0f} | 38% | {0.38*scores['gamma_regime_score']:+.1f} | ... |
-            | Expected vs Realised | {scores['move_score']:+.0f} | 22% | {0.22*scores['move_score']:+.1f} | ... |
-            | Charm / Vanna Flow | {scores['flow_score']:+.0f} | 15% | {0.15*scores['flow_score']:+.1f} | ... |
-            | OR vs GEX Walls | {scores['or_score']:+.0f} | 15% | {0.15*scores['or_score']:+.1f} | ... |
-            | Distance to Flip | {scores.get('flip_score',0):+.0f} | 10% | {0.10*scores.get('flip_score',0):+.1f} | ... |            
-            **Final Rule Applied**
-            - Composite ≥ +40 → PIN / MEAN-REVERSION
-            - Composite ≤ −40 → ACCELERATION / BREAKOUT
-            - |Composite| ≤ 15 → NEUTRAL / CHOP
-            - Otherwise → CONTROLLED TREND
-            
-            In this case Composite = **{scores['composite']:+.0f}** → **{scores['bias']}**  
-            {scores.get('clarity', '')}
-                    """
-                )
+                f"""
+**Current Composite = {scores['composite']:+.0f} → {scores['bias']}**  
+{scores.get('clarity', '')}
+
+| Component | Score | Weight | Contribution |
+|-----------|-------|--------|--------------|
+| Gamma Regime | {scores['gamma_regime_score']:+.0f} | 38% | {0.38*scores['gamma_regime_score']:+.1f} |
+| Expected vs Realised | {scores['move_score']:+.0f} | 22% | {0.22*scores['move_score']:+.1f} |
+| Charm / Vanna Flow | {scores['flow_score']:+.0f} | 15% | {0.15*scores['flow_score']:+.1f} |
+| OR vs GEX Walls | {scores['or_score']:+.0f} | 15% | {0.15*scores['or_score']:+.1f} |
+| Distance to Flip | {scores.get('flip_score', 0):+.0f} | 10% | {0.10*scores.get('flip_score', 0):+.1f} |
+
+**Final Rule**
+- Quiet range + strong long gamma → **QUIET PIN**
+- Big range + strong long gamma → **GAMMA REVERSION**
+- Short gamma / wall break → **TREND / BREAKOUT**
+- |Composite| ≤ 15 → **NO EDGE**
+- Otherwise → **MILD DIRECTIONAL**
+                """
+            )
+            st.markdown("---")
+            st.markdown("**Intraday Decision Log**")
+            if not decision_log:
+                st.caption("No decision log yet for today. Leave Auto-Refresh on to build the timeline.")
+            else:
+                log_lines = []
+                for e in decision_log:
+                    tstr = e["ts"].strftime("%H:%M")
+                    log_lines.append(f"- **{tstr}** → {e['bias']} (Composite {e['composite']:+.0f})")
+                st.markdown("\n".join(log_lines))
+
+        # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
             s1, s2, s3, s4 = st.columns(4)
-
             with s1:
                 st.metric("Gamma Regime", f"{scores['gamma_regime_score']:+.0f}")
                 st.caption("Range: −100 → +100")
-                st.caption("＋ = Long Gamma → **Non-directional**")
-                st.caption("− = Short Gamma → **Directional**")
-
+                st.caption("＋ = Long Gamma → Non-directional")
+                st.caption("− = Short Gamma → Directional")
             with s2:
                 st.metric("Expected vs Realised", f"{scores['move_score']:+.0f}")
                 st.caption("Range: −100 → +100")
-                st.caption("＋ = Straddle rich / quiet → **Non-directional**")
-                st.caption("− = Straddle cheap / big move → **Directional**")
-
+                st.caption("＋ = Straddle rich / quiet → Non-directional")
+                st.caption("− = Straddle cheap / big move → Directional")
             with s3:
                 st.metric("Charm / Vanna Flow", f"{scores['flow_score']:+.0f}")
                 st.caption("Range: −100 → +100")
-                st.caption("＋ = Supports pinning → **Non-directional**")
-                st.caption("− = Supports acceleration → **Directional**")
-
+                st.caption("＋ = Supports pinning → Non-directional")
+                st.caption("− = Supports acceleration → Directional")
             with s4:
                 st.metric("OR vs GEX Walls", f"{scores['or_score']:+.0f}")
                 st.caption("Range: −100 → +100")
-                st.caption("＋ = Range inside walls → **Non-directional**")
-                st.caption("− = Break of walls → **Directional**")
+                st.caption("＋ = Range inside walls → Non-directional")
+                st.caption("− = Break of walls → Directional")
 
             st.markdown("---")
             st.markdown(
@@ -2491,9 +2566,11 @@ def live_dashboard_fragment():
                 <b>Expected Move</b>: {scores['expected_move_pct']:.2f}% &nbsp;|&nbsp;
                 <b>Realised Range</b>: {scores['realised_range_pct']:.2f}% &nbsp;|&nbsp;
                 <b>ATM Straddle</b>: ₹{scores['straddle']:.0f}<br>
-                <b>Net Δ-GEX</b>: ₹{scores['total_delta_gex_cr']:.1f} Cr<br>
-                <b>Opening Range (latest session)</b>: 
+                <b>Net Δ-GEX</b>: ₹{scores['total_delta_gex_cr']:.1f} Cr &nbsp;|&nbsp;
+                <b>DTE</b>: {scores.get('dte', '–')}<br>
+                <b>Opening Range (latest session)</b>:
                 {f"{scores['or_low']:.0f} – {scores['or_high']:.0f}" if scores.get('or_low') is not None else "N/A"}
+                &nbsp;|&nbsp; <b>Dist to Flip</b>: {scores.get('dist_to_flip_pct', 0):.3f}%
                 </div>
                 """,
                 unsafe_allow_html=True
