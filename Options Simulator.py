@@ -2573,45 +2573,56 @@ def live_dashboard_fragment():
 
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
-            s1, s2, s3, s4 = st.columns(4)
-            with s1:
-                st.metric("Gamma Regime", f"{scores['gamma_regime_score']:+.0f}")
-                st.caption("Range: −100 → +100")
-                st.caption("＋ = Long Gamma → Non-directional")
-                st.caption("− = Short Gamma → Directional")
-            with s2:
-                st.metric("Expected vs Realised", f"{scores['move_score']:+.0f}")
-                st.caption("Range: −100 → +100")
-                st.caption("＋ = Straddle rich / quiet → Non-directional")
-                st.caption("− = Straddle cheap / big move → Directional")
-            with s3:
-                st.metric("Charm / Vanna Flow", f"{scores['flow_score']:+.0f}")
-                st.caption("Range: −100 → +100")
-                st.caption("＋ = Supports pinning → Non-directional")
-                st.caption("− = Supports acceleration → Directional")
-            with s4:
-                st.metric("OR vs GEX Walls", f"{scores['or_score']:+.0f}")
-                st.caption("Range: −100 → +100")
-                st.caption("＋ = Range inside walls → Non-directional")
-                st.caption("− = Break of walls → Directional")
+            c1, c2 = st.columns(2)
 
-            st.markdown("---")
-            st.markdown(
-                f"""
-                <div style='font-size:12px;line-height:1.7;color:#CCC;'>
-                <b>Context</b>: {scores.get('move_context', '')}<br>
-                <b>Expected Move</b>: {scores['expected_move_pct']:.2f}% &nbsp;|&nbsp;
-                <b>Realised Range</b>: {scores['realised_range_pct']:.2f}% &nbsp;|&nbsp;
-                <b>ATM Straddle</b>: ₹{scores['straddle']:.0f}<br>
-                <b>Net Δ-GEX</b>: ₹{scores['total_delta_gex_cr']:.1f} Cr &nbsp;|&nbsp;
-                <b>DTE</b>: {scores.get('dte', '–')}<br>
-                <b>Opening Range (latest session)</b>:
-                {f"{scores['or_low']:.0f} – {scores['or_high']:.0f}" if scores.get('or_low') is not None else "N/A"}
-                &nbsp;|&nbsp; <b>Dist to Flip</b>: {scores.get('dist_to_flip_pct', 0):.3f}%
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+            with c1:
+                st.markdown("**Gamma Regime**")
+                st.metric("", f"{scores['gamma_regime_score']:+.0f}", label_visibility="collapsed")
+                st.caption(
+                    f"Net Δ-GEX ₹{scores['total_delta_gex_cr']:.0f} Cr → normalised  \n"
+                    f"DTE={scores.get('dte', '–')} scaling applied  \n"
+                    f"＋ Long γ → Non-dir | − Short γ → Dir"
+                )
+
+                st.markdown("**Expected vs Realised**")
+                st.metric("", f"{scores['move_score']:+.0f}", label_visibility="collapsed")
+                st.caption(
+                    f"Expected {scores['expected_move_pct']:.2f}% vs Realised {scores['realised_range_pct']:.2f}%  \n"
+                    f"({scores.get('move_context', '')})  \n"
+                    f"＋ Straddle rich → Non-dir | − Big move → Dir"
+                )
+
+                st.markdown("**Charm / Vanna Flow**")
+                st.metric("", f"{scores['flow_score']:+.0f}", label_visibility="collapsed")
+                st.caption(
+                    f"Soft tanh(VEX + CEX) scaled to ±85  \n"
+                    f"＋ Supports pin → Non-dir | − Supports accel → Dir"
+                )
+
+            with c2:
+                st.markdown("**OR vs GEX Walls**")
+                st.metric("", f"{scores['or_score']:+.0f}", label_visibility="collapsed")
+                or_txt = f"{scores['or_low']:.0f}–{scores['or_high']:.0f}" if scores.get('or_low') is not None else "N/A"
+                st.caption(
+                    f"OR {or_txt} vs Walls  \n"
+                    f"Time-of-day factor {scores.get('tod_factor', 1):.2f}  \n"
+                    f"＋ Inside walls → Non-dir | − Break → Dir"
+                )
+
+                st.markdown("**Distance to Flip**")
+                st.metric("", f"{scores.get('flip_score', 0):+.0f}", label_visibility="collapsed")
+                st.caption(
+                    f"Spot vs Flip distance {scores.get('dist_to_flip_pct', 0):.3f}%  \n"
+                    f"Close + long γ → pin bonus | Far + short γ → accel  \n"
+                    f"Weight 10%"
+                )
+
+                st.markdown("**Composite**")
+                st.metric("", f"{scores['composite']:+.0f}", label_visibility="collapsed")
+                st.caption(
+                    f"0.38·Γ + 0.22·Move + 0.15·Flow + 0.15·OR + 0.10·Flip  \n"
+                    f"→ **{scores['bias']}**"
+                )
     else:
         st.warning("Could not compute Superhuman scores – insufficient data.")
 
