@@ -708,23 +708,42 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     )
     composite = float(np.clip(composite, -100, 100))
 
-    # Softer thresholds
-    if composite >= 40:
-        bias   = "PIN / MEAN-REVERSION"
-        action = "Non-directional → Iron Condor / Short Straddle / Iron Fly"
+    # Final Decision – Super Clear Labels
+    # ------------------------------------------------------------------
+    strong_long_gamma  = gamma_regime_score >= 55
+    strong_short_gamma = gamma_regime_score <= -55
+    big_range          = realised_range_pct > expected_move_pct * 1.5 if expected_move_pct > 0.1 else realised_range_pct > 1.2
+    quiet_range        = realised_range_pct < expected_move_pct * 0.85 if expected_move_pct > 0.1 else realised_range_pct < 0.7
+
+    if composite >= 42 and strong_long_gamma and quiet_range:
+        bias   = "QUIET PIN"
+        action = "Non-directional → Iron Condor / Short Straddle / Iron Fly (high confidence)"
         colour = "#00E676"
-    elif composite <= -40:
-        bias   = "ACCELERATION / BREAKOUT"
+        clarity = "Strong long-gamma + quiet range. Classic pinning day."
+
+    elif composite >= 35 and strong_long_gamma and big_range:
+        bias   = "GAMMA REVERSION"
+        action = "Fade extended moves → fade breakouts, buy dips / sell rallies into close"
+        colour = "#26A69A"
+        clarity = "Strong long-gamma but price already travelled far. Expect mean-reversion after the trend."
+
+    elif composite <= -42 or (strong_short_gamma and big_range):
+        bias   = "TREND / BREAKOUT"
         action = "Directional → Debit spreads / Futures / Naked options"
         colour = "#FF5252"
+        clarity = "Short-gamma or clean wall break. Directional follow-through favoured."
+
     elif abs(composite) <= 15:
-        bias   = "NEUTRAL / CHOP"
-        action = "Avoid or very tight range strategies only"
+        bias   = "NO EDGE"
+        action = "Stay out or very tight range strategies only"
         colour = "#FF9800"
+        clarity = "No clear dealer positioning or range edge."
+
     else:
-        bias   = "CONTROLLED TREND"
-        action = "Mild directional → Credit spreads / Calendars"
+        bias   = "MILD DIRECTIONAL"
+        action = "Mild directional → Credit spreads / Calendars with defined risk"
         colour = "#2196F3"
+        clarity = "Moderate bias. Prefer defined-risk structures."
 
     return {
         "gamma_regime_score": round(gamma_regime_score, 1),
@@ -736,6 +755,7 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         "bias":   bias,
         "action": action,
         "colour": colour,
+        "clarity": clarity,                    # ← new field
         "is_market_hours":    is_market_hours,
         "move_context":       move_context,
         "expected_move_pct":  round(expected_move_pct, 2),
@@ -752,7 +772,10 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         "day_open":           day_open,
         "day_high":           day_high,
         "day_low":            day_low,
+        "big_range":          big_range,
+        "quiet_range":        quiet_range,
         "timestamp_ist":      now.strftime("%d-%b-%Y %H:%M:%S IST"),
+    }
     }# --- TECHNICAL INDICATOR ENGINE ---
 def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
     df = df_candles.copy()
@@ -2410,6 +2433,7 @@ def live_dashboard_fragment():
             st.metric("Composite", f"{scores['composite']:+.0f}")
         with action_col:
             st.caption(scores["action"])
+        st.caption(f"📌 {scores.get('clarity', '')}")
         with st.expander("▼ Decision Tree – How this judgement was reached", expanded=False):
             st.markdown(
                     f"""
@@ -2428,7 +2452,8 @@ def live_dashboard_fragment():
             - |Composite| ≤ 15 → NEUTRAL / CHOP
             - Otherwise → CONTROLLED TREND
             
-            In this case Composite = **{scores['composite']:+.0f}** → **{scores['bias']}**
+            In this case Composite = **{scores['composite']:+.0f}** → **{scores['bias']}**  
+            {scores.get('clarity', '')}
                     """
                 )
         with st.expander("▼ Score Breakdown & Details", expanded=False):
