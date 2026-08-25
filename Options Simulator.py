@@ -1522,8 +1522,17 @@ def zscore_analysis_fragment(mode="full"):
 # --- INSTITUTIONAL ORDER FLOW SCANNER MODULE ---
 def institutional_order_flow_scanner_fragment():
     st.markdown("---")
-    st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>🏛️ Institutional Order Flow ({Index_Name})</span>", unsafe_allow_html=True)
-    st.caption("High-conviction flow · Premium ≥ ₹10L or Vol ≥ 500 lots")
+    hdr_l, hdr_r = st.columns([0.72, 0.28])
+    with hdr_l:
+        st.markdown(
+            f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
+            f"🏛️ Institutional Order Flow ({Index_Name})</span>",
+            unsafe_allow_html=True
+        )
+        st.caption("High-conviction flow · Premium ≥ ₹10L or Vol ≥ 500 lots")
+    with hdr_r:
+        show_all_flow = st.checkbox("Show all rows", value=False, key="iof_show_all",
+                                    help="Off = only High Vol flagged rows")
 
     if "data_store" not in st.session_state or not st.session_state["data_store"].get("chain_results"):
         st.info("No option chain data available. Run the main fetch process to enable scanning.")
@@ -1534,27 +1543,20 @@ def institutional_order_flow_scanner_fragment():
     lot_size = LOT_SIZES.get(Index_Name, 65)
 
     scanned_trades = []
-
-    # Calculate average volume across current chain strikes for unusual volume ratio calculation
     all_volumes = [r["C_Vol"] for r in chain_data] + [r["P_Vol"] for r in chain_data]
     avg_daily_vol = np.mean(all_volumes) if all_volumes and np.mean(all_volumes) > 0 else 1.0
 
     for row in chain_data:
         strike = row["Strike"]
 
-        # Evaluate Call Option
         c_ltp = row["C_LTP"]
         c_vol = row["C_Vol"]
         c_premium = c_ltp * c_vol * lot_size
         c_lots = c_vol
-
         if c_premium >= 1000000 or c_lots >= 500:
             vol_ratio = c_vol / avg_daily_vol if avg_daily_vol > 0 else 0.0
             unusual_flag = vol_ratio > 3.0
-            
-            # Strike Classification (Call Options)
             strike_role = "Resistance Level" if strike >= spot_price else "Support / In-The-Money Level"
-
             scanned_trades.append({
                 "Strike": strike,
                 "Option_Type": "CE",
@@ -1566,23 +1568,19 @@ def institutional_order_flow_scanner_fragment():
                 "Unusual Vol Flag": "🚨 High Vol" if unusual_flag else "Normal"
             })
 
-        # Evaluate Put Option
         p_ltp = row["P_LTP"]
         p_vol = row["P_Vol"]
         p_premium = p_ltp * p_vol * lot_size
         p_lots = p_vol
-
         if p_premium >= 1000000 or p_lots >= 500:
             vol_ratio = p_vol / avg_daily_vol if avg_daily_vol > 0 else 0.0
             unusual_flag = vol_ratio > 3.0
-            
-            # Strike Classification (Put Options)
             strike_role = "Support Level" if strike <= spot_price else "Resistance / In-The-Money Level"
-
             scanned_trades.append({
                 "Strike": strike,
                 "Option_Type": "PE",
-                "LTP (₹)": p_lots,
+                "LTP (₹)": p_ltp,
+                "Volume (Lots)": p_lots,
                 "Total Premium (₹)": round(p_premium, 2),
                 "Key Level Classification": strike_role,
                 "Volume Ratio": round(vol_ratio, 2),
@@ -1591,6 +1589,11 @@ def institutional_order_flow_scanner_fragment():
 
     if scanned_trades:
         df_scanner = pd.DataFrame(scanned_trades)
+        if not show_all_flow:
+            df_scanner = df_scanner[df_scanner["Unusual Vol Flag"].astype(str).str.contains("High Vol", na=False)]
+            if df_scanner.empty:
+                st.info("No High Vol rows right now. Check **Show all rows** to see full institutional flow.")
+                return
 
         def style_classification(val):
             if "Resistance" in str(val):
@@ -2528,7 +2531,7 @@ def render_live_alert_ribbon(data: dict = None):
 
 
 # --- LIVE DASHBOARD FRAGMENT ---
-@st.fragment(run_every=15 if st.session_state.get("enable_main_refresh", False) else None)
+@st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
 def live_dashboard_fragment():
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
@@ -2554,7 +2557,7 @@ def live_dashboard_fragment():
         if data.get("is_holiday_fallback", False):
             st.caption("⚠️ Non-trading day – showing last session")
     with head_r:
-        cb_main = st.checkbox("Auto-Refresh 15s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
+        cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
         if cb_main != st.session_state["enable_main_refresh"]:
             st.session_state["enable_main_refresh"] = cb_main
             st.rerun()
@@ -3084,7 +3087,7 @@ def live_dashboard_fragment():
                 fig_delta_gex.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
                 fig_delta_gex.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=340, margin=dict(l=10, r=10, t=24, b=8), hovermode="x unified",
+                    height=460, margin=dict(l=10, r=10, t=24, b=8), hovermode="x unified",
                     showlegend=False,
                 )
                 fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
@@ -3119,7 +3122,7 @@ def live_dashboard_fragment():
                         fig_mx.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
                     fig_mx.update_layout(
                         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                        height=340, margin=dict(l=10, r=10, t=24, b=8), hovermode="x unified",
+                        height=460, margin=dict(l=10, r=10, t=24, b=8), hovermode="x unified",
                         showlegend=False,
                     )
                     fig_mx.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
@@ -3146,7 +3149,7 @@ def live_dashboard_fragment():
                 vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].astype(float), df_chain["CEX"].astype(float))
                 fig_vex_cex.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=340, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                    height=400, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
                 )
                 fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
