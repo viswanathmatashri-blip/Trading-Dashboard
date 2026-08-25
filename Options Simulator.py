@@ -107,6 +107,23 @@ if "gex_heatmap_history" not in st.session_state:
 if "alert_metrics_history" not in st.session_state:
     st.session_state["alert_metrics_history"] = []  # snapshots for Exit / Long alert criteria
 
+# ---------- Loading status (sidebar) ----------
+def update_load_status(msg: str):
+    if "load_status_placeholder" not in st.session_state:
+        st.session_state["load_status_placeholder"] = st.sidebar.empty()
+    try:
+        st.session_state["load_status_placeholder"].info(f"⏳ {msg}")
+    except Exception:
+        pass
+
+def clear_load_status():
+    if "load_status_placeholder" in st.session_state:
+        try:
+            st.session_state["load_status_placeholder"].empty()
+        except Exception:
+            pass
+
+
 # Streamlit Cache Persistence Handlers
 @st.cache_data(ttl=86400)
 def get_cached_basket():
@@ -1205,6 +1222,10 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             p_bar.progress(min(1.0, max(0.0, pct)))
         if p_status is not None:
             p_status.caption(f"⏳ {msg}")
+        try:
+            update_load_status(msg)
+        except Exception:
+            pass
 
     update_p(0.10, "Authenticating SmartAPI Session...")
 
@@ -2424,6 +2445,9 @@ def live_dashboard_fragment():
     data = st.session_state["data_store"]
     lvls = data.get("levels", {})
 
+    # UI is loading data – clear any previous status
+    clear_load_status()
+
     # ========== STICKY COMPACT MARKET SUMMARY (cleaned) ==========
     st.markdown("<div class='sticky-summary'>", unsafe_allow_html=True)
     head_l, head_r = st.columns([0.72, 0.28])
@@ -2503,36 +2527,49 @@ def live_dashboard_fragment():
         # Decision Tree + Intraday Log
         with st.expander("▼ Decision Tree & Intraday Log", expanded=False):
             st.markdown(
-                f"""
-**Current Composite = {scores['composite']:+.0f} → {scores['bias']}**  
-{scores.get('clarity', '')}
+                f"**Current Composite = {scores['composite']:+.0f} → {scores['bias']}**  \n"
+                f"{scores.get('clarity', '')}"
+            )
 
-| Component | Score | Weight | Contribution |
-|-----------|-------|--------|--------------|
+            col_left, col_mid, col_right = st.columns([1.2, 1.0, 1.0])
+
+            # LEFT – Weightage table
+            with col_left:
+                st.markdown("**Score Breakdown**")
+                st.markdown(
+                    f"""
+| Component | Score | W | Contrib |
+|-----------|-------|---|--------|
 | Gamma Regime | {scores['gamma_regime_score']:+.0f} | 38% | {0.38*scores['gamma_regime_score']:+.1f} |
-| Expected vs Realised | {scores['move_score']:+.0f} | 22% | {0.22*scores['move_score']:+.1f} |
-| Charm / Vanna Flow | {scores['flow_score']:+.0f} | 15% | {0.15*scores['flow_score']:+.1f} |
-| OR vs GEX Walls | {scores['or_score']:+.0f} | 15% | {0.15*scores['or_score']:+.1f} |
-| Distance to Flip | {scores.get('flip_score', 0):+.0f} | 10% | {0.10*scores.get('flip_score', 0):+.1f} |
+| Exp vs Real | {scores['move_score']:+.0f} | 22% | {0.22*scores['move_score']:+.1f} |
+| Charm/Vanna | {scores['flow_score']:+.0f} | 15% | {0.15*scores['flow_score']:+.1f} |
+| OR vs Walls | {scores['or_score']:+.0f} | 15% | {0.15*scores['or_score']:+.1f} |
+| Dist to Flip | {scores.get('flip_score', 0):+.0f} | 10% | {0.10*scores.get('flip_score', 0):+.1f} |
+                    """
+                )
 
-**Final Rule**
-- Quiet range + strong long gamma → **QUIET PIN**
-- Big range + strong long gamma → **GAMMA REVERSION**
-- Short gamma / wall break → **TREND / BREAKOUT**
+            # MIDDLE – Final Rule
+            with col_mid:
+                st.markdown("**Final Rule**")
+                st.markdown(
+                    """
+- Quiet range + strong long γ → **QUIET PIN**
+- Big range + strong long γ → **GAMMA REVERSION**
+- Short γ / wall break → **TREND / BREAKOUT**
 - |Composite| ≤ 15 → **NO EDGE**
 - Otherwise → **MILD DIRECTIONAL**
-                """
-            )
-            st.markdown("---")
-            st.markdown("**Intraday Decision Log**")
-            if not decision_log:
-                st.caption("No decision log yet for today. Leave Auto-Refresh on to build the timeline.")
-            else:
-                log_lines = []
-                for e in decision_log:
-                    tstr = e["ts"].strftime("%H:%M")
-                    log_lines.append(f"- **{tstr}** → {e['bias']} (Composite {e['composite']:+.0f})")
-                st.markdown("\n".join(log_lines))
+                    """
+                )
+
+            # RIGHT – Intraday Log
+            with col_right:
+                st.markdown("**Intraday Log**")
+                if not decision_log:
+                    st.caption("No log yet. Keep Auto-Refresh on.")
+                else:
+                    for e in decision_log:
+                        tstr = e["ts"].strftime("%H:%M")
+                        st.markdown(f"- **{tstr}** → {e['bias']} ({e['composite']:+.0f})")
 
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
@@ -2965,3 +3002,9 @@ st.markdown("---")
 institutional_order_flow_scanner_fragment()
 st.markdown("---")
 zscore_analysis_fragment(mode="raw")
+
+# Clear loading status once full UI has rendered
+try:
+    clear_load_status()
+except Exception:
+    pass
