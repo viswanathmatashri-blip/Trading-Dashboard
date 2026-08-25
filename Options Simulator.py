@@ -2972,7 +2972,17 @@ def live_dashboard_fragment():
 
         render_live_alert_ribbon(data)
         render_basket_table_fullwidth(data)
-
+        def calculate_synced_ranges(v1_pos, v1_neg, v2_pos, v2_neg):
+            y1_max = max(float(v1_pos.max()) if len(v1_pos) else 1.0, 1.0)
+            y1_min = min(float(v1_neg.min()) if len(v1_neg) else -1.0, -1.0)
+            y2_max = max(float(v2_pos.max()) if len(v2_pos) else 1.0, 1.0)
+            y2_min = min(float(v2_neg.min()) if len(v2_neg) else -1.0, -1.0)
+            ratio1 = abs(y1_min) / max(y1_max, 1e-5)
+            ratio2 = abs(y2_min) / max(y2_max, 1e-5)
+            max_ratio = max(ratio1, ratio2)
+            range1 = [-y1_max * max_ratio * 1.05, y1_max * 1.05]
+            range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
+            return range1, range2
         # VEX/CEX + Skew
         st.markdown("---")
         vex_col, skew_col = st.columns([0.60, 0.40])
