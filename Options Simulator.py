@@ -1795,6 +1795,84 @@ def _save_gex_history(history: list, index_name: str, expiry_str: str):
     except Exception:
         pass
 
+
+@st.cache_data(ttl=120, show_spinner=False)
+def compute_multi_expiry_delta_gex(_api, index_name: str, exchange: str, spot: float, rate: float,
+                                   lot_size: int, strike_lo: float, strike_hi: float, months: int = 6):
+    """Aggregate Delta-Adjusted GEX (OI) across all expiries within `months` for the index.
+    Strike window limited to [strike_lo, strike_hi] for speed / alignment with selected-expiry chart.
+    """
+    try:
+        df_m = download_master_scrip()
+        if df_m is None or df_m.empty:
+            return pd.DataFrame()
+        today = datetime.datetime.now().date()
+        cutoff = today + datetime.timedelta(days=int(months * 31))
+        df_opt = df_m[
+            (df_m["name"] == index_name) &
+            (df_m["exch_seg"] == exchange) &
+            (df_m["instrumenttype"].isin(["OPTIDX", "OPTSTK"]))
+        ].copy()
+        if df_opt.empty:
+            return pd.DataFrame()
+        df_opt["expiry_dt"] = pd.to_datetime(df_opt["expiry"], format="%d%b%Y", errors="coerce")
+        df_opt = df_opt[df_opt["expiry_dt"].notna()]
+        df_opt = df_opt[(df_opt["expiry_dt"].dt.date >= today) & (df_opt["expiry_dt"].dt.date <= cutoff)]
+        df_opt["strike_clean"] = pd.to_numeric(df_opt["strike"], errors="coerce") / (100.0 if exchange == "NFO" else 1.0)
+        if df_opt["strike_clean"].max() > 1e6:
+            df_opt["strike_clean"] = df_opt["strike_clean"] / 100.0
+        df_opt = df_opt[(df_opt["strike_clean"] >= strike_lo) & (df_opt["strike_clean"] <= strike_hi)]
+        if df_opt.empty:
+            return pd.DataFrame()
+
+        tokens = [str(t) for t in df_opt["token"].dropna().unique()]
+        market = {}
+        for i in range(0, len(tokens), 40):
+            chunk = tokens[i:i + 40]
+            res = safe_api_call(_api.getMarketData, "FULL", {exchange: chunk})
+            if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
+                for item in res["data"]["fetched"]:
+                    market[str(item["symbolToken"])] = {
+                        "ltp": float(item.get("ltp", 0) or 0),
+                        "oi": float(item.get("opInterest", item.get("oi", 0)) or 0),
+                    }
+            time.sleep(0.35)
+
+        # Group by strike + CE/PE across expiries
+        rows = []
+        for _, r in df_opt.iterrows():
+            tok = str(r["token"])
+            md = market.get(tok)
+            if not md or md["ltp"] <= 0:
+                continue
+            sym = str(r.get("symbol", ""))
+            opt = "CE" if sym.endswith("CE") else "PE"
+            exp_dt = r["expiry_dt"].date()
+            dte = max((exp_dt - today).days, 0.001)
+            T = dte / 365.0
+            K = float(r["strike_clean"])
+            flag = "c" if opt == "CE" else "p"
+            iv = VolatilityEngine.calculate_iv(md["ltp"], spot, K, T, rate, flag)
+            if iv <= 0:
+                continue
+            greeks = VolatilityEngine.calculate_greeks(spot, K, T, rate, iv, flag)
+            gex_scale = lot_size * (spot ** 2) * 0.01
+            raw_gex = greeks["gamma"] * md["oi"] * gex_scale
+            if opt == "CE":
+                delta_gex = raw_gex * max(greeks["delta"], 0.0)
+            else:
+                delta_gex = -(raw_gex * abs(greeks["delta"]))
+            rows.append({"Strike": K, "Net_Delta_GEX_OI": delta_gex})
+
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        agg = df.groupby("Strike", as_index=False)["Net_Delta_GEX_OI"].sum()
+        return agg.sort_values("Strike")
+    except Exception:
+        return pd.DataFrame()
+
+
 def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatmap_tf_label: str):
     """Render strike × session-time Delta-Adjusted GEX heatmap with persistent history."""
     chain_results = data.get("chain_results") or []
@@ -2971,12 +3049,19 @@ def live_dashboard_fragment():
             else:
                 st.info("GEX/Vol unavailable.")
 
-        # Delta-GEX + Heatmap
+        # Delta-GEX (selected) | Heatmap
+        # Multi-exp Delta-GEX   | VEX/CEX
+        # IV Skew 50%           | Z-Scores 50%
+        # Basket Greeks then Strategy Basket Legs
         if not df_chain.empty and lvls:
             st.markdown("---")
             d_left, d_right = st.columns([0.40, 0.60])
             with d_left:
-                st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🎯 Delta-Adjusted GEX</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
+                    f"🎯 Δ-GEX (OI) — {selected_expiry_str}</span>",
+                    unsafe_allow_html=True
+                )
                 delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
                 fig_delta_gex = plt_go.Figure()
                 fig_delta_gex.add_trace(plt_go.Bar(
@@ -2988,23 +3073,56 @@ def live_dashboard_fragment():
                 fig_delta_gex.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
                 fig_delta_gex.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=520, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+                    height=320, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+                    showlegend=False,
                 )
                 fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
                 fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
                 st.plotly_chart(fig_delta_gex, use_container_width=True)
+
+                # Multi-expiry Δ-GEX (next 6 months) — same strike axis
+                st.markdown(
+                    "<span style='font-weight:700;color:#00E676;font-size:14px;'>"
+                    "🎯 Δ-GEX (OI) — All expiries next 6 months</span>",
+                    unsafe_allow_html=True
+                )
+                smart_api_mx = get_smart_api_client()
+                df_mx = pd.DataFrame()
+                if smart_api_mx:
+                    df_mx = compute_multi_expiry_delta_gex(
+                        smart_api_mx, Index_Name, Exchange,
+                        float(data["spot_price"]), float(rate_param),
+                        int(LOT_SIZES.get(Index_Name, 65)),
+                        float(min_strike_val), float(max_strike_val), months=6,
+                    )
+                if not df_mx.empty:
+                    mx_colors = np.where(df_mx["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
+                    fig_mx = plt_go.Figure()
+                    fig_mx.add_trace(plt_go.Bar(
+                        x=df_mx["Strike"], y=df_mx["Net_Delta_GEX_OI"], name="Δ-GEX 6M",
+                        marker_color=mx_colors, opacity=0.85, width=25,
+                    ))
+                    fig_mx.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
+                    fig_mx.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
+                    if lvls.get("Zero_Gamma_Flip"):
+                        fig_mx.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
+                    fig_mx.update_layout(
+                        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                        height=320, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+                        showlegend=False,
+                    )
+                    fig_mx.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
+                    fig_mx.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                    st.plotly_chart(fig_mx, use_container_width=True)
+                    st.caption("Sum of delta-adjusted GEX (OI) across all listed expiries in the next 6 months, same strike window.")
+                else:
+                    st.info("Multi-expiry Δ-GEX unavailable (API / no data).")
 
             with d_right:
                 render_delta_gex_heatmap(
                     data, Index_Name, selected_expiry_str,
                     st.session_state.get("heatmap_timeframe", "5 min"),
                 )
-
-            # VEX/CEX + Skew
-            st.markdown("---")
-            vex_col, skew_col = st.columns([0.60, 0.40])
-            with vex_col:
                 st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>⚡ VEX / CEX Profile</span>", unsafe_allow_html=True)
                 fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
                 fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20), secondary_y=False)
@@ -3012,12 +3130,19 @@ def live_dashboard_fragment():
                 fig_vex_cex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
                 fig_vex_cex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
                 vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].astype(float), df_chain["CEX"].astype(float))
-                fig_vex_cex.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=400, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
+                fig_vex_cex.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=360, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+                )
                 fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
                 fig_vex_cex.update_yaxes(range=vex_range, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
                 fig_vex_cex.update_yaxes(range=cex_range, secondary_y=True, showgrid=False)
                 st.plotly_chart(fig_vex_cex, use_container_width=True)
 
+            # IV Skew 50% | Z-Scores 50%
+            st.markdown("---")
+            skew_col, z_col = st.columns([0.50, 0.50])
             with skew_col:
                 st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>📉 IV Skew ({selected_expiry_str})</span>", unsafe_allow_html=True)
                 smart_api = get_smart_api_client()
@@ -3044,11 +3169,17 @@ def live_dashboard_fragment():
                         st.info("Skew data unavailable.")
                 else:
                     st.info("API session needed for skew.")
+            with z_col:
+                zscore_analysis_fragment(mode="highlights")
+
         elif not df_chain.empty:
             st.info("Key levels not available – GEX charts skipped.")
 
-        render_live_alert_ribbon(data)
+        # Basket Greeks ABOVE Strategy Basket Legs
+        st.markdown("---")
+        render_basket_metrics_block(data)
         render_basket_table_fullwidth(data)
+
 
 live_dashboard_fragment()
 
