@@ -2359,26 +2359,26 @@ def live_dashboard_fragment():
         with action_col:
             st.caption(scores["action"])
         with st.expander("▼ Decision Tree – How this judgement was reached", expanded=False):
-st.markdown(
-        f"""
-**Composite Score = {scores['composite']:+.0f}**
-
-| Component | Score | Weight | Contribution | Prefers |
-|-----------|-------|--------|--------------|---------|
-| Gamma Regime | {scores['gamma_regime_score']:+.0f} | 30% | {0.30*scores['gamma_regime_score']:+.1f} | {"Non-directional" if scores['gamma_regime_score']>0 else "Directional"} |
-| Expected vs Realised | {scores['move_score']:+.0f} | 25% | {0.25*scores['move_score']:+.1f} | {"Non-directional" if scores['move_score']>0 else "Directional"} |
-| Charm / Vanna Flow | {scores['flow_score']:+.0f} | 20% | {0.20*scores['flow_score']:+.1f} | {"Non-directional" if scores['flow_score']>0 else "Directional"} |
-| OR vs GEX Walls | {scores['or_score']:+.0f} | 25% | {0.25*scores['or_score']:+.1f} | {"Non-directional" if scores['or_score']>0 else "Directional"} |
-
-**Final Rule Applied**
-- Composite ≥ +48 → **PIN / MEAN-REVERSION**
-- Composite ≤ −48 → **ACCELERATION / BREAKOUT**
-- |Composite| ≤ 18 → **NEUTRAL / CHOP**
-- Otherwise → **CONTROLLED TREND**
-
-In this case Composite = **{scores['composite']:+.0f}** → **{scores['bias']}**
-        """
-    )
+            st.markdown(
+                    f"""
+            **Composite Score = {scores['composite']:+.0f}**
+            
+            | Component | Score | Weight | Contribution | Prefers |
+            |-----------|-------|--------|--------------|---------|
+            | Gamma Regime | {scores['gamma_regime_score']:+.0f} | 30% | {0.30*scores['gamma_regime_score']:+.1f} | {"Non-directional" if scores['gamma_regime_score']>0 else "Directional"} |
+            | Expected vs Realised | {scores['move_score']:+.0f} | 25% | {0.25*scores['move_score']:+.1f} | {"Non-directional" if scores['move_score']>0 else "Directional"} |
+            | Charm / Vanna Flow | {scores['flow_score']:+.0f} | 20% | {0.20*scores['flow_score']:+.1f} | {"Non-directional" if scores['flow_score']>0 else "Directional"} |
+            | OR vs GEX Walls | {scores['or_score']:+.0f} | 25% | {0.25*scores['or_score']:+.1f} | {"Non-directional" if scores['or_score']>0 else "Directional"} |
+            
+            **Final Rule Applied**
+            - Composite ≥ +48 → **PIN / MEAN-REVERSION**
+            - Composite ≤ −48 → **ACCELERATION / BREAKOUT**
+            - |Composite| ≤ 18 → **NEUTRAL / CHOP**
+            - Otherwise → **CONTROLLED TREND**
+            
+            In this case Composite = **{scores['composite']:+.0f}** → **{scores['bias']}**
+                    """
+                )
         with st.expander("▼ Score Breakdown & Details", expanded=False):
             s1, s2, s3, s4 = st.columns(4)
 
