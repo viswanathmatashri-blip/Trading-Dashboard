@@ -2363,9 +2363,8 @@ def render_basket_table_fullwidth(data: dict):
 
 def render_futures_cvd_chart(data: dict):
     """Cumulative Volume Delta proxy from near-month futures candles.
-    Uses volume-location formula (not true buy/sell prints):
-        delta = volume * ((close - low) / (high - low) * 2 - 1)
-    SmartAPI does not provide aggressor-side volume for index futures.
+    SmartAPI does not provide buy/sell volume for index futures, so we use a
+    standard directional proxy: +volume when close >= open (up bar), -volume otherwise.
     """
     df_fut = data.get("df_futures", pd.DataFrame())
     if df_fut is None or df_fut.empty or len(df_fut) < 5:
@@ -2375,18 +2374,15 @@ def render_futures_cvd_chart(data: dict):
     df = df_fut.copy()
     df["time"] = pd.to_datetime(df["time"])
     df["session_date"] = df["time"].dt.date
+    # Latest session only for a clean CVD
     latest = sorted(df["session_date"].unique())[-1]
     df = df[df["session_date"] == latest].sort_values("time").reset_index(drop=True)
     if df.empty or "volume" not in df.columns:
         st.info("No volume on futures candles for CVD.")
         return
 
-    # ----- Method 1: Volume-location formula -----
-    hl = (df["high"] - df["low"]).replace(0, np.nan)
-    loc = ((df["close"] - df["low"]) / hl * 2.0 - 1.0).fillna(0.0)
-    # Clamp to [-1, +1] for safety
-    loc = loc.clip(-1.0, 1.0)
-    df["signed_vol"] = df["volume"] * loc
+    # Directional volume proxy
+    df["signed_vol"] = np.where(df["close"] >= df["open"], df["volume"], -df["volume"])
     df["cvd"] = df["signed_vol"].cumsum()
     df["time_str"] = df["time"].dt.strftime("%H:%M")
 
@@ -2395,13 +2391,14 @@ def render_futures_cvd_chart(data: dict):
 
     st.markdown(
         f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
-        f"📉 Futures CVD (volume-location proxy) — {latest}</span>",
+        f"📉 Futures CVD (proxy) — latest session {latest}</span>",
         unsafe_allow_html=True
     )
     st.caption(
-        "CVD = cumulative [volume × ((close−low)/(high−low)×2 − 1)]. "
-        "Close at high → full +volume; close at low → full −volume; mid-range → near 0. "
-        "Proxy only — SmartAPI does not supply buy/sell side volume for index futures."
+        "Cumulative Volume Delta from near-month futures. "
+        "SmartAPI does not supply buy/sell side volume for index futures, "
+        "so each bar’s volume is signed + if close≥open, − otherwise. "
+        "This is a widely used institutional proxy."
     )
 
     fig = plt_go.Figure()
@@ -2423,6 +2420,7 @@ def render_futures_cvd_chart(data: dict):
         hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True)
+
 
 def render_live_alert_ribbon(data: dict = None):
     """Compact layout: left = Basket Greeks | right = Z-Scores. (Live alerts removed)"""
@@ -2738,13 +2736,27 @@ def live_dashboard_fragment():
             fig_ind.update_xaxes(type="category", nticks=6)
             st.plotly_chart(fig_ind, use_container_width=True)
 
-        
         # ========== ROW1: Futures VWAP 70% | GEX vs OI 30% ==========
-        # ========== ROW2: CVD 70% | GEX vs Vol 30% ==========
+        # ========== ROW2: CVD 70%        | GEX vs Vol 30% ==========
         st.markdown("---")
         df_fut = data.get("df_futures", pd.DataFrame())
         df_chain = pd.DataFrame(data.get("chain_results") or [])
         basis = data.get("basis_info", {}) or {}
+
+        def calculate_synced_ranges(primary, secondary):
+            """Align zero line of primary & secondary y-axes at the same vertical position."""
+            p = pd.Series(primary).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+            s = pd.Series(secondary).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+            p_max = max(float(p.max()) if len(p) else 0.0, 0.0) or 1.0
+            p_min = min(float(p.min()) if len(p) else 0.0, 0.0) or -1.0
+            s_max = max(float(s.max()) if len(s) else 0.0, 0.0) or 1.0
+            s_min = min(float(s.min()) if len(s) else 0.0, 0.0) or -1.0
+            p_frac = abs(p_min) / (abs(p_min) + p_max)
+            s_frac = abs(s_min) / (abs(s_min) + s_max)
+            frac = min(max(max(p_frac, s_frac), 0.15), 0.85)
+            p_total = (abs(p_min) + p_max) * 1.10
+            s_total = (abs(s_min) + s_max) * 1.10
+            return [-p_total * frac, p_total * (1.0 - frac)], [-s_total * frac, s_total * (1.0 - frac)]
 
         df_fchart = pd.DataFrame()
         fut_times = []
@@ -2757,7 +2769,16 @@ def live_dashboard_fragment():
             df_fchart["time_str"] = pd.to_datetime(df_fchart["time"]).dt.strftime("%H:%M")
             fut_times = df_fchart["time_str"].tolist()
 
-        # ----- Row 1 -----
+        if not df_chain.empty:
+            min_strike_val = float(df_chain["Strike"].min()) - 50
+            max_strike_val = float(df_chain["Strike"].max()) + 50
+            df_chain["Total_Vol"] = df_chain["C_Vol"] + df_chain["P_Vol"]
+            df_chain["Total_OI"] = df_chain["C_OI"] + df_chain["P_OI"]
+        else:
+            min_strike_val = float(data.get("spot_price", 0) or 0) - 500
+            max_strike_val = float(data.get("spot_price", 0) or 0) + 500
+
+        # ----- Row 1: Futures 70% | GEX OI 30% -----
         r1c1, r1c2 = st.columns([0.70, 0.30])
 
         with r1c1:
@@ -2801,7 +2822,7 @@ def live_dashboard_fragment():
                     vwaps, stds = [], []
                     for i in range(len(group)):
                         vol = float(group.loc[i, "volume"])
-                        tp  = float(group.loc[i, "tp"])
+                        tp = float(group.loc[i, "tp"])
                         cum_vol += vol
                         cum_tp_vol += tp * vol
                         vwap = cum_tp_vol / cum_vol if cum_vol > 0 else tp
@@ -2817,7 +2838,7 @@ def live_dashboard_fragment():
 
                 df_fchart = _calc_session_vwap_bands(df_fchart, sigma_mult)
                 latest_vwap = float(df_fchart["vwap"].iloc[-1])
-                latest_fut  = float(df_fchart["close"].iloc[-1])
+                latest_fut = float(df_fchart["close"].iloc[-1])
                 fmin = min(df_fchart["close"].min(), df_fchart["vwap_lower"].min())
                 fmax = max(df_fchart["close"].max(), df_fchart["vwap_upper"].max())
                 fpad = (fmax - fmin) * 0.06
@@ -2854,28 +2875,36 @@ def live_dashboard_fragment():
         with r1c2:
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📈 GEX vs OI</span>", unsafe_allow_html=True)
             if not df_chain.empty and lvls:
+                primary_oi = df_chain["C_OI"].astype(float) - df_chain["P_OI"].astype(float)
+                # For display: call up, put down separately; secondary = Net GEX
                 gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
                 fig_oi = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_OI"], name="Net GEX",
-                                            marker_color=gex_oi_colors, opacity=0.85, width=25), secondary_y=True)
                 fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_OI"], name="Call OI",
                                             marker_color="#2E7D32", opacity=0.55), secondary_y=False)
                 fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_OI"], name="Put OI",
                                             marker_color="#C62828", opacity=0.55), secondary_y=False)
-                fig_oi.add_hline(y=0, line_width=1, line_color="#FFFFFF")
+                fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_OI"], name="Net GEX",
+                                            marker_color=gex_oi_colors, opacity=0.85, width=25), secondary_y=True)
+                fig_oi.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
                 fig_oi.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
                 fig_oi.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800")
+                oi_primary = pd.concat([df_chain["C_OI"].astype(float), -df_chain["P_OI"].astype(float)])
+                oi1_range, oi2_range = calculate_synced_ranges(oi_primary, df_chain["Net_GEX_OI"].astype(float))
                 fig_oi.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                     height=320, barmode="overlay", margin=dict(l=5, r=5, t=25, b=10),
                     showlegend=False, hovermode="x unified",
                 )
-                fig_oi.update_xaxes(type="linear", tickformat="d", dtick=200)
+                fig_oi.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
+                fig_oi.update_yaxes(range=oi1_range, secondary_y=False, showgrid=True, gridcolor="#262930",
+                                    zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
+                fig_oi.update_yaxes(range=oi2_range, secondary_y=True, showgrid=False,
+                                    zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
                 st.plotly_chart(fig_oi, use_container_width=True)
             else:
                 st.info("GEX/OI unavailable.")
 
-        # ----- Row 2 -----
+        # ----- Row 2: CVD 70% | GEX Vol 30% -----
         r2c1, r2c2 = st.columns([0.70, 0.30])
 
         with r2c1:
@@ -2887,7 +2916,6 @@ def live_dashboard_fragment():
                 df_cvd["cvd"] = df_cvd["signed_vol"].cumsum()
                 latest_cvd = float(df_cvd["cvd"].iloc[-1])
                 colour = "#00E676" if latest_cvd >= 0 else "#FF5252"
-
                 st.markdown(
                     f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
                     f"📉 Futures CVD (volume-location) — {latest_session}</span>",
@@ -2918,116 +2946,110 @@ def live_dashboard_fragment():
             if not df_chain.empty and lvls:
                 gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
                 fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net GEX",
-                                             marker_color=gex_vol_colors, opacity=0.85, width=25), secondary_y=True)
                 fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_Vol"], name="Call Vol",
                                              marker_color="#81C784", opacity=0.55), secondary_y=False)
                 fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_Vol"], name="Put Vol",
                                              marker_color="#FF8A80", opacity=0.55), secondary_y=False)
-                fig_vol.add_hline(y=0, line_width=1, line_color="#FFFFFF")
+                fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net GEX",
+                                             marker_color=gex_vol_colors, opacity=0.85, width=25), secondary_y=True)
+                fig_vol.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
                 fig_vol.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
                 fig_vol.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800")
+                vol_primary = pd.concat([df_chain["C_Vol"].astype(float), -df_chain["P_Vol"].astype(float)])
+                v1_range, v2_range = calculate_synced_ranges(vol_primary, df_chain["Net_GEX_Vol"].astype(float))
                 fig_vol.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                     height=280, barmode="overlay", margin=dict(l=5, r=5, t=25, b=10),
                     showlegend=False, hovermode="x unified",
                 )
-                fig_vol.update_xaxes(type="linear", tickformat="d", dtick=200)
+                fig_vol.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
+                fig_vol.update_yaxes(range=v1_range, secondary_y=False, showgrid=True, gridcolor="#262930",
+                                     zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
+                fig_vol.update_yaxes(range=v2_range, secondary_y=True, showgrid=False,
+                                     zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
                 st.plotly_chart(fig_vol, use_container_width=True)
             else:
                 st.info("GEX/Vol unavailable.")
 
-        # Delta-GEX + Heatmap   ← keep your existing block from here downward        # Delta-GEX + Heatmap
-        st.markdown("---")
-        d_left, d_right = st.columns([0.40, 0.60])
-        with d_left:
-            st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🎯 Delta-Adjusted GEX</span>", unsafe_allow_html=True)
-            delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
-            fig_delta_gex = plt_go.Figure()
-            fig_delta_gex.add_trace(plt_go.Bar(
-                x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], name="Δ-GEX",
-                marker_color=delta_gex_colors, opacity=0.85, width=25,
-            ))
-            fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-            fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-            fig_delta_gex.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
-            fig_delta_gex.update_layout(
-                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=520, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
-            )
-            _min_s = df_chain["Strike"].min() - 50 if not df_chain.empty else data["spot_price"] - 500
-            _max_s = df_chain["Strike"].max() + 50 if not df_chain.empty else data["spot_price"] + 500
-            fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[_min_s, _max_s])
-            fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
-            st.plotly_chart(fig_delta_gex, use_container_width=True)
+        # Delta-GEX + Heatmap
+        if not df_chain.empty and lvls:
+            st.markdown("---")
+            d_left, d_right = st.columns([0.40, 0.60])
+            with d_left:
+                st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🎯 Delta-Adjusted GEX</span>", unsafe_allow_html=True)
+                delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
+                fig_delta_gex = plt_go.Figure()
+                fig_delta_gex.add_trace(plt_go.Bar(
+                    x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], name="Δ-GEX",
+                    marker_color=delta_gex_colors, opacity=0.85, width=25,
+                ))
+                fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
+                fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
+                fig_delta_gex.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
+                fig_delta_gex.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=520, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+                )
+                fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
+                fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                st.plotly_chart(fig_delta_gex, use_container_width=True)
 
-        with d_right:
-            render_delta_gex_heatmap(
-                data, Index_Name, selected_expiry_str,
-                st.session_state.get("heatmap_timeframe", "5 min"),
-            )
+            with d_right:
+                render_delta_gex_heatmap(
+                    data, Index_Name, selected_expiry_str,
+                    st.session_state.get("heatmap_timeframe", "5 min"),
+                )
 
-     
+            # VEX/CEX + Skew
+            st.markdown("---")
+            vex_col, skew_col = st.columns([0.60, 0.40])
+            with vex_col:
+                st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>⚡ VEX / CEX Profile</span>", unsafe_allow_html=True)
+                fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
+                fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20), secondary_y=False)
+                fig_vex_cex.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4)), secondary_y=True)
+                fig_vex_cex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
+                fig_vex_cex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
+                vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].astype(float), df_chain["CEX"].astype(float))
+                fig_vex_cex.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=400, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
+                fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
+                fig_vex_cex.update_yaxes(range=vex_range, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                fig_vex_cex.update_yaxes(range=cex_range, secondary_y=True, showgrid=False)
+                st.plotly_chart(fig_vex_cex, use_container_width=True)
+
+            with skew_col:
+                st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>📉 IV Skew ({selected_expiry_str})</span>", unsafe_allow_html=True)
+                smart_api = get_smart_api_client()
+                if smart_api and not df_master.empty:
+                    latest_spot = data["spot_price"]
+                    df_chain_iv = fetch_and_compute_full_chain_iv(
+                        smart_api, df_master, Index_Name, Exchange, selected_expiry_str,
+                        latest_spot, rate_param, strikes_below=strikes_below, strikes_above=strikes_above,
+                    )
+                    if not df_chain_iv.empty:
+                        tab1, tab2 = st.tabs(["OTM Skew (Puts & Calls)", "Both Raw Curves (CE vs PE)"])
+                        with tab1:
+                            df_skew = get_clean_otm_skew(df_chain_iv, latest_spot)
+                            fig_skew = px.line(df_skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"])
+                            fig_skew.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
+                            fig_skew.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
+                            st.plotly_chart(fig_skew, use_container_width=True)
+                        with tab2:
+                            fig_raw = px.line(df_chain_iv, x="Strike", y="IV_%", color="Option_Type", markers=True, color_discrete_map={"CE": "#00cc96", "PE": "#ff4136"}, hover_data=["LTP"])
+                            fig_raw.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
+                            fig_raw.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
+                            st.plotly_chart(fig_raw, use_container_width=True)
+                    else:
+                        st.info("Skew data unavailable.")
+                else:
+                    st.info("API session needed for skew.")
+        elif not df_chain.empty:
+            st.info("Key levels not available – GEX charts skipped.")
 
         render_live_alert_ribbon(data)
         render_basket_table_fullwidth(data)
-        def calculate_synced_ranges(v1_pos, v1_neg, v2_pos, v2_neg):
-            y1_max = max(float(v1_pos.max()) if len(v1_pos) else 1.0, 1.0)
-            y1_min = min(float(v1_neg.min()) if len(v1_neg) else -1.0, -1.0)
-            y2_max = max(float(v2_pos.max()) if len(v2_pos) else 1.0, 1.0)
-            y2_min = min(float(v2_neg.min()) if len(v2_neg) else -1.0, -1.0)
-            ratio1 = abs(y1_min) / max(y1_max, 1e-5)
-            ratio2 = abs(y2_min) / max(y2_max, 1e-5)
-            max_ratio = max(ratio1, ratio2)
-            range1 = [-y1_max * max_ratio * 1.05, y1_max * 1.05]
-            range2 = [-y2_max * max_ratio * 1.05, y2_max * 1.05]
-            return range1, range2
-        # VEX/CEX + Skew
-        st.markdown("---")
-        vex_col, skew_col = st.columns([0.60, 0.40])
-        with vex_col:
-            st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>⚡ VEX / CEX Profile</span>", unsafe_allow_html=True)
-            fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
-            fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20), secondary_y=False)
-            fig_vex_cex.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4)), secondary_y=True)
-            fig_vex_cex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-            fig_vex_cex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-            vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].clip(lower=0), df_chain["VEX"].clip(upper=0), df_chain["CEX"].clip(lower=0), df_chain["CEX"].clip(upper=0))
-            fig_vex_cex.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=400, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
-            fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
-            fig_vex_cex.update_yaxes(range=vex_range, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
-            fig_vex_cex.update_yaxes(range=cex_range, secondary_y=True, showgrid=False)
-            st.plotly_chart(fig_vex_cex, use_container_width=True)
 
-        with skew_col:
-            st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>📉 IV Skew ({selected_expiry_str})</span>", unsafe_allow_html=True)
-            smart_api = get_smart_api_client()
-            if smart_api and not df_master.empty:
-                latest_spot = data["spot_price"]
-                df_chain_iv = fetch_and_compute_full_chain_iv(
-                    smart_api, df_master, Index_Name, Exchange, selected_expiry_str,
-                    latest_spot, rate_param, strikes_below=strikes_below, strikes_above=strikes_above,
-                )
-                if not df_chain_iv.empty:
-                    tab1, tab2 = st.tabs(["OTM Skew (Puts & Calls)", "Both Raw Curves (CE vs PE)"])
-                    with tab1:
-                        df_skew = get_clean_otm_skew(df_chain_iv, latest_spot)
-                        fig_skew = px.line(df_skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"])
-                        fig_skew.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
-                        fig_skew.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
-                        st.plotly_chart(fig_skew, use_container_width=True)
-                    with tab2:
-                        fig_raw = px.line(df_chain_iv, x="Strike", y="IV_%", color="Option_Type", markers=True, color_discrete_map={"CE": "#00cc96", "PE": "#ff4136"}, hover_data=["LTP"])
-                        fig_raw.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
-                        fig_raw.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
-                        st.plotly_chart(fig_raw, use_container_width=True)
-                else:
-                    st.info("Skew data unavailable.")
-            else:
-                st.info("API session needed for skew.")
-    elif not df_chain.empty:
-        st.info("Key levels not available – GEX charts skipped.")
 live_dashboard_fragment()
 
 # --- Full-width: Institutional Order Flow, then Raw Z-Score details ---
