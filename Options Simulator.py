@@ -1799,13 +1799,12 @@ def _save_gex_history(history: list, index_name: str, expiry_str: str):
 @st.cache_data(ttl=120, show_spinner=False)
 def compute_multi_expiry_delta_gex(_api, index_name: str, exchange: str, spot: float, rate: float,
                                    lot_size: int, strike_lo: float, strike_hi: float, months: int = 6):
-    """Aggregate Delta-Adjusted GEX (OI) across all expiries within `months` for the index.
-    Strike window limited to [strike_lo, strike_hi] for speed / alignment with selected-expiry chart.
-    """
+    """Aggregate Delta-Adjusted GEX (OI) across all expiries within `months` for the index."""
     try:
         df_m = download_master_scrip()
-        if df_m is None or df_m.empty:
+        if df_m is None or df_m.empty or spot <= 0:
             return pd.DataFrame()
+
         today = datetime.datetime.now().date()
         cutoff = today + datetime.timedelta(days=int(months * 31))
         df_opt = df_m[
@@ -1815,62 +1814,74 @@ def compute_multi_expiry_delta_gex(_api, index_name: str, exchange: str, spot: f
         ].copy()
         if df_opt.empty:
             return pd.DataFrame()
-        df_opt["expiry_dt"] = pd.to_datetime(df_opt["expiry"], format="%d%b%Y", errors="coerce")
+
+        if "expiry_dt" not in df_opt.columns:
+            df_opt["expiry_dt"] = pd.to_datetime(df_opt["expiry"], format="%d%b%Y", errors="coerce")
         df_opt = df_opt[df_opt["expiry_dt"].notna()]
         df_opt = df_opt[(df_opt["expiry_dt"].dt.date >= today) & (df_opt["expiry_dt"].dt.date <= cutoff)]
-        df_opt["strike_clean"] = pd.to_numeric(df_opt["strike"], errors="coerce") / (100.0 if exchange == "NFO" else 1.0)
-        if df_opt["strike_clean"].max() > 1e6:
+
+        if "strike_clean" not in df_opt.columns:
+            df_opt["strike_clean"] = pd.to_numeric(df_opt["strike"], errors="coerce") / 100.0
+        # NFO strikes are in paise; if still huge, divide again
+        if df_opt["strike_clean"].median() > spot * 5:
             df_opt["strike_clean"] = df_opt["strike_clean"] / 100.0
+
         df_opt = df_opt[(df_opt["strike_clean"] >= strike_lo) & (df_opt["strike_clean"] <= strike_hi)]
         if df_opt.empty:
             return pd.DataFrame()
 
-        tokens = [str(t) for t in df_opt["token"].dropna().unique()]
+        tokens = [str(t) for t in df_opt["token"].dropna().astype(str).unique()]
         market = {}
-        for i in range(0, len(tokens), 40):
-            chunk = tokens[i:i + 40]
+        for i in range(0, len(tokens), 50):
+            chunk = tokens[i:i + 50]
             res = safe_api_call(_api.getMarketData, "FULL", {exchange: chunk})
             if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
                 for item in res["data"]["fetched"]:
+                    # Angel SmartAPI uses opnInterest for OI
+                    oi_val = item.get("opnInterest", item.get("opInterest", item.get("oi", 0)))
                     market[str(item["symbolToken"])] = {
                         "ltp": float(item.get("ltp", 0) or 0),
-                        "oi": float(item.get("opInterest", item.get("oi", 0)) or 0),
+                        "oi": float(oi_val or 0),
                     }
-            time.sleep(0.35)
+            time.sleep(0.25)
 
-        # Group by strike + CE/PE across expiries
         rows = []
         for _, r in df_opt.iterrows():
             tok = str(r["token"])
             md = market.get(tok)
-            if not md or md["ltp"] <= 0:
+            if not md:
                 continue
-            sym = str(r.get("symbol", ""))
-            opt = "CE" if sym.endswith("CE") else "PE"
-            exp_dt = r["expiry_dt"].date()
-            dte = max((exp_dt - today).days, 0.001)
+            oi = float(md.get("oi", 0) or 0)
+            ltp = float(md.get("ltp", 0) or 0)
+            if oi <= 0 or ltp <= 0:
+                continue
+            sym = str(r.get("symbol", "") or "")
+            opt = "CE" if sym.upper().endswith("CE") else "PE"
+            exp_dt = r["expiry_dt"].date() if hasattr(r["expiry_dt"], "date") else pd.to_datetime(r["expiry_dt"]).date()
+            dte = max((exp_dt - today).days, 0.05)
             T = dte / 365.0
             K = float(r["strike_clean"])
             flag = "c" if opt == "CE" else "p"
-            iv = VolatilityEngine.calculate_iv(md["ltp"], spot, K, T, rate, flag)
-            if iv <= 0:
+            iv = VolatilityEngine.calculate_iv(ltp, spot, K, T, rate, flag)
+            if iv is None or iv <= 0:
                 continue
             greeks = VolatilityEngine.calculate_greeks(spot, K, T, rate, iv, flag)
             gex_scale = lot_size * (spot ** 2) * 0.01
-            raw_gex = greeks["gamma"] * md["oi"] * gex_scale
+            raw_gex = greeks["gamma"] * oi * gex_scale
             if opt == "CE":
-                delta_gex = raw_gex * max(greeks["delta"], 0.0)
+                delta_gex = raw_gex * max(float(greeks["delta"]), 0.0)
             else:
-                delta_gex = -(raw_gex * abs(greeks["delta"]))
+                delta_gex = -raw_gex * abs(float(greeks["delta"]))
             rows.append({"Strike": K, "Net_Delta_GEX_OI": delta_gex})
 
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows)
         agg = df.groupby("Strike", as_index=False)["Net_Delta_GEX_OI"].sum()
-        return agg.sort_values("Strike")
-    except Exception:
+        return agg.sort_values("Strike").reset_index(drop=True)
+    except Exception as e:
         return pd.DataFrame()
+
 
 
 def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatmap_tf_label: str):
@@ -3073,11 +3084,11 @@ def live_dashboard_fragment():
                 fig_delta_gex.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
                 fig_delta_gex.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=320, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+                    height=340, margin=dict(l=10, r=10, t=24, b=8), hovermode="x unified",
                     showlegend=False,
                 )
                 fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
-                fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
                 st.plotly_chart(fig_delta_gex, use_container_width=True)
 
                 # Multi-expiry Δ-GEX (next 6 months) — same strike axis
@@ -3108,13 +3119,16 @@ def live_dashboard_fragment():
                         fig_mx.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
                     fig_mx.update_layout(
                         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                        height=320, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+                        height=340, margin=dict(l=10, r=10, t=24, b=8), hovermode="x unified",
                         showlegend=False,
                     )
                     fig_mx.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
-                    fig_mx.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                    fig_mx.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
                     st.plotly_chart(fig_mx, use_container_width=True)
-                    st.caption("Sum of delta-adjusted GEX (OI) across all listed expiries in the next 6 months, same strike window.")
+                    st.caption(
+                        f"Sum of delta-adjusted GEX (OI) across all listed expiries in the next 6 months "
+                        f"({len(df_mx)} strikes). Same strike window as chart above."
+                    )
                 else:
                     st.info("Multi-expiry Δ-GEX unavailable (API / no data).")
 
@@ -3132,7 +3146,7 @@ def live_dashboard_fragment():
                 vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].astype(float), df_chain["CEX"].astype(float))
                 fig_vex_cex.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=360, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                    height=340, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
                 )
                 fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
