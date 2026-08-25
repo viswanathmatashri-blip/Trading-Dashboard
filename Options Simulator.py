@@ -1450,6 +1450,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 if run_btn or "data_store" not in st.session_state:
     new_data = fetch_live_data(st.session_state["selected_timeframe"], progress_container=main_top_progress_holder)
     if new_data:
+        new_data["selected_expiry"] = selected_expiry_str
         st.session_state["data_store"] = new_data
 
 # --- Z-SCORE ANALYSIS FRAGMENT ---
@@ -2359,75 +2360,82 @@ def render_basket_table_fullwidth(data: dict):
             st.plotly_chart(_plot_bm(combined, "Charm_Scaled", "Charm (scaled)", "#E040FB"), use_container_width=True)
 
 
-def render_live_alert_ribbon(data: dict = None):
-    """Full-width layout: left = Sit1 + Sit2 + Basket | right = Z-Scores."""
-    snap = st.session_state.get("_live_alert_snapshot")
-    if not snap:
+
+def render_futures_cvd_chart(data: dict):
+    """Cumulative Volume Delta proxy from near-month futures candles.
+    SmartAPI does not provide buy/sell volume for index futures, so we use a
+    standard directional proxy: +volume when close >= open (up bar), -volume otherwise.
+    """
+    df_fut = data.get("df_futures", pd.DataFrame())
+    if df_fut is None or df_fut.empty or len(df_fut) < 5:
+        st.info("Futures CVD not available – need futures candles with volume.")
         return
 
-    def _badge_html(flag, yes_txt="YES", no_txt="NO"):
-        if flag:
-            return (
-                f"<span style='background:rgba(255,82,82,0.25);color:#FF5252;"
-                f"padding:2px 8px;border-radius:4px;font-weight:700;"
-                f"border:1px solid #FF5252;font-size:12px'>{yes_txt}</span>"
-            )
-        return (
-            f"<span style='background:rgba(0,230,118,0.15);color:#00E676;"
-            f"padding:2px 8px;border-radius:4px;font-weight:700;"
-            f"border:1px solid #00E676;font-size:12px'>{no_txt}</span>"
-        )
+    df = df_fut.copy()
+    df["time"] = pd.to_datetime(df["time"])
+    df["session_date"] = df["time"].dt.date
+    # Latest session only for a clean CVD
+    latest = sorted(df["session_date"].unique())[-1]
+    df = df[df["session_date"] == latest].sort_values("time").reset_index(drop=True)
+    if df.empty or "volume" not in df.columns:
+        st.info("No volume on futures candles for CVD.")
+        return
 
-    def _sub_html(flag, label):
-        colour = "#FF5252" if flag else "#00E676"
-        txt = "Yes" if flag else "No"
-        return f"<span style='color:{colour};font-weight:600;font-size:12px'>{label} – {txt}</span>"
+    # Directional volume proxy
+    df["signed_vol"] = np.where(df["close"] >= df["open"], df["volume"], -df["volume"])
+    df["cvd"] = df["signed_vol"].cumsum()
+    df["time_str"] = df["time"].dt.strftime("%H:%M")
 
-    exit_label = "YES" if snap["exit_alert"] else "NO"
-    long_label = "YES" if snap["long_alert"] else "NO"
-    cur = snap["cur"]
+    latest_cvd = float(df["cvd"].iloc[-1])
+    colour = "#00E676" if latest_cvd >= 0 else "#FF5252"
 
+    st.markdown(
+        f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
+        f"📉 Futures CVD (proxy) — latest session {latest}</span>",
+        unsafe_allow_html=True
+    )
+    st.caption(
+        "Cumulative Volume Delta from near-month futures. "
+        "SmartAPI does not supply buy/sell side volume for index futures, "
+        "so each bar’s volume is signed + if close≥open, − otherwise. "
+        "This is a widely used institutional proxy."
+    )
+
+    fig = plt_go.Figure()
+    fig.add_trace(plt_go.Scatter(
+        x=df["time_str"], y=df["cvd"],
+        mode="lines", name="CVD",
+        line=dict(color=colour, width=2),
+        fill="tozeroy",
+        fillcolor="rgba(0,230,118,0.08)" if latest_cvd >= 0 else "rgba(255,82,82,0.08)",
+    ))
+    fig.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+        height=280, margin=dict(l=10, r=10, t=30, b=10),
+        title=dict(text=f"CVD: {latest_cvd:,.0f}", x=0.01, font=dict(size=12)),
+        xaxis=dict(type="category", nticks=10),
+        yaxis=dict(title="Cumulative signed volume"),
+        showlegend=False,
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_live_alert_ribbon(data: dict = None):
+    """Compact layout: left = Basket Greeks | right = Z-Scores. (Live alerts removed)"""
     st.markdown("---")
-    st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🚨 Live Alert Status</span>", unsafe_allow_html=True)
-
-    left_blk, right_blk = st.columns([0.66, 0.34])
+    left_blk, right_blk = st.columns([0.40, 0.60])
 
     with left_blk:
-        a1, a2 = st.columns(2)
-        with a1:
-            with st.expander(f"Sit. 1 · Exit / Risk-Off → {exit_label}", expanded=True):
-                st.markdown(f"Overall: {_badge_html(snap['exit_alert'])}", unsafe_allow_html=True)
-                st.markdown(
-                    f"""
-                    <div style='line-height:1.65;font-size:12px'>
-                    {_sub_html(snap['crit_a_exit'], 'Wall Collapse (≥25% / 10m)')}<br>
-                    {_sub_html(snap['crit_b_exit'], 'Vol Expansion (IV ↑ ≥0.8% / 5m)')}<br>
-                    {_sub_html(snap['crit_c_exit'], 'GEX Flip (≤0.3% or –GEX zone)')}<br>
-                    <small style='color:#AAA'>Drop {snap['wall_drop']:.1f}% | Call Δ {snap['call_iv_chg']:+.2f}% | Put Δ {snap['put_iv_chg']:+.2f}% | Flip {snap['dist_to_flip_pct']:.2f}%</small>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-        with a2:
-            with st.expander(f"Sit. 2 · Long Entry → {long_label}", expanded=True):
-                st.markdown(f"Overall: {_badge_html(snap['long_alert'])}", unsafe_allow_html=True)
-                st.markdown(
-                    f"""
-                    <div style='line-height:1.65;font-size:12px'>
-                    {_sub_html(snap['crit_a_long'], 'Gamma Fuel (–GEX or collapse ≥40%)')}<br>
-                    {_sub_html(snap['crit_b_long'], 'Aggressive Demand (Call IV ↑ ≥1.5%)')}<br>
-                    {_sub_html(snap['crit_c_long'], 'Volume Confirm (≥1.5× 20-MA)')}<br>
-                    <small style='color:#AAA'>NegGEX {cur['neg_gex_above']:.1f} Cr | Collapse {snap['pos_collapse']:.1f}% | Call Δ {snap['call_iv_chg']:+.2f}% | Vol {cur['vol_ratio']:.2f}×</small>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-        # Basket metrics under Sit1/Sit2, left of Z-Scores
         if data is not None:
             render_basket_metrics_block(data)
+        else:
+            st.caption("Basket Greeks – no data")
 
     with right_blk:
         zscore_analysis_fragment(mode="highlights")
+
 
 
 # --- LIVE DASHBOARD FRAGMENT ---
@@ -2440,6 +2448,7 @@ def live_dashboard_fragment():
     if st.session_state.get("enable_main_refresh", False):
         refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
         if refreshed_data:
+            refreshed_data["selected_expiry"] = selected_expiry_str
             st.session_state["data_store"] = refreshed_data
 
     data = st.session_state["data_store"]
@@ -2465,13 +2474,24 @@ def live_dashboard_fragment():
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Spot (Fut)", f"{data['spot_price']:.0f} ({data['F']:.0f})")
     c2.metric("Max Pain", f"{data['max_pain_strike']}")
-    c3.metric("Net Δ-GEX", f"₹{data['total_net_gex_oi']/1e7:.1f} Cr")
+    c3.metric("Net GEX (OI)", f"₹{data['total_net_gex_oi']/1e7:.1f} Cr")
     c4.metric("ATM IV Rank", f"{data['iv_percentile']:.0f}%")
     c5.metric("PCR", f"{data['pcr']:.2f}")
     c6.metric("C/P OI", f"{data['total_call_oi']//1000}k/{data['total_put_oi']//1000}k")
     c7.metric("Flip", f"{lvls.get('Zero_Gamma_Flip', '–')}")
     straddle_val = lvls.get("Straddle_Cost", 0)
     c8.metric("Straddle", f"₹{straddle_val:.0f}" if straddle_val else "–")
+
+    # Transparency: what is Net GEX?
+    with st.expander("?  What is Net GEX (OI)?", expanded=False):
+        expiry_shown = data.get("selected_expiry") or "selected expiry"
+        st.caption(
+            "**Net GEX (OI)** = sum(Call gamma * OI - Put gamma * OI) * lot * spot^2 * 0.01\n"
+            "• Built from **Open Interest**, not trade volume\n"
+            f"• Expiry: **{expiry_shown}**\n"
+            "• Per-strike bar chart uses **Delta-Adjusted GEX (OI)** (each wing weighted by its delta)\n"
+            "• Superhuman **Gamma Regime** uses this same OI-based Net GEX total"
+        )
 
     st.markdown(f"<div class='update-timestamp' style='margin-top:2px'>Updated {data['timestamp']}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -2579,9 +2599,10 @@ def live_dashboard_fragment():
                 st.markdown("**Gamma Regime**")
                 st.metric("", f"{scores['gamma_regime_score']:+.0f}", label_visibility="collapsed")
                 st.caption(
-                    f"Net Δ-GEX ₹{scores['total_delta_gex_cr']:.0f} Cr → normalised  \n"
-                    f"DTE={scores.get('dte', '–')} scaling applied  \n"
-                    f"＋ Long γ → Non-dir | − Short γ → Dir"
+                    f"OI Net GEX Rs {scores['total_delta_gex_cr']:.0f} Cr (not trade volume)  \n"
+                    f"sum(Call_g - Put_g) * OI * lot * spot^2 * 0.01  \n"
+                    f"Expiry: selected chain | DTE={scores.get('dte', '-')} scaled  \n"
+                    f"+ Long gamma -> Non-dir | - Short gamma -> Dir"
                 )
 
                 st.markdown("**Expected vs Realised**")
@@ -2589,40 +2610,41 @@ def live_dashboard_fragment():
                 st.caption(
                     f"Expected {scores['expected_move_pct']:.2f}% vs Realised {scores['realised_range_pct']:.2f}%  \n"
                     f"({scores.get('move_context', '')})  \n"
-                    f"＋ Straddle rich → Non-dir | − Big move → Dir"
+                    f"+ Straddle rich -> Non-dir | - Big move -> Dir"
                 )
 
                 st.markdown("**Charm / Vanna Flow**")
                 st.metric("", f"{scores['flow_score']:+.0f}", label_visibility="collapsed")
                 st.caption(
-                    f"Soft tanh(VEX + CEX) scaled to ±85  \n"
-                    f"＋ Supports pin → Non-dir | − Supports accel → Dir"
+                    f"Soft tanh(VEX + CEX) scaled to +/-85  \n"
+                    f"+ Supports pin -> Non-dir | - Supports accel -> Dir"
                 )
 
             with c2:
                 st.markdown("**OR vs GEX Walls**")
                 st.metric("", f"{scores['or_score']:+.0f}", label_visibility="collapsed")
-                or_txt = f"{scores['or_low']:.0f}–{scores['or_high']:.0f}" if scores.get('or_low') is not None else "N/A"
+                or_txt = f"{scores['or_low']:.0f}-{scores['or_high']:.0f}" if scores.get('or_low') is not None else "N/A"
                 st.caption(
                     f"OR {or_txt} vs Walls  \n"
                     f"Time-of-day factor {scores.get('tod_factor', 1):.2f}  \n"
-                    f"＋ Inside walls → Non-dir | − Break → Dir"
+                    f"+ Inside walls -> Non-dir | - Break -> Dir"
                 )
 
                 st.markdown("**Distance to Flip**")
                 st.metric("", f"{scores.get('flip_score', 0):+.0f}", label_visibility="collapsed")
                 st.caption(
                     f"Spot vs Flip distance {scores.get('dist_to_flip_pct', 0):.3f}%  \n"
-                    f"Close + long γ → pin bonus | Far + short γ → accel  \n"
+                    f"Close + long gamma -> pin bonus | Far + short gamma -> accel  \n"
                     f"Weight 10%"
                 )
 
                 st.markdown("**Composite**")
                 st.metric("", f"{scores['composite']:+.0f}", label_visibility="collapsed")
                 st.caption(
-                    f"0.38·Γ + 0.22·Move + 0.15·Flow + 0.15·OR + 0.10·Flip  \n"
-                    f"→ **{scores['bias']}**"
+                    f"0.38*Gamma + 0.22*Move + 0.15*Flow + 0.15*OR + 0.10*Flip  \n"
+                    f"-> **{scores['bias']}**"
                 )
+
     else:
         st.warning("Could not compute Superhuman scores – insufficient data.")
 
@@ -2957,6 +2979,10 @@ def live_dashboard_fragment():
                 data, Index_Name, selected_expiry_str,
                 st.session_state.get("heatmap_timeframe", "5 min"),
             )
+
+        # CVD chart (futures volume proxy)
+        st.markdown("---")
+        render_futures_cvd_chart(data)
 
         render_live_alert_ribbon(data)
         render_basket_table_fullwidth(data)
