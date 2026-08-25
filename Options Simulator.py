@@ -2777,9 +2777,9 @@ def live_dashboard_fragment():
         if not df_fut.empty and len(df_fut) >= 5:
             df_fut = df_fut.copy()
             df_fut["session_date"] = pd.to_datetime(df_fut["time"]).dt.date
-            last_3_fut = sorted(df_fut["session_date"].unique())[-3:]
-            df_fchart = df_fut[df_fut["session_date"].isin(last_3_fut)].copy()
-            df_fchart["time_str"] = pd.to_datetime(df_fchart["time"]).dt.strftime("%d-%b %H:%M")
+            latest_session = sorted(df_fut["session_date"].unique())[-1]
+            df_fchart = df_fut[df_fut["session_date"] == latest_session].copy()
+            df_fchart["time_str"] = pd.to_datetime(df_fchart["time"]).dt.strftime("%H:%M")
 
             # ----- Calculate VWAP Standard Deviation Bands -----
             # ----- Correct Volume-Weighted VWAP Standard Deviation Bands (causal, resets daily) -----
