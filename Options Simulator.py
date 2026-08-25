@@ -2359,7 +2359,7 @@ def live_dashboard_fragment():
         with action_col:
             st.caption(scores["action"])
         with st.expander("▼ Decision Tree – How this judgement was reached", expanded=False):
-    st.markdown(
+st.markdown(
         f"""
 **Composite Score = {scores['composite']:+.0f}**
 
