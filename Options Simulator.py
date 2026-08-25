@@ -1725,13 +1725,18 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
             if (now_ist - last_ts).total_seconds() >= 240:
                 should_append = True
 
-    if should_append:
-        gex_hist.append({"ts": now_ist, "strikes": list(strikes), "gex_cr": list(gex_cr)})
-        # Keep only last 8 hours of today
-        cutoff = now_ist - datetime.timedelta(hours=8)
-        gex_hist = [h for h in gex_hist if h["ts"] >= cutoff]
-        _save_gex_history(gex_hist, index_name, expiry_str)
-
+       should_append = False
+    if is_market_hours:
+        if not gex_hist:
+            should_append = True
+        else:
+            last_ts = gex_hist[-1]["ts"]
+            if (now_ist - last_ts).total_seconds() >= 150:   # every ~2.5 min
+                should_append = True
+    else:
+        # Outside market hours still keep at least one snapshot so the chart is never blank
+        if not gex_hist:
+            should_append = True
         alert_hist.append({
             "ts": now_ist,
             "spot": spot,
@@ -1785,24 +1790,33 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     gex_matrix = np.full((n_strikes, n_times), np.nan, dtype=float)
     current_vec = np.array(gex_cr, dtype=float)
 
-    if not gex_hist:
-        # First load – show current profile only on the latest few columns
-        gex_matrix[:, -3:] = current_vec[:, None]
+    if len(gex_hist) <= 1:
+        # Only one (or zero) snapshot → paint it uniformly across the whole session
+        # so the user always sees a proper coloured band.
+        paint_vec = current_vec if not gex_hist else np.array(gex_hist[-1]["gex_cr"], dtype=float)
+        # Align length just in case
+        if len(paint_vec) != n_strikes:
+            paint_vec = current_vec
+        gex_matrix[:] = paint_vec[:, None]
+
     else:
+        # Multiple snapshots → build true time evolution
         hist_times = []
         hist_vecs = []
         for h in gex_hist:
             ht = h["ts"]
             if getattr(ht, "tzinfo", None) is None:
                 ht = pytz.timezone("Asia/Kolkata").localize(ht)
+
             src_strikes = h["strikes"]
             src_gex = np.array(h["gex_cr"], dtype=float)
+
             if len(src_strikes) == n_strikes and abs(src_strikes[0] - strikes[0]) < 1:
                 vec = src_gex
             else:
                 src_map = dict(zip(src_strikes, src_gex))
                 vec = np.array([
-                    src_map.get(min(src_strikes, key=lambda x: abs(x - s)), np.nan)
+                    src_map.get(min(src_strikes, key=lambda x: abs(x - s)), 0.0)
                     for s in strikes
                 ])
             hist_times.append(ht)
@@ -1821,16 +1835,17 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
 
             if chosen_idx is not None:
                 gex_matrix[:, t_idx] = hist_vecs[chosen_idx]
-            # else leave as NaN (no data yet for this time)
+            else:
+                # Before the first snapshot → use the first snapshot
+                gex_matrix[:, t_idx] = hist_vecs[0]
 
-        # Forward-fill only *after* the first valid snapshot (never backward)
-        last_valid = None
+        # Forward-fill any remaining gaps
+        last_valid = gex_matrix[:, 0].copy()
         for t_idx in range(n_times):
             if not np.isnan(gex_matrix[0, t_idx]):
                 last_valid = gex_matrix[:, t_idx].copy()
-            elif last_valid is not None:
+            else:
                 gex_matrix[:, t_idx] = last_valid
-
     # Colour scale
     finite_vals = gex_matrix[np.isfinite(gex_matrix)]
     if len(finite_vals) > 0:
