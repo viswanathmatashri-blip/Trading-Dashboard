@@ -1577,10 +1577,85 @@ def _prepare_session_candles(df_candles: pd.DataFrame) -> pd.DataFrame:
     df = df[df[time_col].dt.date == latest_date].sort_values(time_col).reset_index(drop=True)
     df.rename(columns={time_col: "time"}, inplace=True)
     return df
+# ============================================================
+# GEX Heatmap History – Disk Persistence
+# ============================================================
+GEX_HISTORY_FILE = "gex_heatmap_history.json"
 
+def _load_gex_history(index_name: str, expiry_str: str) -> list:
+    """Load today's GEX history from disk. Returns list of dicts."""
+    if not os.path.exists(GEX_HISTORY_FILE):
+        return []
+    try:
+        with open(GEX_HISTORY_FILE, "r") as f:
+            raw = json.load(f)
+        # Keep only matching index + expiry + today's date
+        ist = pytz.timezone("Asia/Kolkata")
+        today = datetime.datetime.now(ist).date()
+        history = []
+        for h in raw:
+            if h.get("index") != index_name or h.get("expiry") != expiry_str:
+                continue
+            ts = pd.to_datetime(h["ts"])
+            if ts.tzinfo is None:
+                ts = ist.localize(ts)
+            if ts.date() != today:
+                continue
+            history.append({
+                "ts": ts,
+                "strikes": h["strikes"],
+                "gex_cr": h["gex_cr"],
+            })
+        # Sort by time
+        history.sort(key=lambda x: x["ts"])
+        return history
+    except Exception:
+        return []
+
+
+def _save_gex_history(history: list, index_name: str, expiry_str: str):
+    """Save history to disk (only today's data for this index/expiry)."""
+    try:
+        # Load existing file (may contain other indices/expiries)
+        existing = []
+        if os.path.exists(GEX_HISTORY_FILE):
+            with open(GEX_HISTORY_FILE, "r") as f:
+                existing = json.load(f)
+
+        # Remove old entries for this index+expiry
+        existing = [
+            e for e in existing
+            if not (e.get("index") == index_name and e.get("expiry") == expiry_str)
+        ]
+
+        # Add current history
+        for h in history:
+            existing.append({
+                "index": index_name,
+                "expiry": expiry_str,
+                "ts": h["ts"].isoformat(),
+                "strikes": h["strikes"],
+                "gex_cr": h["gex_cr"],
+            })
+
+        # Keep only last 2 calendar days to avoid unbounded growth
+        ist = pytz.timezone("Asia/Kolkata")
+        cutoff = datetime.datetime.now(ist) - datetime.timedelta(days=2)
+        cleaned = []
+        for e in existing:
+            ts = pd.to_datetime(e["ts"])
+            if ts.tzinfo is None:
+                ts = ist.localize(ts)
+            if ts >= cutoff:
+                cleaned.append(e)
+
+        with open(GEX_HISTORY_FILE, "w") as f:
+            json.dump(cleaned, f)
+    except Exception:
+        pass
 
 def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatmap_tf_label: str):
-    """Render strike × session-time Delta-Adjusted GEX heatmap + Exit / Long alert ribbon."""
+    """Render strike × session-time Delta-Adjusted GEX heatmap with persistent history."""
     chain_results = data.get("chain_results") or []
     if not chain_results:
         st.info("No option chain data available for GEX heatmap.")
@@ -1605,7 +1680,6 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         (df_chain["Strike"] >= spot) & (df_chain["Net_Delta_GEX_OI"] < 0), "Net_Delta_GEX_OI"
     ].sum() / 1e7)
 
-    # OTM Call IV (nearest OTM call) and OTM Put IV (nearest OTM put)
     otm_calls = df_chain[(df_chain["Strike"] >= spot)].copy()
     otm_puts = df_chain[(df_chain["Strike"] < spot)].copy()
     otm_call_iv = 0.0
@@ -1617,7 +1691,6 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         nearest_p = otm_puts.iloc[(otm_puts["Strike"] - spot).abs().argsort()[:1]]
         otm_put_iv = float(nearest_p["P_IV_val"].iloc[0]) * 100.0 if not nearest_p.empty else 0.0
 
-    # Volume from latest 5-min candle vs 20-period MA
     df_candles = data.get("df_candles", pd.DataFrame())
     vol_ratio = 0.0
     if not df_candles.empty and "volume" in df_candles.columns and len(df_candles) >= 21:
@@ -1625,26 +1698,40 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         ma20 = float(df_candles["volume"].iloc[-21:-1].mean())
         vol_ratio = recent_vol / ma20 if ma20 > 0 else 0.0
 
-    # ---- accumulate history for heatmap + alerts ----
+    # ---- Load persistent history from disk ----
     now_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-    gex_hist = st.session_state.get("gex_heatmap_history", [])
+    gex_hist = _load_gex_history(index_name, expiry_str)
     alert_hist = st.session_state.get("alert_metrics_history", [])
 
-    # Reset histories if strike window changes significantly
+    # Reset if strike window changed significantly
     if gex_hist and (len(gex_hist[-1]["strikes"]) != len(strikes) or
                      abs(gex_hist[-1]["strikes"][0] - strikes[0]) > 1 or
                      abs(gex_hist[-1]["strikes"][-1] - strikes[-1]) > 1):
         gex_hist = []
         alert_hist = []
 
-    should_append = True
-    if alert_hist:
-        last_ts = alert_hist[-1]["ts"]
-        if (now_ist - last_ts).total_seconds() < 25:
-            should_append = False
+    # ---- Append new snapshot (only during market hours + enough time gap) ----
+    market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    is_market_hours = (now_ist.weekday() < 5) and (market_open <= now_ist <= market_close)
+
+    should_append = False
+    if is_market_hours:
+        if not gex_hist:
+            should_append = True
+        else:
+            last_ts = gex_hist[-1]["ts"]
+            # Append roughly every 4–5 minutes for a 5-min heatmap
+            if (now_ist - last_ts).total_seconds() >= 240:
+                should_append = True
 
     if should_append:
         gex_hist.append({"ts": now_ist, "strikes": list(strikes), "gex_cr": list(gex_cr)})
+        # Keep only last 8 hours of today
+        cutoff = now_ist - datetime.timedelta(hours=8)
+        gex_hist = [h for h in gex_hist if h["ts"] >= cutoff]
+        _save_gex_history(gex_hist, index_name, expiry_str)
+
         alert_hist.append({
             "ts": now_ist,
             "spot": spot,
@@ -1655,11 +1742,11 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
             "otm_put_iv": otm_put_iv,
             "vol_ratio": vol_ratio,
         })
-        cutoff = now_ist - datetime.timedelta(hours=6)
-        gex_hist = [h for h in gex_hist if h["ts"] >= cutoff]
         alert_hist = [h for h in alert_hist if h["ts"] >= cutoff]
-        st.session_state["gex_heatmap_history"] = gex_hist
         st.session_state["alert_metrics_history"] = alert_hist
+
+    # Also keep a copy in session_state for the rest of the app
+    st.session_state["gex_heatmap_history"] = gex_hist
 
     # ---- session candles ----
     heatmap_tf_label = heatmap_tf_label or st.session_state.get("heatmap_timeframe", "5 min")
@@ -1694,17 +1781,14 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         st.info("Insufficient strike/time points for the GEX heatmap.")
         return
 
-    # ---- evolving GEX matrix from history ----
-    # Place each live snapshot at its real wall-clock time so the same strike
-    # can show different intensity / colour across the session (like the reference).
+    # ---- Build evolving GEX matrix (no longer paints latest GEX on whole day) ----
     gex_matrix = np.full((n_strikes, n_times), np.nan, dtype=float)
     current_vec = np.array(gex_cr, dtype=float)
 
     if not gex_hist:
-        # First load – paint current profile; later refreshes will add variation
-        gex_matrix[:] = current_vec[:, None]
+        # First load – show current profile only on the latest few columns
+        gex_matrix[:, -3:] = current_vec[:, None]
     else:
-        # Build a time-series of GEX vectors aligned to candle timestamps
         hist_times = []
         hist_vecs = []
         for h in gex_hist:
@@ -1717,35 +1801,37 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
                 vec = src_gex
             else:
                 src_map = dict(zip(src_strikes, src_gex))
-                vec = np.array([src_map.get(min(src_strikes, key=lambda x: abs(x - s)), 0.0) for s in strikes])
+                vec = np.array([
+                    src_map.get(min(src_strikes, key=lambda x: abs(x - s)), np.nan)
+                    for s in strikes
+                ])
             hist_times.append(ht)
             hist_vecs.append(vec)
 
         for t_idx, t in enumerate(session_times):
             if getattr(t, "tzinfo", None) is None:
                 t = pytz.timezone("Asia/Kolkata").localize(t)
-            # nearest snapshot whose time is <= candle time
+
+            # Find the latest snapshot that is <= this candle time
             chosen_idx = None
             for i in range(len(hist_times) - 1, -1, -1):
                 if hist_times[i] <= t:
                     chosen_idx = i
                     break
-            if chosen_idx is None:
-                # before first snapshot – use first snapshot (will be overwritten as history grows)
-                gex_matrix[:, t_idx] = hist_vecs[0]
-            else:
+
+            if chosen_idx is not None:
                 gex_matrix[:, t_idx] = hist_vecs[chosen_idx]
+            # else leave as NaN (no data yet for this time)
 
-        # Forward-fill any remaining NaNs with the latest known vector
-        last_valid = current_vec
+        # Forward-fill only *after* the first valid snapshot (never backward)
+        last_valid = None
         for t_idx in range(n_times):
-            if np.isnan(gex_matrix[0, t_idx]):
+            if not np.isnan(gex_matrix[0, t_idx]):
+                last_valid = gex_matrix[:, t_idx].copy()
+            elif last_valid is not None:
                 gex_matrix[:, t_idx] = last_valid
-            else:
-                last_valid = gex_matrix[:, t_idx]
 
-    # Symmetric colour scale centred at 0, but use a robust percentile so extreme
-    # single-strike spikes don't wash out the rest of the surface (matches ref look)
+    # Colour scale
     finite_vals = gex_matrix[np.isfinite(gex_matrix)]
     if len(finite_vals) > 0:
         p95 = float(np.nanpercentile(np.abs(finite_vals), 95))
@@ -1754,12 +1840,12 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         max_abs_gex = 0.05
 
     gex_colorscale = [
-        [0.0, "#b71c1c"],   # deep red (strong short-gamma)
+        [0.0, "#b71c1c"],
         [0.25, "#e53935"],
-        [0.45, "#ffee58"],  # neutral / low GEX
+        [0.45, "#ffee58"],
         [0.55, "#ffee58"],
         [0.75, "#43a047"],
-        [1.0, "#1b5e20"],   # deep green (strong long-gamma)
+        [1.0, "#1b5e20"],
     ]
 
     hm_c1, hm_c2 = st.columns([0.65, 0.35])
@@ -1767,22 +1853,26 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         st.subheader(f"🔥 Delta-Adjusted GEX Heatmap ({index_name})")
     with hm_c2:
         st.markdown(
-            f"<div class='update-timestamp'>Expiry: {expiry_str} | Session: {session_date_str} | {heatmap_tf_label} | Snapshots: {len(gex_hist)}</div>",
+            f"<div class='update-timestamp'>Expiry: {expiry_str} | Session: {session_date_str} | "
+            f"{heatmap_tf_label} | Snapshots: {len(gex_hist)}</div>",
             unsafe_allow_html=True,
         )
+
     n_snap = len(gex_hist)
     if n_snap <= 1:
         st.caption(
-            "Strike vs IST session time. Currently showing the **latest live GEX snapshot** painted across the session "
-            "(single snapshot → uniform bands per strike). This is expected for the last trading session or on first load. "
-            "Enable **Auto-Refresh** during a live market day and let it run – new snapshots will make the same strike "
-            "change shade/intensity over time (like a true GEX surface). "
+            "Strike vs IST session time. Currently showing the **latest live GEX snapshot**. "
+            "Enable **Auto-Refresh** and leave the dashboard open – new snapshots will be saved to disk "
+            "and the heatmap will start showing true evolution of GEX through the day. "
             "Green = long-gamma; red = short-gamma. Cyan = spot path."
         )
     else:
+        first_ts = gex_hist[0]["ts"].strftime("%H:%M")
+        last_ts = gex_hist[-1]["ts"].strftime("%H:%M")
         st.caption(
-            f"Strike vs IST session time. Colour = live Delta-Adjusted Net GEX (₹ Cr) from {n_snap} successive SmartAPI snapshots. "
-            "Same strike can change shade/intensity as GEX evolves. "
+            f"Strike vs IST session time. Colour = live Delta-Adjusted Net GEX (₹ Cr) from "
+            f"**{n_snap} snapshots** ({first_ts} → {last_ts}). "
+            "History is persisted to disk and survives browser refresh. "
             "Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path."
         )
 
@@ -1813,7 +1903,8 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     )
     fig_hm.update_layout(
         title=dict(
-            text=f"<b>{index_name} Delta-Adjusted GEX Heatmap</b> ({heatmap_tf_label}) | Session: {session_date_str} | Expiry: {expiry_str}",
+            text=f"<b>{index_name} Delta-Adjusted GEX Heatmap</b> ({heatmap_tf_label}) | "
+                 f"Session: {session_date_str} | Expiry: {expiry_str}",
             x=0.01,
         ),
         xaxis_title="IST Time",
@@ -1828,7 +1919,6 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
     fig_hm.update_xaxes(type="category")
     fig_hm.update_yaxes(tickformat="d")
     st.plotly_chart(fig_hm, use_container_width=True)
-
     # =====================================================================
     #  ALERT MODULES – Situation 1 (Exit / Risk-Off) & Situation 2 (Long Entry)
     # =====================================================================
