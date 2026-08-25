@@ -2956,7 +2956,9 @@ def live_dashboard_fragment():
                 height=520, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
             )
-            fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
+            _min_s = df_chain["Strike"].min() - 50 if not df_chain.empty else data["spot_price"] - 500
+            _max_s = df_chain["Strike"].max() + 50 if not df_chain.empty else data["spot_price"] + 500
+            fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[_min_s, _max_s])
             fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
             st.plotly_chart(fig_delta_gex, use_container_width=True)
 
