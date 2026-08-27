@@ -108,6 +108,8 @@ if "alert_metrics_history" not in st.session_state:
     st.session_state["alert_metrics_history"] = []  # snapshots for Exit / Long alert criteria
 if "liq_delta_history" not in st.session_state:
     st.session_state["liq_delta_history"] = []
+if "tick_cvd_history" not in st.session_state:
+    st.session_state["tick_cvd_history"] = []
 
 # ---------- Loading status (sidebar) ----------
 def update_load_status(msg: str):
@@ -2561,18 +2563,23 @@ def fetch_futures_book_snapshot(smart_api, index_name: str, fut_token: str) -> d
         if bid_qty > 0 and bid_qty < 20000:
             bid_lots, ask_lots = bid_qty, ask_qty
 
+        ltp = float(item.get("ltp", item.get("lastPrice", 0)) or 0)
+        traded_vol = float(
+            item.get("tradeVolume") or item.get("volume") or item.get("vol") or 0
+        )
         return {
             "bid_qty": bid_qty, "ask_qty": ask_qty,
             "bid_qty_lots": bid_lots, "ask_qty_lots": ask_lots,
             "best_bid": best_bid, "best_ask": best_ask,
-            "ok": (bid_qty > 0 or ask_qty > 0),
+            "ltp": ltp, "traded_vol": traded_vol,
+            "ok": (bid_qty > 0 or ask_qty > 0 or ltp > 0),
         }
     except Exception:
         return empty
 
 
 def update_liq_delta_history(snap: dict, index_name: str) -> list:
-    """Append snapshot + compute bid/ask change vs previous tick."""
+    """Append book snapshot, bid/ask change, and tick-rule incremental CVD."""
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.datetime.now(ist)
     hist = list(st.session_state.get("liq_delta_history") or [])
@@ -2582,6 +2589,34 @@ def update_liq_delta_history(snap: dict, index_name: str) -> list:
     bid_chg = bid - float(prev["bid_qty_lots"]) if prev else 0.0
     ask_chg = ask - float(prev["ask_qty_lots"]) if prev else 0.0
     net = bid_chg - ask_chg
+
+    ltp = float(snap.get("ltp") or 0)
+    vol = float(snap.get("traded_vol") or 0)
+    best_bid = float(snap.get("best_bid") or 0)
+    best_ask = float(snap.get("best_ask") or 0)
+    mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else ltp
+
+    # Tick rule: incremental printed volume since last snapshot
+    dvol = 0.0
+    if prev and vol > 0:
+        prev_vol = float(prev.get("traded_vol") or 0)
+        dvol = max(vol - prev_vol, 0.0)
+        if dvol == 0 and vol < prev_vol:
+            dvol = 0.0  # session volume reset
+    signed = 0.0
+    if dvol > 0 and ltp > 0:
+        prev_ltp = float(prev.get("ltp") or 0) if prev else 0.0
+        if best_ask > 0 and ltp >= best_ask:
+            signed = dvol          # lift the offer
+        elif best_bid > 0 and ltp <= best_bid:
+            signed = -dvol         # hit the bid
+        elif prev_ltp > 0:
+            signed = dvol if ltp >= prev_ltp else -dvol
+        elif mid > 0:
+            signed = dvol if ltp >= mid else -dvol
+    prev_cvd = float(prev.get("tick_cvd") or 0) if prev else 0.0
+    tick_cvd = prev_cvd + signed
+
     rec = {
         "ts": now,
         "index": index_name,
@@ -2590,11 +2625,15 @@ def update_liq_delta_history(snap: dict, index_name: str) -> list:
         "bid_change": bid_chg,
         "ask_change": ask_chg,
         "net_liq": net,
-        "best_bid": snap.get("best_bid"),
-        "best_ask": snap.get("best_ask"),
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "ltp": ltp,
+        "traded_vol": vol,
+        "dvol": dvol,
+        "signed_vol": signed,
+        "tick_cvd": tick_cvd,
     }
     hist.append(rec)
-    # keep last ~90 minutes of ticks
     cutoff = now - datetime.timedelta(minutes=90)
     cleaned = []
     for h in hist:
@@ -3186,10 +3225,21 @@ def live_dashboard_fragment():
                 )
                 fig_cvd = plt_go.Figure()
                 fig_cvd.add_trace(plt_go.Scatter(
-                    x=df_cvd["time_str"], y=df_cvd["cvd"], mode="lines", name="CVD",
+                    x=df_cvd["time_str"], y=df_cvd["cvd"], mode="lines", name="CVD (bar proxy)",
                     line=dict(color=colour, width=2), fill="tozeroy",
                     fillcolor="rgba(0,230,118,0.08)" if latest_cvd >= 0 else "rgba(255,82,82,0.08)",
                 ))
+                tick_hist = [h for h in (st.session_state.get("liq_delta_history") or [])
+                             if h.get("index", Index_Name) == Index_Name and h.get("tick_cvd") is not None]
+                if len(tick_hist) >= 2:
+                    fig_cvd.add_trace(plt_go.Scatter(
+                        x=[h["ts"].strftime("%H:%M:%S") if hasattr(h["ts"], "strftime") else str(h["ts"]) for h in tick_hist],
+                        y=[float(h.get("tick_cvd") or 0) for h in tick_hist],
+                        mode="lines", name="CVD (tick-rule)",
+                        line=dict(color="#FFD54F", width=2, dash="dot"),
+                        yaxis="y2",
+                    ))
+                    fig_cvd.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, title="tick CVD"))
                 fig_cvd.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
                 fig_cvd.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
@@ -3200,7 +3250,7 @@ def live_dashboard_fragment():
                     showlegend=False, hovermode="x unified",
                 )
                 st.plotly_chart(fig_cvd, use_container_width=True)
-                st.caption("CVD proxy: volume × ((close−low)/(high−low)×2 − 1). Not true buy/sell prints.")
+                st.caption("Green = bar volume-location proxy. Yellow dotted = tick-rule CVD from successive futures FULL snapshots (LTP vs bid/ask). Enable Auto-Refresh.")
             else:
                 st.info("CVD not available.")
 
