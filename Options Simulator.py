@@ -106,6 +106,8 @@ if "gex_heatmap_history" not in st.session_state:
     st.session_state["gex_heatmap_history"] = []
 if "alert_metrics_history" not in st.session_state:
     st.session_state["alert_metrics_history"] = []  # snapshots for Exit / Long alert criteria
+if "liq_delta_history" not in st.session_state:
+    st.session_state["liq_delta_history"] = []
 
 # ---------- Loading status (sidebar) ----------
 def update_load_status(msg: str):
@@ -2514,6 +2516,172 @@ def render_futures_cvd_chart(data: dict):
     st.plotly_chart(fig, use_container_width=True)
 
 
+
+def fetch_futures_book_snapshot(smart_api, index_name: str, fut_token: str) -> dict:
+    """One FULL snapshot of near-month futures book. SmartAPI fields vary by version."""
+    empty = {"bid_qty": 0.0, "ask_qty": 0.0, "bid_qty_lots": 0.0, "ask_qty_lots": 0.0,
+             "best_bid": 0.0, "best_ask": 0.0, "ok": False}
+    if not smart_api or not fut_token:
+        return empty
+    try:
+        _, _, fut_exch = INDEX_TOKEN_MAP.get(index_name, ("99926000", "NSE", "NFO"))
+        lot = float(LOT_SIZES.get(index_name, 65) or 65)
+        res = safe_api_call(smart_api.getMarketData, "FULL", {fut_exch: [str(fut_token)]})
+        if not (res and res.get("status") and res.get("data") and res["data"].get("fetched")):
+            return empty
+        item = res["data"]["fetched"][0]
+        depth = item.get("depth") or {}
+        buy_lvls = depth.get("buy") or depth.get("Buy") or []
+        sell_lvls = depth.get("sell") or depth.get("Sell") or []
+
+        def _sum_qty(levels):
+            tot = 0.0
+            for lv in levels or []:
+                tot += float(lv.get("quantity", lv.get("qty", 0)) or 0)
+            return tot
+
+        bid_qty = float(item.get("totBuyQuan", item.get("totalBuyQuantity", 0)) or 0)
+        ask_qty = float(item.get("totSellQuan", item.get("totalSellQuantity", 0)) or 0)
+        if bid_qty <= 0:
+            bid_qty = _sum_qty(buy_lvls)
+        if ask_qty <= 0:
+            ask_qty = _sum_qty(sell_lvls)
+        if bid_qty <= 0:
+            bid_qty = float(item.get("bestBidQty", item.get("bidQty", 0)) or 0)
+        if ask_qty <= 0:
+            ask_qty = float(item.get("bestAskQty", item.get("askQty", 0)) or 0)
+
+        best_bid = float(item.get("bestBidPrice", item.get("bidPrice", 0)) or 0)
+        best_ask = float(item.get("bestAskPrice", item.get("askPrice", 0)) or 0)
+
+        # Angel often reports quantity in units. Convert to lots for alert thresholds.
+        bid_lots = bid_qty / lot if lot > 0 else bid_qty
+        ask_lots = ask_qty / lot if lot > 0 else ask_qty
+        # If already looks like lots (small vs units), keep raw
+        if bid_qty > 0 and bid_qty < 20000:
+            bid_lots, ask_lots = bid_qty, ask_qty
+
+        return {
+            "bid_qty": bid_qty, "ask_qty": ask_qty,
+            "bid_qty_lots": bid_lots, "ask_qty_lots": ask_lots,
+            "best_bid": best_bid, "best_ask": best_ask,
+            "ok": (bid_qty > 0 or ask_qty > 0),
+        }
+    except Exception:
+        return empty
+
+
+def update_liq_delta_history(snap: dict, index_name: str) -> list:
+    """Append snapshot + compute bid/ask change vs previous tick."""
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.datetime.now(ist)
+    hist = list(st.session_state.get("liq_delta_history") or [])
+    prev = hist[-1] if hist else None
+    bid = float(snap.get("bid_qty_lots") or 0)
+    ask = float(snap.get("ask_qty_lots") or 0)
+    bid_chg = bid - float(prev["bid_qty_lots"]) if prev else 0.0
+    ask_chg = ask - float(prev["ask_qty_lots"]) if prev else 0.0
+    net = bid_chg - ask_chg
+    rec = {
+        "ts": now,
+        "index": index_name,
+        "bid_qty_lots": bid,
+        "ask_qty_lots": ask,
+        "bid_change": bid_chg,
+        "ask_change": ask_chg,
+        "net_liq": net,
+        "best_bid": snap.get("best_bid"),
+        "best_ask": snap.get("best_ask"),
+    }
+    hist.append(rec)
+    # keep last ~90 minutes of ticks
+    cutoff = now - datetime.timedelta(minutes=90)
+    cleaned = []
+    for h in hist:
+        ts = h["ts"]
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ist.localize(ts) if hasattr(ist, "localize") else ts
+        if ts >= cutoff and h.get("index", index_name) == index_name:
+            cleaned.append(h)
+    st.session_state["liq_delta_history"] = cleaned[-180:]
+    return st.session_state["liq_delta_history"]
+
+
+def classify_liq_alert(bid_change: float, ask_change: float, price_vs_vwap=None, cvd_slope=None) -> dict:
+    """Alert rules from the liquidity playbook."""
+    if bid_change <= -1000:
+        return {"code": "BIDS_PULLED", "label": "BIDS PULLED", "color": "#FF5252",
+                "hint": "Bid depth dropped >1000 lots. Liquidity vacuum — sellers hitting bids."}
+    if ask_change <= -1000:
+        return {"code": "ASKS_PULLED", "label": "ASKS PULLED", "color": "#00E676",
+                "hint": "Ask depth dropped >1000 lots. Offers lifted — squeeze / short-cover risk."}
+    if bid_change >= 1500:
+        return {"code": "BIDS_STACKED", "label": "BIDS STACKED", "color": "#2196F3",
+                "hint": "Bid wall added >1500 lots. Passive absorption — bounce risk if CVD dumping."}
+    return {"code": "NONE", "label": "NO SIGNAL", "color": "#888888",
+            "hint": "No pull / stack threshold hit."}
+
+
+def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name: str):
+    """Middle panel: futures limit-book liquidity delta + imbalance alerts."""
+    st.markdown(
+        "<span style='font-weight:700;color:#00E676;font-size:13px;'>"
+        "📘 Limit Book Liquidity Δ</span>",
+        unsafe_allow_html=True
+    )
+
+    basis = data.get("basis_info") or {}
+    fut_token = basis.get("fut_token")
+    smart_api = get_smart_api_client()
+    snap = fetch_futures_book_snapshot(smart_api, index_name, fut_token) if smart_api else {"ok": False}
+    hist = update_liq_delta_history(snap, index_name) if snap.get("ok") else list(st.session_state.get("liq_delta_history") or [])
+    hist = [h for h in hist if h.get("index", index_name) == index_name]
+
+    if not hist:
+        st.caption("No book snapshot yet. Enable Auto-Refresh — needs futures FULL depth.")
+        return
+
+    last = hist[-1]
+    alert = classify_liq_alert(float(last.get("bid_change") or 0), float(last.get("ask_change") or 0))
+    st.markdown(
+        f"<div style='border:1px solid {alert['color']};border-radius:6px;padding:6px 8px;margin-bottom:6px;'>"
+        f"<span style='color:{alert['color']};font-weight:800;font-size:12px;'>{alert['label']}</span><br>"
+        f"<span style='color:#AAA;font-size:11px;'>{alert['hint']}</span></div>",
+        unsafe_allow_html=True
+    )
+    m1, m2 = st.columns(2)
+    m1.metric("Bid Δ lots", f"{last.get('bid_change', 0):+.0f}")
+    m2.metric("Ask Δ lots", f"{last.get('ask_change', 0):+.0f}")
+    st.caption(
+        f"Book Bid {last.get('bid_qty_lots', 0):,.0f} | Ask {last.get('ask_qty_lots', 0):,.0f} lots"
+    )
+
+    times = [h["ts"].strftime("%H:%M:%S") if hasattr(h["ts"], "strftime") else str(h["ts"]) for h in hist]
+    nets = [float(h.get("net_liq") or 0) for h in hist]
+    bid_d = [float(h.get("bid_change") or 0) for h in hist]
+    ask_d = [float(h.get("ask_change") or 0) for h in hist]
+    bar_colors = ["#00E676" if v >= 0 else "#FF5252" for v in nets]
+
+    fig = plt_go.Figure()
+    fig.add_trace(plt_go.Bar(x=times, y=nets, name="Net Liq Δ", marker_color=bar_colors, opacity=0.75))
+    fig.add_trace(plt_go.Scatter(x=times, y=bid_d, name="Bid Δ", line=dict(color="#2196F3", width=1.5)))
+    fig.add_trace(plt_go.Scatter(x=times, y=ask_d, name="Ask Δ", line=dict(color="#FF9800", width=1.5)))
+    fig.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
+    fig.add_hline(y=1500, line_width=1, line_color="#2196F3", line_dash="dash")
+    fig.add_hline(y=-1000, line_width=1, line_color="#FF5252", line_dash="dash")
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+        height=280, margin=dict(l=4, r=4, t=18, b=8),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=9)),
+        hovermode="x unified", showlegend=True,
+        title=dict(text="Depth Net Liquidity Change", font=dict(size=11), x=0.01),
+    )
+    fig.update_xaxes(type="category", nticks=5, tickfont=dict(size=8))
+    fig.update_yaxes(title="lots", tickfont=dict(size=9))
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Δ vs previous snapshot. Pulled < −1000 · Stacked > +1500 lots.")
+
+
 def render_live_alert_ribbon(data: dict = None):
     """Compact layout: left = Basket Greeks | right = Z-Scores. (Live alerts removed)"""
     st.markdown("---")
@@ -2828,8 +2996,8 @@ def live_dashboard_fragment():
             fig_ind.update_xaxes(type="category", nticks=6)
             st.plotly_chart(fig_ind, use_container_width=True)
 
-        # ========== ROW1: Futures VWAP 70% | GEX vs OI 30% ==========
-        # ========== ROW2: CVD 70%        | GEX vs Vol 30% ==========
+        # ========== ROW1: Futures 50% | Liq Δ 20% | GEX OI 30% ==========
+        # ========== ROW2: CVD 50%     | Liq Δ 20% | GEX Vol 30% ==========
         st.markdown("---")
         df_fut = data.get("df_futures", pd.DataFrame())
         df_chain = pd.DataFrame(data.get("chain_results") or [])
@@ -2871,7 +3039,7 @@ def live_dashboard_fragment():
             max_strike_val = float(data.get("spot_price", 0) or 0) + 500
 
         # ----- Row 1: Futures 70% | GEX OI 30% -----
-        r1c1, r1c2 = st.columns([0.70, 0.30])
+        r1c1, r1mid, r1c2 = st.columns([0.50, 0.20, 0.30])
 
         with r1c1:
             fut_header_col, basis_col, band_col = st.columns([0.55, 0.25, 0.20])
@@ -2964,6 +3132,9 @@ def live_dashboard_fragment():
             else:
                 st.info("Futures / VWAP not available.")
 
+        with r1mid:
+            render_liquidity_delta_panel(data, df_fchart, Index_Name)
+
         with r1c2:
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📈 GEX vs OI</span>", unsafe_allow_html=True)
             if not df_chain.empty and lvls:
@@ -2997,7 +3168,7 @@ def live_dashboard_fragment():
                 st.info("GEX/OI unavailable.")
 
         # ----- Row 2: CVD 70% | GEX Vol 30% -----
-        r2c1, r2c2 = st.columns([0.70, 0.30])
+        r2c1, r2mid, r2c2 = st.columns([0.50, 0.20, 0.30])
 
         with r2c1:
             if not df_fchart.empty and "volume" in df_fchart.columns:
@@ -3032,6 +3203,25 @@ def live_dashboard_fragment():
                 st.caption("CVD proxy: volume × ((close−low)/(high−low)×2 − 1). Not true buy/sell prints.")
             else:
                 st.info("CVD not available.")
+
+        with r2mid:
+            # Continuation / context of same book tape (compact)
+            hist = [h for h in (st.session_state.get("liq_delta_history") or []) if h.get("index", Index_Name) == Index_Name]
+            if hist:
+                last = hist[-1]
+                alert = classify_liq_alert(float(last.get("bid_change") or 0), float(last.get("ask_change") or 0))
+                st.markdown("**Playbook**")
+                st.caption("RED · Bids Pulled  < −1000 lots")
+                st.caption("GREEN · Asks Pulled  < −1000 lots")
+                st.caption("BLUE · Bids Stacked  > +1500 lots")
+                st.markdown(
+                    f"<div style='color:{alert['color']};font-weight:700;font-size:12px;margin-top:8px;'>"
+                    f"{alert['label']}</div>",
+                    unsafe_allow_html=True
+                )
+                st.caption(alert["hint"])
+            else:
+                st.caption("Liquidity tape builds after Auto-Refresh snapshots.")
 
         with r2c2:
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📊 GEX vs Volume</span>", unsafe_allow_html=True)
