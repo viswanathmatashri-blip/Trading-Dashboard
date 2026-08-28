@@ -22,7 +22,7 @@ from scipy.optimize import brentq
 from scipy.stats import norm
 from SmartApi import SmartConnect
 
-# Setup .streamlit/config.toml programmatically for dark theme
+# Setup .streamlit/config.toml programmatically for dark theme.
 os.makedirs(".streamlit", exist_ok=True)
 config_path = os.path.join(".streamlit", "config.toml")
 if not os.path.exists(config_path):
