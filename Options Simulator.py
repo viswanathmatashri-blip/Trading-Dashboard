@@ -2647,17 +2647,55 @@ def update_liq_delta_history(snap: dict, index_name: str) -> list:
 
 
 
-def compute_session_volume_profile(df: pd.DataFrame, n_bins: int = 28) -> dict:
-    """Session volume-at-price: POC, ±1σ / ±1.5σ value area, LVNs."""
+def _prominence_nodes(vol_at: np.ndarray, mids: np.ndarray, prominence_factor: float = 0.35):
+    """HVN = peaks on volume. LVN = peaks on inverted volume, kept if valley depth
+    vs nearest surrounding HVNs is >= prominence_factor * surrounding peak volume."""
+    n = len(vol_at)
+    if n < 3:
+        return [], []
+    vmax = float(np.max(vol_at)) or 1.0
+    hvn_idx = []
+    for i in range(1, n - 1):
+        if vol_at[i] >= vol_at[i - 1] and vol_at[i] >= vol_at[i + 1] and vol_at[i] >= 0.20 * vmax:
+            hvn_idx.append(i)
+    if not hvn_idx:
+        hvn_idx = [int(np.argmax(vol_at))]
+    inverted = vmax - vol_at
+    lvn_idx = []
+    for i in range(1, n - 1):
+        if not (inverted[i] >= inverted[i - 1] and inverted[i] >= inverted[i + 1]):
+            continue
+        left = [j for j in hvn_idx if j < i]
+        right = [j for j in hvn_idx if j > i]
+        if not left or not right:
+            continue
+        left_p = vol_at[left[-1]]
+        right_p = vol_at[right[0]]
+        surround = min(float(left_p), float(right_p))
+        depth = surround - float(vol_at[i])
+        if surround > 0 and depth >= prominence_factor * surround:
+            lvn_idx.append(i)
+    hvn = [float(mids[i]) for i in hvn_idx]
+    lvn = [float(mids[i]) for i in lvn_idx]
+    return hvn, lvn
+
+
+def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prominence_factor: float = 0.35) -> dict:
+    """Volume-at-price with tick-size bins, POC, ±1σ/±1.5σ VA, prominence HVN/LVN."""
     empty = {"ok": False}
     if df is None or df.empty or "volume" not in df.columns:
         return empty
     lo = float(min(df["low"].min(), df["close"].min()))
     hi = float(max(df["high"].max(), df["close"].max()))
     if hi <= lo:
-        hi = lo + 1.0
-    n_bins = int(max(12, min(n_bins, max(len(df), 12))))
-    edges = np.linspace(lo, hi, n_bins + 1)
+        hi = lo + bin_step
+    bin_step = float(bin_step) if bin_step and bin_step > 0 else 5.0
+    lo = np.floor(lo / bin_step) * bin_step
+    hi = np.ceil(hi / bin_step) * bin_step
+    edges = np.arange(lo, hi + bin_step * 0.5, bin_step)
+    if len(edges) < 3:
+        edges = np.array([lo, lo + bin_step, lo + 2 * bin_step])
+    n_bins = len(edges) - 1
     vol_at = np.zeros(n_bins, dtype=float)
     for _, r in df.iterrows():
         v = float(r.get("volume") or 0)
@@ -2679,12 +2717,7 @@ def compute_session_volume_profile(df: pd.DataFrame, n_bins: int = 28) -> dict:
     poc_i = int(np.argmax(vol_at))
     wmean = float(np.sum(mids * vol_at) / tot)
     wstd = float(np.sqrt(max(np.sum(vol_at * (mids - wmean) ** 2) / tot, 0.0)))
-    pos = vol_at[vol_at > 0]
-    pct = float(np.percentile(pos, 30)) if len(pos) else 0.0
-    lvn = []
-    for i in range(1, n_bins - 1):
-        if vol_at[i] <= pct and vol_at[i] < vol_at[i - 1] and vol_at[i] < vol_at[i + 1] and vol_at[i] > 0:
-            lvn.append(float(mids[i]))
+    hvn, lvn = _prominence_nodes(vol_at, mids, prominence_factor=prominence_factor)
     return {
         "ok": True,
         "mids": mids,
@@ -2697,7 +2730,9 @@ def compute_session_volume_profile(df: pd.DataFrame, n_bins: int = 28) -> dict:
         "val1": wmean - wstd,
         "vah15": wmean + 1.5 * wstd,
         "val15": wmean - 1.5 * wstd,
+        "hvn": hvn,
         "lvn": lvn,
+        "bin_step": bin_step,
     }
 
 def book_change_sigmas(hist: list, min_n: int = 8):
@@ -3238,7 +3273,7 @@ def live_dashboard_fragment():
                 fmax = max(df_fchart["close"].max(), df_fchart["vwap_upper"].max())
                 fpad = (fmax - fmin) * 0.06
 
-                vp = compute_session_volume_profile(df_fchart, n_bins=28)
+                vp = compute_session_volume_profile(df_fchart, bin_step=5.0, prominence_factor=0.35)
                 y0, y1 = fmin - fpad, fmax + fpad
 
                 fig_fut = make_subplots(
@@ -3263,21 +3298,37 @@ def live_dashboard_fragment():
                     x=df_fchart["time_str"], y=df_fchart["close"], mode="lines", name="Futures",
                     line=dict(color="#2196F3", width=2)), row=1, col=1)
 
+                spot_now = float(data.get("spot_price") or 0)
                 if vp.get("ok"):
                     fig_fut.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F",
                                       annotation_text="POC", annotation_font_size=9,
                                       annotation_font_color="#FFD54F", row=1, col=1)
-                    fig_fut.add_hline(y=vp["vah1"], line_width=1, line_color="#FAFAFA", line_dash="dot",
+                    fig_fut.add_hline(y=vp["vah1"], line_width=1.2, line_color="#FAFAFA", line_dash="dot",
                                       annotation_text="VAH 1σ", annotation_font_size=8, row=1, col=1)
-                    fig_fut.add_hline(y=vp["val1"], line_width=1, line_color="#FAFAFA", line_dash="dot",
+                    fig_fut.add_hline(y=vp["val1"], line_width=1.2, line_color="#FAFAFA", line_dash="dot",
                                       annotation_text="VAL 1σ", annotation_font_size=8, row=1, col=1)
-                    fig_fut.add_hline(y=vp["vah15"], line_width=1, line_color="#90A4AE", line_dash="dash",
+                    fig_fut.add_hline(y=vp["vah15"], line_width=3.2, line_color="#B0BEC5", line_dash="dot",
                                       annotation_text="VAH 1.5σ", annotation_font_size=8, row=1, col=1)
-                    fig_fut.add_hline(y=vp["val15"], line_width=1, line_color="#90A4AE", line_dash="dash",
+                    fig_fut.add_hline(y=vp["val15"], line_width=3.2, line_color="#B0BEC5", line_dash="dot",
                                       annotation_text="VAL 1.5σ", annotation_font_size=8, row=1, col=1)
-                    for lv in vp["lvn"][:6]:
-                        fig_fut.add_hline(y=lv, line_width=0.8, line_color="#CE93D8", line_dash="dot", row=1, col=1)
-                    colors = ["#FFD54F" if abs(m - vp["poc"]) < 1e-6 else "rgba(100,181,246,0.55)" for m in vp["mids"]]
+                    if spot_now > 0:
+                        fig_fut.add_hline(y=spot_now, line_width=2, line_color="#00E676",
+                                          annotation_text="Spot", annotation_font_size=9,
+                                          annotation_font_color="#00E676", row=1, col=1)
+                    for hv in vp.get("hvn", [])[:8]:
+                        fig_fut.add_hline(y=hv, line_width=1, line_color="#81D4FA", line_dash="dash", row=1, col=1)
+                    for lv in vp["lvn"][:8]:
+                        fig_fut.add_hline(y=lv, line_width=1.2, line_color="#CE93D8", line_dash="dot", row=1, col=1)
+                    colors = []
+                    for m in vp["mids"]:
+                        if abs(m - vp["poc"]) < 1e-6:
+                            colors.append("#FFD54F")
+                        elif any(abs(m - h) < 1e-6 for h in vp.get("hvn", [])):
+                            colors.append("rgba(129,212,250,0.75)")
+                        elif any(abs(m - h) < 1e-6 for h in vp.get("lvn", [])):
+                            colors.append("rgba(206,147,216,0.75)")
+                        else:
+                            colors.append("rgba(100,181,246,0.45)")
                     fig_fut.add_trace(plt_go.Bar(
                         x=vp["vol"], y=vp["mids"], orientation="h", name="VP",
                         marker=dict(color=colors), showlegend=False, hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
@@ -3304,25 +3355,38 @@ def live_dashboard_fragment():
                         marker_color=["#FFD54F" if abs(m - vp["poc"]) < 1e-6 else "rgba(100,181,246,0.6)" for m in vp["mids"]],
                         showlegend=False,
                     ))
-                    fig_vp.add_vline(x=vp["poc"], line_color="#FFD54F", line_width=1.5, annotation_text="POC", annotation_font_size=9)
-                    fig_vp.add_vline(x=vp["val1"], line_color="#FAFAFA", line_dash="dot", line_width=1)
-                    fig_vp.add_vline(x=vp["vah1"], line_color="#FAFAFA", line_dash="dot", line_width=1)
-                    fig_vp.add_vline(x=vp["val15"], line_color="#90A4AE", line_dash="dash", line_width=1)
-                    fig_vp.add_vline(x=vp["vah15"], line_color="#90A4AE", line_dash="dash", line_width=1)
-                    for lv in vp["lvn"][:6]:
-                        fig_vp.add_vline(x=lv, line_color="#CE93D8", line_dash="dot", line_width=0.8)
+                    fig_vp.add_vline(x=vp["poc"], line_color="#FFD54F", line_width=1.6, annotation_text="POC", annotation_font_size=9)
+                    fig_vp.add_vline(x=vp["val1"], line_color="#FAFAFA", line_dash="dot", line_width=1.2)
+                    fig_vp.add_vline(x=vp["vah1"], line_color="#FAFAFA", line_dash="dot", line_width=1.2)
+                    fig_vp.add_vline(x=vp["val15"], line_color="#B0BEC5", line_dash="dot", line_width=3.2)
+                    fig_vp.add_vline(x=vp["vah15"], line_color="#B0BEC5", line_dash="dot", line_width=3.2)
+                    if spot_now > 0:
+                        fig_vp.add_vline(x=spot_now, line_color="#00E676", line_width=2.2, annotation_text="Spot", annotation_font_size=9)
+                    for lv in vp["lvn"][:8]:
+                        fig_vp.add_vline(x=lv, line_color="#CE93D8", line_dash="dot", line_width=1.2)
+                    basis_pts = (basis.get("basis") if isinstance(basis, dict) else None)
+                    if basis_pts is None and spot_now > 0:
+                        basis_pts = latest_fut - spot_now
+                    basis_pts = float(basis_pts or 0)
+                    tick_n = max(6, min(12, len(vp["mids"])))
+                    step = max(1, len(vp["mids"]) // tick_n)
+                    tickvals = [float(vp["mids"][i]) for i in range(0, len(vp["mids"]), step)]
+                    ticktext = [f"{p:.0f}<br><span style='color:#00E676'>{p - basis_pts:.0f}</span>" for p in tickvals]
                     fig_vp.update_layout(
                         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                        height=130, margin=dict(l=10, r=8, t=18, b=8),
-                        title=dict(text="Volume profile  ·  gold=POC  ·  white=±1σ VA  ·  grey=±1.5σ  ·  purple=LVN",
+                        height=150, margin=dict(l=10, r=8, t=18, b=36),
+                        title=dict(text="Volume profile  ·  gold=POC  ·  white dotted=±1σ  ·  thick grey=±1.5σ  ·  purple=LVN  ·  green=Spot",
                                    font=dict(size=11), x=0.01),
                     )
-                    fig_vp.update_xaxes(tickformat="d", title=None)
+                    fig_vp.update_xaxes(tickmode="array", tickvals=tickvals, ticktext=ticktext, title="Futures px  /  Index px")
                     fig_vp.update_yaxes(title="vol", showgrid=True, gridcolor="#262930")
                     st.plotly_chart(fig_vp, use_container_width=True)
                     st.caption(
                         f"POC {vp['poc']:.0f}  ·  VA ±1σ {vp['val1']:.0f}–{vp['vah1']:.0f}  ·  "
-                        f"±1.5σ {vp['val15']:.0f}–{vp['vah15']:.0f}  ·  LVN {', '.join(f'{x:.0f}' for x in vp['lvn'][:6]) or '—'}"
+                        f"±1.5σ {vp['val15']:.0f}–{vp['vah15']:.0f}  ·  "
+                        f"HVN {', '.join(f'{x:.0f}' for x in vp.get('hvn', [])[:6]) or '—'}  ·  "
+                        f"LVN {', '.join(f'{x:.0f}' for x in vp['lvn'][:6]) or '—'}  ·  "
+                        f"axis: futures / index (fut − basis {basis_pts:+.1f})"
                     )
             else:
                 st.info("Futures / VWAP not available.")
