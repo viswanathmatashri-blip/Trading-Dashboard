@@ -3311,10 +3311,7 @@ def live_dashboard_fragment():
                                       annotation_text="VAH 1.5σ", annotation_font_size=8, row=1, col=1)
                     fig_fut.add_hline(y=vp["val15"], line_width=3.2, line_color="#B0BEC5", line_dash="dot",
                                       annotation_text="VAL 1.5σ", annotation_font_size=8, row=1, col=1)
-                    if spot_now > 0:
-                        fig_fut.add_hline(y=spot_now, line_width=2, line_color="#00E676",
-                                          annotation_text="Spot", annotation_font_size=9,
-                                          annotation_font_color="#00E676", row=1, col=1)
+                    
                     for hv in vp.get("hvn", [])[:8]:
                         fig_fut.add_hline(y=hv, line_width=1, line_color="#81D4FA", line_dash="dash", row=1, col=1)
                     for lv in vp["lvn"][:8]:
@@ -3361,7 +3358,7 @@ def live_dashboard_fragment():
                     fig_vp.add_vline(x=vp["val15"], line_color="#B0BEC5", line_dash="dot", line_width=3.2)
                     fig_vp.add_vline(x=vp["vah15"], line_color="#B0BEC5", line_dash="dot", line_width=3.2)
                     if spot_now > 0:
-                        fig_vp.add_vline(x=spot_now, line_color="#00E676", line_width=2.2, annotation_text="Spot", annotation_font_size=9)
+                        fig_vp.add_vline(x=latest_fut, line_color="#00E676", line_width=2.2, annotation_text="Fut", annotation_font_size=9)
                     for lv in vp["lvn"][:8]:
                         fig_vp.add_vline(x=lv, line_color="#CE93D8", line_dash="dot", line_width=1.2)
                     basis_pts = (basis.get("basis") if isinstance(basis, dict) else None)
