@@ -2646,6 +2646,60 @@ def update_liq_delta_history(snap: dict, index_name: str) -> list:
     return st.session_state["liq_delta_history"]
 
 
+
+def compute_session_volume_profile(df: pd.DataFrame, n_bins: int = 28) -> dict:
+    """Session volume-at-price: POC, ±1σ / ±1.5σ value area, LVNs."""
+    empty = {"ok": False}
+    if df is None or df.empty or "volume" not in df.columns:
+        return empty
+    lo = float(min(df["low"].min(), df["close"].min()))
+    hi = float(max(df["high"].max(), df["close"].max()))
+    if hi <= lo:
+        hi = lo + 1.0
+    n_bins = int(max(12, min(n_bins, max(len(df), 12))))
+    edges = np.linspace(lo, hi, n_bins + 1)
+    vol_at = np.zeros(n_bins, dtype=float)
+    for _, r in df.iterrows():
+        v = float(r.get("volume") or 0)
+        if v <= 0:
+            continue
+        l = float(r["low"]); h = float(r["high"])
+        if h <= l:
+            h = l + 1e-6
+        span = h - l
+        for i in range(n_bins):
+            a, b = edges[i], edges[i + 1]
+            overlap = max(0.0, min(h, b) - max(l, a))
+            if overlap > 0:
+                vol_at[i] += v * (overlap / span)
+    mids = (edges[:-1] + edges[1:]) / 2.0
+    tot = float(vol_at.sum())
+    if tot <= 0:
+        return empty
+    poc_i = int(np.argmax(vol_at))
+    wmean = float(np.sum(mids * vol_at) / tot)
+    wstd = float(np.sqrt(max(np.sum(vol_at * (mids - wmean) ** 2) / tot, 0.0)))
+    pos = vol_at[vol_at > 0]
+    pct = float(np.percentile(pos, 30)) if len(pos) else 0.0
+    lvn = []
+    for i in range(1, n_bins - 1):
+        if vol_at[i] <= pct and vol_at[i] < vol_at[i - 1] and vol_at[i] < vol_at[i + 1] and vol_at[i] > 0:
+            lvn.append(float(mids[i]))
+    return {
+        "ok": True,
+        "mids": mids,
+        "vol": vol_at,
+        "poc": float(mids[poc_i]),
+        "poc_vol": float(vol_at[poc_i]),
+        "wmean": wmean,
+        "wstd": wstd,
+        "vah1": wmean + wstd,
+        "val1": wmean - wstd,
+        "vah15": wmean + 1.5 * wstd,
+        "val15": wmean - 1.5 * wstd,
+        "lvn": lvn,
+    }
+
 def book_change_sigmas(hist: list, min_n: int = 8):
     """Std of bid/ask lot changes from the live tape. Returns (bid_sigma, ask_sigma)."""
     bids = [float(h.get("bid_change") or 0) for h in hist]
@@ -3184,36 +3238,92 @@ def live_dashboard_fragment():
                 fmax = max(df_fchart["close"].max(), df_fchart["vwap_upper"].max())
                 fpad = (fmax - fmin) * 0.06
 
-                fig_fut = plt_go.Figure()
+                vp = compute_session_volume_profile(df_fchart, n_bins=28)
+                y0, y1 = fmin - fpad, fmax + fpad
+
+                fig_fut = make_subplots(
+                    rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.01,
+                    column_widths=[0.84, 0.16],
+                )
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap_upper"], mode="lines",
                     name=f"+{sigma_mult}σ",
                     line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                    showlegend=False, hoverinfo="skip"))
+                    showlegend=False, hoverinfo="skip"), row=1, col=1)
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap_lower"], mode="lines",
                     name=f"−{sigma_mult}σ",
                     line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
                     fill="tonexty", fillcolor="rgba(255,152,0,0.08)",
-                    showlegend=False, hoverinfo="skip"))
+                    showlegend=False, hoverinfo="skip"), row=1, col=1)
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap"], mode="lines", name="VWAP",
-                    line=dict(color="#FF9800", width=2.2, dash="dot")))
+                    line=dict(color="#FF9800", width=2.2, dash="dot")), row=1, col=1)
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["close"], mode="lines", name="Futures",
-                    line=dict(color="#2196F3", width=2)))
+                    line=dict(color="#2196F3", width=2)), row=1, col=1)
+
+                if vp.get("ok"):
+                    fig_fut.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F",
+                                      annotation_text="POC", annotation_font_size=9,
+                                      annotation_font_color="#FFD54F", row=1, col=1)
+                    fig_fut.add_hline(y=vp["vah1"], line_width=1, line_color="#FAFAFA", line_dash="dot",
+                                      annotation_text="VAH 1σ", annotation_font_size=8, row=1, col=1)
+                    fig_fut.add_hline(y=vp["val1"], line_width=1, line_color="#FAFAFA", line_dash="dot",
+                                      annotation_text="VAL 1σ", annotation_font_size=8, row=1, col=1)
+                    fig_fut.add_hline(y=vp["vah15"], line_width=1, line_color="#90A4AE", line_dash="dash",
+                                      annotation_text="VAH 1.5σ", annotation_font_size=8, row=1, col=1)
+                    fig_fut.add_hline(y=vp["val15"], line_width=1, line_color="#90A4AE", line_dash="dash",
+                                      annotation_text="VAL 1.5σ", annotation_font_size=8, row=1, col=1)
+                    for lv in vp["lvn"][:6]:
+                        fig_fut.add_hline(y=lv, line_width=0.8, line_color="#CE93D8", line_dash="dot", row=1, col=1)
+                    colors = ["#FFD54F" if abs(m - vp["poc"]) < 1e-6 else "rgba(100,181,246,0.55)" for m in vp["mids"]]
+                    fig_fut.add_trace(plt_go.Bar(
+                        x=vp["vol"], y=vp["mids"], orientation="h", name="VP",
+                        marker=dict(color=colors), showlegend=False, hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
+                    ), row=1, col=2)
+
                 fig_fut.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=320, margin=dict(l=10, r=10, t=8, b=28),
-                    legend=dict(orientation="h", yanchor="top", y=-0.16, x=0.0, xanchor="left",
+                    height=360, margin=dict(l=10, r=8, t=8, b=28),
+                    legend=dict(orientation="h", yanchor="top", y=-0.14, x=0.0, xanchor="left",
                                 font=dict(size=11), bgcolor="rgba(14,17,23,0.9)", itemsizing="constant"),
-                    hovermode="x unified",
-                    yaxis=dict(range=[fmin - fpad, fmax + fpad], tickformat="d"),
-                    xaxis=dict(type="category", categoryorder="array", categoryarray=fut_times, nticks=8),
-                    title=None,
+                    hovermode="x unified", barmode="overlay",
                 )
+                fig_fut.update_yaxes(range=[y0, y1], tickformat="d", row=1, col=1)
+                fig_fut.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
+                fig_fut.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times, nticks=8, row=1, col=1)
+                fig_fut.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
                 st.caption(f"Futures {latest_fut:,.1f}  ·  VWAP {latest_vwap:,.1f}  ·  bands ±{sigma_mult}σ")
                 st.plotly_chart(fig_fut, use_container_width=True)
+
+                if vp.get("ok"):
+                    fig_vp = plt_go.Figure()
+                    fig_vp.add_trace(plt_go.Bar(
+                        x=vp["mids"], y=vp["vol"], name="Volume @ price",
+                        marker_color=["#FFD54F" if abs(m - vp["poc"]) < 1e-6 else "rgba(100,181,246,0.6)" for m in vp["mids"]],
+                        showlegend=False,
+                    ))
+                    fig_vp.add_vline(x=vp["poc"], line_color="#FFD54F", line_width=1.5, annotation_text="POC", annotation_font_size=9)
+                    fig_vp.add_vline(x=vp["val1"], line_color="#FAFAFA", line_dash="dot", line_width=1)
+                    fig_vp.add_vline(x=vp["vah1"], line_color="#FAFAFA", line_dash="dot", line_width=1)
+                    fig_vp.add_vline(x=vp["val15"], line_color="#90A4AE", line_dash="dash", line_width=1)
+                    fig_vp.add_vline(x=vp["vah15"], line_color="#90A4AE", line_dash="dash", line_width=1)
+                    for lv in vp["lvn"][:6]:
+                        fig_vp.add_vline(x=lv, line_color="#CE93D8", line_dash="dot", line_width=0.8)
+                    fig_vp.update_layout(
+                        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                        height=130, margin=dict(l=10, r=8, t=18, b=8),
+                        title=dict(text="Volume profile  ·  gold=POC  ·  white=±1σ VA  ·  grey=±1.5σ  ·  purple=LVN",
+                                   font=dict(size=11), x=0.01),
+                    )
+                    fig_vp.update_xaxes(tickformat="d", title=None)
+                    fig_vp.update_yaxes(title="vol", showgrid=True, gridcolor="#262930")
+                    st.plotly_chart(fig_vp, use_container_width=True)
+                    st.caption(
+                        f"POC {vp['poc']:.0f}  ·  VA ±1σ {vp['val1']:.0f}–{vp['vah1']:.0f}  ·  "
+                        f"±1.5σ {vp['val15']:.0f}–{vp['vah15']:.0f}  ·  LVN {', '.join(f'{x:.0f}' for x in vp['lvn'][:6]) or '—'}"
+                    )
             else:
                 st.info("Futures / VWAP not available.")
 
