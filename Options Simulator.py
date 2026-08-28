@@ -2646,28 +2646,59 @@ def update_liq_delta_history(snap: dict, index_name: str) -> list:
     return st.session_state["liq_delta_history"]
 
 
-def classify_liq_alert(bid_change: float, ask_change: float, price_vs_vwap=None, cvd_slope=None) -> dict:
-    """Alert rules from the liquidity playbook."""
-    if bid_change <= -1000:
+def book_change_sigmas(hist: list, min_n: int = 8):
+    """Std of bid/ask lot changes from the live tape. Returns (bid_sigma, ask_sigma)."""
+    bids = [float(h.get("bid_change") or 0) for h in hist]
+    asks = [float(h.get("ask_change") or 0) for h in hist]
+    if len(bids) < min_n:
+        return None, None
+    bid_s = float(np.std(bids, ddof=1)) if len(bids) > 1 else 0.0
+    ask_s = float(np.std(asks, ddof=1)) if len(asks) > 1 else 0.0
+    bid_s = max(bid_s, 1.0)
+    ask_s = max(ask_s, 1.0)
+    return bid_s, ask_s
+
+
+def classify_liq_alert(bid_change: float, ask_change: float, bid_sigma=None, ask_sigma=None, k=1.5) -> dict:
+    """Flag pull/stack when |Δ| exceeds k × rolling σ of that side's book changes."""
+    if bid_sigma is None or ask_sigma is None:
+        return {"code": "NONE", "label": "NO SIGNAL", "color": "#888888",
+                "hint": "Need more snapshots to estimate σ. Keep Auto-Refresh on.",
+                "bid_thr": None, "ask_thr": None, "k": k}
+    bid_thr = k * float(bid_sigma)
+    ask_thr = k * float(ask_sigma)
+    if bid_change <= -bid_thr:
         return {"code": "BIDS_PULLED", "label": "BIDS PULLED", "color": "#FF5252",
-                "hint": "Bid depth dropped >1000 lots. Liquidity vacuum — sellers hitting bids."}
-    if ask_change <= -1000:
+                "hint": f"Bid Δ {bid_change:+.0f} ≤ −{k:g}σ ({-bid_thr:.0f} lots). Liquidity vacuum.",
+                "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
+    if ask_change <= -ask_thr:
         return {"code": "ASKS_PULLED", "label": "ASKS PULLED", "color": "#00E676",
-                "hint": "Ask depth dropped >1000 lots. Offers lifted — squeeze / short-cover risk."}
-    if bid_change >= 1500:
+                "hint": f"Ask Δ {ask_change:+.0f} ≤ −{k:g}σ ({-ask_thr:.0f} lots). Offers lifted.",
+                "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
+    if bid_change >= bid_thr:
         return {"code": "BIDS_STACKED", "label": "BIDS STACKED", "color": "#2196F3",
-                "hint": "Bid wall added >1500 lots. Passive absorption — bounce risk if CVD dumping."}
+                "hint": f"Bid Δ {bid_change:+.0f} ≥ +{k:g}σ ({bid_thr:.0f} lots). Passive absorption.",
+                "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
     return {"code": "NONE", "label": "NO SIGNAL", "color": "#888888",
-            "hint": "No pull / stack threshold hit."}
+            "hint": f"Inside ±{k:g}σ  (bid {bid_thr:.0f} / ask {ask_thr:.0f} lots).",
+            "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
 
 
 def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name: str):
     """Middle panel: futures limit-book liquidity delta + imbalance alerts."""
-    st.markdown(
-        "<span style='font-weight:700;color:#00E676;font-size:13px;'>"
-        "📘 Limit Book Liquidity Δ</span>",
-        unsafe_allow_html=True
-    )
+    tcol, kcol = st.columns([0.62, 0.38])
+    with tcol:
+        st.markdown(
+            "<span style='font-weight:700;color:#00E676;font-size:13px;'>"
+            "📘 Limit Book Liquidity Δ</span>",
+            unsafe_allow_html=True
+        )
+    with kcol:
+        st.session_state["liq_sigma_k"] = st.selectbox(
+            "σ flag", options=[1.5, 2.0], index=0,
+            format_func=lambda x: f"±{x}σ", key="liq_sigma_select",
+            label_visibility="collapsed",
+        )
 
     basis = data.get("basis_info") or {}
     fut_token = basis.get("fut_token")
@@ -2681,7 +2712,13 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
         return
 
     last = hist[-1]
-    alert = classify_liq_alert(float(last.get("bid_change") or 0), float(last.get("ask_change") or 0))
+    liq_k = float(st.session_state.get("liq_sigma_k", 1.5))
+    bid_s, ask_s = book_change_sigmas(hist)
+    alert = classify_liq_alert(
+        float(last.get("bid_change") or 0),
+        float(last.get("ask_change") or 0),
+        bid_s, ask_s, k=liq_k,
+    )
     st.markdown(
         f"<div style='border:1px solid {alert['color']};border-radius:6px;padding:6px 8px;margin-bottom:6px;'>"
         f"<span style='color:{alert['color']};font-weight:800;font-size:12px;'>{alert['label']}</span><br>"
@@ -2702,23 +2739,28 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
     bar_colors = ["#00E676" if v >= 0 else "#FF5252" for v in nets]
 
     fig = plt_go.Figure()
-    fig.add_trace(plt_go.Bar(x=times, y=nets, name="Net Liq Δ", marker_color=bar_colors, opacity=0.75))
-    fig.add_trace(plt_go.Scatter(x=times, y=bid_d, name="Bid Δ", line=dict(color="#2196F3", width=1.5)))
-    fig.add_trace(plt_go.Scatter(x=times, y=ask_d, name="Ask Δ", line=dict(color="#FF9800", width=1.5)))
+    fig.add_trace(plt_go.Bar(x=times, y=nets, name="Net Δ", marker_color=bar_colors, opacity=0.7, showlegend=True))
+    fig.add_trace(plt_go.Scatter(x=times, y=bid_d, name="Bid Δ", line=dict(color="#2196F3", width=1.6), showlegend=True))
+    fig.add_trace(plt_go.Scatter(x=times, y=ask_d, name="Ask Δ", line=dict(color="#FF9800", width=1.6), showlegend=True))
     fig.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
-    fig.add_hline(y=1500, line_width=1, line_color="#2196F3", line_dash="dash")
-    fig.add_hline(y=-1000, line_width=1, line_color="#FF5252", line_dash="dash")
+    if alert.get("bid_thr"):
+        fig.add_hline(y=alert["bid_thr"], line_width=1, line_color="#2196F3", line_dash="dash")
+        fig.add_hline(y=-alert["bid_thr"], line_width=1, line_color="#FF5252", line_dash="dash")
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-        height=280, margin=dict(l=4, r=4, t=18, b=8),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=9)),
+        height=280, margin=dict(l=4, r=4, t=8, b=36),
+        legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.0, xanchor="left",
+                    font=dict(size=9), bgcolor="rgba(14,17,23,0.85)"),
         hovermode="x unified", showlegend=True,
-        title=dict(text="Depth Net Liquidity Change", font=dict(size=11), x=0.01),
+        title=None,
     )
     fig.update_xaxes(type="category", nticks=5, tickfont=dict(size=8))
     fig.update_yaxes(title="lots", tickfont=dict(size=9))
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("Δ vs previous snapshot. Pulled < −1000 · Stacked > +1500 lots.")
+    if bid_s and ask_s:
+        st.caption(f"Flag at ±{liq_k:g}σ · bid σ={bid_s:.0f} ask σ={ask_s:.0f} lots")
+    else:
+        st.caption("σ estimated after ~8 snapshots. Keep Auto-Refresh on.")
 
 
 def render_live_alert_ribbon(data: dict = None):
@@ -3146,12 +3188,14 @@ def live_dashboard_fragment():
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap_upper"], mode="lines",
                     name=f"+{sigma_mult}σ",
-                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")))
+                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                    showlegend=False, hoverinfo="skip"))
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap_lower"], mode="lines",
                     name=f"−{sigma_mult}σ",
                     line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                    fill="tonexty", fillcolor="rgba(255,152,0,0.08)"))
+                    fill="tonexty", fillcolor="rgba(255,152,0,0.08)",
+                    showlegend=False, hoverinfo="skip"))
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap"], mode="lines", name="VWAP",
                     line=dict(color="#FF9800", width=2.2, dash="dot")))
@@ -3160,13 +3204,15 @@ def live_dashboard_fragment():
                     line=dict(color="#2196F3", width=2)))
                 fig_fut.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=320, margin=dict(l=10, r=10, t=35, b=10),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+                    height=320, margin=dict(l=10, r=10, t=8, b=28),
+                    legend=dict(orientation="h", yanchor="top", y=-0.16, x=0.0, xanchor="left",
+                                font=dict(size=11), bgcolor="rgba(14,17,23,0.9)", itemsizing="constant"),
                     hovermode="x unified",
                     yaxis=dict(range=[fmin - fpad, fmax + fpad], tickformat="d"),
                     xaxis=dict(type="category", categoryorder="array", categoryarray=fut_times, nticks=8),
-                    title=dict(text=f"Futures: {latest_fut:,.1f}  |  VWAP: {latest_vwap:,.1f}", x=0.01, font=dict(size=12)),
+                    title=None,
                 )
+                st.caption(f"Futures {latest_fut:,.1f}  ·  VWAP {latest_vwap:,.1f}  ·  bands ±{sigma_mult}σ")
                 st.plotly_chart(fig_fut, use_container_width=True)
             else:
                 st.info("Futures / VWAP not available.")
@@ -3259,11 +3305,17 @@ def live_dashboard_fragment():
             hist = [h for h in (st.session_state.get("liq_delta_history") or []) if h.get("index", Index_Name) == Index_Name]
             if hist:
                 last = hist[-1]
-                alert = classify_liq_alert(float(last.get("bid_change") or 0), float(last.get("ask_change") or 0))
+                liq_k = float(st.session_state.get("liq_sigma_k", 1.5))
+                bid_s, ask_s = book_change_sigmas(hist)
+                alert = classify_liq_alert(
+                    float(last.get("bid_change") or 0),
+                    float(last.get("ask_change") or 0),
+                    bid_s, ask_s, k=liq_k,
+                )
                 st.markdown("**Playbook**")
-                st.caption("RED · Bids Pulled  < −1000 lots")
-                st.caption("GREEN · Asks Pulled  < −1000 lots")
-                st.caption("BLUE · Bids Stacked  > +1500 lots")
+                st.caption(f"RED · Bids Pulled  ≤ −{liq_k:g}σ(bid Δ)")
+                st.caption(f"GREEN · Asks Pulled  ≤ −{liq_k:g}σ(ask Δ)")
+                st.caption(f"BLUE · Bids Stacked  ≥ +{liq_k:g}σ(bid Δ)")
                 st.markdown(
                     f"<div style='color:{alert['color']};font-weight:700;font-size:12px;margin-top:8px;'>"
                     f"{alert['label']}</div>",
