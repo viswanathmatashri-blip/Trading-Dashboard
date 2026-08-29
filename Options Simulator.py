@@ -3232,8 +3232,10 @@ def live_dashboard_fragment():
         with st.expander("▼ Trigger · Decision tree · Intraday log", expanded=False):
             trig = scores.get("dir_trigger") or {}
             st.caption(
-                "LONG if ≥3 of GEX / VWAP / OBV / CVD bullish and EFI>0. "
-                "SHORT if ≥3 bearish and EFI<0."
+                "LONG TRIGGER = ≥3 of GEX/VWAP/OBV/CVD bullish AND EFI>0. "
+                "SHORT TRIGGER = ≥3 bearish AND EFI<0. "
+                "BIAS (no fire) = setup is 3/4 aligned but EFI has not confirmed yet — do not enter. "
+                "NO DIRECTIONAL TRIGGER = checks are split (neither side has 3/4)."
             )
             t1, t2, t3 = st.columns([1.35, 0.90, 0.75])
             with t1:
@@ -3540,15 +3542,15 @@ def live_dashboard_fragment():
 
                 fig_stack = make_subplots(
                     rows=4, cols=2,
-                    column_widths=[0.78, 0.22],
+                    column_widths=[0.84, 0.16],
                     row_heights=[0.46, 0.16, 0.16, 0.22],
                     shared_xaxes=True,
                     shared_yaxes=False,
-                    horizontal_spacing=0.012,
+                    horizontal_spacing=0.01,
                     vertical_spacing=0.018,
                     specs=[
                         [{}, {}],
-                        [{}, {"rowspan": 3}],
+                        [{}, None],
                         [{}, None],
                         [{}, None],
                     ],
@@ -3568,16 +3570,14 @@ def live_dashboard_fragment():
                     x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
                     line=dict(color="#2196F3", width=2)), row=1, col=1)
                 if vp.get("ok"):
-                    colors = []
-                    for m in vp["mids"]:
-                        if abs(m - vp["poc"]) < 1e-6:
-                            colors.append("#FFD54F")
-                        elif y0 is not None and not (y0 <= m <= y1):
-                            colors.append("rgba(0,0,0,0)")
-                        else:
-                            colors.append("rgba(100,181,246,0.55)")
+                    mids, vols, colors = [], [], []
+                    for m, v in zip(vp["mids"], vp["vol"]):
+                        if y0 is not None and not (y0 <= float(m) <= y1):
+                            continue
+                        mids.append(float(m)); vols.append(float(v))
+                        colors.append("#FFD54F" if abs(m - vp["poc"]) < 1e-6 else "rgba(100,181,246,0.7)")
                     fig_stack.add_trace(plt_go.Bar(
-                        x=vp["vol"], y=vp["mids"], orientation="h", showlegend=False, name="VP",
+                        x=vols, y=mids, orientation="h", showlegend=False, name="VP",
                         marker=dict(color=colors),
                         hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
                     ), row=1, col=2)
@@ -3635,34 +3635,29 @@ def live_dashboard_fragment():
                 if isinstance(scores, dict) and "error" not in scores:
                     snap_lines.append(f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})")
                     snap_lines.append(str((trig or {}).get("trigger", "NO TRIGGER")))
-                fig_stack.add_trace(plt_go.Scatter(x=[0], y=[0], mode="markers", marker=dict(opacity=0), showlegend=False, hoverinfo="skip"), row=2, col=2)
-                fig_stack.update_xaxes(visible=False, row=2, col=2)
-                fig_stack.update_yaxes(visible=False, range=[0, 1], row=2, col=2)
-                y_pos = 0.92
+                y_pos = 0.48
                 for ln in snap_lines:
                     colr = "#FAFAFA"
-                    if "SPOT" in ln or "FUT" in ln:
-                        colr = "#00E676" if "+" in ln.split()[-1] or ln.split()[-1].startswith("+") else ("#FF5252" if ln.split()[-1].startswith("-") else "#FAFAFA")
-                        try:
+                    try:
+                        if ln.split()[-1].endswith("%"):
                             pct = float(ln.split()[-1].replace("%", ""))
                             colr = "#00E676" if pct >= 0 else "#FF5252"
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
                     if "LONG TRIGGER" in ln:
                         colr = "#00E676"
                     elif "SHORT TRIGGER" in ln:
                         colr = "#FF5252"
-                    elif "NO DIRECTIONAL" in ln or "NO TRIGGER" in ln:
+                    elif "no fire" in ln.lower() or "NO DIRECTIONAL" in ln or "NO TRIGGER" in ln:
                         colr = "#FF9800"
-                    elif "PIN" in ln or "REVERSION" in ln or "TREND" in ln or "EDGE" in ln or "MILD" in ln:
-                        colr = scores.get("colour", "#00E676") if isinstance(scores, dict) else "#00E676"
+                    elif isinstance(scores, dict) and scores.get("bias") and scores.get("bias") in ln:
+                        colr = scores.get("colour", "#00E676")
                     fig_stack.add_annotation(
-                        xref="x domain", yref="y domain", x=0.02, y=y_pos,
+                        xref="paper", yref="paper", x=0.855, y=y_pos,
                         text=ln, showarrow=False, align="left", xanchor="left",
                         font=dict(size=11, color=colr, family="Arial"),
-                        row=2, col=2,
                     )
-                    y_pos -= 0.22
+                    y_pos -= 0.06
 
                 xr = [-0.5, max(len(fut_times) - 0.5, 0.5)]
                 fig_stack.update_layout(
@@ -3672,11 +3667,11 @@ def live_dashboard_fragment():
                                 bgcolor="rgba(14,17,23,0.4)"),
                     hovermode="x unified", bargap=0.15,
                 )
-                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", row=1, col=1)
-                fig_stack.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
+                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", row=1, col=1)
+                fig_stack.update_yaxes(range=[y0, y1], type="linear", showticklabels=False, row=1, col=2)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
                                        range=xr, showticklabels=False, row=1, col=1)
-                fig_stack.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
+                fig_stack.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=2)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
                                        range=xr, showticklabels=False, row=2, col=1)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
