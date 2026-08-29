@@ -550,6 +550,149 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
         "Target_Down": target_downside,
         "Straddle_Cost": round(atm_straddle_cost, 2)
     }
+
+def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
+    """Long/short trigger from GEX location, VWAP, OBV, CVD, EFI."""
+    levels = data.get("levels", {}) or {}
+    spot = float(data.get("spot_price") or 0)
+    gex_sup = float(levels.get("GEX_Support") or spot or 0)
+    gex_res = float(levels.get("GEX_Resistance") or spot or 0)
+    checks = []
+    long_n = short_n = 0
+
+    px = None
+    vwap = None
+    obv = obv_ma = None
+    cvd = None
+    efi = None
+    lvn = []
+
+    df = pd.DataFrame()
+    if df_candles is not None and not df_candles.empty:
+        try:
+            df, _, _ = pick_last_nse_session(df_candles, min_bars=10)
+        except Exception:
+            df = df_candles.copy()
+            df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    if not df.empty and "close" in df.columns:
+        df = df.copy().reset_index(drop=True)
+        px = float(df["close"].iloc[-1])
+        if "volume" in df.columns:
+            tp = (df["high"] + df["low"] + df["close"]) / 3.0 if {"high", "low"}.issubset(df.columns) else df["close"]
+            vol = df["volume"].astype(float)
+            cum_v = vol.cumsum().replace(0, np.nan)
+            vwap = float((tp.astype(float) * vol).cumsum().iloc[-1] / cum_v.iloc[-1]) if cum_v.iloc[-1] == cum_v.iloc[-1] else px
+            direction = np.sign(df["close"].astype(float).diff().fillna(0.0))
+            obv_s = (direction * vol).cumsum()
+            obv = float(obv_s.iloc[-1])
+            obv_ma = float(obv_s.rolling(20, min_periods=5).mean().iloc[-1])
+            hl = (df["high"] - df["low"]).replace(0, np.nan)
+            loc = ((df["close"] - df["low"]) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
+            cvd_s = (vol * loc).cumsum()
+            cvd = float(cvd_s.iloc[-1])
+            efi = float((df["close"].astype(float).diff() * vol).ewm(span=13, adjust=False).mean().iloc[-1])
+            try:
+                vp = compute_session_volume_profile(df, bin_step=5.0, prominence_factor=0.35)
+                lvn = list(vp.get("lvn") or [])
+            except Exception:
+                lvn = []
+        else:
+            vwap = px
+
+    # 1 Location GEX
+    loc_long = loc_short = False
+    loc_note = "GEX walls unavailable"
+    if px and gex_sup and gex_res:
+        near_lvn = any(abs(px - lv) <= 15 for lv in lvn)
+        loc_long = (px >= gex_sup) or near_lvn
+        loc_short = px <= gex_res and px < gex_sup + (gex_res - gex_sup) * 0.35
+        if px > gex_res:
+            loc_short = True
+            loc_long = False
+        if px < gex_sup:
+            loc_long = True
+        loc_note = f"px {px:.0f} · put-wall {gex_sup:.0f} · call-wall {gex_res:.0f}"
+        if near_lvn:
+            loc_note += " · through LVN"
+    checks.append({"name": "Location (GEX)", "long": loc_long, "short": loc_short, "note": loc_note})
+
+    # 2 VWAP
+    vwap_long = vwap_short = False
+    vwap_note = "VWAP unavailable"
+    if px and vwap:
+        vwap_long = px > vwap
+        vwap_short = px < vwap
+        vwap_note = f"px {px:.1f} vs VWAP {vwap:.1f}"
+    checks.append({"name": "Trend (VWAP)", "long": vwap_long, "short": vwap_short, "note": vwap_note})
+
+    # 3 OBV
+    obv_long = obv_short = False
+    obv_note = "OBV unavailable"
+    if obv is not None and obv_ma is not None and not np.isnan(obv_ma):
+        obv_long = obv > obv_ma
+        obv_short = obv < obv_ma
+        obv_note = f"OBV {obv:.0f} vs MA20 {obv_ma:.0f}"
+    checks.append({"name": "Macro Flow (OBV)", "long": obv_long, "short": obv_short, "note": obv_note})
+
+    # 4 CVD structure
+    cvd_long = cvd_short = False
+    cvd_note = "CVD unavailable"
+    if cvd is not None and not df.empty and "volume" in df.columns:
+        half = max(len(df) // 2, 3)
+        cvd_s = (df["volume"].astype(float) * loc).cumsum() if "volume" in df.columns else None
+        if cvd_s is not None and len(cvd_s) >= 6:
+            early = float(cvd_s.iloc[:half].max())
+            late = float(cvd_s.iloc[half:].max())
+            early_lo = float(cvd_s.iloc[:half].min())
+            late_lo = float(cvd_s.iloc[half:].min())
+            cvd_long = late > early and cvd > 0
+            cvd_short = late_lo < early_lo and cvd < 0
+            cvd_note = f"CVD {cvd:.0f} · HH={cvd_long} LL={cvd_short}"
+    checks.append({"name": "Order Delta (CVD)", "long": cvd_long, "short": cvd_short, "note": cvd_note})
+
+    # 5 EFI execution
+    efi_long = efi_short = False
+    efi_note = "EFI unavailable"
+    if efi is not None and not np.isnan(efi):
+        efi_long = efi > 0
+        efi_short = efi < 0
+        efi_note = f"EFI13 {efi:.1f}"
+    checks.append({"name": "Execution (EFI 13)", "long": efi_long, "short": efi_short, "note": efi_note})
+
+    for ch in checks:
+        if ch["long"]:
+            long_n += 1
+        if ch["short"]:
+            short_n += 1
+
+    setup_long = sum(1 for ch in checks[:4] if ch["long"]) >= 3
+    setup_short = sum(1 for ch in checks[:4] if ch["short"]) >= 3
+    if setup_long and efi_long and long_n >= 4:
+        trigger, colour = "LONG TRIGGER", "#00E676"
+        summary = "Setup aligned + EFI green. Directional long."
+    elif setup_short and efi_short and short_n >= 4:
+        trigger, colour = "SHORT TRIGGER", "#FF5252"
+        summary = "Setup aligned + EFI red. Directional short."
+    elif long_n >= 3 and long_n > short_n:
+        trigger, colour = "LONG BIAS (no fire)", "#80CBC4"
+        summary = "Long conditions building; wait for EFI > 0."
+    elif short_n >= 3 and short_n > long_n:
+        trigger, colour = "SHORT BIAS (no fire)", "#EF9A9A"
+        summary = "Short conditions building; wait for EFI < 0."
+    else:
+        trigger, colour = "NO DIRECTIONAL TRIGGER", "#FF9800"
+        summary = "Checks split. No long/short fire."
+
+    return {
+        "trigger": trigger,
+        "colour": colour,
+        "summary": summary,
+        "long_hits": long_n,
+        "short_hits": short_n,
+        "checks": checks,
+    }
+
+
 def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     """
     Superhuman Decision Engine – v2
@@ -770,6 +913,7 @@ def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
         "big_range":          big_range,
         "quiet_range":        quiet_range,
         "timestamp_ist":      now.strftime("%d-%b-%Y %H:%M:%S IST"),
+        "dir_trigger":        evaluate_directional_trigger(data, df_candles),
     }
 
 
@@ -3029,6 +3173,38 @@ def live_dashboard_fragment():
 
         # Clarity message
         st.caption(f"📌 {scores.get('clarity', '')}")
+
+        trig = scores.get("dir_trigger") or {}
+        t_col, t_hits = st.columns([0.62, 0.38])
+        with t_col:
+            st.markdown(
+                f"<div style='font-size:14px;font-weight:800;color:{trig.get('colour','#FF9800')};margin-top:4px;'>"
+                f"⚡ {trig.get('trigger', 'NO DIRECTIONAL TRIGGER')}</div>",
+                unsafe_allow_html=True
+            )
+            st.caption(trig.get("summary", ""))
+        with t_hits:
+            st.caption(f"Long checks {trig.get('long_hits', 0)}/5 · Short checks {trig.get('short_hits', 0)}/5")
+        with st.expander("? Trigger logic", expanded=False):
+            st.markdown(
+                "Fires **LONG** if at least 3 of Location / VWAP / OBV / CVD are bullish and EFI > 0. "
+                "Fires **SHORT** if at least 3 of those four are bearish and EFI < 0."
+            )
+            rows = ["| Metric | Long rule | Short rule | Now |",
+                    "|---|---|---|---|"]
+            rules = {
+                "Location (GEX)": ("Above put wall / through LVN", "Below call wall / GEX resistance"),
+                "Trend (VWAP)": ("Price > VWAP", "Price < VWAP"),
+                "Macro Flow (OBV)": ("OBV rising / above MA20", "OBV falling / below MA20"),
+                "Order Delta (CVD)": ("CVD higher highs", "CVD lower lows"),
+                "Execution (EFI 13)": ("EFI(13) > 0", "EFI(13) < 0"),
+            }
+            for ch in trig.get("checks") or []:
+                side = "LONG" if ch.get("long") and not ch.get("short") else (
+                    "SHORT" if ch.get("short") and not ch.get("long") else "—")
+                long_r, short_r = rules.get(ch["name"], ("", ""))
+                rows.append(f"| {ch['name']} | {long_r} | {short_r} | **{side}** · {ch.get('note','')} |")
+            st.markdown("\n".join(rows))
 
         # Decision Tree + Intraday Log
         with st.expander("▼ Decision Tree & Intraday Log", expanded=False):
