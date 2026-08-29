@@ -3549,8 +3549,8 @@ def live_dashboard_fragment():
                     specs=[
                         [{}, {}],
                         [{}, {"rowspan": 3}],
-                        [None, None],
-                        [None, None],
+                        [{}, None],
+                        [{}, None],
                     ],
                 )
                 # price
