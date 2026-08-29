@@ -3207,9 +3207,9 @@ def live_dashboard_fragment():
         with tech_right:
             fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.55, 0.45])
             colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
-            fig_ind.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="Hist", marker_color=colors_macd, showlegend=False), row=1, col=1)
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD [{macd_val:.1f}]", line=dict(color="#2196F3", width=1.3)), row=1, col=1)
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Sig [{macd_sig:.1f}]", line=dict(color="#FF9800", width=1.3)), row=1, col=1)
+            fig_ind.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="Hist", marker_color=colors_macd, showlegend=False))
+            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD [{macd_val:.1f}]", line=dict(color="#2196F3", width=1.3)))
+            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Sig [{macd_sig:.1f}]", line=dict(color="#FF9800", width=1.3)))
             fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name=f"RSI [{rsi_val:.0f}]", line=dict(color="#E040FB", width=1.3)), row=2, col=1)
             fig_ind.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=2, col=1)
             fig_ind.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=2, col=1)
@@ -3301,6 +3301,7 @@ def live_dashboard_fragment():
             elif fut_msg:
                 st.caption(fut_msg)
 
+            vp = {"ok": False}
             if not df_fchart.empty:
                 df_fchart = df_fchart.copy()
                 df_fchart["tp"] = (df_fchart["high"] + df_fchart["low"] + df_fchart["close"]) / 3.0
@@ -3335,48 +3336,47 @@ def live_dashboard_fragment():
                 vp = compute_session_volume_profile(df_fchart, bin_step=5.0, prominence_factor=0.35)
                 y0, y1 = fmin - fpad, fmax + fpad
 
-                fig_fut = make_subplots(
-                    rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.01,
-                    column_widths=[0.84, 0.16],
-                )
+                _xax = dict(type="category", categoryorder="array", categoryarray=fut_times,
+                            range=[-0.5, max(len(fut_times) - 0.5, 0.5)], nticks=8)
+                fig_fut = plt_go.Figure()
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap_upper"], mode="lines",
                     name=f"+{sigma_mult}σ",
                     line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                    showlegend=False, hoverinfo="skip"), row=1, col=1)
+                    showlegend=False, hoverinfo="skip"))
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap_lower"], mode="lines",
                     name=f"−{sigma_mult}σ",
                     line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
                     fill="tonexty", fillcolor="rgba(255,152,0,0.08)",
-                    showlegend=False, hoverinfo="skip"), row=1, col=1)
+                    showlegend=False, hoverinfo="skip"))
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["vwap"], mode="lines", name="VWAP",
-                    line=dict(color="#FF9800", width=2.2, dash="dot")), row=1, col=1)
+                    line=dict(color="#FF9800", width=2.2, dash="dot")))
                 fig_fut.add_trace(plt_go.Scatter(
                     x=df_fchart["time_str"], y=df_fchart["close"], mode="lines", name="Futures",
-                    line=dict(color="#2196F3", width=2)), row=1, col=1)
+                    line=dict(color="#2196F3", width=2)))
 
                 spot_now = float(data.get("spot_price") or 0)
                 if vp.get("ok"):
                     fig_fut.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F",
                                       annotation_text="POC", annotation_font_size=9,
-                                      annotation_font_color="#FFD54F", row=1, col=1)
+                                      annotation_font_color="#FFD54F")
                     fig_fut.add_hline(y=vp["vah1"], line_width=1.2, line_color="#FAFAFA", line_dash="dot",
-                                      annotation_text="VAH 1σ", annotation_font_size=8, row=1, col=1)
+                                      annotation_text="VAH 1σ", annotation_font_size=8)
                     fig_fut.add_hline(y=vp["val1"], line_width=1.2, line_color="#FAFAFA", line_dash="dot",
-                                      annotation_text="VAL 1σ", annotation_font_size=8, row=1, col=1)
+                                      annotation_text="VAL 1σ", annotation_font_size=8)
                     fig_fut.add_hline(y=vp["vah15"], line_width=3.2, line_color="#B0BEC5", line_dash="dot",
-                                      annotation_text="VAH 1.5σ", annotation_font_size=8, row=1, col=1)
+                                      annotation_text="VAH 1.5σ", annotation_font_size=8)
                     fig_fut.add_hline(y=vp["val15"], line_width=3.2, line_color="#B0BEC5", line_dash="dot",
-                                      annotation_text="VAL 1.5σ", annotation_font_size=8, row=1, col=1)
+                                      annotation_text="VAL 1.5σ", annotation_font_size=8)
                     fig_fut.add_hline(y=latest_fut, line_width=2, line_color="#00E676",
                                       annotation_text="Fut", annotation_font_size=9,
-                                      annotation_font_color="#00E676", row=1, col=1)
+                                      annotation_font_color="#00E676")
                     for hv in vp.get("hvn", [])[:8]:
-                        fig_fut.add_hline(y=hv, line_width=1, line_color="#81D4FA", line_dash="dash", row=1, col=1)
+                        fig_fut.add_hline(y=hv, line_width=1, line_color="#81D4FA", line_dash="dash")
                     for lv in vp["lvn"][:8]:
-                        fig_fut.add_hline(y=lv, line_width=1.2, line_color="#CE93D8", line_dash="dot", row=1, col=1)
+                        fig_fut.add_hline(y=lv, line_width=1.2, line_color="#CE93D8", line_dash="dot")
                     colors = []
                     for m in vp["mids"]:
                         if abs(m - vp["poc"]) < 1e-6:
@@ -3387,22 +3387,17 @@ def live_dashboard_fragment():
                             colors.append("rgba(206,147,216,0.75)")
                         else:
                             colors.append("rgba(100,181,246,0.45)")
-                    fig_fut.add_trace(plt_go.Bar(
-                        x=vp["vol"], y=vp["mids"], orientation="h", name="VP",
-                        marker=dict(color=colors), showlegend=False, hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
-                    ), row=1, col=2)
 
                 fig_fut.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=360, margin=dict(l=10, r=8, t=8, b=28),
-                    legend=dict(orientation="h", yanchor="top", y=-0.14, x=0.0, xanchor="left",
+                    height=320, margin=dict(l=42, r=8, t=8, b=18),
+                    legend=dict(orientation="h", yanchor="top", y=-0.12, x=0.0, xanchor="left",
                                 font=dict(size=11), bgcolor="rgba(14,17,23,0.9)", itemsizing="constant"),
-                    hovermode="x unified", barmode="overlay",
+                    hovermode="x unified",
                 )
-                fig_fut.update_yaxes(range=[y0, y1], tickformat="d", row=1, col=1)
-                fig_fut.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
-                fig_fut.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times, nticks=8, row=1, col=1)
-                fig_fut.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
+                fig_fut.update_yaxes(range=[y0, y1], tickformat="d")
+                fig_fut.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                                     range=[-0.5, max(len(fut_times) - 0.5, 0.5)], nticks=8, showticklabels=False)
                 cap = f"Futures {latest_fut:,.1f}  ·  VWAP {latest_vwap:,.1f}  ·  bands ±{sigma_mult}σ"
                 if vp.get("ok"):
                     cap += (
@@ -3431,15 +3426,15 @@ def live_dashboard_fragment():
                     line=dict(color="#00E676", width=1.7),
                     fill="tozeroy", fillcolor="rgba(0,230,118,0.15)",
                     showlegend=False,
-                ), row=1, col=1)
+                ))
                 fig_flow.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0),
                     mode="lines", name="OBV-",
                     line=dict(color="#FF5252", width=1.7),
                     fill="tozeroy", fillcolor="rgba(255,82,82,0.15)",
                     showlegend=False,
-                ), row=1, col=1)
-                fig_flow.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=1, col=1)
+                ))
+                fig_flow.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
                 efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
                 fig_flow.add_trace(plt_go.Bar(
                     x=dfi["time_str"], y=dfi["efi13"], name="EFI13",
@@ -3452,10 +3447,10 @@ def live_dashboard_fragment():
                     hovermode="x unified",
                 )
                 fig_flow.update_xaxes(type="category", categoryorder="array",
-                                      categoryarray=fut_times, nticks=8, showticklabels=False, row=1, col=1)
+                                      categoryarray=fut_times, nticks=8, showticklabels=False)
                 fig_flow.update_xaxes(type="category", categoryorder="array",
                                       categoryarray=fut_times, nticks=8, row=2, col=1)
-                fig_flow.update_yaxes(tickfont=dict(size=8), row=1, col=1)
+                fig_flow.update_yaxes(tickfont=dict(size=8))
                 fig_flow.update_yaxes(tickfont=dict(size=8), row=2, col=1)
                 fig_flow.update_annotations(font_size=11)
                 st.plotly_chart(fig_flow, use_container_width=True)
@@ -3463,7 +3458,39 @@ def live_dashboard_fragment():
                 st.info("Futures / VWAP not available.")
 
         with r1mid:
-            render_liquidity_delta_panel(data, df_fchart, Index_Name)
+            st.markdown("<span style='font-weight:700;color:#00E676;font-size:13px;'>📦 Volume Profile</span>", unsafe_allow_html=True)
+            if vp.get("ok"):
+                colors = []
+                for m in vp["mids"]:
+                    if abs(m - vp["poc"]) < 1e-6:
+                        colors.append("#FFD54F")
+                    elif any(abs(m - h) < 1e-6 for h in vp.get("hvn", [])):
+                        colors.append("rgba(129,212,250,0.75)")
+                    elif any(abs(m - h) < 1e-6 for h in vp.get("lvn", [])):
+                        colors.append("rgba(206,147,216,0.75)")
+                    else:
+                        colors.append("rgba(100,181,246,0.45)")
+                fig_vp_side = plt_go.Figure()
+                fig_vp_side.add_trace(plt_go.Bar(
+                    x=vp["vol"], y=vp["mids"], orientation="h",
+                    marker=dict(color=colors), showlegend=False,
+                    hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
+                ))
+                fig_vp_side.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F")
+                fig_vp_side.add_hline(y=latest_fut if not df_fchart.empty else vp["poc"],
+                                      line_width=2, line_color="#00E676")
+                fig_vp_side.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=320, margin=dict(l=4, r=4, t=8, b=18),
+                )
+                _yr = None
+                if not df_fchart.empty:
+                    _yr = [float(df_fchart['low'].min()) * 0.999, float(df_fchart['high'].max()) * 1.001]
+                fig_vp_side.update_yaxes(range=_yr, showticklabels=False)
+                fig_vp_side.update_xaxes(showticklabels=False, showgrid=False)
+                st.plotly_chart(fig_vp_side, use_container_width=True)
+            else:
+                st.caption("VP unavailable.")
 
         with r1c2:
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📈 GEX vs OI</span>", unsafe_allow_html=True)
@@ -3534,9 +3561,10 @@ def live_dashboard_fragment():
                 fig_cvd.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
                 fig_cvd.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=280, margin=dict(l=10, r=10, t=30, b=10),
+                    height=220, margin=dict(l=42, r=8, t=24, b=28),
                     title=dict(text=f"CVD: {latest_cvd:,.0f}", x=0.01, font=dict(size=12)),
-                    xaxis=dict(type="category", categoryorder="array", categoryarray=fut_times, nticks=8),
+                    xaxis=dict(type="category", categoryorder="array", categoryarray=fut_times,
+                               range=[-0.5, max(len(fut_times) - 0.5, 0.5)], nticks=8),
                     yaxis=dict(title="Cumulative signed vol"),
                     showlegend=False, hovermode="x unified",
                 )
@@ -3546,7 +3574,7 @@ def live_dashboard_fragment():
                 st.info("CVD not available.")
 
         with r2mid:
-            # Continuation / context of same book tape (compact)
+            render_liquidity_delta_panel(data, df_fchart, Index_Name)
             hist = [h for h in (st.session_state.get("liq_delta_history") or []) if h.get("index", Index_Name) == Index_Name]
             if hist:
                 last = hist[-1]
@@ -3557,16 +3585,9 @@ def live_dashboard_fragment():
                     float(last.get("ask_change") or 0),
                     bid_s, ask_s, k=liq_k,
                 )
-                st.markdown("**Playbook**")
-                st.caption(f"RED · Bids Pulled  ≤ −{liq_k:g}σ(bid Δ)")
-                st.caption(f"GREEN · Asks Pulled  ≤ −{liq_k:g}σ(ask Δ)")
-                st.caption(f"BLUE · Bids Stacked  ≥ +{liq_k:g}σ(bid Δ)")
-                st.markdown(
-                    f"<div style='color:{alert['color']};font-weight:700;font-size:12px;margin-top:8px;'>"
-                    f"{alert['label']}</div>",
-                    unsafe_allow_html=True
+                st.caption(
+                    f"{alert['label']} · R −{liq_k:g}σ bid · G −{liq_k:g}σ ask · B +{liq_k:g}σ bid"
                 )
-                st.caption(alert["hint"])
             else:
                 st.caption("Liquidity tape builds after Auto-Refresh snapshots.")
 
