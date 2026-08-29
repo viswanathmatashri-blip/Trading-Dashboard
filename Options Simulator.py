@@ -2829,7 +2829,7 @@ def classify_liq_alert(bid_change: float, ask_change: float, bid_sigma=None, ask
             "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
 
 
-def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name: str):
+def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name: str, compact: bool = False):
     """Middle panel: futures limit-book liquidity delta + imbalance alerts."""
     tcol, kcol = st.columns([0.62, 0.38])
     with tcol:
@@ -2893,7 +2893,7 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
         fig.add_hline(y=-alert["bid_thr"], line_width=1, line_color="#FF5252", line_dash="dash")
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-        height=280, margin=dict(l=4, r=4, t=8, b=36),
+        height=170 if compact else 240, margin=dict(l=4, r=4, t=4, b=28),
         legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.0, xanchor="left",
                     font=dict(size=9), bgcolor="rgba(14,17,23,0.85)"),
         hovermode="x unified", showlegend=True,
@@ -3267,7 +3267,12 @@ def live_dashboard_fragment():
             min_strike_val = float(data.get("spot_price", 0) or 0) - 500
             max_strike_val = float(data.get("spot_price", 0) or 0) + 500
 
-        # ----- Row 1: Futures 70% | GEX OI 30% -----
+        # ----- Row 1: Futures 50% | VP+Book 20% | GEX OI 30% -----
+        fut_msg = data.get("fut_fallback_msg", "")
+        if data.get("fut_is_fallback") or "closed" in str(fut_msg).lower():
+            st.warning(fut_msg)
+        elif fut_msg:
+            st.caption(fut_msg)
         r1c1, r1mid, r1c2 = st.columns([0.50, 0.20, 0.30])
 
         with r1c1:
@@ -3295,13 +3300,8 @@ def live_dashboard_fragment():
                     label_visibility="collapsed"
                 )
 
-            fut_msg = data.get("fut_fallback_msg", "")
-            if data.get("fut_is_fallback") or "closed" in str(fut_msg).lower():
-                st.warning(fut_msg)
-            elif fut_msg:
-                st.caption(fut_msg)
-
             vp = {"ok": False}
+            y0 = y1 = None
             if not df_fchart.empty:
                 df_fchart = df_fchart.copy()
                 df_fchart["tp"] = (df_fchart["high"] + df_fchart["low"] + df_fchart["close"]) / 3.0
@@ -3477,20 +3477,19 @@ def live_dashboard_fragment():
                     hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
                 ))
                 fig_vp_side.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F")
-                fig_vp_side.add_hline(y=latest_fut if not df_fchart.empty else vp["poc"],
-                                      line_width=2, line_color="#00E676")
+                if not df_fchart.empty:
+                    fig_vp_side.add_hline(y=float(df_fchart["close"].iloc[-1]), line_width=2, line_color="#00E676")
                 fig_vp_side.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                     height=320, margin=dict(l=4, r=4, t=8, b=18),
                 )
-                _yr = None
-                if not df_fchart.empty:
-                    _yr = [float(df_fchart['low'].min()) * 0.999, float(df_fchart['high'].max()) * 1.001]
-                fig_vp_side.update_yaxes(range=_yr, showticklabels=False)
+                # lock to the SAME price range as the futures chart
+                fig_vp_side.update_yaxes(range=[y0, y1], showticklabels=False, zeroline=False)
                 fig_vp_side.update_xaxes(showticklabels=False, showgrid=False)
                 st.plotly_chart(fig_vp_side, use_container_width=True)
             else:
                 st.caption("VP unavailable.")
+            render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
 
         with r1c2:
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📈 GEX vs OI</span>", unsafe_allow_html=True)
@@ -3574,22 +3573,7 @@ def live_dashboard_fragment():
                 st.info("CVD not available.")
 
         with r2mid:
-            render_liquidity_delta_panel(data, df_fchart, Index_Name)
-            hist = [h for h in (st.session_state.get("liq_delta_history") or []) if h.get("index", Index_Name) == Index_Name]
-            if hist:
-                last = hist[-1]
-                liq_k = float(st.session_state.get("liq_sigma_k", 1.5))
-                bid_s, ask_s = book_change_sigmas(hist)
-                alert = classify_liq_alert(
-                    float(last.get("bid_change") or 0),
-                    float(last.get("ask_change") or 0),
-                    bid_s, ask_s, k=liq_k,
-                )
-                st.caption(
-                    f"{alert['label']} · R −{liq_k:g}σ bid · G −{liq_k:g}σ ask · B +{liq_k:g}σ bid"
-                )
-            else:
-                st.caption("Liquidity tape builds after Auto-Refresh snapshots.")
+            pass
 
         with r2c2:
             st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📊 GEX vs Volume</span>", unsafe_allow_html=True)
