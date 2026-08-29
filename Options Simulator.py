@@ -166,6 +166,7 @@ INDEX_TOKEN_MAP = {
     "MIDCPNIFTY": ("99926074", "NSE", "NFO"),
     "SENSEX": ("99919000", "BSE", "BFO")
 }
+INDIA_VIX_TOKEN = "99926017"
 
 # --- RATE LIMIT SAFEGUARD WRAPPER ---
 def safe_api_call(func, *args, max_retries=4, base_delay=0.6, **kwargs):
@@ -1081,6 +1082,44 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20) -> tuple:
     sess = out[out["session_date"] == chosen].copy().reset_index(drop=True)
     sess["time_str"] = sess["time"].dt.strftime("%H:%M")
     return sess, chosen, True
+
+
+def fetch_india_vix_sessions(smart_api, lookback_days=10):
+    """Last 3 NSE sessions of India VIX (5-min) + last-session % change."""
+    empty = (pd.DataFrame(), None, None)
+    if not smart_api:
+        return empty
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.datetime.now(ist)
+    candle_param = {
+        "exchange": "NSE",
+        "symboltoken": INDIA_VIX_TOKEN,
+        "interval": "FIVE_MINUTE",
+        "fromdate": (now - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d 09:15"),
+        "todate": now.strftime("%Y-%m-%d 15:30"),
+    }
+    res = safe_api_call(smart_api.getCandleData, candle_param)
+    if not (res and res.get("status") and res.get("data")):
+        return empty
+    df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df["time"] = series_to_ist(df["time"])
+    df = df.dropna(subset=["time"])
+    mins = df["time"].dt.hour * 60 + df["time"].dt.minute
+    df = df[(mins >= 9 * 60 + 15) & (mins <= 15 * 60 + 30)]
+    df["session"] = df["time"].dt.date
+    dates = [d for d in sorted(df["session"].unique()) if d.weekday() < 5][-3:]
+    if not dates:
+        return empty
+    df = df[df["session"].isin(dates)].sort_values("time")
+    last_d = dates[-1]
+    sess = df[df["session"] == last_d]
+    open_px = float(sess["open"].iloc[0])
+    last_px = float(sess["close"].iloc[-1])
+    pct = ((last_px - open_px) / open_px * 100.0) if open_px else 0.0
+    df["time_str"] = df["time"].dt.strftime("%d-%b %H:%M")
+    return df, pct, last_d
+
 
 def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15):
     """
@@ -3677,19 +3716,8 @@ def live_dashboard_fragment():
                 fig_gex.update_yaxes(range=v2, secondary_y=True, row=2, col=1, showgrid=False)
                 fig_gex.update_annotations(font_size=11)
                 st.plotly_chart(fig_gex, use_container_width=True)
-            else:
-                st.info("GEX unavailable.")
-
-        # Delta-GEX (selected) | Heatmap
-        # Multi-exp Delta-GEX   | VEX/CEX
-        # IV Skew 50%           | Z-Scores 50%
-        # Basket Greeks then Strategy Basket Legs
-        if not df_chain.empty and lvls:
-            st.markdown("---")
-            d_left, d_right = st.columns([0.40, 0.60])
-            with d_left:
                 st.markdown(
-                    f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
+                    f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
                     f"🎯 Δ-GEX (OI) — {selected_expiry_str}</span>",
                     unsafe_allow_html=True
                 )
@@ -3701,62 +3729,26 @@ def live_dashboard_fragment():
                 ))
                 fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
                 fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-                fig_delta_gex.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
+                fig_delta_gex.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
                 fig_delta_gex.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=460, margin=dict(l=10, r=10, t=24, b=8), hovermode="x unified",
+                    height=280, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
                     showlegend=False,
                 )
-                fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
+                fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
                 fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
                 st.plotly_chart(fig_delta_gex, use_container_width=True)
+            else:
+                st.info("GEX unavailable.")
 
-                # Multi-expiry Δ-GEX (next 6 months) — same strike axis
-                st.markdown(
-                    "<span style='font-weight:700;color:#00E676;font-size:14px;'>"
-                    "🎯 Δ-GEX (OI) — All expiries next 6 months</span>",
-                    unsafe_allow_html=True
-                )
-                smart_api_mx = get_smart_api_client()
-                df_mx = pd.DataFrame()
-                if smart_api_mx:
-                    df_mx = compute_multi_expiry_delta_gex(
-                        smart_api_mx, Index_Name, Exchange,
-                        float(data["spot_price"]), float(rate_param),
-                        int(LOT_SIZES.get(Index_Name, 65)),
-                        float(min_strike_val), float(max_strike_val), months=6,
-                    )
-                if not df_mx.empty:
-                    mx_colors = np.where(df_mx["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
-                    fig_mx = plt_go.Figure()
-                    fig_mx.add_trace(plt_go.Bar(
-                        x=df_mx["Strike"], y=df_mx["Net_Delta_GEX_OI"], name="Δ-GEX 6M",
-                        marker_color=mx_colors, opacity=0.85, width=25,
-                    ))
-                    fig_mx.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-                    fig_mx.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-                    if lvls.get("Zero_Gamma_Flip"):
-                        fig_mx.add_vline(x=lvls["Zero_Gamma_Flip"], line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
-                    fig_mx.update_layout(
-                        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                        height=460, margin=dict(l=10, r=10, t=24, b=8), hovermode="x unified",
-                        showlegend=False,
-                    )
-                    fig_mx.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
-                    fig_mx.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
-                    st.plotly_chart(fig_mx, use_container_width=True)
-                    st.caption(
-                        f"Sum of delta-adjusted GEX (OI) across all listed expiries in the next 6 months "
-                        f"({len(df_mx)} strikes). Same strike window as chart above."
-                    )
-                else:
-                    st.info("Multi-expiry Δ-GEX unavailable (API / no data).")
-
-            with d_right:
-                render_delta_gex_heatmap(
-                    data, Index_Name, selected_expiry_str,
-                    st.session_state.get("heatmap_timeframe", "5 min"),
-                )
+        # Delta-GEX (selected) | Heatmap
+        # Multi-exp Delta-GEX   | VEX/CEX
+        # IV Skew 50%           | Z-Scores 50%
+        # Basket Greeks then Strategy Basket Legs
+        if not df_chain.empty and lvls:
+            st.markdown("---")
+            d_left, d_right = st.columns([0.40, 0.60])
+            with d_left:
                 st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>⚡ VEX / CEX Profile</span>", unsafe_allow_html=True)
                 fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
                 fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20), secondary_y=False)
@@ -3766,13 +3758,19 @@ def live_dashboard_fragment():
                 vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].astype(float), df_chain["CEX"].astype(float))
                 fig_vex_cex.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=400, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                    height=520, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
                     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
                 )
                 fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
                 fig_vex_cex.update_yaxes(range=vex_range, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
                 fig_vex_cex.update_yaxes(range=cex_range, secondary_y=True, showgrid=False)
                 st.plotly_chart(fig_vex_cex, use_container_width=True)
+
+            with d_right:
+                render_delta_gex_heatmap(
+                    data, Index_Name, selected_expiry_str,
+                    st.session_state.get("heatmap_timeframe", "5 min"),
+                )
 
             # IV Skew 50% | Z-Scores 50%
             st.markdown("---")
@@ -3787,7 +3785,7 @@ def live_dashboard_fragment():
                         latest_spot, rate_param, strikes_below=strikes_below, strikes_above=strikes_above,
                     )
                     if not df_chain_iv.empty:
-                        tab1, tab2 = st.tabs(["OTM Skew (Puts & Calls)", "Both Raw Curves (CE vs PE)"])
+                        tab1, tab2, tab3 = st.tabs(["OTM Skew (Puts & Calls)", "Both Raw Curves (CE vs PE)", "INDIA VIX"])
                         with tab1:
                             df_skew = get_clean_otm_skew(df_chain_iv, latest_spot)
                             fig_skew = px.line(df_skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"])
@@ -3799,6 +3797,32 @@ def live_dashboard_fragment():
                             fig_raw.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
                             fig_raw.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
                             st.plotly_chart(fig_raw, use_container_width=True)
+                        with tab3:
+                            df_vix, vix_pct, vix_day = fetch_india_vix_sessions(smart_api)
+                            if df_vix.empty:
+                                st.info("India VIX candles unavailable.")
+                            else:
+                                colr = "#00E676" if (vix_pct or 0) >= 0 else "#FF5252"
+                                st.markdown(
+                                    f"<div style='font-size:18px;font-weight:800;color:{colr};'>"
+                                    f"INDIA VIX {float(df_vix['close'].iloc[-1]):.2f}  "
+                                    f"{vix_pct:+.2f}% <span style='font-size:12px;font-weight:500;color:#AAA;'>"
+                                    f"({vix_day} session)</span></div>",
+                                    unsafe_allow_html=True
+                                )
+                                fig_vix = plt_go.Figure()
+                                fig_vix.add_trace(plt_go.Scatter(
+                                    x=df_vix["time_str"], y=df_vix["close"], mode="lines",
+                                    line=dict(color="#FFD54F", width=2), name="VIX",
+                                ))
+                                fig_vix.update_layout(
+                                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                    height=320, margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
+                                )
+                                fig_vix.update_xaxes(type="category", nticks=8)
+                                fig_vix.update_yaxes(title="VIX")
+                                st.plotly_chart(fig_vix, use_container_width=True)
+                                st.caption("% is last session open→close. Chart = last 3 trading sessions.")
                     else:
                         st.info("Skew data unavailable.")
                 else:
