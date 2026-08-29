@@ -3342,6 +3342,7 @@ def live_dashboard_fragment():
                 vol = dfi["volume"].astype(float)
                 direction = np.sign(close.diff().fillna(0.0))
                 dfi["obv"] = (direction * vol).cumsum()
+                dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
                 dfi["efi13"] = (close.diff() * vol).ewm(span=13, adjust=False).mean()
                 hl = (dfi["high"] - dfi["low"]).replace(0, np.nan)
                 loc = ((dfi["close"] - dfi["low"]) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
@@ -3376,13 +3377,7 @@ def live_dashboard_fragment():
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
                     line=dict(color="#2196F3", width=2)), row=1, col=1)
-                fig_stack.add_hline(y=latest_fut, line_width=1.6, line_color="#00E676", row=1, col=1)
                 if vp.get("ok"):
-                    fig_stack.add_hline(y=vp["poc"], line_width=1.2, line_color="#FFD54F", row=1, col=1)
-                    fig_stack.add_hline(y=vp["vah1"], line_width=1, line_color="#FAFAFA", line_dash="dot", row=1, col=1)
-                    fig_stack.add_hline(y=vp["val1"], line_width=1, line_color="#FAFAFA", line_dash="dot", row=1, col=1)
-                    fig_stack.add_hline(y=vp["vah15"], line_width=2.6, line_color="#B0BEC5", line_dash="dot", row=1, col=1)
-                    fig_stack.add_hline(y=vp["val15"], line_width=2.6, line_color="#B0BEC5", line_dash="dot", row=1, col=1)
                     colors = []
                     for m in vp["mids"]:
                         if abs(m - vp["poc"]) < 1e-6:
@@ -3405,6 +3400,10 @@ def live_dashboard_fragment():
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0), mode="lines", showlegend=False,
                     line=dict(color="#FF5252", width=1.5), fill="tozeroy", fillcolor="rgba(255,82,82,0.16)",
+                ), row=2, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", name="OBV MA20",
+                    line=dict(color="#FFF176", width=1.6), showlegend=False,
                 ), row=2, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
                 # EFI
@@ -3442,9 +3441,12 @@ def live_dashboard_fragment():
                                        range=xr, showticklabels=False, row=3, col=1)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
                                        range=xr, nticks=8, row=4, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="OBV", title_font=dict(size=10), row=2, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI13", title_font=dict(size=10), row=3, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", title_font=dict(size=10), row=4, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="OBV",
+                                       title_font=dict(size=16, color="#00E676", family="Arial Black"), row=2, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI13",
+                                       title_font=dict(size=16, color="#00E676", family="Arial Black"), row=3, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD",
+                                       title_font=dict(size=16, color="#00E676", family="Arial Black"), row=4, col=1)
                 st.plotly_chart(fig_stack, use_container_width=True)
                 cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
                 if vp.get("ok"):
