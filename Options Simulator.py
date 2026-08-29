@@ -22,7 +22,7 @@ from scipy.optimize import brentq
 from scipy.stats import norm
 from SmartApi import SmartConnect
 
-# Setup .streamlit/config.toml programmatically for dark theme.
+# Setup .streamlit/config.toml programmatically for dark theme
 os.makedirs(".streamlit", exist_ok=True)
 config_path = os.path.join(".streamlit", "config.toml")
 if not os.path.exists(config_path):
@@ -3311,7 +3311,9 @@ def live_dashboard_fragment():
                                       annotation_text="VAH 1.5σ", annotation_font_size=8, row=1, col=1)
                     fig_fut.add_hline(y=vp["val15"], line_width=3.2, line_color="#B0BEC5", line_dash="dot",
                                       annotation_text="VAL 1.5σ", annotation_font_size=8, row=1, col=1)
-                    
+                    fig_fut.add_hline(y=latest_fut, line_width=2, line_color="#00E676",
+                                      annotation_text="Fut", annotation_font_size=9,
+                                      annotation_font_color="#00E676", row=1, col=1)
                     for hv in vp.get("hvn", [])[:8]:
                         fig_fut.add_hline(y=hv, line_width=1, line_color="#81D4FA", line_dash="dash", row=1, col=1)
                     for lv in vp["lvn"][:8]:
@@ -3342,49 +3344,51 @@ def live_dashboard_fragment():
                 fig_fut.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
                 fig_fut.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times, nticks=8, row=1, col=1)
                 fig_fut.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
-                st.caption(f"Futures {latest_fut:,.1f}  ·  VWAP {latest_vwap:,.1f}  ·  bands ±{sigma_mult}σ")
+                cap = f"Futures {latest_fut:,.1f}  ·  VWAP {latest_vwap:,.1f}  ·  bands ±{sigma_mult}σ"
+                if vp.get("ok"):
+                    cap += (
+                        f"  ·  POC {vp['poc']:.0f}  ·  VA±1σ {vp['val1']:.0f}–{vp['vah1']:.0f}"
+                        f"  ·  LVN {', '.join(f'{x:.0f}' for x in vp['lvn'][:4]) or '—'}"
+                    )
+                st.caption(cap)
                 st.plotly_chart(fig_fut, use_container_width=True)
 
-                if vp.get("ok"):
-                    fig_vp = plt_go.Figure()
-                    fig_vp.add_trace(plt_go.Bar(
-                        x=vp["mids"], y=vp["vol"], name="Volume @ price",
-                        marker_color=["#FFD54F" if abs(m - vp["poc"]) < 1e-6 else "rgba(100,181,246,0.6)" for m in vp["mids"]],
-                        showlegend=False,
-                    ))
-                    fig_vp.add_vline(x=vp["poc"], line_color="#FFD54F", line_width=1.6, annotation_text="POC", annotation_font_size=9)
-                    fig_vp.add_vline(x=vp["val1"], line_color="#FAFAFA", line_dash="dot", line_width=1.2)
-                    fig_vp.add_vline(x=vp["vah1"], line_color="#FAFAFA", line_dash="dot", line_width=1.2)
-                    fig_vp.add_vline(x=vp["val15"], line_color="#B0BEC5", line_dash="dot", line_width=3.2)
-                    fig_vp.add_vline(x=vp["vah15"], line_color="#B0BEC5", line_dash="dot", line_width=3.2)
-                    if spot_now > 0:
-                        fig_vp.add_vline(x=latest_fut, line_color="#00E676", line_width=2.2, annotation_text="Fut", annotation_font_size=9)
-                    for lv in vp["lvn"][:8]:
-                        fig_vp.add_vline(x=lv, line_color="#CE93D8", line_dash="dot", line_width=1.2)
-                    basis_pts = (basis.get("basis") if isinstance(basis, dict) else None)
-                    if basis_pts is None and spot_now > 0:
-                        basis_pts = latest_fut - spot_now
-                    basis_pts = float(basis_pts or 0)
-                    tick_n = max(6, min(12, len(vp["mids"])))
-                    step = max(1, len(vp["mids"]) // tick_n)
-                    tickvals = [float(vp["mids"][i]) for i in range(0, len(vp["mids"]), step)]
-                    ticktext = [f"{p:.0f}<br><span style='color:#00E676'>{p - basis_pts:.0f}</span>" for p in tickvals]
-                    fig_vp.update_layout(
-                        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                        height=150, margin=dict(l=10, r=8, t=18, b=36),
-                        title=dict(text="Volume profile  ·  gold=POC  ·  white dotted=±1σ  ·  thick grey=±1.5σ  ·  purple=LVN  ·  green=Spot",
-                                   font=dict(size=11), x=0.01),
-                    )
-                    fig_vp.update_xaxes(tickmode="array", tickvals=tickvals, ticktext=ticktext, title="Futures px  /  Index px")
-                    fig_vp.update_yaxes(title="vol", showgrid=True, gridcolor="#262930")
-                    st.plotly_chart(fig_vp, use_container_width=True)
-                    st.caption(
-                        f"POC {vp['poc']:.0f}  ·  VA ±1σ {vp['val1']:.0f}–{vp['vah1']:.0f}  ·  "
-                        f"±1.5σ {vp['val15']:.0f}–{vp['vah15']:.0f}  ·  "
-                        f"HVN {', '.join(f'{x:.0f}' for x in vp.get('hvn', [])[:6]) or '—'}  ·  "
-                        f"LVN {', '.join(f'{x:.0f}' for x in vp['lvn'][:6]) or '—'}  ·  "
-                        f"axis: futures / index (fut − basis {basis_pts:+.1f})"
-                    )
+                # Compact OBV + 13-period EFI under futures, above CVD
+                dfi = df_fchart.copy().reset_index(drop=True)
+                close = dfi["close"].astype(float)
+                vol = dfi["volume"].astype(float)
+                direction = np.sign(close.diff().fillna(0.0))
+                dfi["obv"] = (direction * vol).cumsum()
+                raw_efi = close.diff() * vol
+                dfi["efi13"] = raw_efi.ewm(span=13, adjust=False).mean()
+                fig_flow = make_subplots(
+                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                    row_heights=[0.50, 0.50],
+                    subplot_titles=("OBV", "EFI (13)"),
+                )
+                fig_flow.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv"], mode="lines", name="OBV",
+                    line=dict(color="#26C6DA", width=1.6), showlegend=False,
+                ), row=1, col=1)
+                efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
+                fig_flow.add_trace(plt_go.Bar(
+                    x=dfi["time_str"], y=dfi["efi13"], name="EFI13",
+                    marker_color=efi_col, showlegend=False,
+                ), row=2, col=1)
+                fig_flow.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
+                fig_flow.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=200, margin=dict(l=10, r=8, t=22, b=8),
+                    hovermode="x unified",
+                )
+                fig_flow.update_xaxes(type="category", categoryorder="array",
+                                      categoryarray=fut_times, nticks=8, showticklabels=False, row=1, col=1)
+                fig_flow.update_xaxes(type="category", categoryorder="array",
+                                      categoryarray=fut_times, nticks=8, row=2, col=1)
+                fig_flow.update_yaxes(tickfont=dict(size=8), row=1, col=1)
+                fig_flow.update_yaxes(tickfont=dict(size=8), row=2, col=1)
+                fig_flow.update_annotations(font_size=11)
+                st.plotly_chart(fig_flow, use_container_width=True)
             else:
                 st.info("Futures / VWAP not available.")
 
