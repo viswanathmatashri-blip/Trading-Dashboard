@@ -3267,30 +3267,34 @@ def live_dashboard_fragment():
             min_strike_val = float(data.get("spot_price", 0) or 0) - 500
             max_strike_val = float(data.get("spot_price", 0) or 0) + 500
 
-        # ----- Row 1: Futures 50% | VP+Book 20% | GEX OI 30% -----
+        # ----- Compact: Futures+VP+OBV+EFI+CVD | GEX OI + GEX Vol -----
         fut_msg = data.get("fut_fallback_msg", "")
         if data.get("fut_is_fallback") or "closed" in str(fut_msg).lower():
             st.warning(fut_msg)
         elif fut_msg:
             st.caption(fut_msg)
-        r1c1, r1mid, r1c2 = st.columns([0.50, 0.20, 0.30])
 
-        with r1c1:
-            fut_header_col, basis_col, band_col = st.columns([0.55, 0.25, 0.20])
+        left_col, right_col = st.columns([0.70, 0.30])
+        vp = {"ok": False}
+        y0 = y1 = None
+        sigma_mult = 1.5
+
+        with left_col:
+            fut_header_col, basis_col, band_col = st.columns([0.58, 0.22, 0.20])
             with fut_header_col:
                 expiry_txt = basis.get("fut_expiry", "N/A")
                 st.markdown(
-                    f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
-                    f"📉 Near-Month Futures + Real VWAP ({expiry_txt})</span>",
+                    f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
+                    f"📉 Near-Month Futures + VWAP + VP ({expiry_txt})</span>",
                     unsafe_allow_html=True
                 )
             with basis_col:
                 if basis.get("basis") is not None:
                     basis_color = "#00E676" if basis["basis"] >= 0 else "#FF5252"
                     st.markdown(
-                        f"<div style='text-align:right;font-size:13px;padding-top:4px;'>"
+                        f"<div style='text-align:right;font-size:12px;padding-top:2px;'>"
                         f"Basis: <span style='color:{basis_color};font-weight:700;'>"
-                        f"{basis['basis']:+.1f}</span> pts</div>",
+                        f"{basis['basis']:+.1f}</span></div>",
                         unsafe_allow_html=True
                     )
             with band_col:
@@ -3300,8 +3304,6 @@ def live_dashboard_fragment():
                     label_visibility="collapsed"
                 )
 
-            vp = {"ok": False}
-            y0 = y1 = None
             if not df_fchart.empty:
                 df_fchart = df_fchart.copy()
                 df_fchart["tp"] = (df_fchart["high"] + df_fchart["low"] + df_fchart["close"]) / 3.0
@@ -3332,285 +3334,173 @@ def live_dashboard_fragment():
                 fmin = min(df_fchart["close"].min(), df_fchart["vwap_lower"].min())
                 fmax = max(df_fchart["close"].max(), df_fchart["vwap_upper"].max())
                 fpad = (fmax - fmin) * 0.06
-
-                vp = compute_session_volume_profile(df_fchart, bin_step=5.0, prominence_factor=0.35)
                 y0, y1 = fmin - fpad, fmax + fpad
+                vp = compute_session_volume_profile(df_fchart, bin_step=5.0, prominence_factor=0.35)
 
-                _xax = dict(type="category", categoryorder="array", categoryarray=fut_times,
-                            range=[-0.5, max(len(fut_times) - 0.5, 0.5)], nticks=8)
-                fig_fut = plt_go.Figure()
-                fig_fut.add_trace(plt_go.Scatter(
-                    x=df_fchart["time_str"], y=df_fchart["vwap_upper"], mode="lines",
-                    name=f"+{sigma_mult}σ",
-                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                    showlegend=False, hoverinfo="skip"))
-                fig_fut.add_trace(plt_go.Scatter(
-                    x=df_fchart["time_str"], y=df_fchart["vwap_lower"], mode="lines",
-                    name=f"−{sigma_mult}σ",
-                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                    fill="tonexty", fillcolor="rgba(255,152,0,0.08)",
-                    showlegend=False, hoverinfo="skip"))
-                fig_fut.add_trace(plt_go.Scatter(
-                    x=df_fchart["time_str"], y=df_fchart["vwap"], mode="lines", name="VWAP",
-                    line=dict(color="#FF9800", width=2.2, dash="dot")))
-                fig_fut.add_trace(plt_go.Scatter(
-                    x=df_fchart["time_str"], y=df_fchart["close"], mode="lines", name="Futures",
-                    line=dict(color="#2196F3", width=2)))
-
-                spot_now = float(data.get("spot_price") or 0)
-                if vp.get("ok"):
-                    fig_fut.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F",
-                                      annotation_text="POC", annotation_font_size=9,
-                                      annotation_font_color="#FFD54F")
-                    fig_fut.add_hline(y=vp["vah1"], line_width=1.2, line_color="#FAFAFA", line_dash="dot",
-                                      annotation_text="VAH 1σ", annotation_font_size=8)
-                    fig_fut.add_hline(y=vp["val1"], line_width=1.2, line_color="#FAFAFA", line_dash="dot",
-                                      annotation_text="VAL 1σ", annotation_font_size=8)
-                    fig_fut.add_hline(y=vp["vah15"], line_width=3.2, line_color="#B0BEC5", line_dash="dot",
-                                      annotation_text="VAH 1.5σ", annotation_font_size=8)
-                    fig_fut.add_hline(y=vp["val15"], line_width=3.2, line_color="#B0BEC5", line_dash="dot",
-                                      annotation_text="VAL 1.5σ", annotation_font_size=8)
-                    fig_fut.add_hline(y=latest_fut, line_width=2, line_color="#00E676",
-                                      annotation_text="Fut", annotation_font_size=9,
-                                      annotation_font_color="#00E676")
-                    for hv in vp.get("hvn", [])[:8]:
-                        fig_fut.add_hline(y=hv, line_width=1, line_color="#81D4FA", line_dash="dash")
-                    for lv in vp["lvn"][:8]:
-                        fig_fut.add_hline(y=lv, line_width=1.2, line_color="#CE93D8", line_dash="dot")
-                    colors = []
-                    for m in vp["mids"]:
-                        if abs(m - vp["poc"]) < 1e-6:
-                            colors.append("#FFD54F")
-                        elif any(abs(m - h) < 1e-6 for h in vp.get("hvn", [])):
-                            colors.append("rgba(129,212,250,0.75)")
-                        elif any(abs(m - h) < 1e-6 for h in vp.get("lvn", [])):
-                            colors.append("rgba(206,147,216,0.75)")
-                        else:
-                            colors.append("rgba(100,181,246,0.45)")
-
-                fig_fut.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=400, margin=dict(l=42, r=6, t=6, b=4),
-                    legend=dict(orientation="h", yanchor="top", y=0.99, x=0.01, xanchor="left",
-                                font=dict(size=10), bgcolor="rgba(14,17,23,0.55)", itemsizing="constant"),
-                    hovermode="x unified",
-                )
-                fig_fut.update_yaxes(range=[y0, y1], tickformat="d", constrain="domain", fixedrange=False)
-                fig_fut.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
-                                     range=[-0.5, max(len(fut_times) - 0.5, 0.5)], nticks=8, showticklabels=False)
-                cap = f"Futures {latest_fut:,.1f}  ·  VWAP {latest_vwap:,.1f}  ·  bands ±{sigma_mult}σ"
-                if vp.get("ok"):
-                    cap += (
-                        f"  ·  POC {vp['poc']:.0f}  ·  VA±1σ {vp['val1']:.0f}–{vp['vah1']:.0f}"
-                        f"  ·  LVN {', '.join(f'{x:.0f}' for x in vp['lvn'][:4]) or '—'}"
-                    )
-                st.caption(cap)
-                st.plotly_chart(fig_fut, use_container_width=True)
-
-                # Compact OBV + 13-period EFI under futures, above CVD
                 dfi = df_fchart.copy().reset_index(drop=True)
                 close = dfi["close"].astype(float)
                 vol = dfi["volume"].astype(float)
                 direction = np.sign(close.diff().fillna(0.0))
                 dfi["obv"] = (direction * vol).cumsum()
-                raw_efi = close.diff() * vol
-                dfi["efi13"] = raw_efi.ewm(span=13, adjust=False).mean()
-                fig_flow = make_subplots(
-                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                    row_heights=[0.50, 0.50],
-                    subplot_titles=("OBV", "EFI (13)"),
+                dfi["efi13"] = (close.diff() * vol).ewm(span=13, adjust=False).mean()
+                hl = (dfi["high"] - dfi["low"]).replace(0, np.nan)
+                loc = ((dfi["close"] - dfi["low"]) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
+                dfi["cvd"] = (dfi["volume"] * loc).cumsum()
+
+                fig_stack = make_subplots(
+                    rows=4, cols=2,
+                    column_widths=[0.84, 0.16],
+                    row_heights=[0.46, 0.16, 0.16, 0.22],
+                    shared_xaxes=True,
+                    shared_yaxes=False,
+                    horizontal_spacing=0.012,
+                    vertical_spacing=0.018,
+                    specs=[
+                        [{}, {}],
+                        [{}, None],
+                        [{}, None],
+                        [{}, None],
+                    ],
                 )
-                fig_flow.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] >= 0),
-                    mode="lines", name="OBV+",
-                    line=dict(color="#00E676", width=1.7),
-                    fill="tozeroy", fillcolor="rgba(0,230,118,0.15)",
-                    showlegend=False,
-                ))
-                fig_flow.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0),
-                    mode="lines", name="OBV-",
-                    line=dict(color="#FF5252", width=1.7),
-                    fill="tozeroy", fillcolor="rgba(255,82,82,0.15)",
-                    showlegend=False,
-                ))
-                fig_flow.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
-                efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
-                fig_flow.add_trace(plt_go.Bar(
-                    x=dfi["time_str"], y=dfi["efi13"], name="EFI13",
-                    marker_color=efi_col, showlegend=False,
+                # price
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["vwap_upper"], mode="lines", showlegend=False, hoverinfo="skip",
+                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["vwap_lower"], mode="lines", showlegend=False, hoverinfo="skip",
+                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                    fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
+                    line=dict(color="#FF9800", width=2)), row=1, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
+                    line=dict(color="#2196F3", width=2)), row=1, col=1)
+                fig_stack.add_hline(y=latest_fut, line_width=1.6, line_color="#00E676", row=1, col=1)
+                if vp.get("ok"):
+                    fig_stack.add_hline(y=vp["poc"], line_width=1.2, line_color="#FFD54F", row=1, col=1)
+                    fig_stack.add_hline(y=vp["vah1"], line_width=1, line_color="#FAFAFA", line_dash="dot", row=1, col=1)
+                    fig_stack.add_hline(y=vp["val1"], line_width=1, line_color="#FAFAFA", line_dash="dot", row=1, col=1)
+                    fig_stack.add_hline(y=vp["vah15"], line_width=2.6, line_color="#B0BEC5", line_dash="dot", row=1, col=1)
+                    fig_stack.add_hline(y=vp["val15"], line_width=2.6, line_color="#B0BEC5", line_dash="dot", row=1, col=1)
+                    colors = []
+                    for m in vp["mids"]:
+                        if abs(m - vp["poc"]) < 1e-6:
+                            colors.append("#FFD54F")
+                        elif y0 is not None and not (y0 <= m <= y1):
+                            colors.append("rgba(0,0,0,0)")
+                        else:
+                            colors.append("rgba(100,181,246,0.55)")
+                    fig_stack.add_trace(plt_go.Bar(
+                        x=vp["vol"], y=vp["mids"], orientation="h", showlegend=False, name="VP",
+                        marker=dict(color=colors),
+                        hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
+                    ), row=1, col=2)
+
+                # OBV
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] >= 0), mode="lines", showlegend=False,
+                    line=dict(color="#00E676", width=1.5), fill="tozeroy", fillcolor="rgba(0,230,118,0.16)",
                 ), row=2, col=1)
-                fig_flow.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
-                fig_flow.update_layout(
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0), mode="lines", showlegend=False,
+                    line=dict(color="#FF5252", width=1.5), fill="tozeroy", fillcolor="rgba(255,82,82,0.16)",
+                ), row=2, col=1)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
+                # EFI
+                efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
+                fig_stack.add_trace(plt_go.Bar(
+                    x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
+                ), row=3, col=1)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
+                # CVD
+                cvd_last = float(dfi["cvd"].iloc[-1])
+                cvd_col = "#00E676" if cvd_last >= 0 else "#FF5252"
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
+                    line=dict(color=cvd_col, width=1.8), fill="tozeroy",
+                    fillcolor="rgba(0,230,118,0.08)" if cvd_last >= 0 else "rgba(255,82,82,0.08)",
+                ), row=4, col=1)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
+
+                xr = [-0.5, max(len(fut_times) - 0.5, 0.5)]
+                fig_stack.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=168, margin=dict(l=42, r=8, t=14, b=2),
-                    hovermode="x unified",
+                    height=620, margin=dict(l=40, r=6, t=8, b=18),
+                    legend=dict(orientation="h", yanchor="top", y=1.0, x=0.0, font=dict(size=10),
+                                bgcolor="rgba(14,17,23,0.4)"),
+                    hovermode="x unified", bargap=0.15,
                 )
-                fig_flow.update_xaxes(type="category", categoryorder="array",
-                                      categoryarray=fut_times, nticks=8, showticklabels=False)
-                fig_flow.update_xaxes(type="category", categoryorder="array",
-                                      categoryarray=fut_times, nticks=8, row=2, col=1)
-                fig_flow.update_yaxes(tickfont=dict(size=8))
-                fig_flow.update_yaxes(tickfont=dict(size=8), row=2, col=1)
-                fig_flow.update_annotations(font_size=11)
-                st.plotly_chart(fig_flow, use_container_width=True)
+                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", row=1, col=1)
+                fig_stack.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                                       range=xr, showticklabels=False, row=1, col=1)
+                fig_stack.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                                       range=xr, showticklabels=False, row=2, col=1)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                                       range=xr, showticklabels=False, row=3, col=1)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                                       range=xr, nticks=8, row=4, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="OBV", title_font=dict(size=10), row=2, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI13", title_font=dict(size=10), row=3, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", title_font=dict(size=10), row=4, col=1)
+                st.plotly_chart(fig_stack, use_container_width=True)
+                cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
+                if vp.get("ok"):
+                    cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
+                st.caption(cap)
+                render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
             else:
                 st.info("Futures / VWAP not available.")
 
-        with r1mid:
-            st.markdown("<span style='font-weight:700;color:#00E676;font-size:13px;'>📦 Volume Profile</span>", unsafe_allow_html=True)
-            if vp.get("ok"):
-                colors = []
-                for m in vp["mids"]:
-                    if abs(m - vp["poc"]) < 1e-6:
-                        colors.append("#FFD54F")
-                    elif any(abs(m - h) < 1e-6 for h in vp.get("hvn", [])):
-                        colors.append("rgba(129,212,250,0.75)")
-                    elif any(abs(m - h) < 1e-6 for h in vp.get("lvn", [])):
-                        colors.append("rgba(206,147,216,0.75)")
-                    else:
-                        colors.append("rgba(100,181,246,0.45)")
-                mids = list(vp["mids"])
-                vols = list(vp["vol"])
-                keep = [(m, v, c) for m, v, c in zip(mids, vols, colors) if y0 is not None and y0 <= m <= y1]
-                if keep:
-                    mids, vols, colors = zip(*keep)
-                fig_vp_side = plt_go.Figure()
-                fig_vp_side.add_trace(plt_go.Bar(
-                    x=list(vols), y=list(mids), orientation="h",
-                    marker=dict(color=list(colors)), showlegend=False,
-                    hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
-                ))
-                if y0 is not None and y0 <= vp["poc"] <= y1:
-                    fig_vp_side.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F")
-                if not df_fchart.empty:
-                    lf = float(df_fchart["close"].iloc[-1])
-                    if y0 is not None and y0 <= lf <= y1:
-                        fig_vp_side.add_hline(y=lf, line_width=2, line_color="#00E676")
-                fig_vp_side.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=400, margin=dict(l=4, r=4, t=6, b=4),
-                )
-                fig_vp_side.update_yaxes(range=[y0, y1], showticklabels=False, zeroline=False, constrain="domain")
-                fig_vp_side.update_xaxes(showticklabels=False, showgrid=False)
-                st.plotly_chart(fig_vp_side, use_container_width=True)
-            else:
-                st.caption("VP unavailable.")
-            render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
-
-        with r1c2:
-            st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📈 GEX vs OI</span>", unsafe_allow_html=True)
+        with right_col:
+            st.markdown("<span style='font-weight:700;color:#00E676;font-size:13px;'>📈 GEX vs OI</span>", unsafe_allow_html=True)
             if not df_chain.empty and lvls:
-                primary_oi = df_chain["C_OI"].astype(float) - df_chain["P_OI"].astype(float)
-                # For display: call up, put down separately; secondary = Net GEX
                 gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
-                fig_oi = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_OI"], name="Call OI",
-                                            marker_color="#2E7D32", opacity=0.55), secondary_y=False)
-                fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_OI"], name="Put OI",
-                                            marker_color="#C62828", opacity=0.55), secondary_y=False)
-                fig_oi.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_OI"], name="Net GEX",
-                                            marker_color=gex_oi_colors, opacity=0.85, width=25), secondary_y=True)
-                fig_oi.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-                fig_oi.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
-                fig_oi.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800")
+                fig_gex = make_subplots(
+                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+                    row_heights=[0.50, 0.50],
+                    specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
+                    subplot_titles=("GEX / OI", "GEX / Volume"),
+                )
+                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_OI"], name="Call OI",
+                                            marker_color="#2E7D32", opacity=0.55, showlegend=False), row=1, col=1, secondary_y=False)
+                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_OI"], name="Put OI",
+                                            marker_color="#C62828", opacity=0.55, showlegend=False), row=1, col=1, secondary_y=False)
+                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_OI"], name="Net GEX",
+                                            marker_color=gex_oi_colors, opacity=0.85, width=25, showlegend=False), row=1, col=1, secondary_y=True)
+                fig_gex.add_hline(y=0, line_width=1, line_color="#FFFFFF", row=1, col=1)
+                fig_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", row=1, col=1)
                 oi_primary = pd.concat([df_chain["C_OI"].astype(float), -df_chain["P_OI"].astype(float)])
-                oi1_range, oi2_range = calculate_synced_ranges(oi_primary, df_chain["Net_GEX_OI"].astype(float))
-                fig_oi.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=320, barmode="overlay", margin=dict(l=5, r=5, t=25, b=10),
-                    showlegend=False, hovermode="x unified",
-                )
-                fig_oi.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
-                fig_oi.update_yaxes(range=oi1_range, secondary_y=False, showgrid=True, gridcolor="#262930",
-                                    zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
-                fig_oi.update_yaxes(range=oi2_range, secondary_y=True, showgrid=False,
-                                    zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
-                st.plotly_chart(fig_oi, use_container_width=True)
-            else:
-                st.info("GEX/OI unavailable.")
+                oi1, oi2 = calculate_synced_ranges(oi_primary, df_chain["Net_GEX_OI"].astype(float))
 
-        # ----- Row 2: CVD 70% | GEX Vol 30% -----
-        r2c1, r2mid, r2c2 = st.columns([0.50, 0.20, 0.30])
-
-        with r2c1:
-            if not df_fchart.empty and "volume" in df_fchart.columns:
-                df_cvd = df_fchart.copy()
-                hl = (df_cvd["high"] - df_cvd["low"]).replace(0, np.nan)
-                loc = ((df_cvd["close"] - df_cvd["low"]) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
-                df_cvd["signed_vol"] = df_cvd["volume"] * loc
-                df_cvd["cvd"] = df_cvd["signed_vol"].cumsum()
-                latest_cvd = float(df_cvd["cvd"].iloc[-1])
-                colour = "#00E676" if latest_cvd >= 0 else "#FF5252"
-                st.markdown(
-                    f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
-                    f"📉 Futures CVD (volume-location) — {latest_session}</span>",
-                    unsafe_allow_html=True
-                )
-                fig_cvd = plt_go.Figure()
-                fig_cvd.add_trace(plt_go.Scatter(
-                    x=df_cvd["time_str"], y=df_cvd["cvd"], mode="lines", name="CVD (bar proxy)",
-                    line=dict(color=colour, width=2), fill="tozeroy",
-                    fillcolor="rgba(0,230,118,0.08)" if latest_cvd >= 0 else "rgba(255,82,82,0.08)",
-                ))
-                tick_hist = [h for h in (st.session_state.get("liq_delta_history") or [])
-                             if h.get("index", Index_Name) == Index_Name and h.get("tick_cvd") is not None]
-                if len(tick_hist) >= 2:
-                    fig_cvd.add_trace(plt_go.Scatter(
-                        x=[h["ts"].strftime("%H:%M:%S") if hasattr(h["ts"], "strftime") else str(h["ts"]) for h in tick_hist],
-                        y=[float(h.get("tick_cvd") or 0) for h in tick_hist],
-                        mode="lines", name="CVD (tick-rule)",
-                        line=dict(color="#FFD54F", width=2, dash="dot"),
-                        yaxis="y2",
-                    ))
-                    fig_cvd.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, title="tick CVD"))
-                fig_cvd.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
-                fig_cvd.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=190, margin=dict(l=42, r=8, t=16, b=22),
-                    title=dict(text=f"CVD: {latest_cvd:,.0f}", x=0.01, font=dict(size=12)),
-                    xaxis=dict(type="category", categoryorder="array", categoryarray=fut_times,
-                               range=[-0.5, max(len(fut_times) - 0.5, 0.5)], nticks=8),
-                    yaxis=dict(title="Cumulative signed vol"),
-                    showlegend=False, hovermode="x unified",
-                )
-                st.plotly_chart(fig_cvd, use_container_width=True)
-                st.caption("Green = bar volume-location proxy. Yellow dotted = tick-rule CVD from successive futures FULL snapshots (LTP vs bid/ask). Enable Auto-Refresh.")
-            else:
-                st.info("CVD not available.")
-
-        with r2mid:
-            pass
-
-        with r2c2:
-            st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>📊 GEX vs Volume</span>", unsafe_allow_html=True)
-            if not df_chain.empty and lvls:
                 gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
-                fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_Vol"], name="Call Vol",
-                                             marker_color="#81C784", opacity=0.55), secondary_y=False)
-                fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_Vol"], name="Put Vol",
-                                             marker_color="#FF8A80", opacity=0.55), secondary_y=False)
-                fig_vol.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net GEX",
-                                             marker_color=gex_vol_colors, opacity=0.85, width=25), secondary_y=True)
-                fig_vol.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-                fig_vol.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
-                fig_vol.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800")
+                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_Vol"], name="Call Vol",
+                                            marker_color="#81C784", opacity=0.55, showlegend=False), row=2, col=1, secondary_y=False)
+                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_Vol"], name="Put Vol",
+                                            marker_color="#FF8A80", opacity=0.55, showlegend=False), row=2, col=1, secondary_y=False)
+                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net GEX V",
+                                            marker_color=gex_vol_colors, opacity=0.85, width=25, showlegend=False), row=2, col=1, secondary_y=True)
+                fig_gex.add_hline(y=0, line_width=1, line_color="#FFFFFF", row=2, col=1)
+                fig_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", row=2, col=1)
                 vol_primary = pd.concat([df_chain["C_Vol"].astype(float), -df_chain["P_Vol"].astype(float)])
-                v1_range, v2_range = calculate_synced_ranges(vol_primary, df_chain["Net_GEX_Vol"].astype(float))
-                fig_vol.update_layout(
+                v1, v2 = calculate_synced_ranges(vol_primary, df_chain["Net_GEX_Vol"].astype(float))
+                fig_gex.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=280, barmode="overlay", margin=dict(l=5, r=5, t=25, b=10),
-                    showlegend=False, hovermode="x unified",
+                    height=620, barmode="overlay", margin=dict(l=8, r=8, t=24, b=18),
+                    hovermode="x unified",
                 )
-                fig_vol.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
-                fig_vol.update_yaxes(range=v1_range, secondary_y=False, showgrid=True, gridcolor="#262930",
-                                     zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
-                fig_vol.update_yaxes(range=v2_range, secondary_y=True, showgrid=False,
-                                     zeroline=True, zerolinecolor="#FFFFFF", zerolinewidth=1.5)
-                st.plotly_chart(fig_vol, use_container_width=True)
+                fig_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val], row=1, col=1)
+                fig_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val], row=2, col=1)
+                fig_gex.update_yaxes(range=oi1, secondary_y=False, row=1, col=1, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                fig_gex.update_yaxes(range=oi2, secondary_y=True, row=1, col=1, showgrid=False)
+                fig_gex.update_yaxes(range=v1, secondary_y=False, row=2, col=1, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                fig_gex.update_yaxes(range=v2, secondary_y=True, row=2, col=1, showgrid=False)
+                fig_gex.update_annotations(font_size=11)
+                st.plotly_chart(fig_gex, use_container_width=True)
             else:
-                st.info("GEX/Vol unavailable.")
+                st.info("GEX unavailable.")
 
         # Delta-GEX (selected) | Heatmap
         # Multi-exp Delta-GEX   | VEX/CEX
