@@ -890,6 +890,54 @@ def get_near_month_futures_token(df_scrip_master, index_name, fut_exch):
     return None, None
 
 
+
+def series_to_ist(times) -> pd.Series:
+    """Coerce SmartAPI candle times to timezone-aware IST."""
+    ts = pd.to_datetime(times, errors="coerce", utc=False)
+    if getattr(ts.dt, "tz", None) is not None:
+        return ts.dt.tz_convert("Asia/Kolkata")
+    # Naive: if median hour is outside NSE cash session, treat as UTC
+    med = float(ts.dt.hour.median()) if ts.notna().any() else 12
+    if med < 7 or med > 18:
+        return ts.dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+    return ts.dt.tz_localize("Asia/Kolkata")
+
+
+def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20) -> tuple:
+    """Return (session_df, session_date, is_fallback_weekend_or_thin) using IST session date.
+    Skips Sat/Sun and thin leftover bars (timezone artefacts).
+    """
+    empty = (pd.DataFrame(), None, True)
+    if df is None or df.empty or "time" not in df.columns:
+        return empty
+    out = df.copy()
+    out["time"] = series_to_ist(out["time"])
+    out = out.dropna(subset=["time"]).sort_values("time")
+    # keep only official cash hours
+    mins = out["time"].dt.hour * 60 + out["time"].dt.minute
+    out = out[(mins >= 9 * 60 + 15) & (mins <= 15 * 60 + 30)]
+    if out.empty:
+        return empty
+    out["session_date"] = out["time"].dt.date
+    counts = out.groupby("session_date").size().sort_index()
+    chosen = None
+    for d, n in list(counts.items())[::-1]:
+        if d.weekday() >= 5:
+            continue
+        if int(n) >= min_bars:
+            chosen = d
+            break
+    if chosen is None:
+        # fallback: weekday with the most bars
+        weekdays = [(d, n) for d, n in counts.items() if d.weekday() < 5]
+        if weekdays:
+            chosen = max(weekdays, key=lambda x: x[1])[0]
+        else:
+            chosen = counts.index[-1]
+    sess = out[out["session_date"] == chosen].copy().reset_index(drop=True)
+    sess["time_str"] = sess["time"].dt.strftime("%H:%M")
+    return sess, chosen, True
+
 def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15):
     """
     Fetch near-month futures candles + real VWAP.
@@ -913,8 +961,10 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
     best_df = pd.DataFrame()
     best_offset = 0
 
-    for offset in range(0, 12):
+    for offset in range(0, 16):
         target_to = now_dt - datetime.timedelta(days=offset)
+        if target_to.weekday() >= 5:
+            continue
         target_from = target_to - datetime.timedelta(days=lookback_days)
 
         candle_param = {
@@ -937,6 +987,7 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
         if df.empty or len(df) < 5:
             continue
 
+        df["time"] = series_to_ist(df["time"])
         df = compute_technical_indicators(df)
         best_df = df
         best_offset = offset
@@ -965,17 +1016,22 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
         "basis": round(fut_ltp - spot_ltp, 2) if (spot_ltp and fut_ltp) else None
     }
 
-    last_bar_time = pd.to_datetime(best_df["time"].iloc[-1])
-    session_date_str = last_bar_time.strftime("%d-%b-%Y")
+    sess_df, sess_date, _ = pick_last_nse_session(best_df, min_bars=20)
+    if sess_df.empty:
+        last_bar_time = pd.to_datetime(best_df["time"].iloc[-1])
+        session_date_str = last_bar_time.strftime("%d-%b-%Y")
+    else:
+        best_df = sess_df if len(sess_df) >= 5 else best_df
+        session_date_str = sess_date.strftime("%d-%b-%Y") if sess_date else pd.to_datetime(best_df["time"].iloc[-1]).strftime("%d-%b-%Y")
 
-    if currently_closed or best_offset > 0:
+    if currently_closed or best_offset > 0 or (sess_date and sess_date != now_dt.date()):
         fallback_msg = (
-            f"⚠️ Market is currently closed. Showing last available session: "
-            f"**{session_date_str}** (fallback)"
+            f"⚠️ Market is currently closed. Showing last trading session: "
+            f"**{session_date_str} IST** (fallback)"
         )
         is_fallback = True
     else:
-        fallback_msg = f"Live session • {session_date_str}"
+        fallback_msg = f"Live session • {session_date_str} IST"
         is_fallback = False
 
     return best_df, is_fallback, basis_info, fallback_msg
@@ -3192,11 +3248,14 @@ def live_dashboard_fragment():
         fut_times = []
         latest_session = None
         if not df_fut.empty and len(df_fut) >= 5:
-            df_fut = df_fut.copy()
-            df_fut["session_date"] = pd.to_datetime(df_fut["time"]).dt.date
-            latest_session = sorted(df_fut["session_date"].unique())[-1]
-            df_fchart = df_fut[df_fut["session_date"] == latest_session].copy().reset_index(drop=True)
-            df_fchart["time_str"] = pd.to_datetime(df_fchart["time"]).dt.strftime("%H:%M")
+            df_fchart, latest_session, _ = pick_last_nse_session(df_fut, min_bars=20)
+            if df_fchart.empty:
+                df_fut = df_fut.copy()
+                df_fut["time"] = series_to_ist(df_fut["time"])
+                df_fut["session_date"] = df_fut["time"].dt.date
+                latest_session = sorted(df_fut["session_date"].unique())[-1]
+                df_fchart = df_fut[df_fut["session_date"] == latest_session].copy().reset_index(drop=True)
+                df_fchart["time_str"] = df_fchart["time"].dt.strftime("%H:%M")
             fut_times = df_fchart["time_str"].tolist()
 
         if not df_chain.empty:
@@ -3367,9 +3426,20 @@ def live_dashboard_fragment():
                     subplot_titles=("OBV", "EFI (13)"),
                 )
                 fig_flow.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"], mode="lines", name="OBV",
-                    line=dict(color="#26C6DA", width=1.6), showlegend=False,
+                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] >= 0),
+                    mode="lines", name="OBV+",
+                    line=dict(color="#00E676", width=1.7),
+                    fill="tozeroy", fillcolor="rgba(0,230,118,0.15)",
+                    showlegend=False,
                 ), row=1, col=1)
+                fig_flow.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0),
+                    mode="lines", name="OBV-",
+                    line=dict(color="#FF5252", width=1.7),
+                    fill="tozeroy", fillcolor="rgba(255,82,82,0.15)",
+                    showlegend=False,
+                ), row=1, col=1)
+                fig_flow.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=1, col=1)
                 efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
                 fig_flow.add_trace(plt_go.Bar(
                     x=dfi["time_str"], y=dfi["efi13"], name="EFI13",
