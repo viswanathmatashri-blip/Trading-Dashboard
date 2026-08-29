@@ -553,21 +553,14 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
     }
 
 def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
-    """Long/short trigger from GEX location, VWAP, OBV, CVD, EFI."""
     levels = data.get("levels", {}) or {}
     spot = float(data.get("spot_price") or 0)
     gex_sup = float(levels.get("GEX_Support") or spot or 0)
     gex_res = float(levels.get("GEX_Resistance") or spot or 0)
     checks = []
     long_n = short_n = 0
-
-    px = None
-    vwap = None
-    obv = obv_ma = None
-    cvd = None
-    efi = None
+    px = vwap = obv = obv_ma = cvd = efi = None
     lvn = []
-
     df = pd.DataFrame()
     if df_candles is not None and not df_candles.empty:
         try:
@@ -582,7 +575,7 @@ def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
             tp = (df["high"] + df["low"] + df["close"]) / 3.0 if {"high", "low"}.issubset(df.columns) else df["close"]
             vol = df["volume"].astype(float)
             cum_v = vol.cumsum().replace(0, np.nan)
-            vwap = float((tp.astype(float) * vol).cumsum().iloc[-1] / cum_v.iloc[-1]) if cum_v.iloc[-1] == cum_v.iloc[-1] else px
+            vwap = float((tp.astype(float) * vol).cumsum().iloc[-1] / cum_v.iloc[-1]) if pd.notna(cum_v.iloc[-1]) else px
             direction = np.sign(df["close"].astype(float).diff().fillna(0.0))
             obv_s = (direction * vol).cumsum()
             obv = float(obv_s.iloc[-1])
@@ -600,99 +593,91 @@ def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
         else:
             vwap = px
 
-    # 1 Location GEX
     loc_long = loc_short = False
     loc_note = "GEX walls unavailable"
-    if px and gex_sup and gex_res:
-        near_lvn = any(abs(px - lv) <= 15 for lv in lvn)
-        loc_long = (px >= gex_sup) or near_lvn
-        loc_short = px <= gex_res and px < gex_sup + (gex_res - gex_sup) * 0.35
-        if px > gex_res:
-            loc_short = True
-            loc_long = False
-        if px < gex_sup:
-            loc_long = True
-        loc_note = f"px {px:.0f} · put-wall {gex_sup:.0f} · call-wall {gex_res:.0f}"
+    if spot > 0 and gex_sup and gex_res:
+        near_lvn = any(abs(spot - lv) <= 15 for lv in lvn)
+        near_call = abs(spot - gex_res) <= max(12.0, 0.0006 * spot)
+        if spot > gex_res:
+            loc_long, loc_short = True, False
+            loc_note = f"spot {spot:.0f} above call-wall {gex_res:.0f} (break)"
+        elif spot < gex_sup:
+            loc_long, loc_short = False, True
+            loc_note = f"spot {spot:.0f} below put-wall {gex_sup:.0f}"
+        elif near_call:
+            loc_long, loc_short = False, True
+            loc_note = f"spot {spot:.0f} rejected at call-wall {gex_res:.0f}"
+        else:
+            loc_long, loc_short = True, False
+            loc_note = f"spot {spot:.0f} above put-wall {gex_sup:.0f} · below call {gex_res:.0f}"
         if near_lvn:
+            loc_long = True
             loc_note += " · through LVN"
     checks.append({"name": "Location (GEX)", "long": loc_long, "short": loc_short, "note": loc_note})
 
-    # 2 VWAP
     vwap_long = vwap_short = False
     vwap_note = "VWAP unavailable"
     if px and vwap:
-        vwap_long = px > vwap
-        vwap_short = px < vwap
-        vwap_note = f"px {px:.1f} vs VWAP {vwap:.1f}"
+        vwap_long, vwap_short = px > vwap, px < vwap
+        vwap_note = f"fut {px:.1f} vs VWAP {vwap:.1f}"
     checks.append({"name": "Trend (VWAP)", "long": vwap_long, "short": vwap_short, "note": vwap_note})
 
-    # 3 OBV
     obv_long = obv_short = False
     obv_note = "OBV unavailable"
     if obv is not None and obv_ma is not None and not np.isnan(obv_ma):
-        obv_long = obv > obv_ma
-        obv_short = obv < obv_ma
+        obv_long, obv_short = obv > obv_ma, obv < obv_ma
         obv_note = f"OBV {obv:.0f} vs MA20 {obv_ma:.0f}"
     checks.append({"name": "Macro Flow (OBV)", "long": obv_long, "short": obv_short, "note": obv_note})
 
-    # 4 CVD structure
     cvd_long = cvd_short = False
     cvd_note = "CVD unavailable"
     if cvd is not None and not df.empty and "volume" in df.columns:
         half = max(len(df) // 2, 3)
-        cvd_s = (df["volume"].astype(float) * loc).cumsum() if "volume" in df.columns else None
-        if cvd_s is not None and len(cvd_s) >= 6:
-            early = float(cvd_s.iloc[:half].max())
-            late = float(cvd_s.iloc[half:].max())
-            early_lo = float(cvd_s.iloc[:half].min())
-            late_lo = float(cvd_s.iloc[half:].min())
+        if len(cvd_s) >= 6:
+            early, late = float(cvd_s.iloc[:half].max()), float(cvd_s.iloc[half:].max())
+            early_lo, late_lo = float(cvd_s.iloc[:half].min()), float(cvd_s.iloc[half:].min())
             cvd_long = late > early and cvd > 0
             cvd_short = late_lo < early_lo and cvd < 0
             cvd_note = f"CVD {cvd:.0f} · HH={cvd_long} LL={cvd_short}"
     checks.append({"name": "Order Delta (CVD)", "long": cvd_long, "short": cvd_short, "note": cvd_note})
 
-    # 5 EFI execution
     efi_long = efi_short = False
     efi_note = "EFI unavailable"
     if efi is not None and not np.isnan(efi):
-        efi_long = efi > 0
-        efi_short = efi < 0
+        efi_long, efi_short = efi > 0, efi < 0
         efi_note = f"EFI13 {efi:.1f}"
     checks.append({"name": "Execution (EFI 13)", "long": efi_long, "short": efi_short, "note": efi_note})
 
     for ch in checks:
-        if ch["long"]:
-            long_n += 1
-        if ch["short"]:
-            short_n += 1
+        long_n += int(bool(ch["long"]))
+        short_n += int(bool(ch["short"]))
+    setup_l = sum(1 for ch in checks[:4] if ch["long"])
+    setup_s = sum(1 for ch in checks[:4] if ch["short"])
 
-    setup_long = sum(1 for ch in checks[:4] if ch["long"]) >= 3
-    setup_short = sum(1 for ch in checks[:4] if ch["short"]) >= 3
-    if setup_long and efi_long and long_n >= 4:
+    if setup_l >= 3 and efi_long:
         trigger, colour = "LONG TRIGGER", "#00E676"
-        summary = "Setup aligned + EFI green. Directional long."
-    elif setup_short and efi_short and short_n >= 4:
+        summary = f"Setup {setup_l}/4 long + EFI>0."
+    elif setup_s >= 3 and efi_short:
         trigger, colour = "SHORT TRIGGER", "#FF5252"
-        summary = "Setup aligned + EFI red. Directional short."
-    elif long_n >= 3 and long_n > short_n:
+        summary = f"Setup {setup_s}/4 short + EFI<0."
+    elif setup_l >= 3:
         trigger, colour = "LONG BIAS (no fire)", "#80CBC4"
-        summary = "Long conditions building; wait for EFI > 0."
-    elif short_n >= 3 and short_n > long_n:
+        summary = f"Setup {setup_l}/4 long but EFI not >0."
+    elif setup_s >= 3:
         trigger, colour = "SHORT BIAS (no fire)", "#EF9A9A"
-        summary = "Short conditions building; wait for EFI < 0."
+        summary = f"Setup {setup_s}/4 short but EFI not <0."
+    elif setup_l > setup_s:
+        trigger, colour = "LONG LEAN (no fire)", "#80CBC4"
+        summary = f"Only {setup_l}/4 setup long (need 3)."
+    elif setup_s > setup_l:
+        trigger, colour = "SHORT LEAN (no fire)", "#EF9A9A"
+        summary = f"Only {setup_s}/4 setup short (need 3)."
     else:
         trigger, colour = "NO DIRECTIONAL TRIGGER", "#FF9800"
-        summary = "Checks split. No long/short fire."
+        summary = f"Setup split {setup_l}L/{setup_s}S."
 
-    return {
-        "trigger": trigger,
-        "colour": colour,
-        "summary": summary,
-        "long_hits": long_n,
-        "short_hits": short_n,
-        "checks": checks,
-    }
-
+    return {"trigger": trigger, "colour": colour, "summary": summary,
+            "long_hits": long_n, "short_hits": short_n, "checks": checks}
 
 def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     """
@@ -3234,8 +3219,9 @@ def live_dashboard_fragment():
             st.caption(
                 "LONG TRIGGER = ≥3 of GEX/VWAP/OBV/CVD bullish AND EFI>0. "
                 "SHORT TRIGGER = ≥3 bearish AND EFI<0. "
-                "BIAS (no fire) = setup is 3/4 aligned but EFI has not confirmed yet — do not enter. "
-                "NO DIRECTIONAL TRIGGER = checks are split (neither side has 3/4)."
+                "BIAS (no fire) = 3/4 setup aligned but EFI has not confirmed. "
+                "LEAN (no fire) = fewer than 3/4 setup checks; EFI does not matter yet. "
+                "NO DIRECTIONAL TRIGGER = setup split."
             )
             t1, t2, t3 = st.columns([1.35, 0.90, 0.75])
             with t1:
