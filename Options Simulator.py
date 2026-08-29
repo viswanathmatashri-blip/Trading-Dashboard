@@ -3390,12 +3390,12 @@ def live_dashboard_fragment():
 
                 fig_fut.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=320, margin=dict(l=42, r=8, t=8, b=18),
-                    legend=dict(orientation="h", yanchor="top", y=-0.12, x=0.0, xanchor="left",
-                                font=dict(size=11), bgcolor="rgba(14,17,23,0.9)", itemsizing="constant"),
+                    height=400, margin=dict(l=42, r=6, t=6, b=4),
+                    legend=dict(orientation="h", yanchor="top", y=0.99, x=0.01, xanchor="left",
+                                font=dict(size=10), bgcolor="rgba(14,17,23,0.55)", itemsizing="constant"),
                     hovermode="x unified",
                 )
-                fig_fut.update_yaxes(range=[y0, y1], tickformat="d")
+                fig_fut.update_yaxes(range=[y0, y1], tickformat="d", constrain="domain", fixedrange=False)
                 fig_fut.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
                                      range=[-0.5, max(len(fut_times) - 0.5, 0.5)], nticks=8, showticklabels=False)
                 cap = f"Futures {latest_fut:,.1f}  ·  VWAP {latest_vwap:,.1f}  ·  bands ±{sigma_mult}σ"
@@ -3416,7 +3416,7 @@ def live_dashboard_fragment():
                 raw_efi = close.diff() * vol
                 dfi["efi13"] = raw_efi.ewm(span=13, adjust=False).mean()
                 fig_flow = make_subplots(
-                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
                     row_heights=[0.50, 0.50],
                     subplot_titles=("OBV", "EFI (13)"),
                 )
@@ -3443,7 +3443,7 @@ def live_dashboard_fragment():
                 fig_flow.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
                 fig_flow.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=200, margin=dict(l=10, r=8, t=22, b=8),
+                    height=168, margin=dict(l=42, r=8, t=14, b=2),
                     hovermode="x unified",
                 )
                 fig_flow.update_xaxes(type="category", categoryorder="array",
@@ -3470,21 +3470,28 @@ def live_dashboard_fragment():
                         colors.append("rgba(206,147,216,0.75)")
                     else:
                         colors.append("rgba(100,181,246,0.45)")
+                mids = list(vp["mids"])
+                vols = list(vp["vol"])
+                keep = [(m, v, c) for m, v, c in zip(mids, vols, colors) if y0 is not None and y0 <= m <= y1]
+                if keep:
+                    mids, vols, colors = zip(*keep)
                 fig_vp_side = plt_go.Figure()
                 fig_vp_side.add_trace(plt_go.Bar(
-                    x=vp["vol"], y=vp["mids"], orientation="h",
-                    marker=dict(color=colors), showlegend=False,
+                    x=list(vols), y=list(mids), orientation="h",
+                    marker=dict(color=list(colors)), showlegend=False,
                     hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
                 ))
-                fig_vp_side.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F")
+                if y0 is not None and y0 <= vp["poc"] <= y1:
+                    fig_vp_side.add_hline(y=vp["poc"], line_width=1.4, line_color="#FFD54F")
                 if not df_fchart.empty:
-                    fig_vp_side.add_hline(y=float(df_fchart["close"].iloc[-1]), line_width=2, line_color="#00E676")
+                    lf = float(df_fchart["close"].iloc[-1])
+                    if y0 is not None and y0 <= lf <= y1:
+                        fig_vp_side.add_hline(y=lf, line_width=2, line_color="#00E676")
                 fig_vp_side.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=320, margin=dict(l=4, r=4, t=8, b=18),
+                    height=400, margin=dict(l=4, r=4, t=6, b=4),
                 )
-                # lock to the SAME price range as the futures chart
-                fig_vp_side.update_yaxes(range=[y0, y1], showticklabels=False, zeroline=False)
+                fig_vp_side.update_yaxes(range=[y0, y1], showticklabels=False, zeroline=False, constrain="domain")
                 fig_vp_side.update_xaxes(showticklabels=False, showgrid=False)
                 st.plotly_chart(fig_vp_side, use_container_width=True)
             else:
@@ -3560,7 +3567,7 @@ def live_dashboard_fragment():
                 fig_cvd.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
                 fig_cvd.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=220, margin=dict(l=42, r=8, t=24, b=28),
+                    height=190, margin=dict(l=42, r=8, t=16, b=22),
                     title=dict(text=f"CVD: {latest_cvd:,.0f}", x=0.01, font=dict(size=12)),
                     xaxis=dict(type="category", categoryorder="array", categoryarray=fut_times,
                                range=[-0.5, max(len(fut_times) - 0.5, 0.5)], nticks=8),
