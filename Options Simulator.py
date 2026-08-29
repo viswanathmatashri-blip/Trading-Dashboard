@@ -3130,7 +3130,13 @@ def live_dashboard_fragment():
     st.markdown("<div class='sticky-summary'>", unsafe_allow_html=True)
     head_l, head_r = st.columns([0.72, 0.28])
     with head_l:
-        st.markdown("<h1 class='custom-heading' style='margin:0;font-size:17px;'>📊 Market Summary</h1>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;'>"
+            f"<h1 class='custom-heading' style='margin:0;font-size:17px;'>📊 Market Summary</h1>"
+            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
         if data.get("is_holiday_fallback", False):
             st.caption("⚠️ Non-trading day – showing last session")
     with head_r:
@@ -3162,11 +3168,10 @@ def live_dashboard_fragment():
             "• Superhuman **Gamma Regime** uses this same OI-based Net GEX total"
         )
 
-    st.markdown(f"<div class='update-timestamp' style='margin-top:2px'>Updated {data['timestamp']}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ========== SUPERHUMAN DECISION ENGINE ==========
-    scores = compute_superhuman_scores(data, data.get("df_candles", pd.DataFrame()))
+    scores = compute_superhuman_scores(data, data.get("df_futures") if data.get("df_futures") is not None and not data.get("df_futures").empty else data.get("df_candles", pd.DataFrame()))
 
     if "error" not in scores:
         # ----- Decision Log (persist bias changes during the day) -----
@@ -3224,73 +3229,43 @@ def live_dashboard_fragment():
             st.caption(trig.get("summary", ""))
         with t_hits:
             st.caption(f"Long checks {trig.get('long_hits', 0)}/5 · Short checks {trig.get('short_hits', 0)}/5")
-        with st.expander("? Trigger logic", expanded=False):
-            st.markdown(
-                "Fires **LONG** if at least 3 of Location / VWAP / OBV / CVD are bullish and EFI > 0. "
-                "Fires **SHORT** if at least 3 of those four are bearish and EFI < 0."
+        with st.expander("▼ Trigger · Decision tree · Intraday log", expanded=False):
+            trig = scores.get("dir_trigger") or {}
+            st.caption(
+                "LONG if ≥3 of GEX / VWAP / OBV / CVD bullish and EFI>0. "
+                "SHORT if ≥3 bearish and EFI<0."
             )
-            rows = ["| Metric | Long rule | Short rule | Now |",
-                    "|---|---|---|---|"]
-            rules = {
-                "Location (GEX)": ("Above put wall / through LVN", "Below call wall / GEX resistance"),
-                "Trend (VWAP)": ("Price > VWAP", "Price < VWAP"),
-                "Macro Flow (OBV)": ("OBV rising / above MA20", "OBV falling / below MA20"),
-                "Order Delta (CVD)": ("CVD higher highs", "CVD lower lows"),
-                "Execution (EFI 13)": ("EFI(13) > 0", "EFI(13) < 0"),
-            }
-            for ch in trig.get("checks") or []:
-                side = "LONG" if ch.get("long") and not ch.get("short") else (
-                    "SHORT" if ch.get("short") and not ch.get("long") else "—")
-                long_r, short_r = rules.get(ch["name"], ("", ""))
-                rows.append(f"| {ch['name']} | {long_r} | {short_r} | **{side}** · {ch.get('note','')} |")
-            st.markdown("\n".join(rows))
-
-        # Decision Tree + Intraday Log
-        with st.expander("▼ Decision Tree & Intraday Log", expanded=False):
-            st.markdown(
-                f"**Current Composite = {scores['composite']:+.0f} → {scores['bias']}**  \n"
-                f"{scores.get('clarity', '')}"
-            )
-
-            col_left, col_mid, col_right = st.columns([1.2, 1.0, 1.0])
-
-            # LEFT – Weightage table
-            with col_left:
-                st.markdown("**Score Breakdown**")
+            t1, t2, t3 = st.columns([1.35, 0.90, 0.75])
+            with t1:
+                rules = {
+                    "Location (GEX)": ("Above put wall / LVN", "Below call wall"),
+                    "Trend (VWAP)": ("Price > VWAP", "Price < VWAP"),
+                    "Macro Flow (OBV)": ("OBV > MA20", "OBV < MA20"),
+                    "Order Delta (CVD)": ("CVD HH", "CVD LL"),
+                    "Execution (EFI 13)": ("EFI > 0", "EFI < 0"),
+                }
+                lines = ["| Metric | L | S | Now |", "|---|---|---|---|"]
+                for ch in trig.get("checks") or []:
+                    side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
+                    lr, sr = rules.get(ch["name"], ("", ""))
+                    lines.append(f"| {ch['name']} | {lr} | {sr} | **{side}** {ch.get('note','')} |")
+                st.markdown("\n".join(lines))
+            with t2:
                 st.markdown(
-                    f"""
-| Component | Score | W | Contrib |
-|-----------|-------|---|--------|
-| Gamma Regime | {scores['gamma_regime_score']:+.0f} | 38% | {0.38*scores['gamma_regime_score']:+.1f} |
-| Exp vs Real | {scores['move_score']:+.0f} | 22% | {0.22*scores['move_score']:+.1f} |
-| Charm/Vanna | {scores['flow_score']:+.0f} | 15% | {0.15*scores['flow_score']:+.1f} |
-| OR vs Walls | {scores['or_score']:+.0f} | 15% | {0.15*scores['or_score']:+.1f} |
-| Dist to Flip | {scores.get('flip_score', 0):+.0f} | 10% | {0.10*scores.get('flip_score', 0):+.1f} |
-                    """
+                    f"**{scores['bias']} ({scores['composite']:+.0f})**  \n"
+                    f"- Quiet + long γ → PIN  \n"
+                    f"- Big range + long γ → REVERSION  \n"
+                    f"- Short γ / wall break → TREND  \n"
+                    f"- |C|≤15 → NO EDGE  \n"
+                    f"- else → MILD DIR"
                 )
-
-            # MIDDLE – Final Rule
-            with col_mid:
-                st.markdown("**Final Rule**")
-                st.markdown(
-                    """
-- Quiet range + strong long γ → **QUIET PIN**
-- Big range + strong long γ → **GAMMA REVERSION**
-- Short γ / wall break → **TREND / BREAKOUT**
-- |Composite| ≤ 15 → **NO EDGE**
-- Otherwise → **MILD DIRECTIONAL**
-                    """
-                )
-
-            # RIGHT – Intraday Log
-            with col_right:
-                st.markdown("**Intraday Log**")
+            with t3:
+                st.markdown("**Log**")
                 if not decision_log:
-                    st.caption("No log yet. Keep Auto-Refresh on.")
+                    st.caption("No log yet.")
                 else:
-                    for e in decision_log:
-                        tstr = e["ts"].strftime("%H:%M")
-                        st.markdown(f"- **{tstr}** → {e['bias']} ({e['composite']:+.0f})")
+                    for e in decision_log[-8:]:
+                        st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
 
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
@@ -3565,7 +3540,7 @@ def live_dashboard_fragment():
 
                 fig_stack = make_subplots(
                     rows=4, cols=2,
-                    column_widths=[0.84, 0.16],
+                    column_widths=[0.78, 0.22],
                     row_heights=[0.46, 0.16, 0.16, 0.22],
                     shared_xaxes=True,
                     shared_yaxes=False,
@@ -3573,9 +3548,9 @@ def live_dashboard_fragment():
                     vertical_spacing=0.018,
                     specs=[
                         [{}, {}],
-                        [{}, None],
-                        [{}, None],
-                        [{}, None],
+                        [{}, {"rowspan": 3}],
+                        [None, None],
+                        [None, None],
                     ],
                 )
                 # price
@@ -3636,6 +3611,58 @@ def live_dashboard_fragment():
                     fillcolor="rgba(0,230,118,0.08)" if cvd_last >= 0 else "rgba(255,82,82,0.08)",
                 ), row=4, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
+
+                def _sess_chg(src):
+                    if src is None or getattr(src, "empty", True):
+                        return None
+                    try:
+                        sess, _, _ = pick_last_nse_session(src, min_bars=5)
+                    except Exception:
+                        sess = src
+                    if sess is None or sess.empty:
+                        return None
+                    o = float(sess["open"].iloc[0]); cl = float(sess["close"].iloc[-1])
+                    return cl, cl - o, (cl - o) / o * 100.0 if o else 0.0
+
+                spot_chg = _sess_chg(data.get("df_candles"))
+                fut_chg = _sess_chg(df_fchart if not df_fchart.empty else data.get("df_futures"))
+                trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
+                snap_lines = []
+                if spot_chg:
+                    snap_lines.append(f"SPOT {spot_chg[0]:,.0f}  {spot_chg[1]:+.0f}  {spot_chg[2]:+.2f}%")
+                if fut_chg:
+                    snap_lines.append(f"FUT  {fut_chg[0]:,.0f}  {fut_chg[1]:+.0f}  {fut_chg[2]:+.2f}%")
+                if isinstance(scores, dict) and "error" not in scores:
+                    snap_lines.append(f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})")
+                    snap_lines.append(str((trig or {}).get("trigger", "NO TRIGGER")))
+                fig_stack.add_trace(plt_go.Scatter(x=[0], y=[0], mode="markers", marker=dict(opacity=0), showlegend=False, hoverinfo="skip"), row=2, col=2)
+                fig_stack.update_xaxes(visible=False, row=2, col=2)
+                fig_stack.update_yaxes(visible=False, range=[0, 1], row=2, col=2)
+                y_pos = 0.92
+                for ln in snap_lines:
+                    colr = "#FAFAFA"
+                    if "SPOT" in ln or "FUT" in ln:
+                        colr = "#00E676" if "+" in ln.split()[-1] or ln.split()[-1].startswith("+") else ("#FF5252" if ln.split()[-1].startswith("-") else "#FAFAFA")
+                        try:
+                            pct = float(ln.split()[-1].replace("%", ""))
+                            colr = "#00E676" if pct >= 0 else "#FF5252"
+                        except Exception:
+                            pass
+                    if "LONG TRIGGER" in ln:
+                        colr = "#00E676"
+                    elif "SHORT TRIGGER" in ln:
+                        colr = "#FF5252"
+                    elif "NO DIRECTIONAL" in ln or "NO TRIGGER" in ln:
+                        colr = "#FF9800"
+                    elif "PIN" in ln or "REVERSION" in ln or "TREND" in ln or "EDGE" in ln or "MILD" in ln:
+                        colr = scores.get("colour", "#00E676") if isinstance(scores, dict) else "#00E676"
+                    fig_stack.add_annotation(
+                        xref="x domain", yref="y domain", x=0.02, y=y_pos,
+                        text=ln, showarrow=False, align="left", xanchor="left",
+                        font=dict(size=11, color=colr, family="Arial"),
+                        row=2, col=2,
+                    )
+                    y_pos -= 0.22
 
                 xr = [-0.5, max(len(fut_times) - 0.5, 0.5)]
                 fig_stack.update_layout(
