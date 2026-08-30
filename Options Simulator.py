@@ -552,15 +552,173 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
         "Straddle_Cost": round(atm_straddle_cost, 2)
     }
 
+
+# 81-state microstructure playbook: Price, EFI, CVD, OBV → (label, action)
+# arrows: u=up d=down f=flat
+MICRO_PLAYBOOK = {
+    ("u","u","u","u"): ("Pure Institutional Aggression", "LONG BREAKOUT (Target: Upper 2.0σ)"),
+    ("u","u","u","f"): ("Thin-Book Impulse", "CAUTIOUS LONG (Trailing SL tight)"),
+    ("u","u","u","d"): ("Low-Volume Markup", "CAUTIOUS LONG / PREPARE TRAIL"),
+    ("u","u","f","u"): ("Passive Wall Sweeping", "HOLD LONG"),
+    ("u","u","f","f"): ("Steady Markup", "HOLD LONG"),
+    ("u","u","f","d"): ("Low-Volume Steady Drift", "NO ENTRY (Unstable move)"),
+    ("u","u","d","u"): ("Bullish Passive Limit Accumulation", "HOLD LONG (Institutional support)"),
+    ("u","u","d","f"): ("Absorbed Drift", "HOLD LONG"),
+    ("u","u","d","d"): ("Illiquid Short Squeeze", "NO ENTRY (High reversal risk)"),
+    ("u","f","u","u"): ("High-Volume Choke", "WARNING: Limit sell wall building"),
+    ("u","f","u","f"): ("Mild Buying Friction", "HOLD LONG / NO NEW ENTRIES"),
+    ("u","f","u","d"): ("Fading Buying Effort", "BLOCK LONG ENTRIES"),
+    ("u","f","f","u"): ("High Volume Neutral Drift", "HOLD LONG"),
+    ("u","f","f","f"): ("Low-Volatility Up-Drift", "HOLD EXISTING POSITIONS"),
+    ("u","f","f","d"): ("Volume Drying Upbeat", "PREPARE EXIT LONG"),
+    ("u","f","d","u"): ("Distribution under Cover", "EXIT LONG / PREPARE SHORT"),
+    ("u","f","d","f"): ("Passive Seller Pressure", "EXIT LONG"),
+    ("u","f","d","d"): ("Diverging Drift", "EXIT LONG"),
+    ("u","d","u","u"): ("Institutional Supply Absorption", "EXIT LONG / DYNAMIC ABSORPTION EXIT"),
+    ("u","d","u","f"): ("Buying Force Decay", "EXIT LONG"),
+    ("u","d","u","d"): ("Fading Bullish Push", "EXIT LONG"),
+    ("u","d","f","u"): ("High Volume Momentum Trap", "PREPARE SHORT"),
+    ("u","d","f","f"): ("Momentum Exhaustion", "EXIT LONG"),
+    ("u","d","f","d"): ("Low-Volume Top Building", "PREPARE SHORT"),
+    ("u","d","d","u"): ("Classic Bearish Institutional Distribution", "SHORT MEAN-REVERSION (At Upper Band)"),
+    ("u","d","d","f"): ("Bearish Divergence (Standard)", "SHORT MEAN-REVERSION"),
+    ("u","d","d","d"): ("Triple Bearish Divergence", "SHORT MEAN-REVERSION / SHORT ENTRY"),
+    ("f","u","u","u"): ("Coil Compression (Bullish Push)", "PRE-BREAKOUT LONG PREPARATION"),
+    ("f","u","u","f"): ("Hidden Aggressive Buying", "PRE-BREAKOUT LONG"),
+    ("f","u","u","d"): ("Selective Aggressive Buying", "WATCH FOR BREAKOUT"),
+    ("f","u","f","u"): ("Force Expansion in Consolidation", "WATCH FOR BREAKOUT"),
+    ("f","u","f","f"): ("Quiet Force Building", "NO ENTRY / NO EDGE"),
+    ("f","u","f","d"): ("Low-Volume Force Shift", "NO ENTRY"),
+    ("f","u","d","u"): ("Passive Limit Floor Building", "BULLISH ABSORPTION WATCH"),
+    ("f","u","d","f"): ("Mild Passive Support", "NO ENTRY"),
+    ("f","u","d","d"): ("Conflicted Consolidation", "NO ENTRY"),
+    ("f","f","u","u"): ("Institutional Accumulation Box", "ACCUMULATION WATCH"),
+    ("f","f","u","f"): ("Quiet Delta Accumulation", "ACCUMULATION WATCH"),
+    ("f","f","u","d"): ("Low-Volume Delta Push", "NO ENTRY"),
+    ("f","f","f","u"): ("High-Volume Equilibrium", "ORDER BOOK REBALANCING"),
+    ("f","f","f","f"): ("DEAD MARKET / LUNCH HOUR CHOP", "NO ENTRY (BLOCK ALL SIGNALS)"),
+    ("f","f","f","d"): ("Liquidity Drying Up", "NO ENTRY"),
+    ("f","f","d","u"): ("Institutional Distribution Box", "DISTRIBUTION WATCH"),
+    ("f","f","d","f"): ("Quiet Delta Distribution", "DISTRIBUTION WATCH"),
+    ("f","f","d","d"): ("Low-Volume Slippage", "NO ENTRY"),
+    ("f","d","u","u"): ("Passive Limit Wall Blocking Force", "NO ENTRY"),
+    ("f","d","u","f"): ("Fading Buying Impulse in Range", "NO ENTRY"),
+    ("f","d","u","d"): ("Low-Volume Friction", "NO ENTRY"),
+    ("f","d","f","u"): ("High-Volume Bearish Force", "WATCH FOR BREAKDOWN"),
+    ("f","d","f","f"): ("Quiet Force Decay", "NO ENTRY"),
+    ("f","d","f","d"): ("Low-Volume Force Breakdown", "NO ENTRY"),
+    ("f","d","d","u"): ("Coil Compression (Bearish Push)", "PRE-BREAKDOWN SHORT PREPARATION"),
+    ("f","d","d","f"): ("Hidden Aggressive Selling", "PRE-BREAKDOWN SHORT"),
+    ("f","d","d","d"): ("Triple Bearish Compression", "SHORT BREAKDOWN PREPARATION"),
+    ("d","u","u","u"): ("Triple Bullish Divergence", "LONG MEAN-REVERSION / LONG ENTRY"),
+    ("d","u","u","f"): ("Bullish Divergence (Standard)", "LONG MEAN-REVERSION"),
+    ("d","u","u","d"): ("Classic Bullish Institutional Accumulation", "LONG MEAN-REVERSION (At Lower Band)"),
+    ("d","u","f","u"): ("High-Volume Bottom Building", "PREPARE LONG"),
+    ("d","u","f","f"): ("Momentum Floor", "EXIT SHORT"),
+    ("d","u","f","d"): ("Low-Volume Bottom Building", "PREPARE LONG"),
+    ("d","u","d","u"): ("Institutional Demand Absorption", "EXIT SHORT / DYNAMIC ABSORPTION EXIT"),
+    ("d","u","d","f"): ("Selling Force Decay", "EXIT SHORT"),
+    ("d","u","d","d"): ("Fading Bearish Push", "EXIT SHORT"),
+    ("d","f","u","u"): ("Accumulation under Cover", "EXIT SHORT / PREPARE LONG"),
+    ("d","f","u","f"): ("Passive Buyer Pressure", "EXIT SHORT"),
+    ("d","f","u","d"): ("Diverging Down-Drift", "EXIT SHORT"),
+    ("d","f","f","u"): ("High Volume Neutral Down-Drift", "HOLD SHORT"),
+    ("d","f","f","f"): ("Low-Volatility Down-Drift", "HOLD EXISTING POSITIONS"),
+    ("d","f","f","d"): ("Volume Drying Downbeat", "PREPARE EXIT SHORT"),
+    ("d","f","d","u"): ("High-Volume Friction", "WARNING: Limit buy wall building"),
+    ("d","f","d","f"): ("Mild Selling Friction", "HOLD SHORT / NO NEW ENTRIES"),
+    ("d","f","d","d"): ("Fading Selling Effort", "BLOCK SHORT ENTRIES"),
+    ("d","d","u","u"): ("Bullish Passive Limit Absorption", "HOLD SHORT (Institutional resistance)"),
+    ("d","d","u","f"): ("Absorbed Down-Drift", "HOLD SHORT"),
+    ("d","d","u","d"): ("Illiquid Long Squeeze", "NO ENTRY (High reversal risk)"),
+    ("d","d","f","u"): ("Passive Wall Sweeping Down", "HOLD SHORT"),
+    ("d","d","f","f"): ("Steady Markdown", "HOLD SHORT"),
+    ("d","d","f","d"): ("Low-Volume Steady Down-Drift", "NO ENTRY (Unstable move)"),
+    ("d","d","d","u"): ("Low-Volume Markdown", "CAUTIOUS SHORT / PREPARE TRAIL"),
+    ("d","d","d","f"): ("Thin-Book Down-Impulse", "CAUTIOUS SHORT (Trailing SL tight)"),
+    ("d","d","d","d"): ("Pure Institutional Aggression (Bearish)", "SHORT BREAKOUT (Target: Lower 2.0σ)"),
+}
+ARROW_GLYPH = {"u": "↑", "f": "→", "d": "↓"}
+
+
+def _robust_arrow(series: pd.Series, z_th: float = 0.90, ema_span: int = 8) -> str:
+    """Require EMA agreement + z-score of last change vs its own noise. Flat if weak."""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 10:
+        return "f"
+    last = float(s.iloc[-1])
+    ema = float(s.ewm(span=ema_span, adjust=False).mean().iloc[-1])
+    chg = s.diff().dropna()
+    if len(chg) < 6:
+        return "f"
+    sd = float(chg.tail(20).std(ddof=1) or 0.0)
+    if sd <= 1e-12:
+        return "f"
+    z = float(chg.iloc[-1]) / sd
+    lvl_sd = float(s.tail(20).std(ddof=1) or sd)
+    z_lvl = (last - float(s.tail(20).mean())) / max(lvl_sd, 1e-12)
+    score = 0.65 * z + 0.35 * z_lvl
+    if last > ema and score >= z_th:
+        return "u"
+    if last < ema and score <= -z_th:
+        return "d"
+    return "f"
+
+
+def classify_microstructure(dfi: pd.DataFrame) -> dict:
+    """Live Price / EFI / CVD / OBV arrows + playbook row. Price uses close vs VWAP + return z."""
+    empty = {"ok": False, "arrows": "→ → → →", "micro": "", "action": "NO ENTRY",
+             "key": ("f","f","f","f"), "hover": ""}
+    if dfi is None or dfi.empty:
+        return empty
+    d = dfi.copy()
+    price_s = d["close"].astype(float)
+    efi_s = d["efi13"] if "efi13" in d.columns else pd.Series(dtype=float)
+    cvd_s = d["cvd"] if "cvd" in d.columns else pd.Series(dtype=float)
+    obv_s = d["obv"] if "obv" in d.columns else pd.Series(dtype=float)
+
+    p_arr = _robust_arrow(price_s, z_th=0.95)
+    if "vwap" in d.columns and len(price_s):
+        last_px = float(price_s.iloc[-1])
+        last_vw = float(d["vwap"].iloc[-1])
+        # VWAP must agree for a non-flat price call (filters noise ticks)
+        if p_arr == "u" and last_px <= last_vw:
+            p_arr = "f"
+        if p_arr == "d" and last_px >= last_vw:
+            p_arr = "f"
+    e_arr = _robust_arrow(efi_s, z_th=0.85) if len(efi_s) else "f"
+    c_arr = _robust_arrow(cvd_s, z_th=0.85) if len(cvd_s) else "f"
+    o_arr = _robust_arrow(obv_s, z_th=0.85) if len(obv_s) else "f"
+    key = (p_arr, e_arr, c_arr, o_arr)
+    micro, action = MICRO_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
+    glyphs = " ".join(ARROW_GLYPH[k] for k in key)
+    hover = (
+        f"Spot/Fut {ARROW_GLYPH[p_arr]}  EFI {ARROW_GLYPH[e_arr]}  "
+        f"CVD {ARROW_GLYPH[c_arr]}  OBV {ARROW_GLYPH[o_arr]}<br>"
+        f"<b>{action}</b><br>{micro}"
+    )
+    return {
+        "ok": True, "key": key, "arrows": glyphs, "micro": micro, "action": action,
+        "price": p_arr, "efi": e_arr, "cvd": c_arr, "obv": o_arr, "hover": hover,
+    }
+
+
 def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
+    """Long/short trigger from GEX location, VWAP, OBV, CVD, EFI."""
     levels = data.get("levels", {}) or {}
     spot = float(data.get("spot_price") or 0)
     gex_sup = float(levels.get("GEX_Support") or spot or 0)
     gex_res = float(levels.get("GEX_Resistance") or spot or 0)
     checks = []
     long_n = short_n = 0
-    px = vwap = obv = obv_ma = cvd = efi = None
+
+    px = None
+    vwap = None
+    obv = obv_ma = None
+    cvd = None
+    efi = None
     lvn = []
+
     df = pd.DataFrame()
     if df_candles is not None and not df_candles.empty:
         try:
@@ -575,7 +733,7 @@ def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
             tp = (df["high"] + df["low"] + df["close"]) / 3.0 if {"high", "low"}.issubset(df.columns) else df["close"]
             vol = df["volume"].astype(float)
             cum_v = vol.cumsum().replace(0, np.nan)
-            vwap = float((tp.astype(float) * vol).cumsum().iloc[-1] / cum_v.iloc[-1]) if pd.notna(cum_v.iloc[-1]) else px
+            vwap = float((tp.astype(float) * vol).cumsum().iloc[-1] / cum_v.iloc[-1]) if cum_v.iloc[-1] == cum_v.iloc[-1] else px
             direction = np.sign(df["close"].astype(float).diff().fillna(0.0))
             obv_s = (direction * vol).cumsum()
             obv = float(obv_s.iloc[-1])
@@ -593,6 +751,7 @@ def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
         else:
             vwap = px
 
+    # 1 Location GEX — INDEX SPOT vs GEX walls (never futures)
     loc_long = loc_short = False
     loc_note = "GEX walls unavailable"
     if spot > 0 and gex_sup and gex_res:
@@ -615,69 +774,88 @@ def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
             loc_note += " · through LVN"
     checks.append({"name": "Location (GEX)", "long": loc_long, "short": loc_short, "note": loc_note})
 
+    # 2 VWAP
     vwap_long = vwap_short = False
     vwap_note = "VWAP unavailable"
     if px and vwap:
-        vwap_long, vwap_short = px > vwap, px < vwap
-        vwap_note = f"fut {px:.1f} vs VWAP {vwap:.1f}"
+        vwap_long = px > vwap
+        vwap_short = px < vwap
+        vwap_note = f"px {px:.1f} vs VWAP {vwap:.1f}"
     checks.append({"name": "Trend (VWAP)", "long": vwap_long, "short": vwap_short, "note": vwap_note})
 
+    # 3 OBV
     obv_long = obv_short = False
     obv_note = "OBV unavailable"
     if obv is not None and obv_ma is not None and not np.isnan(obv_ma):
-        obv_long, obv_short = obv > obv_ma, obv < obv_ma
+        obv_long = obv > obv_ma
+        obv_short = obv < obv_ma
         obv_note = f"OBV {obv:.0f} vs MA20 {obv_ma:.0f}"
     checks.append({"name": "Macro Flow (OBV)", "long": obv_long, "short": obv_short, "note": obv_note})
 
+    # 4 CVD structure
     cvd_long = cvd_short = False
     cvd_note = "CVD unavailable"
     if cvd is not None and not df.empty and "volume" in df.columns:
         half = max(len(df) // 2, 3)
-        if len(cvd_s) >= 6:
-            early, late = float(cvd_s.iloc[:half].max()), float(cvd_s.iloc[half:].max())
-            early_lo, late_lo = float(cvd_s.iloc[:half].min()), float(cvd_s.iloc[half:].min())
+        cvd_s = (df["volume"].astype(float) * loc).cumsum() if "volume" in df.columns else None
+        if cvd_s is not None and len(cvd_s) >= 6:
+            early = float(cvd_s.iloc[:half].max())
+            late = float(cvd_s.iloc[half:].max())
+            early_lo = float(cvd_s.iloc[:half].min())
+            late_lo = float(cvd_s.iloc[half:].min())
             cvd_long = late > early and cvd > 0
             cvd_short = late_lo < early_lo and cvd < 0
             cvd_note = f"CVD {cvd:.0f} · HH={cvd_long} LL={cvd_short}"
     checks.append({"name": "Order Delta (CVD)", "long": cvd_long, "short": cvd_short, "note": cvd_note})
 
+    # 5 EFI execution
     efi_long = efi_short = False
     efi_note = "EFI unavailable"
     if efi is not None and not np.isnan(efi):
-        efi_long, efi_short = efi > 0, efi < 0
+        efi_long = efi > 0
+        efi_short = efi < 0
         efi_note = f"EFI13 {efi:.1f}"
     checks.append({"name": "Execution (EFI 13)", "long": efi_long, "short": efi_short, "note": efi_note})
 
     for ch in checks:
-        long_n += int(bool(ch["long"]))
-        short_n += int(bool(ch["short"]))
+        if ch["long"]:
+            long_n += 1
+        if ch["short"]:
+            short_n += 1
+
     setup_l = sum(1 for ch in checks[:4] if ch["long"])
     setup_s = sum(1 for ch in checks[:4] if ch["short"])
-
     if setup_l >= 3 and efi_long:
         trigger, colour = "LONG TRIGGER", "#00E676"
-        summary = f"Setup {setup_l}/4 long + EFI>0."
+        summary = f"Setup {setup_l}/4 long + EFI>0. Directional long."
     elif setup_s >= 3 and efi_short:
         trigger, colour = "SHORT TRIGGER", "#FF5252"
-        summary = f"Setup {setup_s}/4 short + EFI<0."
-    elif setup_l >= 3:
+        summary = f"Setup {setup_s}/4 short + EFI<0. Directional short."
+    elif setup_l >= 3 and not efi_long:
         trigger, colour = "LONG BIAS (no fire)", "#80CBC4"
-        summary = f"Setup {setup_l}/4 long but EFI not >0."
-    elif setup_s >= 3:
+        summary = f"Setup {setup_l}/4 long but EFI is not >0 — no entry yet."
+    elif setup_s >= 3 and not efi_short:
         trigger, colour = "SHORT BIAS (no fire)", "#EF9A9A"
-        summary = f"Setup {setup_s}/4 short but EFI not <0."
+        summary = f"Setup {setup_s}/4 short but EFI is not <0 — no entry yet."
     elif setup_l > setup_s:
         trigger, colour = "LONG LEAN (no fire)", "#80CBC4"
-        summary = f"Only {setup_l}/4 setup long (need 3)."
+        summary = f"Only {setup_l}/4 setup long (need 3). EFI already {'green' if efi_long else 'not green'}."
     elif setup_s > setup_l:
         trigger, colour = "SHORT LEAN (no fire)", "#EF9A9A"
-        summary = f"Only {setup_s}/4 setup short (need 3)."
+        summary = f"Only {setup_s}/4 setup short (need 3). EFI already {'red' if efi_short else 'not red'}."
     else:
         trigger, colour = "NO DIRECTIONAL TRIGGER", "#FF9800"
-        summary = f"Setup split {setup_l}L/{setup_s}S."
+        summary = f"Setup split {setup_l}L/{setup_s}S. No fire."
 
-    return {"trigger": trigger, "colour": colour, "summary": summary,
-            "long_hits": long_n, "short_hits": short_n, "checks": checks}
+    return {
+        "trigger": trigger,
+        "colour": colour,
+        "summary": summary,
+        "long_hits": long_n,
+        "short_hits": short_n,
+        "checks": checks,
+    }
+
 
 def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
     """
@@ -3621,7 +3799,14 @@ def live_dashboard_fragment():
                 if isinstance(scores, dict) and "error" not in scores:
                     snap_lines.append(f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})")
                     snap_lines.append(str((trig or {}).get("trigger", "NO TRIGGER")))
-                y_pos = 0.48
+                micro = classify_microstructure(dfi)
+                if micro.get("ok"):
+                    snap_lines.append(f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}")
+                    act = micro["action"]
+                    if len(act) > 34:
+                        act = act[:32] + "…"
+                    snap_lines.append(act)
+                y_pos = 0.46
                 for ln in snap_lines:
                     colr = "#FAFAFA"
                     try:
@@ -3643,7 +3828,14 @@ def live_dashboard_fragment():
                         text=ln, showarrow=False, align="left", xanchor="left",
                         font=dict(size=11, color=colr, family="Arial"),
                     )
-                    y_pos -= 0.06
+                    y_pos -= 0.055
+                if micro.get("ok"):
+                    fig_stack.add_trace(plt_go.Scatter(
+                        x=[dfi["time_str"].iloc[-1]], y=[float(dfi["cvd"].iloc[-1])],
+                        mode="markers", marker=dict(size=14, color="rgba(0,0,0,0)"),
+                        showlegend=False, name="tape",
+                        hovertemplate=micro["hover"] + "<extra></extra>",
+                    ), row=4, col=1)
 
                 xr = [-0.5, max(len(fut_times) - 0.5, 0.5)]
                 fig_stack.update_layout(
