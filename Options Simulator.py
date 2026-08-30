@@ -3642,22 +3642,33 @@ def live_dashboard_fragment():
         sigma_mult = 1.5
 
         with left_col:
-            fut_header_col, chip_col, basis_col, band_col = st.columns([0.40, 0.28, 0.16, 0.16])
+            fut_header_col, basis_col, band_col = st.columns([0.64, 0.18, 0.18])
             with fut_header_col:
                 expiry_txt = basis.get("fut_expiry", "N/A")
-                heading_ribbon(
-                    f"📉 Near-Month Futures + VWAP + VP ({expiry_txt})",
-                    "<b>Futures</b> last traded price of the near-month contract.<br>"
-                    "<b>VWAP</b> = Σ(TypicalPrice × Volume) / Σ Volume, session reset.<br>"
-                    "TypicalPrice = (H+L+C)/3. Real futures volume (index has none).<br>"
-                    "<b>Volume profile</b> = volume histogram by 5-pt price bin. "
-                    "POC = max bin. VA ±1σ / ±1.5σ = value area. HVN/LVN via prominence.",
-                    13,
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;gap:6px;flex-wrap:nowrap;'>"
+                    f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
+                    f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
+                    f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
+                    f"📉 Near-Month Futures + VWAP + VP ({expiry_txt})</span>"
+                    f"<div class='micro-tip'><b>Futures</b> near-month LTP.<br>"
+                    f"<b>VWAP</b> = Σ(TP×V)/ΣV, TP=(H+L+C)/3.<br>"
+                    f"<b>VP</b> volume-by-price · POC / VA / HVN / LVN.</div></div>"
+                    f"<div class='micro-hover' style='display:inline-block;padding:3px 8px;"
+                    f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
+                    f"<span style='font-weight:700;color:#00E676;font-size:11px;'>OBV</span>"
+                    f"<div class='micro-tip'><b>OBV</b> = Σ sign(ΔClose)×Volume. Executed net volume.</div></div>"
+                    f"<div class='micro-hover' style='display:inline-block;padding:3px 8px;"
+                    f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
+                    f"<span style='font-weight:700;color:#00E676;font-size:11px;'>EFI13</span>"
+                    f"<div class='micro-tip'><b>EFI13</b> = EMA13((C−prev)×V). Force / execution.</div></div>"
+                    f"<div class='micro-hover' style='display:inline-block;padding:3px 8px;"
+                    f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
+                    f"<span style='font-weight:700;color:#00E676;font-size:11px;'>CVD</span>"
+                    f"<div class='micro-tip'><b>CVD</b> = Σ V×(2(C−L)/(H−L)−1). Market-order-like proxy.</div></div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
                 )
-            with chip_col:
-                heading_ribbon("OBV", "<b>OBV</b> = Σ sign(ΔClose)×Volume. Executed net volume.", 11)
-                heading_ribbon("EFI13", "<b>EFI13</b> = EMA13((C-prev)×V). Force / execution trigger.", 11)
-                heading_ribbon("CVD", "<b>CVD</b> = Σ V×(2(C-L)/(H-L)-1). Market-order-like proxy.", 11)
             with basis_col:
                 if basis.get("basis") is not None:
                     basis_color = "#00E676" if basis["basis"] >= 0 else "#FF5252"
@@ -3764,7 +3775,7 @@ def live_dashboard_fragment():
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
                     line=dict(color="#FF9800", width=2),
-                    hovertemplate="VWAP %{y:.1f}<extra></extra>"), row=1, col=1)
+                    hoverinfo="skip"), row=1, col=1)
                 cd = np.column_stack([
                     dfi["vwap"].astype(float).values,
                     dfi["spot_px"].astype(float).values,
@@ -3773,7 +3784,7 @@ def live_dashboard_fragment():
                     x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
                     line=dict(color="#2196F3", width=2),
                     customdata=cd,
-                    hovertemplate="Fut %{y:.1f}<br>VWAP %{customdata[0]:.1f}<br>NIFTY %{customdata[1]:.1f}<extra></extra>",
+                    hovertemplate="NIFTY %{customdata[1]:.1f}<br>Fut %{y:.1f}<br>VWAP %{customdata[0]:.1f}<extra></extra>",
                 ), row=1, col=1)
                 last_fut = float(dfi["close"].iloc[-1])
                 last_sp = dfi["spot_px"].iloc[-1]
