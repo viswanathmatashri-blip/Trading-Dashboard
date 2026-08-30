@@ -3500,21 +3500,6 @@ def live_dashboard_fragment():
     df_fut  = data.get("df_futures", pd.DataFrame())
     basis   = data.get("basis_info", {})
 
-    chart_head_col, tf_col = st.columns([0.75, 0.25])
-    with chart_head_col:
-        heading_ribbon("📈 Underlying Technicals",
-            "Spot + Bollinger (20,2). MACD 12/26/9. RSI 14. Squeeze = BB width ≤ 20th percentile of last 20 bars.")
-    with tf_col:
-        selected_tf = st.selectbox("TF", ["1 min", "3 min", "5 min", "15 min"],
-                                   index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"]),
-                                   key="tf_select_frag", label_visibility="collapsed")
-        if selected_tf != st.session_state["selected_timeframe"]:
-            st.session_state["selected_timeframe"] = selected_tf
-            updated_chart_data = fetch_live_data(selected_tf)
-            if updated_chart_data:
-                st.session_state["data_store"] = updated_chart_data
-                st.rerun()
-
     if not df_full.empty and len(df_full) >= 20:
         latest_row = df_full.iloc[-1]
         rsi_val = latest_row["rsi"]
@@ -3529,15 +3514,33 @@ def live_dashboard_fragment():
         is_sqz = latest_row["bb_bandwidth"] <= bw_threshold
         sqz_status = "Squeeze" if is_sqz else "Expand"
         sqz_badge_cls = "badge-neutral" if is_sqz else "badge-bullish"
-
-        st.markdown(
-            f"<div style='margin-bottom:4px'>"
+        badge_html = (
             f"<span class='status-badge {sqz_badge_cls}'>BB: {sqz_status}</span>"
             f"<span class='status-badge {macd_badge_cls}'>MACD: {macd_status}</span>"
             f"<span class='status-badge {rsi_badge_cls}'>RSI: {rsi_val:.0f} ({rsi_status})</span>"
-            f"</div>",
-            unsafe_allow_html=True,
         )
+    else:
+        badge_html = ""
+
+    tech_h, tech_b, tf_col = st.columns([0.28, 0.52, 0.20])
+    with tech_h:
+        heading_ribbon("📈 Underlying Technicals",
+            "Spot + Bollinger (20,2). MACD 12/26/9. RSI 14. Squeeze = BB width ≤ 20th pct of last 20 bars.")
+    with tech_b:
+        if badge_html:
+            st.markdown(f"<div style='padding-top:2px;'>{badge_html}</div>", unsafe_allow_html=True)
+    with tf_col:
+        selected_tf = st.selectbox("TF", ["1 min", "3 min", "5 min", "15 min"],
+                                   index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"]),
+                                   key="tf_select_frag", label_visibility="collapsed")
+        if selected_tf != st.session_state["selected_timeframe"]:
+            st.session_state["selected_timeframe"] = selected_tf
+            updated_chart_data = fetch_live_data(selected_tf)
+            if updated_chart_data:
+                st.session_state["data_store"] = updated_chart_data
+                st.rerun()
+
+    if not df_full.empty and len(df_full) >= 20:
 
         # Spot chart (no VWAP)
         df_full["session_date"] = pd.to_datetime(df_full["time"]).dt.date
@@ -3552,7 +3555,6 @@ def live_dashboard_fragment():
         tech_left, tech_right = st.columns([0.58, 0.42])
 
         with tech_left:
-            st.caption("Spot Price + Bollinger (VWAP moved to Futures chart below)")
             fig_px = plt_go.Figure()
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot", line=dict(color="#00E676", width=2)))
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper", line=dict(color="rgba(33,150,243,0.5)", width=1)))
@@ -3631,22 +3633,26 @@ def live_dashboard_fragment():
 
         # ----- Compact: Futures+VP+OBV+EFI+CVD | GEX OI + GEX Vol -----
         fut_msg = data.get("fut_fallback_msg", "")
-        if data.get("fut_is_fallback") or "closed" in str(fut_msg).lower():
-            st.warning(fut_msg)
-        elif fut_msg:
-            st.caption(fut_msg)
-
         left_col, right_col = st.columns([0.70, 0.30])
         vp = {"ok": False}
         y0 = y1 = None
         sigma_mult = 1.5
 
         with left_col:
-            fut_header_col, basis_col, band_col = st.columns([0.64, 0.18, 0.18])
+            fut_header_col, basis_col, band_col = st.columns([0.70, 0.16, 0.14])
             with fut_header_col:
                 expiry_txt = basis.get("fut_expiry", "N/A")
+                fb = str(fut_msg or "").replace("**", "").replace("⚠️ ", "")
+                fb_html = ""
+                if data.get("fut_is_fallback") or "closed" in fb.lower():
+                    fb_html = (
+                        f"<span style='color:#FFD54F;font-size:11px;white-space:nowrap;'>"
+                        f"{fb}</span>"
+                    )
+                elif fb:
+                    fb_html = f"<span style='color:#7CB342;font-size:11px;white-space:nowrap;'>{fb}</span>"
                 st.markdown(
-                    f"<div style='display:flex;align-items:center;gap:6px;flex-wrap:nowrap;'>"
+                    f"<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;'>"
                     f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
                     f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
                     f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
@@ -3666,6 +3672,7 @@ def live_dashboard_fragment():
                     f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
                     f"<span style='font-weight:700;color:#00E676;font-size:11px;'>CVD</span>"
                     f"<div class='micro-tip'><b>CVD</b> = Σ V×(2(C−L)/(H−L)−1). Market-order-like proxy.</div></div>"
+                    f"{fb_html}"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
@@ -3673,8 +3680,8 @@ def live_dashboard_fragment():
                 if basis.get("basis") is not None:
                     basis_color = "#00E676" if basis["basis"] >= 0 else "#FF5252"
                     st.markdown(
-                        f"<div style='text-align:right;font-size:12px;padding-top:2px;'>"
-                        f"Basis: <span style='color:{basis_color};font-weight:700;'>"
+                        f"<div style='text-align:right;font-size:14px;padding-top:2px;'>"
+                        f"Basis: <span style='color:{basis_color};font-weight:800;'>"
                         f"{basis['basis']:+.1f}</span></div>",
                         unsafe_allow_html=True
                     )
