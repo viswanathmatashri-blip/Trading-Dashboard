@@ -3373,40 +3373,22 @@ def live_dashboard_fragment():
             decision_log = [e for e in decision_log if e["ts"] >= day_start]
             _save_decision_log(decision_log, Index_Name)
 
-        st.markdown("---")
+        trig = scores.get("dir_trigger") or {}
         st.markdown(
-            f"<div style='background:#1A1F2B;border:1px solid #2A2F3A;border-radius:8px;padding:10px 14px;margin-bottom:8px;'>"
-            f"<span style='font-weight:700;color:#00E676;font-size:14px;'>🧠 Superhuman Decision Engine</span>"
+            f"<div style='background:#1A1F2B;border:1px solid #2A2F3A;border-radius:8px;"
+            f"padding:6px 12px;margin:6px 0 8px 0;display:flex;flex-wrap:wrap;align-items:center;gap:14px;'>"
+            f"<span style='font-weight:700;color:#00E676;font-size:13px;'>🧠 Superhuman</span>"
+            f"<span style='font-weight:800;color:{scores['colour']};font-size:14px;'>"
+            f"{scores['bias']} ({scores['composite']:+.0f})</span>"
+            f"<span style='color:#AAA;font-size:12px;'>{scores.get('clarity','')}</span>"
+            f"<span style='font-weight:800;color:{trig.get('colour','#FF9800')};font-size:13px;'>"
+            f"⚡ {trig.get('trigger','NO TRIGGER')}</span>"
+            f"<span style='color:#CCC;font-size:12px;'>{trig.get('summary','')}</span>"
+            f"<span style='color:#888;font-size:11px;margin-left:auto;'>"
+            f"L {trig.get('long_hits',0)}/5 · S {trig.get('short_hits',0)}/5</span>"
             f"</div>",
             unsafe_allow_html=True
         )
-
-        bias_col, score_col, action_col = st.columns([0.28, 0.18, 0.54])
-        with bias_col:
-            st.markdown(
-                f"<div style='font-size:15px;font-weight:700;color:{scores['colour']};'>"
-                f"{scores['bias']}</div>",
-                unsafe_allow_html=True
-            )
-        with score_col:
-            st.metric("Composite", f"{scores['composite']:+.0f}")
-        with action_col:
-            st.caption(scores["action"])
-
-        # Clarity message
-        st.caption(f"📌 {scores.get('clarity', '')}")
-
-        trig = scores.get("dir_trigger") or {}
-        t_col, t_hits = st.columns([0.62, 0.38])
-        with t_col:
-            st.markdown(
-                f"<div style='font-size:14px;font-weight:800;color:{trig.get('colour','#FF9800')};margin-top:4px;'>"
-                f"⚡ {trig.get('trigger', 'NO DIRECTIONAL TRIGGER')}</div>",
-                unsafe_allow_html=True
-            )
-            st.caption(trig.get("summary", ""))
-        with t_hits:
-            st.caption(f"Long checks {trig.get('long_hits', 0)}/5 · Short checks {trig.get('short_hits', 0)}/5")
         with st.expander("▼ Trigger · Decision tree · Intraday log", expanded=False):
             trig = scores.get("dir_trigger") or {}
             st.caption(
@@ -3855,49 +3837,41 @@ def live_dashboard_fragment():
                         f"<div class='micro-tip'>{tip}</div></div>"
                     )
                 chips = []
-                sc = f"SPOT {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else "SPOT —"
+                sc = f"NIFTY {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else "NIFTY —"
                 fc = f"FUT {fut_chg[0]:,.0f} {fut_chg[1]:+.0f} {fut_chg[2]:+.2f}%" if fut_chg else "FUT —"
-                bias_txt = ""
+                chips.append(_chip(
+                    f"{sc}<br>{fc}",
+                    "Index spot and near-month futures session open→close. GEX walls use spot; VWAP uses futures.",
+                    "#00E676" if (spot_chg and spot_chg[2] >= 0) else "#FF5252",
+                ))
                 if isinstance(scores, dict) and "error" not in scores:
-                    bias_txt = f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})"
-                tip1 = (
-                    f"<b>Superhuman decision</b><br>"
-                    f"{scores.get('clarity','') if isinstance(scores, dict) else ''}<br>"
-                    f"{scores.get('action','') if isinstance(scores, dict) else ''}<br>"
-                    f"Quiet + long γ → PIN<br>Big range + long γ → REVERSION<br>"
-                    f"Short γ / wall break → TREND<br>|C|≤15 → NO EDGE<br>else → MILD DIR"
-                )
-                body1 = f"{sc}<br>{fc}"
-                if bias_txt:
-                    body1 += f"<br>{bias_txt}"
-                col1 = scores.get("colour", "#00E676") if isinstance(scores, dict) else "#00E676"
-                chips.append(_chip(body1, tip1, col1))
-
+                    chips.append(_chip(
+                        f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})",
+                        f"<b>Superhuman</b><br>{scores.get('clarity','')}<br>{scores.get('action','')}<br>"
+                        f"Quiet + long γ → PIN<br>Big range + long γ → REVERSION<br>"
+                        f"Short γ / wall break → TREND<br>|C|≤15 → NO EDGE<br>else → MILD DIR",
+                        scores.get("colour", "#00E676"),
+                    ))
                 tname = (trig or {}).get("trigger", "NO TRIGGER")
-                tcol = (trig or {}).get("colour", "#FF9800")
                 tbits = []
                 for ch in (trig or {}).get("checks") or []:
                     side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
                     tbits.append(f"{ch.get('name','')} <b>{side}</b> · {ch.get('note','')}")
-                tip2 = (
-                    f"<b>{tname}</b><br>{(trig or {}).get('summary','')}<br><br>"
-                    + "<br>".join(tbits)
-                )
-                chips.append(_chip(tname, tip2, tcol))
-
+                chips.append(_chip(
+                    tname,
+                    f"<b>{tname}</b><br>{(trig or {}).get('summary','')}<br><br>" + "<br>".join(tbits),
+                    (trig or {}).get("colour", "#FF9800"),
+                ))
                 if micro.get("ok"):
                     act = micro["action"]
-                    body3 = (
+                    chips.append(_chip(
                         f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} "
-                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}"
-                        f"<br>{act}"
-                    )
-                    tip3 = (
-                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br><br>"
-                        f"<b>Algo action:</b> {act}"
-                    )
-                    chips.append(_chip(body3, tip3, "#00E676"))
+                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}<br>{act}",
+                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br><br><b>Algo action:</b> {act}",
+                        "#00E676",
+                    ))
                 st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+
                 render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
             else:
                 st.info("Futures / VWAP not available.")
