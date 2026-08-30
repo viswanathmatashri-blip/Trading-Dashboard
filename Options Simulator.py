@@ -82,13 +82,19 @@ div[data-baseweb="select"] > div { background-color: #1E222D !important; color: 
 .sticky-summary .stMetric { padding: 2px 0 !important; }
 .micro-hover { position: relative; display: inline-block; cursor: help; }
 .micro-hover .micro-tip {
-    display: none; position: absolute; left: 0; bottom: 128%;
-    z-index: 4000; width: 420px; max-width: 80vw;
+    display: none; position: absolute; right: 0; bottom: 112%;
+    z-index: 4000; width: 360px; max-width: 70vw;
     background: #1A1F2B; color: #FAFAFA; border: 1px solid #00E676;
-    border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.45;
+    border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.4;
     box-shadow: 0 8px 24px rgba(0,0,0,0.55);
 }
 .micro-hover:hover .micro-tip { display: block; }
+.micro-float {
+    position: relative; z-index: 25;
+    margin-top: -248px; margin-bottom: 168px;
+    margin-left: auto; margin-right: 6px;
+    width: 196px;
+}
 </style>
 """
 st.markdown(custom_css, unsafe_allow_html=True)
@@ -3819,12 +3825,6 @@ def live_dashboard_fragment():
                     snap_lines.append(f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})")
                     snap_lines.append(str((trig or {}).get("trigger", "NO TRIGGER")))
                 micro = classify_microstructure(dfi)
-                if micro.get("ok"):
-                    snap_lines.append(f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}")
-                    act = micro["action"]
-                    if len(act) > 34:
-                        act = act[:32] + "…"
-                    snap_lines.append(act)
                 y_pos = 0.46
                 for ln in snap_lines:
                     colr = "#FAFAFA"
@@ -3887,17 +3887,18 @@ def live_dashboard_fragment():
                     cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
                 st.caption(cap)
                 if micro.get("ok"):
+                    act = micro["action"]
                     st.markdown(
-                        f"<div class='micro-hover' style='margin:2px 0 8px 0;padding:6px 10px;"
-                        f"background:#151922;border:1px solid #2A2F3A;border-radius:6px;max-width:520px;'>"
-                        f"<span style='color:#00E676;font-weight:800;font-size:13px;'>"
+                        f"<div class='micro-float'><div class='micro-hover' "
+                        f"style='padding:6px 8px;background:rgba(21,25,34,0.92);"
+                        f"border:1px solid #2A2F3A;border-radius:6px;width:196px;'>"
+                        f"<div style='color:#00E676;font-weight:800;font-size:12px;line-height:1.2;'>"
                         f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} "
-                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}</span>"
-                        f"<span style='color:#FAFAFA;font-weight:700;font-size:12px;margin-left:10px;'>"
-                        f"{micro['action']}</span>"
+                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}</div>"
+                        f"<div style='color:#FAFAFA;font-weight:700;font-size:11px;line-height:1.25;margin-top:3px;'>"
+                        f"{act}</div>"
                         f"<div class='micro-tip'><b>Underlying Market Microstructure</b><br>"
-                        f"{micro['micro']}<br><br><b>Algo action:</b> {micro['action']}<br>"
-                        f"<span style='color:#AAA'>Hover off to hide. Price needs VWAP + z-score confirmation.</span>"
+                        f"{micro['micro']}<br><br><b>Algo action:</b> {act}</div>"
                         f"</div></div>",
                         unsafe_allow_html=True,
                     )
