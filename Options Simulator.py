@@ -1965,10 +1965,11 @@ def institutional_order_flow_scanner_fragment():
     st.markdown("---")
     hdr_l, hdr_r = st.columns([0.72, 0.28])
     with hdr_l:
-        st.markdown(
-            f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
-            f"🏛️ Institutional Order Flow ({Index_Name})</span>",
-            unsafe_allow_html=True
+        heading_ribbon(
+            f"🏛️ Institutional Order Flow ({Index_Name})",
+            "Flags strikes where premium (LTP×OI×lot) ≥ ₹10L or volume ≥ 500 lots.<br>"
+            "Unusual vol = session volume well above that strike’s typical print.<br>"
+            "Use as flow tape, not a standalone entry.",
         )
         st.caption("High-conviction flow · Premium ≥ ₹10L or Vol ≥ 500 lots")
     with hdr_r:
@@ -2537,7 +2538,12 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
 
     hm_c1, hm_c2 = st.columns([0.65, 0.35])
     with hm_c1:
-        st.subheader(f"🔥 Delta-Adjusted GEX Heatmap ({index_name})")
+        heading_ribbon(
+            f"🔥 Delta-Adjusted GEX Heatmap ({index_name})",
+            "Strike × session time. Each snapshot stores delta-adjusted GEX (OI) per strike.<br>"
+            "GEX_i × |Δ_i|. Green = long-gamma; red = short-gamma. Cyan = spot path.<br>"
+            "Enable Auto-Refresh so the band evolves instead of one snapshot painted all day.",
+        )
     with hm_c2:
         st.markdown(
             f"<div class='update-timestamp'>Expiry: {expiry_str} | Session: {session_date_str} | "
@@ -3221,26 +3227,20 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
     hist = update_liq_delta_history(snap, index_name) if snap.get("ok") else list(st.session_state.get("liq_delta_history") or [])
     hist = [h for h in hist if h.get("index", index_name) == index_name]
 
-    tcol, scol, kcol = st.columns([0.36, 0.42, 0.22])
-    with tcol:
-        heading_ribbon(
-            "📘 Limit Book Liquidity Δ",
-            "<b>Resting book size only</b> — not executed prints.<br>"
-            "ΔBid = BidQty_t − BidQty_t-1 · Net = ΔBid − ΔAsk<br>"
-            "A size drop can be a pull or a hit; the feed does not tag which.<br>"
-            "Absorption: bids restacked ≥ +kσ while price holds. Exhaustion: size pulled and price runs.",
-        )
-    with kcol:
-        st.session_state["liq_sigma_k"] = st.selectbox(
-            "σ flag", options=[1.5, 2.0], index=0,
-            format_func=lambda x: f"±{x}σ", key="liq_sigma_select",
-            label_visibility="collapsed",
-        )
-
     if not hist:
-        with scol:
-            st.caption("NO SIGNAL — need snapshots")
-        st.caption("No book snapshot yet. Enable Auto-Refresh.")
+        h1, h2 = st.columns([0.78, 0.22])
+        with h1:
+            heading_ribbon(
+                "📘 Limit Book Liquidity Δ",
+                "<b>Resting book size only</b> — not executed prints. ΔBid=Bid_t-Bid_t-1.",
+            )
+            st.caption("NO SIGNAL — need snapshots. Enable Auto-Refresh.")
+        with h2:
+            st.session_state["liq_sigma_k"] = st.selectbox(
+                "σ flag", options=[1.5, 2.0], index=0,
+                format_func=lambda x: f"±{x}σ", key="liq_sigma_select",
+                label_visibility="collapsed",
+            )
         return
 
     last = hist[-1]
@@ -3251,20 +3251,32 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
         float(last.get("ask_change") or 0),
         bid_s, ask_s, k=liq_k,
     )
-    with scol:
+    h1, h2, h3, h4, h5 = st.columns([0.26, 0.24, 0.16, 0.20, 0.14])
+    with h1:
+        heading_ribbon(
+            "📘 Limit Book Liquidity Δ",
+            "<b>Resting book size only</b> — not executed prints.<br>"
+            "ΔBid = BidQty_t − BidQty_t-1 · Net = ΔBid − ΔAsk<br>"
+            "A size drop can be a pull or a hit; the feed does not tag which.",
+        )
+    with h2:
+        st.caption(
+            f"Book Bid {last.get('bid_qty_lots', 0):,.0f} / Ask {last.get('ask_qty_lots', 0):,.0f}"
+        )
+    with h3:
+        st.caption(f"ΔBid {last.get('bid_change', 0):+.0f} · ΔAsk {last.get('ask_change', 0):+.0f}")
+    with h4:
         st.markdown(
-            f"<div style='border:1px solid {alert['color']};border-radius:6px;padding:4px 8px;'>"
-            f"<span style='color:{alert['color']};font-weight:800;font-size:12px;'>{alert['label']}</span>"
-            f"<span style='color:#AAA;font-size:11px;'> · {alert['hint']}</span></div>",
+            f"<div style='border:1px solid {alert['color']};border-radius:6px;padding:3px 8px;'>"
+            f"<span style='color:{alert['color']};font-weight:800;font-size:12px;'>{alert['label']}</span></div>",
             unsafe_allow_html=True
         )
-    m1, m2 = st.columns(2)
-    m1.metric("Bid Δ lots", f"{last.get('bid_change', 0):+.0f}")
-    m2.metric("Ask Δ lots", f"{last.get('ask_change', 0):+.0f}")
-    st.caption(
-        f"Book Bid {last.get('bid_qty_lots', 0):,.0f} | Ask {last.get('ask_qty_lots', 0):,.0f} lots"
-        f"  ·  Δ scale in lots"
-    )
+    with h5:
+        st.session_state["liq_sigma_k"] = st.selectbox(
+            "σ flag", options=[1.5, 2.0], index=0,
+            format_func=lambda x: f"±{x}σ", key="liq_sigma_select",
+            label_visibility="collapsed",
+        )
 
     times = [h["ts"].strftime("%H:%M:%S") if hasattr(h["ts"], "strftime") else str(h["ts"]) for h in hist]
     nets = [float(h.get("net_liq") or 0) for h in hist]
@@ -3630,7 +3642,7 @@ def live_dashboard_fragment():
         sigma_mult = 1.5
 
         with left_col:
-            fut_header_col, basis_col, band_col = st.columns([0.58, 0.22, 0.20])
+            fut_header_col, chip_col, basis_col, band_col = st.columns([0.40, 0.28, 0.16, 0.16])
             with fut_header_col:
                 expiry_txt = basis.get("fut_expiry", "N/A")
                 heading_ribbon(
@@ -3642,6 +3654,10 @@ def live_dashboard_fragment():
                     "POC = max bin. VA ±1σ / ±1.5σ = value area. HVN/LVN via prominence.",
                     13,
                 )
+            with chip_col:
+                heading_ribbon("OBV", "<b>OBV</b> = Σ sign(ΔClose)×Volume. Executed net volume.", 11)
+                heading_ribbon("EFI13", "<b>EFI13</b> = EMA13((C-prev)×V). Force / execution trigger.", 11)
+                heading_ribbon("CVD", "<b>CVD</b> = Σ V×(2(C-L)/(H-L)-1). Market-order-like proxy.", 11)
             with basis_col:
                 if basis.get("basis") is not None:
                     basis_color = "#00E676" if basis["basis"] >= 0 else "#FF5252"
@@ -3692,6 +3708,26 @@ def live_dashboard_fragment():
                 vp = compute_session_volume_profile(df_fchart, bin_step=5.0, prominence_factor=0.35)
 
                 dfi = df_fchart.copy().reset_index(drop=True)
+                dfi["spot_px"] = np.nan
+                df_sp = data.get("df_candles")
+                if df_sp is not None and not getattr(df_sp, "empty", True) and "close" in df_sp.columns:
+                    try:
+                        sp = df_sp.copy()
+                        sp["time"] = pd.to_datetime(sp["time"], utc=True, errors="coerce")
+                        if getattr(sp["time"].dt, "tz", None) is not None:
+                            sp["time"] = sp["time"].dt.tz_convert("Asia/Kolkata")
+                        sp["tmin"] = sp["time"].dt.floor("min")
+                        tmp = dfi.copy()
+                        tmp["tmin"] = pd.to_datetime(tmp["time"], utc=True, errors="coerce")
+                        if getattr(tmp["tmin"].dt, "tz", None) is not None:
+                            tmp["tmin"] = tmp["tmin"].dt.tz_convert("Asia/Kolkata")
+                        tmp["tmin"] = tmp["tmin"].dt.floor("min")
+                        merged = tmp.merge(sp[["tmin", "close"]].rename(columns={"close": "spot_px"}), on="tmin", how="left")
+                        dfi["spot_px"] = pd.to_numeric(merged["spot_px"], errors="coerce")
+                    except Exception:
+                        pass
+                if dfi["spot_px"].isna().all() and data.get("spot_price"):
+                    dfi["spot_px"] = float(data["spot_price"])
                 close = dfi["close"].astype(float)
                 vol = dfi["volume"].astype(float)
                 direction = np.sign(close.diff().fillna(0.0))
@@ -3727,10 +3763,27 @@ def live_dashboard_fragment():
                     fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
-                    line=dict(color="#FF9800", width=2)), row=1, col=1)
+                    line=dict(color="#FF9800", width=2),
+                    hovertemplate="VWAP %{y:.1f}<extra></extra>"), row=1, col=1)
+                cd = np.column_stack([
+                    dfi["vwap"].astype(float).values,
+                    dfi["spot_px"].astype(float).values,
+                ])
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
-                    line=dict(color="#2196F3", width=2)), row=1, col=1)
+                    line=dict(color="#2196F3", width=2),
+                    customdata=cd,
+                    hovertemplate="Fut %{y:.1f}<br>VWAP %{customdata[0]:.1f}<br>NIFTY %{customdata[1]:.1f}<extra></extra>",
+                ), row=1, col=1)
+                last_fut = float(dfi["close"].iloc[-1])
+                last_sp = dfi["spot_px"].iloc[-1]
+                last_sp = float(last_sp) if pd.notna(last_sp) else float(data.get("spot_price") or 0)
+                fig_stack.add_annotation(
+                    x=dfi["time_str"].iloc[-1], y=last_fut,
+                    text=f"{last_fut:.0f} ({last_sp:.0f})",
+                    showarrow=False, xanchor="left", font=dict(size=11, color="#00E676"),
+                    row=1, col=1,
+                )
                 if vp.get("ok"):
                     mids, vols, colors = [], [], []
                     for m, v in zip(vp["mids"], vp["vol"]):
@@ -3813,16 +3866,6 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
-                r_obv, r_efi, r_cvd = st.columns(3)
-                with r_obv:
-                    heading_ribbon("OBV",
-                        "<b>OBV</b> = Σ sign(ΔClose) × Volume<br>Executed net volume (prints that move the close).", 12)
-                with r_efi:
-                    heading_ribbon("EFI13",
-                        "<b>EFI(13)</b> = EMA13((Close-prev)×Volume)<br>Elder Force. Playbook execution trigger.", 12)
-                with r_cvd:
-                    heading_ribbon("CVD",
-                        "<b>CVD</b> = Σ Volume × (2(C-L)/(H-L) - 1)<br>Market-order-like bar proxy. Not tick CVD.", 12)
                 st.plotly_chart(fig_stack, use_container_width=True)
                 cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
                 if vp.get("ok"):
