@@ -80,6 +80,15 @@ div[data-baseweb="select"] > div { background-color: #1E222D !important; color: 
     box-shadow: 0 2px 8px rgba(0,0,0,0.45);
 }
 .sticky-summary .stMetric { padding: 2px 0 !important; }
+.micro-hover { position: relative; display: inline-block; cursor: help; }
+.micro-hover .micro-tip {
+    display: none; position: absolute; left: 0; bottom: 128%;
+    z-index: 4000; width: 420px; max-width: 80vw;
+    background: #1A1F2B; color: #FAFAFA; border: 1px solid #00E676;
+    border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.45;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.55);
+}
+.micro-hover:hover .micro-tip { display: block; }
 </style>
 """
 st.markdown(custom_css, unsafe_allow_html=True)
@@ -3433,6 +3442,16 @@ def live_dashboard_fragment():
                     for e in decision_log[-8:]:
                         st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
 
+        with st.expander("▼ Micro Playbook (81 states)", expanded=False):
+            rows = ["| # | P | EFI | CVD | OBV | Microstructure | Action |",
+                    "|---|---|---|---|---|---|---|"]
+            for i, (k, v) in enumerate(MICRO_PLAYBOOK.items(), 1):
+                g = [ARROW_GLYPH[x] for x in k]
+                mark = ""
+                rows.append(f"| {i} | {g[0]} | {g[1]} | {g[2]} | {g[3]} | {v[0]} | {v[1]} |")
+            st.markdown("\n".join(rows))
+            st.caption("P=Price (fut vs VWAP + z). Arrows need EMA + z ≥ 0.9 vs own noise.")
+
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
             c1, c2 = st.columns(2)
@@ -3867,6 +3886,21 @@ def live_dashboard_fragment():
                 if vp.get("ok"):
                     cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
                 st.caption(cap)
+                if micro.get("ok"):
+                    st.markdown(
+                        f"<div class='micro-hover' style='margin:2px 0 8px 0;padding:6px 10px;"
+                        f"background:#151922;border:1px solid #2A2F3A;border-radius:6px;max-width:520px;'>"
+                        f"<span style='color:#00E676;font-weight:800;font-size:13px;'>"
+                        f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} "
+                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}</span>"
+                        f"<span style='color:#FAFAFA;font-weight:700;font-size:12px;margin-left:10px;'>"
+                        f"{micro['action']}</span>"
+                        f"<div class='micro-tip'><b>Underlying Market Microstructure</b><br>"
+                        f"{micro['micro']}<br><br><b>Algo action:</b> {micro['action']}<br>"
+                        f"<span style='color:#AAA'>Hover off to hide. Price needs VWAP + z-score confirmation.</span>"
+                        f"</div></div>",
+                        unsafe_allow_html=True,
+                    )
                 render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
             else:
                 st.info("Futures / VWAP not available.")
