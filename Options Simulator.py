@@ -725,6 +725,18 @@ def classify_microstructure(dfi: pd.DataFrame) -> dict:
     }
 
 
+
+def heading_ribbon(title: str, tip_html: str, size: int = 13):
+    """Compact hoverable chart-title ribbon."""
+    st.markdown(
+        f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
+        f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;margin:0 0 4px 0;'>"
+        f"<span style='font-weight:700;color:#00E676;font-size:{size}px;'>{title}</span>"
+        f"<div class='micro-tip'>{tip_html}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
     """Long/short trigger from GEX location, VWAP, OBV, CVD, EFI."""
     levels = data.get("levels", {}) or {}
@@ -1894,7 +1906,8 @@ def zscore_analysis_fragment(mode="full"):
             return 'background-color: #b3ffb3; color: black;'
 
     if mode in ("highlights", "full"):
-        st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>📊 Z-Scores ({Index_Name})</span>", unsafe_allow_html=True)
+        heading_ribbon(f"📊 Z-Scores ({Index_Name})",
+            "z = (x − μ) / σ over the lookback window. Used for unusual OI/volume and index z.")
         st.caption("HV + Futures Volume Z")
         enable_z_ref = st.checkbox("Auto-Refresh 5 min", value=st.session_state["enable_zscore_refresh"], key="cb_zscore_refresh")
         if enable_z_ref != st.session_state["enable_zscore_refresh"]:
@@ -2714,7 +2727,8 @@ def _compute_basket_live_totals(data: dict):
 
 def render_basket_metrics_block(data: dict):
     """Compact P&L / Greeks metrics only (for left of Z-Scores under alerts)."""
-    st.markdown("<span style='font-weight:700;color:#00E676;font-size:13px;'>🧺 Basket Greeks</span>", unsafe_allow_html=True)
+    heading_ribbon("🧺 Basket Greeks",
+            "Sum of Δ, Γ, Θ, Vega across strategy legs × qty × lot. Net exposure of the basket.")
     totals, _ = _compute_basket_live_totals(data)
     if totals is None:
         st.caption("No legs – add from sidebar")
@@ -2734,7 +2748,8 @@ def render_basket_table_fullwidth(data: dict):
         return
 
     st.markdown("---")
-    st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>🧺 Strategy Basket – Legs</span>", unsafe_allow_html=True)
+    heading_ribbon("🧺 Strategy Basket – Legs",
+            "Each listed option leg with strike, type, side, qty. Greeks from BS on live LTP / IV.")
     df_b = pd.DataFrame(calculated_legs)
     tbl_c, del_c = st.columns([0.92, 0.08])
     with tbl_c:
@@ -3201,10 +3216,22 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
     """Middle panel: futures limit-book liquidity delta + imbalance alerts."""
     tcol, kcol = st.columns([0.62, 0.38])
     with tcol:
-        st.markdown(
-            "<span style='font-weight:700;color:#00E676;font-size:13px;'>"
-            "📘 Limit Book Liquidity Δ</span>",
-            unsafe_allow_html=True
+        heading_ribbon(
+            "📘 Limit Book Liquidity Δ",
+            "<b>What it measures</b><br>"
+            "Snapshot-to-snapshot change in <b>displayed</b> futures bid/ask size "
+            "(depth on the book), in lots.<br>"
+            "ΔBid = BidQty<sub>t</sub> − BidQty<sub>t-1</sub><br>"
+            "ΔAsk = AskQty<sub>t</sub> − AskQty<sub>t-1</sub><br>"
+            "Net = ΔBid − ΔAsk<br><br>"
+            "<b>Pulled vs executed?</b><br>"
+            "This panel is <b>resting limit size only</b>. It does <b>not</b> count prints. "
+            "A drop in bid size can be a pull <i>or</i> a hit that took the bid — SmartAPI depth "
+            "does not tag which.<br>"
+            "<b>Absorption</b> is inferred when bid size is restacked (≥ +kσ) while price holds.<br>"
+            "<b>Exhaustion</b> is inferred when size is pulled (≥ +kσ on the opposite side) "
+            "and price starts to run.<br>"
+            "Printed flow is the separate futures CVD (market-like volume proxy).",
         )
     with kcol:
         st.session_state["liq_sigma_k"] = st.selectbox(
@@ -3500,7 +3527,8 @@ def live_dashboard_fragment():
 
     chart_head_col, tf_col = st.columns([0.75, 0.25])
     with chart_head_col:
-        st.markdown("<span style='font-weight:700;color:#00E676;font-size:15px;'>📈 Underlying Technicals</span>", unsafe_allow_html=True)
+        heading_ribbon("📈 Underlying Technicals",
+            "Spot + Bollinger (20,2). MACD 12/26/9. RSI 14. Squeeze = BB width ≤ 20th percentile of last 20 bars.")
     with tf_col:
         selected_tf = st.selectbox("TF", ["1 min", "3 min", "5 min", "15 min"],
                                    index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"]),
@@ -3642,10 +3670,14 @@ def live_dashboard_fragment():
             fut_header_col, basis_col, band_col = st.columns([0.58, 0.22, 0.20])
             with fut_header_col:
                 expiry_txt = basis.get("fut_expiry", "N/A")
-                st.markdown(
-                    f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
-                    f"📉 Near-Month Futures + VWAP + VP ({expiry_txt})</span>",
-                    unsafe_allow_html=True
+                heading_ribbon(
+                    f"📉 Near-Month Futures + VWAP + VP ({expiry_txt})",
+                    "<b>Futures</b> last traded price of the near-month contract.<br>"
+                    "<b>VWAP</b> = Σ(TypicalPrice × Volume) / Σ Volume, session reset.<br>"
+                    "TypicalPrice = (H+L+C)/3. Real futures volume (index has none).<br>"
+                    "<b>Volume profile</b> = volume histogram by 5-pt price bin. "
+                    "POC = max bin. VA ±1σ / ±1.5σ = value area. HVN/LVN via prominence.",
+                    13,
                 )
             with basis_col:
                 if basis.get("basis") is not None:
@@ -3826,6 +3858,20 @@ def live_dashboard_fragment():
                 if vp.get("ok"):
                     cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
                 st.caption(cap)
+                heading_ribbon(
+                    "OBV · EFI13 · CVD",
+                    "<b>OBV</b> = Σ sign(ΔClose) × Volume<br>"
+                    "Executed net volume (market + any print that moves the close). "
+                    "Green above 0 / MA20 = persistent buying.<br><br>"
+                    "<b>EFI(13)</b> = EMA<sub>13</sub>((Close − Close<sub>prev</sub>) × Volume)<br>"
+                    "Elder's Force Index. Sign = direction of last push × size. "
+                    "Execution trigger in the playbook.<br><br>"
+                    "<b>CVD (futures proxy)</b> = Σ Volume × (2×(C−L)/(H−L) − 1)<br>"
+                    "Bar-close location inside the range — a <b>market-order-like</b> proxy. "
+                    "SmartAPI has no bid/ask tape, so this is not true tick CVD. "
+                    "Close near high → +delta (buyers lifted offers).",
+                    12,
+                )
                 def _chip(body, tip, color="#00E676"):
                     return (
                         f"<div class='micro-hover micro-chip'>"
@@ -3873,7 +3919,14 @@ def live_dashboard_fragment():
                 st.info("Futures / VWAP not available.")
 
         with right_col:
-            st.markdown("<span style='font-weight:700;color:#00E676;font-size:13px;'>📈 GEX vs OI</span>", unsafe_allow_html=True)
+            heading_ribbon(
+                "📈 GEX vs OI / Volume",
+                "<b>GEX (OI)</b> = (Call_γ − Put_γ) × OI × lot × S² × 0.01<br>"
+                "Dealer gamma inventory from open interest. Positive GEX = long-gamma pin.<br>"
+                "<b>GEX (Volume)</b> same formula with session trade volume instead of OI — "
+                "today’s printed flow, not overnight positioning.<br>"
+                "Call OI/Vol up, Put OI/Vol down on the same strike axis. Zero lines aligned.",
+            )
             if not df_chain.empty and lvls:
                 gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
                 fig_gex = make_subplots(
@@ -3917,10 +3970,12 @@ def live_dashboard_fragment():
                 fig_gex.update_yaxes(range=v2, secondary_y=True, row=2, col=1, showgrid=False)
                 fig_gex.update_annotations(font_size=11)
                 st.plotly_chart(fig_gex, use_container_width=True)
-                st.markdown(
-                    f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
-                    f"🎯 Δ-GEX (OI) — {selected_expiry_str}</span>",
-                    unsafe_allow_html=True
+                heading_ribbon(
+                    f"🎯 Δ-GEX (OI) — {selected_expiry_str}",
+                    "<b>Delta-adjusted GEX (OI)</b><br>"
+                    "GEX_i × |Δ_i| so far OTM wings are down-weighted.<br>"
+                    "Expiry = selected chain only. Built from <b>OI</b>, not trade volume.<br>"
+                    "Flip line = zero-gamma strike.",
                 )
                 delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
                 fig_delta_gex = plt_go.Figure()
@@ -3950,7 +4005,12 @@ def live_dashboard_fragment():
             st.markdown("---")
             d_left, d_right = st.columns([0.40, 0.60])
             with d_left:
-                st.markdown("<span style='font-weight:700;color:#00E676;font-size:14px;'>⚡ VEX / CEX Profile</span>", unsafe_allow_html=True)
+                heading_ribbon(
+                    "⚡ VEX / CEX Profile",
+                    "<b>VEX (vanna)</b> ≈ −pdf(d1)×d2/σ × OI × lot — dealer vanna vs spot/IV.<br>"
+                    "<b>CEX (charm)</b> ≈ ∂Δ/∂t × OI × lot — delta decay into expiry.<br>"
+                    "Positive vanna/charm often supports a pin; large negative supports acceleration.",
+                )
                 fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
                 fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20), secondary_y=False)
                 fig_vex_cex.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4)), secondary_y=True)
@@ -3977,7 +4037,9 @@ def live_dashboard_fragment():
             st.markdown("---")
             skew_col, z_col = st.columns([0.50, 0.50])
             with skew_col:
-                st.markdown(f"<span style='font-weight:700;color:#00E676;font-size:14px;'>📉 IV Skew ({selected_expiry_str})</span>", unsafe_allow_html=True)
+                heading_ribbon(f"📉 IV Skew ({selected_expiry_str})",
+            "IV from LTP via Black-Scholes (Brent). OTM tab = puts below spot + calls at/above. "
+            "Raw tab = full CE and PE IV curves. VIX tab = India VIX 5-min, last 3 sessions.")
                 smart_api = get_smart_api_client()
                 if smart_api and not df_master.empty:
                     latest_spot = data["spot_price"]
