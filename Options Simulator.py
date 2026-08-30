@@ -3816,45 +3816,7 @@ def live_dashboard_fragment():
                 spot_chg = _sess_chg(data.get("df_candles"))
                 fut_chg = _sess_chg(df_fchart if not df_fchart.empty else data.get("df_futures"))
                 trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
-                snap_lines = []
-                if spot_chg:
-                    snap_lines.append(f"SPOT {spot_chg[0]:,.0f}  {spot_chg[1]:+.0f}  {spot_chg[2]:+.2f}%")
-                if fut_chg:
-                    snap_lines.append(f"FUT  {fut_chg[0]:,.0f}  {fut_chg[1]:+.0f}  {fut_chg[2]:+.2f}%")
-                if isinstance(scores, dict) and "error" not in scores:
-                    snap_lines.append(f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})")
-                    snap_lines.append(str((trig or {}).get("trigger", "NO TRIGGER")))
                 micro = classify_microstructure(dfi)
-                y_pos = 0.46
-                for ln in snap_lines:
-                    colr = "#FAFAFA"
-                    try:
-                        if ln.split()[-1].endswith("%"):
-                            pct = float(ln.split()[-1].replace("%", ""))
-                            colr = "#00E676" if pct >= 0 else "#FF5252"
-                    except Exception:
-                        pass
-                    if "LONG TRIGGER" in ln:
-                        colr = "#00E676"
-                    elif "SHORT TRIGGER" in ln:
-                        colr = "#FF5252"
-                    elif "no fire" in ln.lower() or "NO DIRECTIONAL" in ln or "NO TRIGGER" in ln:
-                        colr = "#FF9800"
-                    elif isinstance(scores, dict) and scores.get("bias") and scores.get("bias") in ln:
-                        colr = scores.get("colour", "#00E676")
-                    fig_stack.add_annotation(
-                        xref="paper", yref="paper", x=0.855, y=y_pos,
-                        text=ln, showarrow=False, align="left", xanchor="left",
-                        font=dict(size=11, color=colr, family="Arial"),
-                    )
-                    y_pos -= 0.055
-                if micro.get("ok"):
-                    fig_stack.add_trace(plt_go.Scatter(
-                        x=[dfi["time_str"].iloc[-1]], y=[float(dfi["cvd"].iloc[-1])],
-                        mode="markers", marker=dict(size=14, color="rgba(0,0,0,0)"),
-                        showlegend=False, name="tape",
-                        hovertemplate=micro["hover"] + "<extra></extra>",
-                    ), row=4, col=1)
 
                 xr = [-0.5, max(len(fut_times) - 0.5, 0.5)]
                 fig_stack.update_layout(
@@ -3886,22 +3848,56 @@ def live_dashboard_fragment():
                 if vp.get("ok"):
                     cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
                 st.caption(cap)
+                def _chip(body, tip, color="#00E676"):
+                    return (
+                        f"<div class='micro-hover micro-chip'>"
+                        f"<div style='color:{color};font-weight:800;font-size:11px;line-height:1.25;text-align:center;'>{body}</div>"
+                        f"<div class='micro-tip'>{tip}</div></div>"
+                    )
+                chips = []
+                sc = f"SPOT {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else "SPOT —"
+                fc = f"FUT {fut_chg[0]:,.0f} {fut_chg[1]:+.0f} {fut_chg[2]:+.2f}%" if fut_chg else "FUT —"
+                bias_txt = ""
+                if isinstance(scores, dict) and "error" not in scores:
+                    bias_txt = f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})"
+                tip1 = (
+                    f"<b>Superhuman decision</b><br>"
+                    f"{scores.get('clarity','') if isinstance(scores, dict) else ''}<br>"
+                    f"{scores.get('action','') if isinstance(scores, dict) else ''}<br>"
+                    f"Quiet + long γ → PIN<br>Big range + long γ → REVERSION<br>"
+                    f"Short γ / wall break → TREND<br>|C|≤15 → NO EDGE<br>else → MILD DIR"
+                )
+                body1 = f"{sc}<br>{fc}"
+                if bias_txt:
+                    body1 += f"<br>{bias_txt}"
+                col1 = scores.get("colour", "#00E676") if isinstance(scores, dict) else "#00E676"
+                chips.append(_chip(body1, tip1, col1))
+
+                tname = (trig or {}).get("trigger", "NO TRIGGER")
+                tcol = (trig or {}).get("colour", "#FF9800")
+                tbits = []
+                for ch in (trig or {}).get("checks") or []:
+                    side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
+                    tbits.append(f"{ch.get('name','')} <b>{side}</b> · {ch.get('note','')}")
+                tip2 = (
+                    f"<b>{tname}</b><br>{(trig or {}).get('summary','')}<br><br>"
+                    + "<br>".join(tbits)
+                )
+                chips.append(_chip(tname, tip2, tcol))
+
                 if micro.get("ok"):
                     act = micro["action"]
-                    st.markdown(
-                        f"<div class='micro-float'><div class='micro-hover' "
-                        f"style='padding:6px 8px;background:rgba(21,25,34,0.92);"
-                        f"border:1px solid #2A2F3A;border-radius:6px;width:196px;'>"
-                        f"<div style='color:#00E676;font-weight:800;font-size:12px;line-height:1.2;'>"
+                    body3 = (
                         f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} "
-                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}</div>"
-                        f"<div style='color:#FAFAFA;font-weight:700;font-size:11px;line-height:1.25;margin-top:3px;'>"
-                        f"{act}</div>"
-                        f"<div class='micro-tip'><b>Underlying Market Microstructure</b><br>"
-                        f"{micro['micro']}<br><br><b>Algo action:</b> {act}</div>"
-                        f"</div></div>",
-                        unsafe_allow_html=True,
+                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}"
+                        f"<br>{act}"
                     )
+                    tip3 = (
+                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br><br>"
+                        f"<b>Algo action:</b> {act}"
+                    )
+                    chips.append(_chip(body3, tip3, "#00E676"))
+                st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
                 render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
             else:
                 st.info("Futures / VWAP not available.")
