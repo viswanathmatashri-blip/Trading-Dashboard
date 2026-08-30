@@ -80,20 +80,27 @@ div[data-baseweb="select"] > div { background-color: #1E222D !important; color: 
     box-shadow: 0 2px 8px rgba(0,0,0,0.45);
 }
 .sticky-summary .stMetric { padding: 2px 0 !important; }
-.micro-hover { position: relative; display: inline-block; cursor: help; }
+.micro-hover { position: relative; display: block; cursor: help; }
 .micro-hover .micro-tip {
-    display: none; position: absolute; right: 0; bottom: 112%;
-    z-index: 4000; width: 360px; max-width: 70vw;
+    display: none; position: absolute; left: 104%; top: 0;
+    z-index: 4000; width: 340px; max-width: 42vw;
     background: #1A1F2B; color: #FAFAFA; border: 1px solid #00E676;
     border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.4;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.55);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.55); text-align: left;
 }
 .micro-hover:hover .micro-tip { display: block; }
 .micro-float {
     position: relative; z-index: 25;
-    margin-top: -248px; margin-bottom: 168px;
-    margin-left: auto; margin-right: 6px;
-    width: 196px;
+    margin-top: -272px; margin-bottom: 92px;
+    margin-left: auto; margin-right: 4px;
+    width: 218px; text-align: center;
+}
+.micro-chip {
+    display: block; margin: 0 auto 6px auto; padding: 6px 8px;
+    background: #1A1F2B;
+    border: 1px solid #3A4150; border-radius: 8px;
+    width: 218px; text-align: center;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.35);
 }
 </style>
 """
@@ -3335,17 +3342,6 @@ def live_dashboard_fragment():
     straddle_val = lvls.get("Straddle_Cost", 0)
     c8.metric("Straddle", f"₹{straddle_val:.0f}" if straddle_val else "–")
 
-    # Transparency: what is Net GEX?
-    with st.expander("?  What is Net GEX (OI)?", expanded=False):
-        expiry_shown = data.get("selected_expiry") or "selected expiry"
-        st.caption(
-            "**Net GEX (OI)** = sum(Call gamma * OI - Put gamma * OI) * lot * spot^2 * 0.01\n"
-            "• Built from **Open Interest**, not trade volume\n"
-            f"• Expiry: **{expiry_shown}**\n"
-            "• Per-strike bar chart uses **Delta-Adjusted GEX (OI)** (each wing weighted by its delta)\n"
-            "• Superhuman **Gamma Regime** uses this same OI-based Net GEX total"
-        )
-
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ========== SUPERHUMAN DECISION ENGINE ==========
@@ -3833,7 +3829,7 @@ def live_dashboard_fragment():
                 def _chip(body, tip, color="#00E676"):
                     return (
                         f"<div class='micro-hover micro-chip'>"
-                        f"<div style='color:{color};font-weight:800;font-size:11px;line-height:1.25;text-align:center;'>{body}</div>"
+                        f"<div style='color:{color};font-weight:800;font-size:12px;line-height:1.3;text-align:center;'>{body}</div>"
                         f"<div class='micro-tip'>{tip}</div></div>"
                     )
                 chips = []
