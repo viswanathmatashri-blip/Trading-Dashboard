@@ -3214,24 +3214,21 @@ def classify_liq_alert(bid_change: float, ask_change: float, bid_sigma=None, ask
 
 def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name: str, compact: bool = False):
     """Middle panel: futures limit-book liquidity delta + imbalance alerts."""
-    tcol, kcol = st.columns([0.62, 0.38])
+    basis = data.get("basis_info") or {}
+    fut_token = basis.get("fut_token")
+    smart_api = get_smart_api_client()
+    snap = fetch_futures_book_snapshot(smart_api, index_name, fut_token) if smart_api else {"ok": False}
+    hist = update_liq_delta_history(snap, index_name) if snap.get("ok") else list(st.session_state.get("liq_delta_history") or [])
+    hist = [h for h in hist if h.get("index", index_name) == index_name]
+
+    tcol, scol, kcol = st.columns([0.36, 0.42, 0.22])
     with tcol:
         heading_ribbon(
             "📘 Limit Book Liquidity Δ",
-            "<b>What it measures</b><br>"
-            "Snapshot-to-snapshot change in <b>displayed</b> futures bid/ask size "
-            "(depth on the book), in lots.<br>"
-            "ΔBid = BidQty<sub>t</sub> − BidQty<sub>t-1</sub><br>"
-            "ΔAsk = AskQty<sub>t</sub> − AskQty<sub>t-1</sub><br>"
-            "Net = ΔBid − ΔAsk<br><br>"
-            "<b>Pulled vs executed?</b><br>"
-            "This panel is <b>resting limit size only</b>. It does <b>not</b> count prints. "
-            "A drop in bid size can be a pull <i>or</i> a hit that took the bid — SmartAPI depth "
-            "does not tag which.<br>"
-            "<b>Absorption</b> is inferred when bid size is restacked (≥ +kσ) while price holds.<br>"
-            "<b>Exhaustion</b> is inferred when size is pulled (≥ +kσ on the opposite side) "
-            "and price starts to run.<br>"
-            "Printed flow is the separate futures CVD (market-like volume proxy).",
+            "<b>Resting book size only</b> — not executed prints.<br>"
+            "ΔBid = BidQty_t − BidQty_t-1 · Net = ΔBid − ΔAsk<br>"
+            "A size drop can be a pull or a hit; the feed does not tag which.<br>"
+            "Absorption: bids restacked ≥ +kσ while price holds. Exhaustion: size pulled and price runs.",
         )
     with kcol:
         st.session_state["liq_sigma_k"] = st.selectbox(
@@ -3240,15 +3237,10 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
             label_visibility="collapsed",
         )
 
-    basis = data.get("basis_info") or {}
-    fut_token = basis.get("fut_token")
-    smart_api = get_smart_api_client()
-    snap = fetch_futures_book_snapshot(smart_api, index_name, fut_token) if smart_api else {"ok": False}
-    hist = update_liq_delta_history(snap, index_name) if snap.get("ok") else list(st.session_state.get("liq_delta_history") or [])
-    hist = [h for h in hist if h.get("index", index_name) == index_name]
-
     if not hist:
-        st.caption("No book snapshot yet. Enable Auto-Refresh — needs futures FULL depth.")
+        with scol:
+            st.caption("NO SIGNAL — need snapshots")
+        st.caption("No book snapshot yet. Enable Auto-Refresh.")
         return
 
     last = hist[-1]
@@ -3259,17 +3251,19 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
         float(last.get("ask_change") or 0),
         bid_s, ask_s, k=liq_k,
     )
-    st.markdown(
-        f"<div style='border:1px solid {alert['color']};border-radius:6px;padding:6px 8px;margin-bottom:6px;'>"
-        f"<span style='color:{alert['color']};font-weight:800;font-size:12px;'>{alert['label']}</span><br>"
-        f"<span style='color:#AAA;font-size:11px;'>{alert['hint']}</span></div>",
-        unsafe_allow_html=True
-    )
+    with scol:
+        st.markdown(
+            f"<div style='border:1px solid {alert['color']};border-radius:6px;padding:4px 8px;'>"
+            f"<span style='color:{alert['color']};font-weight:800;font-size:12px;'>{alert['label']}</span>"
+            f"<span style='color:#AAA;font-size:11px;'> · {alert['hint']}</span></div>",
+            unsafe_allow_html=True
+        )
     m1, m2 = st.columns(2)
     m1.metric("Bid Δ lots", f"{last.get('bid_change', 0):+.0f}")
     m2.metric("Ask Δ lots", f"{last.get('ask_change', 0):+.0f}")
     st.caption(
         f"Book Bid {last.get('bid_qty_lots', 0):,.0f} | Ask {last.get('ask_qty_lots', 0):,.0f} lots"
+        f"  ·  Δ scale in lots"
     )
 
     times = [h["ts"].strftime("%H:%M:%S") if hasattr(h["ts"], "strftime") else str(h["ts"]) for h in hist]
@@ -3295,7 +3289,7 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
         title=None,
     )
     fig.update_xaxes(type="category", nticks=5, tickfont=dict(size=8))
-    fig.update_yaxes(title="lots", tickfont=dict(size=9))
+    fig.update_yaxes(title="", tickfont=dict(size=9))
     st.plotly_chart(fig, use_container_width=True)
     if bid_s and ask_s:
         st.caption(f"Flag at ±{liq_k:g}σ · bid σ={bid_s:.0f} ask σ={ask_s:.0f} lots")
@@ -3454,68 +3448,37 @@ def live_dashboard_fragment():
                         st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
 
         with st.expander("▼ Micro Playbook (81 states)", expanded=False):
-            rows = ["| # | P | EFI | CVD | OBV | Microstructure | Action |",
-                    "|---|---|---|---|---|---|---|"]
-            for i, (k, v) in enumerate(MICRO_PLAYBOOK.items(), 1):
-                g = [ARROW_GLYPH[x] for x in k]
-                mark = ""
-                rows.append(f"| {i} | {g[0]} | {g[1]} | {g[2]} | {g[3]} | {v[0]} | {v[1]} |")
-            st.markdown("\n".join(rows))
-            st.caption("P=Price (fut vs VWAP + z). Arrows need EMA + z ≥ 0.9 vs own noise.")
+            items = list(MICRO_PLAYBOOK.items())
+            cols = st.columns(3)
+            for ci, col in enumerate(cols):
+                chunk = items[ci * 27:(ci + 1) * 27]
+                rows = ["| # | P EFI CVD OBV | Micro · Action |", "|---|---|---|"]
+                for i, (k, v) in enumerate(chunk, start=ci * 27 + 1):
+                    g = "".join(ARROW_GLYPH[x] for x in k)
+                    rows.append(f"| {i} | {g} | {v[0]} — {v[1]} |")
+                with col:
+                    st.markdown(chr(10).join(rows))
+            st.caption("P=fut vs VWAP + z. EFI/CVD/OBV need EMA + z>=0.9.")
 
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
-            c1, c2 = st.columns(2)
-
-            with c1:
-                st.markdown("**Gamma Regime**")
-                st.metric("", f"{scores['gamma_regime_score']:+.0f}", label_visibility="collapsed")
-                st.caption(
-                    f"OI Net GEX Rs {scores['total_delta_gex_cr']:.0f} Cr (not trade volume)  \n"
-                    f"sum(Call_g - Put_g) * OI * lot * spot^2 * 0.01  \n"
-                    f"Expiry: selected chain | DTE={scores.get('dte', '-')} scaled  \n"
-                    f"+ Long gamma -> Non-dir | - Short gamma -> Dir"
-                )
-
-                st.markdown("**Expected vs Realised**")
-                st.metric("", f"{scores['move_score']:+.0f}", label_visibility="collapsed")
-                st.caption(
-                    f"Expected {scores['expected_move_pct']:.2f}% vs Realised {scores['realised_range_pct']:.2f}%  \n"
-                    f"({scores.get('move_context', '')})  \n"
-                    f"+ Straddle rich -> Non-dir | - Big move -> Dir"
-                )
-
-                st.markdown("**Charm / Vanna Flow**")
-                st.metric("", f"{scores['flow_score']:+.0f}", label_visibility="collapsed")
-                st.caption(
-                    f"Soft tanh(VEX + CEX) scaled to +/-85  \n"
-                    f"+ Supports pin -> Non-dir | - Supports accel -> Dir"
-                )
-
-            with c2:
-                st.markdown("**OR vs GEX Walls**")
-                st.metric("", f"{scores['or_score']:+.0f}", label_visibility="collapsed")
-                or_txt = f"{scores['or_low']:.0f}-{scores['or_high']:.0f}" if scores.get('or_low') is not None else "N/A"
-                st.caption(
-                    f"OR {or_txt} vs Walls  \n"
-                    f"Time-of-day factor {scores.get('tod_factor', 1):.2f}  \n"
-                    f"+ Inside walls -> Non-dir | - Break -> Dir"
-                )
-
-                st.markdown("**Distance to Flip**")
-                st.metric("", f"{scores.get('flip_score', 0):+.0f}", label_visibility="collapsed")
-                st.caption(
-                    f"Spot vs Flip distance {scores.get('dist_to_flip_pct', 0):.3f}%  \n"
-                    f"Close + long gamma -> pin bonus | Far + short gamma -> accel  \n"
-                    f"Weight 10%"
-                )
-
-                st.markdown("**Composite**")
-                st.metric("", f"{scores['composite']:+.0f}", label_visibility="collapsed")
-                st.caption(
-                    f"0.38*Gamma + 0.22*Move + 0.15*Flow + 0.15*OR + 0.10*Flip  \n"
-                    f"-> **{scores['bias']}**"
-                )
+            or_txt = f"{scores['or_low']:.0f}-{scores['or_high']:.0f}" if scores.get("or_low") is not None else "N/A"
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                st.markdown(f"**Gamma** {scores['gamma_regime_score']:+.0f}")
+                st.caption(f"OI GEX Rs {scores['total_delta_gex_cr']:.0f} Cr · DTE {scores.get('dte','-')}")
+                st.markdown(f"**Exp vs Real** {scores['move_score']:+.0f}")
+                st.caption(f"{scores['expected_move_pct']:.2f}% vs {scores['realised_range_pct']:.2f}%")
+            with s2:
+                st.markdown(f"**Vanna/Charm** {scores['flow_score']:+.0f}")
+                st.caption("tanh(VEX+CEX) · pin vs accel")
+                st.markdown(f"**OR vs Walls** {scores['or_score']:+.0f}")
+                st.caption(f"OR {or_txt} · tod {scores.get('tod_factor',1):.2f}")
+            with s3:
+                st.markdown(f"**Flip dist** {scores.get('flip_score',0):+.0f}")
+                st.caption(f"{scores.get('dist_to_flip_pct',0):.3f}% from flip")
+                st.markdown(f"**Composite** {scores['composite']:+.0f} → {scores['bias']}")
+                st.caption("0.38g + 0.22 move + 0.15 flow + 0.15 OR + 0.10 flip")
 
     else:
         st.warning("Could not compute Superhuman scores – insufficient data.")
@@ -3847,31 +3810,24 @@ def live_dashboard_fragment():
                                        range=xr, showticklabels=False, row=3, col=1)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
                                        range=xr, nticks=8, row=4, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="OBV",
-                                       title_font=dict(size=16, color="#00E676", family="Arial Black"), row=2, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI13",
-                                       title_font=dict(size=16, color="#00E676", family="Arial Black"), row=3, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD",
-                                       title_font=dict(size=16, color="#00E676", family="Arial Black"), row=4, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
+                r_obv, r_efi, r_cvd = st.columns(3)
+                with r_obv:
+                    heading_ribbon("OBV",
+                        "<b>OBV</b> = Σ sign(ΔClose) × Volume<br>Executed net volume (prints that move the close).", 12)
+                with r_efi:
+                    heading_ribbon("EFI13",
+                        "<b>EFI(13)</b> = EMA13((Close-prev)×Volume)<br>Elder Force. Playbook execution trigger.", 12)
+                with r_cvd:
+                    heading_ribbon("CVD",
+                        "<b>CVD</b> = Σ Volume × (2(C-L)/(H-L) - 1)<br>Market-order-like bar proxy. Not tick CVD.", 12)
                 st.plotly_chart(fig_stack, use_container_width=True)
                 cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
                 if vp.get("ok"):
                     cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
                 st.caption(cap)
-                heading_ribbon(
-                    "OBV · EFI13 · CVD",
-                    "<b>OBV</b> = Σ sign(ΔClose) × Volume<br>"
-                    "Executed net volume (market + any print that moves the close). "
-                    "Green above 0 / MA20 = persistent buying.<br><br>"
-                    "<b>EFI(13)</b> = EMA<sub>13</sub>((Close − Close<sub>prev</sub>) × Volume)<br>"
-                    "Elder's Force Index. Sign = direction of last push × size. "
-                    "Execution trigger in the playbook.<br><br>"
-                    "<b>CVD (futures proxy)</b> = Σ Volume × (2×(C−L)/(H−L) − 1)<br>"
-                    "Bar-close location inside the range — a <b>market-order-like</b> proxy. "
-                    "SmartAPI has no bid/ask tape, so this is not true tick CVD. "
-                    "Close near high → +delta (buyers lifted offers).",
-                    12,
-                )
                 def _chip(body, tip, color="#00E676"):
                     return (
                         f"<div class='micro-hover micro-chip'>"
