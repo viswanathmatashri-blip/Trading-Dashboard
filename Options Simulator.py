@@ -1245,9 +1245,10 @@ def series_to_ist(times) -> pd.Series:
     return ts.dt.tz_localize("Asia/Kolkata")
 
 
-def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20) -> tuple:
-    """Return (session_df, session_date, is_fallback_weekend_or_thin) using IST session date.
-    Skips Sat/Sun and thin leftover bars (timezone artefacts).
+def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bool = True) -> tuple:
+    """Return (session_df, session_date, used_prior_session).
+    During live hours prefer TODAY even with 1–2 bars (Mon 09:16 problem).
+    min_bars only applies when falling back to a completed prior session.
     """
     empty = (pd.DataFrame(), None, True)
     if df is None or df.empty or "time" not in df.columns:
@@ -1255,30 +1256,38 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20) -> tuple:
     out = df.copy()
     out["time"] = series_to_ist(out["time"])
     out = out.dropna(subset=["time"]).sort_values("time")
-    # keep only official cash hours
     mins = out["time"].dt.hour * 60 + out["time"].dt.minute
     out = out[(mins >= 9 * 60 + 15) & (mins <= 15 * 60 + 30)]
     if out.empty:
         return empty
     out["session_date"] = out["time"].dt.date
     counts = out.groupby("session_date").size().sort_index()
+    ist = pytz.timezone("Asia/Kolkata")
+    today = datetime.datetime.now(ist).date()
     chosen = None
-    for d, n in list(counts.items())[::-1]:
-        if d.weekday() >= 5:
-            continue
-        if int(n) >= min_bars:
-            chosen = d
-            break
-    if chosen is None:
-        # fallback: weekday with the most bars
-        weekdays = [(d, n) for d, n in counts.items() if d.weekday() < 5]
-        if weekdays:
-            chosen = max(weekdays, key=lambda x: x[1])[0]
-        else:
-            chosen = counts.index[-1]
+    used_prior = True
+    if prefer_today and today in counts.index and today.weekday() < 5 and int(counts.loc[today]) >= 1:
+        chosen = today
+        used_prior = False
+    else:
+        for d, n in list(counts.items())[::-1]:
+            if d.weekday() >= 5:
+                continue
+            if d == today:
+                continue
+            if int(n) >= min_bars:
+                chosen = d
+                break
+        if chosen is None:
+            weekdays = [(d, n) for d, n in counts.items() if d.weekday() < 5]
+            if weekdays:
+                chosen = max(weekdays, key=lambda x: x[1])[0]
+            else:
+                chosen = counts.index[-1]
+            used_prior = chosen != today
     sess = out[out["session_date"] == chosen].copy().reset_index(drop=True)
     sess["time_str"] = sess["time"].dt.strftime("%H:%M")
-    return sess, chosen, True
+    return sess, chosen, used_prior
 
 
 def fetch_india_vix_sessions(smart_api, lookback_days=10):
@@ -1396,23 +1405,36 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
         "basis": round(fut_ltp - spot_ltp, 2) if (spot_ltp and fut_ltp) else None
     }
 
-    sess_df, sess_date, _ = pick_last_nse_session(best_df, min_bars=20)
+    sess_df, sess_date, used_prior = pick_last_nse_session(best_df, min_bars=20, prefer_today=True)
     if sess_df.empty:
         last_bar_time = pd.to_datetime(best_df["time"].iloc[-1])
         session_date_str = last_bar_time.strftime("%d-%b-%Y")
+        used_prior = True
     else:
-        best_df = sess_df if len(sess_df) >= 5 else best_df
+        # Keep today's live tape even if only a handful of bars (do not require 5)
+        if sess_date == now_dt.date() or len(sess_df) >= 5:
+            best_df = sess_df
         session_date_str = sess_date.strftime("%d-%b-%Y") if sess_date else pd.to_datetime(best_df["time"].iloc[-1]).strftime("%d-%b-%Y")
 
-    if currently_closed or best_offset > 0 or (sess_date and sess_date != now_dt.date()):
+    today_sess = sess_date == now_dt.date() if sess_date else False
+    live_now = is_weekday and (market_open <= now_dt <= market_close)
+
+    if today_sess and live_now:
+        fallback_msg = f"Live session • {session_date_str} IST"
+        is_fallback = False
+    elif live_now and used_prior:
         fallback_msg = (
-            f"⚠️ Market is currently closed. Showing last trading session: "
-            f"**{session_date_str} IST** (fallback)"
+            f"Today's candles not in yet — showing last session {session_date_str} IST"
+        )
+        is_fallback = True
+    elif currently_closed:
+        fallback_msg = (
+            f"Market closed. Last session: {session_date_str} IST (fallback)"
         )
         is_fallback = True
     else:
-        fallback_msg = f"Live session • {session_date_str} IST"
-        is_fallback = False
+        fallback_msg = f"Session {session_date_str} IST"
+        is_fallback = used_prior
 
     return best_df, is_fallback, basis_info, fallback_msg
 
