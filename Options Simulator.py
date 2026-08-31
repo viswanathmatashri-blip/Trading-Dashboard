@@ -3633,8 +3633,8 @@ def live_dashboard_fragment():
         df_fchart = pd.DataFrame()
         fut_times = []
         latest_session = None
-        if not df_fut.empty and len(df_fut) >= 5:
-            df_fchart, latest_session, _ = pick_last_nse_session(df_fut, min_bars=20)
+        if not df_fut.empty and len(df_fut) >= 1:
+            df_fchart, latest_session, _ = pick_last_nse_session(df_fut, min_bars=20, prefer_today=True)
             if df_fchart.empty:
                 df_fut = df_fut.copy()
                 df_fut["time"] = series_to_ist(df_fut["time"])
