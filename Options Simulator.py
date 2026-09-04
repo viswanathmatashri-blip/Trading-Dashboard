@@ -678,6 +678,59 @@ MICRO_PLAYBOOK = {
 }
 ARROW_GLYPH = {"u": "↑", "f": "→", "d": "↓"}
 
+# 27 states used ONLY when EFI is statistically near 0 (Price, CVD, OBV)
+EFI_ZERO_PLAYBOOK = {
+    ("f","u","u"): ("Supply Absorption Trap", "EXIT LONG / PREPARE SHORT (Reversal Watch)"),
+    ("f","u","f"): ("Aggressive Buyer Friction", "WARNING: Limit sell wall testing / No New Longs"),
+    ("f","u","d"): ("Fading Buying Effort", "BLOCK LONG ENTRIES / EXIT CALLS"),
+    ("f","f","u"): ("Passive Wall Sweeping", "NEUTRAL WATCH (Vol expansion coming)"),
+    ("f","f","f"): ("Pure Market Stagnation", "NO ENTRY / LUNCH CHOP"),
+    ("f","f","d"): ("Volume Drying Neutral", "NO ENTRY (High slippage)"),
+    ("f","d","u"): ("Covert Distribution", "EXIT LONG / PREPARE SHORT"),
+    ("f","d","f"): ("Aggressive Seller Friction", "WARNING: Limit buy floor testing / No New Shorts"),
+    ("f","d","d"): ("Demand Absorption Floor", "EXIT SHORT / PREPARE LONG"),
+    ("u","u","u"): ("Stealth Mark-Up", "CAUTIOUS LONG (Tight trail)"),
+    ("u","u","f"): ("Delta-Driven Grind", "HOLD EXISTING LONGS"),
+    ("u","u","d"): ("Exhaustion Up-Drift", "TAKE PROFITS / BLOCK NEW LONGS"),
+    ("u","f","u"): ("Passive Ask Pull", "HOLD LONGS"),
+    ("u","f","f"): ("Low-Volatility Up-Drift", "HOLD EXISTING LONGS (Do not chase)"),
+    ("u","f","d"): ("Illiquid Drift Up", "PREPARE EXIT LONG"),
+    ("u","d","u"): ("Distribution Under Cover", "EXIT LONG / PREPARE SHORT"),
+    ("u","d","f"): ("Passive Seller Pressure", "EXIT LONG"),
+    ("u","d","d"): ("Bearish Diverging Drift", "EXIT LONG / PREPARE SHORT"),
+    ("d","u","u"): ("Bullish Diverging Slide", "EXIT SHORT / PREPARE LONG"),
+    ("d","u","f"): ("Passive Absorption Bleed", "WARNING: Downside stalling"),
+    ("d","u","d"): ("Fading Downside Effort", "EXIT SHORT"),
+    ("d","f","u"): ("Passive Bid Removal", "HOLD SHORTS"),
+    ("d","f","f"): ("Low-Volatility Bleed", "HOLD EXISTING SHORTS"),
+    ("d","f","d"): ("Illiquid Drift Down", "HOLD SHORTS (Trail close)"),
+    ("d","d","u"): ("Aggressive Mark-Down Friction", "HOLD SHORTS"),
+    ("d","d","f"): ("Stealth Mark-Down", "HOLD EXISTING SHORTS"),
+    ("d","d","d"): ("Clean Passive Mark-Down", "HOLD SHORTS (Target −2.0σ VWAP)"),
+}
+
+# 18-state flow book: Price, CVD, DEX, Premium  (tape is a note, not a fake print)
+FLOW_PLAYBOOK = {
+    ("u","u","u","u"): ("Pure Institutional Call Sweep", "LONG BREAKOUT"),
+    ("u","f","u","f"): ("Gamma Squeeze Drift", "HOLD LONG"),
+    ("u","u","d","d"): ("Distribution under Cover", "EXIT LONG / PREPARE SHORT"),
+    ("u","d","d","d"): ("Institutional Call Liquidation", "PREPARE SHORT"),
+    ("f","u","u","u"): ("Coil Compression (Bullish)", "PRE-BREAKOUT LONG"),
+    ("f","f","f","f"): ("Gamma Pin / Quiet Regime", "NO ENTRY / SELL NEUTRAL STRADDLE"),
+    ("f","d","d","u"): ("Institutional Distribution Box", "PRE-BREAKDOWN SHORT"),
+    ("d","d","d","d"): ("Pure Institutional Markdown", "SHORT BREAKOUT"),
+    ("d","f","d","f"): ("Short Gamma Drag", "HOLD SHORT"),
+    ("d","d","u","u"): ("Institutional Demand Absorption", "EXIT SHORT / PREPARE LONG"),
+    ("d","u","u","d"): ("Put Shorting / Floor Building", "PREPARE LONG"),
+    ("d","f","f","f"): ("Low-Volume Slippage", "NO ENTRY / BLOCK SHORT ENTRIES"),
+    ("u","d","u","u"): ("Short Gamma Squeeze", "RIDE LONG"),
+    ("d","u","d","u"): ("Short Gamma Unwind", "RIDE SHORT"),
+    ("u","u","f","d"): ("Futures-Driven Momentum", "CAUTIOUS LONG"),
+    ("u","d","u","d"): ("Short Covering Ramp", "HOLD LONG"),
+    ("d","u","d","d"): ("Long Unwinding Bleed", "HOLD SHORT"),
+    ("f","u","d","u"): ("Cross / Strangle Creation", "STAND ASIDE (Vol expansion)"),
+}
+
 
 def _robust_arrow(series: pd.Series, z_th: float = 0.90, ema_span: int = 8) -> str:
     """Require EMA agreement + z-score of last change vs its own noise. Flat if weak."""
@@ -728,17 +781,67 @@ def classify_microstructure(dfi: pd.DataFrame) -> dict:
     c_arr = _robust_arrow(cvd_s, z_th=0.85) if len(cvd_s) else "f"
     o_arr = _robust_arrow(obv_s, z_th=0.85) if len(obv_s) else "f"
     key = (p_arr, e_arr, c_arr, o_arr)
-    micro, action = MICRO_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
+    efi_zero = False
+    efi_note = ""
+    if len(efi_s) >= 12:
+        ev = pd.to_numeric(efi_s, errors="coerce").dropna()
+        last_e = float(ev.iloc[-1])
+        sd_e = float(ev.tail(20).std(ddof=1) or 0.0)
+        # Substantial: |EFI| small vs own noise AND robust arrow already flat
+        if sd_e > 0 and abs(last_e) <= 0.40 * sd_e and e_arr == "f":
+            efi_zero = True
+            e_arr = "f"
+            key = (p_arr, "f", c_arr, o_arr)
+            zkey = (p_arr, c_arr, o_arr)
+            micro, action = EFI_ZERO_PLAYBOOK.get(zkey, MICRO_PLAYBOOK.get(key, ("Unclassified", "NO ENTRY")))
+            efi_note = f"|EFI| {last_e:.0f} ≤ 0.40σ ({0.40*sd_e:.0f}) → 27-state EFI≈0 book"
+        else:
+            micro, action = MICRO_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
+            efi_note = f"|EFI| {last_e:.0f} vs 0.40σ={0.40*sd_e:.0f} → 81-state book"
+    else:
+        micro, action = MICRO_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
     glyphs = " ".join(ARROW_GLYPH[k] for k in key)
     hover = (
         f"Spot/Fut {ARROW_GLYPH[p_arr]}  EFI {ARROW_GLYPH[e_arr]}  "
         f"CVD {ARROW_GLYPH[c_arr]}  OBV {ARROW_GLYPH[o_arr]}<br>"
-        f"<b>{action}</b><br>{micro}"
+        f"<b>{action}</b><br>{micro}<br>{efi_note}"
     )
     return {
         "ok": True, "key": key, "arrows": glyphs, "micro": micro, "action": action,
         "price": p_arr, "efi": e_arr, "cvd": c_arr, "obv": o_arr, "hover": hover,
+        "efi_zero": efi_zero, "efi_note": efi_note,
     }
+
+
+def classify_flow_playbook(dfi: pd.DataFrame, data: dict) -> dict:
+    empty = {"ok": False, "action": "", "micro": "", "hover": ""}
+    if dfi is None or dfi.empty:
+        return empty
+    p = _robust_arrow(dfi["close"].astype(float), z_th=0.95)
+    if "vwap" in dfi.columns:
+        last_px = float(dfi["close"].iloc[-1]); last_vw = float(dfi["vwap"].iloc[-1])
+        if p == "u" and last_px <= last_vw: p = "f"
+        if p == "d" and last_px >= last_vw: p = "f"
+    c = _robust_arrow(dfi["cvd"], z_th=0.85) if "cvd" in dfi.columns else "f"
+    tape = list(st.session_state.get("flow_tape") or [])
+    if len(tape) >= 6:
+        dex = pd.Series([t.get("dex", 0) for t in tape], dtype=float)
+        pc = pd.Series([t.get("prem_c", 0) for t in tape], dtype=float)
+        pp = pd.Series([t.get("prem_p", 0) for t in tape], dtype=float)
+        d_arr = _robust_arrow(dex, z_th=0.80)
+        net_p = pc - pp
+        prem_arr = _robust_arrow(net_p, z_th=0.80)
+    else:
+        d_arr = prem_arr = "f"
+    key = (p, c, d_arr, prem_arr)
+    micro, action = FLOW_PLAYBOOK.get(key, ("Unclassified flow", "NO ENTRY"))
+    hover = (
+        f"P{ARROW_GLYPH[p]} C{ARROW_GLYPH[c]} DEX{ARROW_GLYPH[d_arr]} Prem{ARROW_GLYPH[prem_arr]}<br>"
+        f"<b>{action}</b><br>{micro}<br>"
+        "DEX/premium arrows need ≥6 live tape snaps. Missing snaps stay →."
+    )
+    return {"ok": True, "action": action, "micro": micro, "hover": hover,
+            "price": p, "cvd": c, "dex": d_arr, "prem": prem_arr}
 
 
 
@@ -3721,7 +3824,7 @@ def live_dashboard_fragment():
                     for e in decision_log[-8:]:
                         st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
 
-        with st.expander("▼ Micro Playbook (81 states)", expanded=False):
+        with st.expander("▼ Micro Playbook (81 + EFI≈0 27 + Flow 18)", expanded=False):
             items = list(MICRO_PLAYBOOK.items())
             cols = st.columns(3)
             for ci, col in enumerate(cols):
@@ -3732,7 +3835,17 @@ def live_dashboard_fragment():
                     rows.append(f"| {i} | {g} | {v[0]} — {v[1]} |")
                 with col:
                     st.markdown(chr(10).join(rows))
-            st.caption("P=fut vs VWAP + z. EFI/CVD/OBV need EMA + z>=0.9.")
+            st.caption("81-state: P vs VWAP+z; EFI/CVD/OBV EMA+z.")
+            st.markdown("**EFI ≈ 0 book (27)** — used only if |EFI| ≤ 0.40 × 20-bar σ(EFI) and EFI arrow is flat.")
+            zrows = ["| P CVD OBV | Micro · Action |", "|---|---|"]
+            for k, v in EFI_ZERO_PLAYBOOK.items():
+                zrows.append(f"| {''.join(ARROW_GLYPH[x] for x in k)} | {v[0]} — {v[1]} |")
+            st.markdown(chr(10).join(zrows))
+            st.markdown("**Flow book (18)** — P, CVD, DEX tape, net call−put premium. DEX/prem stay → until ≥6 snaps.")
+            frows = ["| P C DEX Prem | Micro · Action |", "|---|---|"]
+            for k, v in FLOW_PLAYBOOK.items():
+                frows.append(f"| {''.join(ARROW_GLYPH[x] for x in k)} | {v[0]} — {v[1]} |")
+            st.markdown(chr(10).join(frows))
 
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
@@ -4255,12 +4368,22 @@ def live_dashboard_fragment():
                 ))
                 if micro.get("ok"):
                     act = micro["action"]
+                    tag = " EFI≈0" if micro.get("efi_zero") else ""
                     chips.append(_chip(
                         f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} "
-                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}<br>{act}",
-                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br><br><b>Algo action:</b> {act}",
+                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}{tag}<br>{act}",
+                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br>"
+                        f"{micro.get('efi_note','')}<br><b>Algo action:</b> {act}",
                         "#00E676",
                     ))
+                    flow = classify_flow_playbook(dfi, data)
+                    if flow.get("ok"):
+                        chips.append(_chip(
+                            f"P{ARROW_GLYPH[flow['price']]} C{ARROW_GLYPH[flow['cvd']]} "
+                            f"D{ARROW_GLYPH[flow['dex']]} $ {ARROW_GLYPH[flow['prem']]}<br>{flow['action']}",
+                            f"<b>Flow playbook (18)</b><br>{flow['hover']}",
+                            "#90CAF9",
+                        ))
                 st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
 
                 liq_l, tape_r = st.columns([0.50, 0.50])
