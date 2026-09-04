@@ -3394,52 +3394,89 @@ def classify_liq_alert(bid_change: float, ask_change: float, bid_sigma=None, ask
 
 
 def render_block_tape(data: dict, index_name: str):
-    """Adaptive unusual-print tape from the live chain (not exchange tick tape)."""
+    """Credible tape: only Δsession-volume between two chain snapshots.
+
+    Not exchange TBT. Side is inferred only when LTP is outside the same-snap bid/ask.
+    Cumulative volume is never shown as 'lots'.
+    """
     heading_ribbon(
-        "📜 Block tape (chain)",
-        "Not NSE tick-by-tick. Each row is a strike wing whose <b>session volume</b> "
-        "is large versus this snapshot’s own distribution.<br>"
-        "Lots = Vol / lot size. Premium = LTP × Vol × lot.<br>"
-        "Threshold = max( median(lots), mean + 1.5σ ). Quiet tape → fewer rows; "
-        "busy day → more. Cap 40 so the panel stays readable.",
+        "📜 Block tape (Δ volume)",
+        "REST chain differencing — <b>not</b> NSE tick tape.<br>"
+        "Δlots = (Vol_now − Vol_prev) / lot. Ignore ΔVol ≤ 0.<br>"
+        "Side only if LTP ≥ ask (LIFT) or LTP ≤ bid (HIT) on <b>that</b> snapshot; else —.<br>"
+        "Premium = Δlots × lot × LTP. Time = snapshot clock, not exchange match time.<br>"
+        "Cutoff = max(8 lots, median Δlots, mean+1.5σ of positive Δlots). Cap 40 rows.",
     )
     chain = data.get("chain_results") or []
-    lot = LOT_SIZES.get(index_name, 65)
-    rows = []
-    lots_list = []
+    lot = max(int(LOT_SIZES.get(index_name, 65)), 1)
+    ts = str(data.get("timestamp") or "")
+    live, today, _, _ = market_session_state()
+    sess_day = today
+    df_fut = data.get("df_futures")
+    if isinstance(df_fut, pd.DataFrame) and not df_fut.empty and "time" in df_fut.columns:
+        try:
+            sess_day = pd.to_datetime(series_to_ist(df_fut["time"]).iloc[-1]).date()
+        except Exception:
+            pass
+    prev_key = f"chain_vol_{index_name}_{sess_day}"
+    tape_key = f"block_events_{index_name}_{sess_day}"
+    prev = dict(st.session_state.get(prev_key) or {})
+    events = list(st.session_state.get(tape_key) or [])
+    now_map = {}
+    new_deltas = []
     for r in chain:
-        for side, vol_k, ltp_k, d_k in (("CE", "C_Vol", "C_LTP", "C_Δ"), ("PE", "P_Vol", "P_LTP", "P_Δ")):
+        K = int(r.get("Strike") or 0)
+        for typ, vol_k, ltp_k, d_k, bid_k, ask_k in (
+            ("CE", "C_Vol", "C_LTP", "C_Δ", "C_Bid", "C_Ask"),
+            ("PE", "P_Vol", "P_LTP", "P_Δ", "P_Bid", "P_Ask"),
+        ):
+            key = f"{K}{typ}"
             vol = float(r.get(vol_k) or 0)
-            if vol <= 0:
+            now_map[key] = vol
+            if not live or sess_day != today:
                 continue
-            lots = vol / max(lot, 1)
-            lots_list.append(lots)
-            rows.append({
-                "Strike": int(r.get("Strike") or 0),
-                "Type": side,
-                "Lots": lots,
-                "LTP": float(r.get(ltp_k) or 0),
-                "Δ": float(r.get(d_k) or 0),
-                "Prem L": float(r.get(ltp_k) or 0) * vol * lot / 1e5,
+            if key not in prev:
+                continue
+            dvol = vol - float(prev[key])
+            if dvol <= 0:
+                continue
+            dlots = dvol / lot
+            ltp = float(r.get(ltp_k) or 0)
+            bid = float(r.get(bid_k) or 0)
+            ask = float(r.get(ask_k) or 0)
+            side = "—"
+            if ltp > 0 and ask > 0 and ltp >= ask:
+                side = "LIFT"
+            elif ltp > 0 and bid > 0 and ltp <= bid:
+                side = "HIT"
+            new_deltas.append(dlots)
+            events.append({
+                "Time": ts[-12:] if ts else "",
+                "Contract": f"{K} {typ}",
+                "Side": side,
+                "ΔLots": round(dlots, 1),
+                "LTP": round(ltp, 2),
+                "Δ": round(float(r.get(d_k) or 0), 2),
+                "Prem ₹L": round(dlots * lot * ltp / 1e5, 2),
             })
-    if not rows:
-        st.caption("No chain volume.")
+    st.session_state[prev_key] = now_map
+    if new_deltas:
+        s = pd.Series(new_deltas, dtype=float)
+        thr = max(8.0, float(s.median()), float(s.mean() + 1.5 * (s.std(ddof=0) or 0)))
+    else:
+        thr = 8.0
+    events = [e for e in events if float(e.get("ΔLots") or 0) >= thr]
+    events = events[-40:]
+    st.session_state[tape_key] = events
+    if not live:
+        st.caption(f"Replay {sess_day} · {len(events)} stored Δ prints (no new diffs off-hours).")
+    elif not prev:
+        st.caption("Baseline stored. Next refresh will emit Δlots. Keep Auto-Refresh on.")
         return
-    s = pd.Series(lots_list, dtype=float)
-    thr = max(float(s.median()), float(s.mean() + 1.5 * s.std(ddof=0))) if len(s) else 0
-    flagged = [x for x in rows if x["Lots"] >= thr]
-    flagged.sort(key=lambda x: -x["Lots"])
-    flagged = flagged[:40]
-    heading_ribbon(
-        f"thr {thr:.0f} lots · {len(flagged)} prints",
-        "Adaptive cutoff from this chain snapshot.",
-    )
-    df = pd.DataFrame(flagged)
-    if df.empty:
-        st.caption("No wing above adaptive σ cutoff.")
+    if not events:
+        st.caption(f"No Δlots ≥ {thr:.0f} since baseline.")
         return
-    df["Lots"] = df["Lots"].map(lambda v: f"{v:.0f}")
-    df["Prem L"] = df["Prem L"].map(lambda v: f"{v:.1f}")
+    df = pd.DataFrame(events[::-1])
     st.dataframe(df, use_container_width=True, hide_index=True, height=220)
 
 
