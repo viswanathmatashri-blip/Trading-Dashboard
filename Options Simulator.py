@@ -3392,6 +3392,57 @@ def classify_liq_alert(bid_change: float, ask_change: float, bid_sigma=None, ask
             "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
 
 
+
+def render_block_tape(data: dict, index_name: str):
+    """Adaptive unusual-print tape from the live chain (not exchange tick tape)."""
+    heading_ribbon(
+        "📜 Block tape (chain)",
+        "Not NSE tick-by-tick. Each row is a strike wing whose <b>session volume</b> "
+        "is large versus this snapshot’s own distribution.<br>"
+        "Lots = Vol / lot size. Premium = LTP × Vol × lot.<br>"
+        "Threshold = max( median(lots), mean + 1.5σ ). Quiet tape → fewer rows; "
+        "busy day → more. Cap 40 so the panel stays readable.",
+    )
+    chain = data.get("chain_results") or []
+    lot = LOT_SIZES.get(index_name, 65)
+    rows = []
+    lots_list = []
+    for r in chain:
+        for side, vol_k, ltp_k, d_k in (("CE", "C_Vol", "C_LTP", "C_Δ"), ("PE", "P_Vol", "P_LTP", "P_Δ")):
+            vol = float(r.get(vol_k) or 0)
+            if vol <= 0:
+                continue
+            lots = vol / max(lot, 1)
+            lots_list.append(lots)
+            rows.append({
+                "Strike": int(r.get("Strike") or 0),
+                "Type": side,
+                "Lots": lots,
+                "LTP": float(r.get(ltp_k) or 0),
+                "Δ": float(r.get(d_k) or 0),
+                "Prem L": float(r.get(ltp_k) or 0) * vol * lot / 1e5,
+            })
+    if not rows:
+        st.caption("No chain volume.")
+        return
+    s = pd.Series(lots_list, dtype=float)
+    thr = max(float(s.median()), float(s.mean() + 1.5 * s.std(ddof=0))) if len(s) else 0
+    flagged = [x for x in rows if x["Lots"] >= thr]
+    flagged.sort(key=lambda x: -x["Lots"])
+    flagged = flagged[:40]
+    heading_ribbon(
+        f"thr {thr:.0f} lots · {len(flagged)} prints",
+        "Adaptive cutoff from this chain snapshot.",
+    )
+    df = pd.DataFrame(flagged)
+    if df.empty:
+        st.caption("No wing above adaptive σ cutoff.")
+        return
+    df["Lots"] = df["Lots"].map(lambda v: f"{v:.0f}")
+    df["Prem L"] = df["Prem L"].map(lambda v: f"{v:.1f}")
+    st.dataframe(df, use_container_width=True, hide_index=True, height=220)
+
+
 def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name: str, compact: bool = False):
     """Middle panel: futures limit-book liquidity delta + imbalance alerts."""
     basis = data.get("basis_info") or {}
@@ -4125,14 +4176,8 @@ def live_dashboard_fragment():
                     fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=2, col=1)
                     fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=3, col=1)
                     st.markdown("<div class='chart-card'><div class='card-title'>DEX flow &amp; net premium</div>", unsafe_allow_html=True)
-                    if not tape:
-                        st.caption(
-                            f"No saved DEX tape for {sess_day}. "
-                            "Intra-day DEX/premium is stored only while Auto-Refresh runs in market hours. "
-                            "After hours we reload that session file — we cannot rebuild Friday’s path from one EOD chain print."
-                        )
-                    else:
-                        st.caption(f"DEX / premium tape · session {sess_day} · {len(tape)} snapshots")
+                    if tape:
+                        st.caption(f"DEX / premium · {sess_day} · {len(tape)} snaps")
                     st.plotly_chart(fig_dex, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                 cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
@@ -4181,7 +4226,13 @@ def live_dashboard_fragment():
                     ))
                 st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
 
-                render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
+                liq_l, tape_r = st.columns([0.50, 0.50])
+                with liq_l:
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tape_r:
+                    render_block_tape(data, Index_Name)
             else:
                 st.info("Futures / VWAP not available.")
 
@@ -4195,48 +4246,34 @@ def live_dashboard_fragment():
                 "Call OI/Vol up, Put OI/Vol down on the same strike axis. Zero lines aligned.",
             )
             if not df_chain.empty and lvls:
-                gex_oi_colors = np.where(df_chain["Net_GEX_OI"] >= 0, "#006400", "#8B0000")
-                fig_gex = make_subplots(
-                    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04,
-                    row_heights=[0.50, 0.50],
-                    specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
-                    subplot_titles=("GEX / OI", "GEX / Volume"),
-                )
-                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_OI"], name="Call OI",
-                                            marker_color="#2E7D32", opacity=0.55, showlegend=False), row=1, col=1, secondary_y=False)
-                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_OI"], name="Put OI",
-                                            marker_color="#C62828", opacity=0.55, showlegend=False), row=1, col=1, secondary_y=False)
-                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_OI"], name="Net GEX",
-                                            marker_color=gex_oi_colors, opacity=0.85, width=25, showlegend=False), row=1, col=1, secondary_y=True)
-                fig_gex.add_hline(y=0, line_width=1, line_color="#FFFFFF", row=1, col=1)
-                fig_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", row=1, col=1)
-                oi_primary = pd.concat([df_chain["C_OI"].astype(float), -df_chain["P_OI"].astype(float)])
-                oi1, oi2 = calculate_synced_ranges(oi_primary, df_chain["Net_GEX_OI"].astype(float))
-
-                gex_vol_colors = np.where(df_chain["Net_GEX_Vol"] >= 0, "#006400", "#8B0000")
-                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["C_Vol"], name="Call Vol",
-                                            marker_color="#81C784", opacity=0.55, showlegend=False), row=2, col=1, secondary_y=False)
-                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain["P_Vol"], name="Put Vol",
-                                            marker_color="#FF8A80", opacity=0.55, showlegend=False), row=2, col=1, secondary_y=False)
-                fig_gex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_GEX_Vol"], name="Net GEX V",
-                                            marker_color=gex_vol_colors, opacity=0.85, width=25, showlegend=False), row=2, col=1, secondary_y=True)
-                fig_gex.add_hline(y=0, line_width=1, line_color="#FFFFFF", row=2, col=1)
-                fig_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", row=2, col=1)
-                vol_primary = pd.concat([df_chain["C_Vol"].astype(float), -df_chain["P_Vol"].astype(float)])
-                v1, v2 = calculate_synced_ranges(vol_primary, df_chain["Net_GEX_Vol"].astype(float))
-                fig_gex.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=620, barmode="overlay", margin=dict(l=8, r=8, t=24, b=18),
-                    hovermode="x unified",
-                )
-                fig_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val], row=1, col=1)
-                fig_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val], row=2, col=1)
-                fig_gex.update_yaxes(range=oi1, secondary_y=False, row=1, col=1, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
-                fig_gex.update_yaxes(range=oi2, secondary_y=True, row=1, col=1, showgrid=False)
-                fig_gex.update_yaxes(range=v1, secondary_y=False, row=2, col=1, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
-                fig_gex.update_yaxes(range=v2, secondary_y=True, row=2, col=1, showgrid=False)
-                fig_gex.update_annotations(font_size=11)
-                st.plotly_chart(fig_gex, use_container_width=True)
+                def _one_gex(c_col, p_col, net_col, h):
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+                    cols = np.where(df_chain[net_col] >= 0, "#006400", "#8B0000")
+                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain[c_col], name="Call",
+                                            marker_color="#2E7D32", opacity=0.55, showlegend=False), secondary_y=False)
+                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain[p_col], name="Put",
+                                            marker_color="#C62828", opacity=0.55, showlegend=False), secondary_y=False)
+                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain[net_col], name="Net GEX",
+                                            marker_color=cols, opacity=0.85, width=25, showlegend=False), secondary_y=True)
+                    fig.add_hline(y=0, line_width=1, line_color="#FFFFFF")
+                    fig.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
+                    prim = pd.concat([df_chain[c_col].astype(float), -df_chain[p_col].astype(float)])
+                    r1, r2 = calculate_synced_ranges(prim, df_chain[net_col].astype(float))
+                    fig.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                                      height=h, barmode="overlay", margin=dict(l=8, r=8, t=8, b=18), hovermode="x unified")
+                    fig.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
+                    fig.update_yaxes(range=r1, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                    fig.update_yaxes(range=r2, secondary_y=True, showgrid=False)
+                    return fig
+                g_oi, g_vol = st.tabs(["GEX / OI", "GEX / Volume"])
+                with g_oi:
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 340), use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with g_vol:
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 340), use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
                 heading_ribbon(
                     f"🎯 Δ-GEX (OI) — {selected_expiry_str}",
                     "<b>Delta-adjusted GEX (OI)</b><br>"
@@ -4253,14 +4290,16 @@ def live_dashboard_fragment():
                 fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
                 fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
                 fig_delta_gex.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
+                st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
                 fig_delta_gex.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=280, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
+                    template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                    height=260, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
                     showlegend=False,
                 )
                 fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
                 fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
                 st.plotly_chart(fig_delta_gex, use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.info("GEX unavailable.")
 
