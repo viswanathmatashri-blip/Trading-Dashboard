@@ -1325,6 +1325,25 @@ def save_session_cache(kind: str, index_name: str, interval: str, df: pd.DataFra
         pass
 
 
+def load_flow_tape(index_name: str, day):
+    path = SESSION_CACHE_DIR / f"flow_{index_name}_{day}.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return list(st.session_state.get(f"flow_tape_{index_name}_{day}") or [])
+
+
+def save_flow_tape(index_name: str, day, tape):
+    st.session_state[f"flow_tape_{index_name}_{day}"] = tape
+    st.session_state["flow_tape"] = tape
+    try:
+        (SESSION_CACHE_DIR / f"flow_{index_name}_{day}.json").write_text(json.dumps(tape))
+    except Exception:
+        pass
+
+
 def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     parts = [x for x in (old, new) if x is not None and not getattr(x, "empty", True)]
     if not parts:
@@ -1991,22 +2010,30 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         levels = calculate_support_resistance_targets(chain_results, spot_price, max_pain_strike)
 
         try:
+            live_now, today, _, _ = market_session_state(now_dt)
+            sess_day = today
+            if df_futures is not None and not df_futures.empty and "time" in df_futures.columns:
+                ft = series_to_ist(df_futures["time"])
+                sess_day = pd.to_datetime(ft.iloc[-1]).date()
             lot = LOT_SIZES.get(Index_Name, 65)
-            dex = 0.0
-            prem_c = prem_p = 0.0
+            dex = prem_c = prem_p = 0.0
             for r in chain_results:
                 dex += float(r.get("C_Δ") or 0) * float(r.get("C_Vol") or 0) * lot
                 dex -= abs(float(r.get("P_Δ") or 0)) * float(r.get("P_Vol") or 0) * lot
                 prem_c += float(r.get("C_LTP") or 0) * float(r.get("C_Vol") or 0) * lot
                 prem_p += float(r.get("P_LTP") or 0) * float(r.get("P_Vol") or 0) * lot
-            tape = list(st.session_state.get("flow_tape") or [])
-            tape.append({
-                "ts": now_dt.strftime("%H:%M:%S"),
-                "dex": dex, "prem_c": prem_c, "prem_p": prem_p,
-            })
-            if len(tape) > 240:
-                tape = tape[-240:]
-            st.session_state["flow_tape"] = tape
+            tape = load_flow_tape(Index_Name, sess_day)
+            if live_now and sess_day == today:
+                tape.append({
+                    "ts": now_dt.strftime("%H:%M"),
+                    "dex": dex, "prem_c": prem_c, "prem_p": prem_p,
+                    "day": str(sess_day),
+                })
+                tape = tape[-300:]
+                save_flow_tape(Index_Name, sess_day, tape)
+            else:
+                st.session_state["flow_tape"] = tape
+                st.session_state["flow_tape_day"] = str(sess_day)
         except Exception:
             pass
 
@@ -4037,7 +4064,8 @@ def live_dashboard_fragment():
                     st.plotly_chart(fig_stack, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                 with tab_dex:
-                    tape = list(st.session_state.get("flow_tape") or [])
+                    sess_day = latest_session or _ist_now().date()
+                    tape = load_flow_tape(Index_Name, sess_day) or list(st.session_state.get("flow_tape") or [])
                     fig_dex = make_subplots(
                         rows=3, cols=2,
                         column_widths=[0.84, 0.16],
@@ -4047,6 +4075,14 @@ def live_dashboard_fragment():
                         horizontal_spacing=0.01,
                         specs=[[{}, {}], [{}, None], [{}, None]],
                     )
+                    if "vwap_upper" in dfi.columns:
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=dfi["time_str"], y=dfi["vwap_upper"], mode="lines", showlegend=False, hoverinfo="skip",
+                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=dfi["time_str"], y=dfi["vwap_lower"], mode="lines", showlegend=False, hoverinfo="skip",
+                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                            fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
                     fig_dex.add_trace(plt_go.Scatter(
                         x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
                         line=dict(color="#FF9800", width=2), hoverinfo="skip"), row=1, col=1)
@@ -4090,7 +4126,13 @@ def live_dashboard_fragment():
                     fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=3, col=1)
                     st.markdown("<div class='chart-card'><div class='card-title'>DEX flow &amp; net premium</div>", unsafe_allow_html=True)
                     if not tape:
-                        st.caption("DEX / premium tape builds on each refresh (Auto-Refresh). Chain snapshot × Δ × volume.")
+                        st.caption(
+                            f"No saved DEX tape for {sess_day}. "
+                            "Intra-day DEX/premium is stored only while Auto-Refresh runs in market hours. "
+                            "After hours we reload that session file — we cannot rebuild Friday’s path from one EOD chain print."
+                        )
+                    else:
+                        st.caption(f"DEX / premium tape · session {sess_day} · {len(tape)} snapshots")
                     st.plotly_chart(fig_dex, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                 cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
