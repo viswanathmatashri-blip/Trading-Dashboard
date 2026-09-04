@@ -103,6 +103,19 @@ div[data-baseweb="select"] > div { background-color: #1E222D !important; color: 
     width: 218px; text-align: center;
     box-shadow: 0 1px 6px rgba(0,0,0,0.35);
 }
+.chart-card {
+    background: #11151C;
+    border: 1px solid #2A3340;
+    border-radius: 10px;
+    padding: 8px 8px 4px 8px;
+    margin: 0 0 8px 0;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03);
+}
+.chart-card .card-title {
+    color: #8FA4B8; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.04em; text-transform: uppercase;
+    margin: 0 0 4px 2px;
+}
 </style>
 """
 st.markdown(custom_css, unsafe_allow_html=True)
@@ -133,6 +146,8 @@ if "liq_delta_history" not in st.session_state:
     st.session_state["liq_delta_history"] = []
 if "tick_cvd_history" not in st.session_state:
     st.session_state["tick_cvd_history"] = []
+if "flow_tape" not in st.session_state:
+    st.session_state["flow_tape"] = []
 
 # ---------- Loading status (sidebar) ----------
 def update_load_status(msg: str):
@@ -1974,6 +1989,26 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 
         max_pain_strike = VolatilityEngine.calculate_max_pain(chain_results)
         levels = calculate_support_resistance_targets(chain_results, spot_price, max_pain_strike)
+
+        try:
+            lot = LOT_SIZES.get(Index_Name, 65)
+            dex = 0.0
+            prem_c = prem_p = 0.0
+            for r in chain_results:
+                dex += float(r.get("C_Δ") or 0) * float(r.get("C_Vol") or 0) * lot
+                dex -= abs(float(r.get("P_Δ") or 0)) * float(r.get("P_Vol") or 0) * lot
+                prem_c += float(r.get("C_LTP") or 0) * float(r.get("C_Vol") or 0) * lot
+                prem_p += float(r.get("P_LTP") or 0) * float(r.get("P_Vol") or 0) * lot
+            tape = list(st.session_state.get("flow_tape") or [])
+            tape.append({
+                "ts": now_dt.strftime("%H:%M:%S"),
+                "dex": dex, "prem_c": prem_c, "prem_p": prem_p,
+            })
+            if len(tape) > 240:
+                tape = tape[-240:]
+            st.session_state["flow_tape"] = tape
+        except Exception:
+            pass
 
         update_p(1.0, "Done!")
         if p_bar: p_bar.empty()
@@ -3996,7 +4031,68 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
-                st.plotly_chart(fig_stack, use_container_width=True)
+                tab_flow, tab_dex = st.tabs(["Futures · OBV · EFI · CVD", "Futures · DEX · Premium"])
+                with tab_flow:
+                    st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
+                    st.plotly_chart(fig_stack, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tab_dex:
+                    tape = list(st.session_state.get("flow_tape") or [])
+                    fig_dex = make_subplots(
+                        rows=3, cols=2,
+                        column_widths=[0.84, 0.16],
+                        row_heights=[0.46, 0.27, 0.27],
+                        shared_xaxes=False,
+                        vertical_spacing=0.06,
+                        horizontal_spacing=0.01,
+                        specs=[[{}, {}], [{}, None], [{}, None]],
+                    )
+                    fig_dex.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
+                        line=dict(color="#FF9800", width=2), hoverinfo="skip"), row=1, col=1)
+                    fig_dex.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
+                        line=dict(color="#2196F3", width=2)), row=1, col=1)
+                    if vp.get("ok"):
+                        fig_dex.add_trace(plt_go.Bar(
+                            x=vols if vp.get("ok") else [], y=mids if vp.get("ok") else [],
+                            orientation="h", showlegend=False,
+                            marker=dict(color=colors if vp.get("ok") else "#64B5F6"),
+                        ), row=1, col=2)
+                    if tape:
+                        txs = [t["ts"] for t in tape]
+                        dex_s = pd.Series([t["dex"] for t in tape], dtype=float)
+                        dex_ema = dex_s.ewm(span=8, adjust=False).mean()
+                        bar_c = np.where(dex_s >= 0, "#00E676", "#FF5252")
+                        fig_dex.add_trace(plt_go.Bar(
+                            x=txs, y=dex_s, name="DEX", marker_color=bar_c, opacity=0.75, showlegend=False,
+                        ), row=2, col=1)
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=txs, y=dex_ema, name="DEX EMA8",
+                            line=dict(color="#FFD54F", width=2),
+                        ), row=2, col=1)
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=txs, y=[t["prem_c"]/1e7 for t in tape], name="Call prem Cr",
+                            line=dict(color="#00E676", width=2),
+                        ), row=3, col=1)
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=txs, y=[t["prem_p"]/1e7 for t in tape], name="Put prem Cr",
+                            line=dict(color="#FF5252", width=2),
+                        ), row=3, col=1)
+                    fig_dex.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
+                    fig_dex.update_layout(
+                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                        height=620, margin=dict(l=40, r=6, t=8, b=18),
+                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                        hovermode="x unified",
+                    )
+                    fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=2, col=1)
+                    fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=3, col=1)
+                    st.markdown("<div class='chart-card'><div class='card-title'>DEX flow &amp; net premium</div>", unsafe_allow_html=True)
+                    if not tape:
+                        st.caption("DEX / premium tape builds on each refresh (Auto-Refresh). Chain snapshot × Δ × volume.")
+                    st.plotly_chart(fig_dex, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
                 cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
                 if vp.get("ok"):
                     cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
