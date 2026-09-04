@@ -92,9 +92,9 @@ div[data-baseweb="select"] > div { background-color: #1E222D !important; color: 
 .micro-hover:hover .micro-tip { display: block; }
 .micro-float {
     position: relative; z-index: 25;
-    margin-top: -272px; margin-bottom: 92px;
-    margin-left: auto; margin-right: 4px;
-    width: 218px; text-align: center;
+    margin-top: -355px; margin-bottom: 8px;
+    margin-left: auto; margin-right: 2px;
+    width: 200px; text-align: center;
 }
 .micro-chip {
     display: block; margin: 0 auto 6px auto; padding: 6px 8px;
@@ -3622,11 +3622,16 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
             "📘 Limit Book Liquidity Δ",
             "<b>Resting book size only</b> — not executed prints.<br>"
             "ΔBid = BidQty_t − BidQty_t-1 · Net = ΔBid − ΔAsk<br>"
+            "<b>Imbalance</b> = (BidLots − AskLots) / (BidLots + AskLots)<br>"
+            "Range −1…+1. + → bid-heavy (support). − → ask-heavy (supply).<br>"
             "A size drop can be a pull or a hit; the feed does not tag which.",
         )
     with h2:
+        bq = float(last.get('bid_qty_lots') or 0)
+        aq = float(last.get('ask_qty_lots') or 0)
+        imb = (bq - aq) / (bq + aq) if (bq + aq) else 0.0
         st.caption(
-            f"Book Bid {last.get('bid_qty_lots', 0):,.0f} / Ask {last.get('ask_qty_lots', 0):,.0f}"
+            f"Book Bid {bq:,.0f} / Ask {aq:,.0f} · Imb {imb:+.2f}"
         )
     with h3:
         st.caption(f"ΔBid {last.get('bid_change', 0):+.0f} · ΔAsk {last.get('ask_change', 0):+.0f}")
@@ -4385,14 +4390,6 @@ def live_dashboard_fragment():
                             "#90CAF9",
                         ))
                 st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
-
-                liq_l, tape_r = st.columns([0.50, 0.50])
-                with liq_l:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with tape_r:
-                    render_block_tape(data, Index_Name)
             else:
                 st.info("Futures / VWAP not available.")
 
@@ -4462,6 +4459,16 @@ def live_dashboard_fragment():
                 st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.info("GEX unavailable.")
+
+        book_l, tape_r = st.columns([0.50, 0.50])
+        with book_l:
+            st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+            render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+        with tape_r:
+            st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+            render_block_tape(data, Index_Name)
+            st.markdown("</div>", unsafe_allow_html=True)
 
         # Delta-GEX (selected) | Heatmap
         # Multi-exp Delta-GEX   | VEX/CEX
