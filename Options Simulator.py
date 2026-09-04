@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import logging
 import warnings
 import time
@@ -1190,11 +1191,14 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
 def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15):
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
-    
-    for offset in range(0, 10):
+    live, today, _, _ = market_session_state(now_dt)
+    cached = load_session_cache("spot", "IDX", api_interval, today)
+    offsets = [0] if live else list(range(0, 10))
+    for offset in offsets:
         target_to = now_dt - datetime.timedelta(days=offset)
+        if live and target_to.date() != today:
+            continue
         target_from = target_to - datetime.timedelta(days=lookback_days)
-        
         candle_param = {
             "exchange": exchange,
             "symboltoken": spot_token,
@@ -1202,15 +1206,19 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
             "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
             "todate": target_to.strftime("%Y-%m-%d 15:30")
         }
-        
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
-        time.sleep(0.40)
+        time.sleep(0.20)
         if candle_res and candle_res.get("status") and candle_res.get("data"):
             df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
             df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
             if not df_candles.empty:
-                return compute_technical_indicators(df_candles), offset > 0
-
+                df_candles["time"] = series_to_ist(df_candles["time"])
+                if live:
+                    df_candles = merge_candle_frames(cached, df_candles)
+                    save_session_cache("spot", "IDX", api_interval, df_candles, today)
+                return compute_technical_indicators(df_candles), (offset > 0 and not live)
+    if live and not cached.empty:
+        return compute_technical_indicators(cached.copy()), False
     return pd.DataFrame(), False
 
 
@@ -1245,6 +1253,74 @@ def series_to_ist(times) -> pd.Series:
     return ts.dt.tz_localize("Asia/Kolkata")
 
 
+
+SESSION_CACHE_DIR = Path("/home/workdir/artifacts/session_cache")
+try:
+    SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    SESSION_CACHE_DIR = Path("session_cache")
+    SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ist_now():
+    return datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+
+
+def market_session_state(now=None):
+    now = now or _ist_now()
+    open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    live = now.weekday() < 5 and open_t <= now <= close_t
+    return live, now.date(), open_t, close_t
+
+
+def _cache_path(kind: str, index_name: str, interval: str, day):
+    safe = f"{kind}_{index_name}_{interval}_{day}.pkl".replace(" ", "")
+    return SESSION_CACHE_DIR / safe
+
+
+def load_session_cache(kind: str, index_name: str, interval: str, day=None):
+    live, today, _, _ = market_session_state()
+    day = day or today
+    path = _cache_path(kind, index_name, interval, day)
+    if path.exists():
+        try:
+            df = pd.read_pickle(path)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            pass
+    key = f"sess_cache_{kind}_{index_name}_{interval}_{day}"
+    df = st.session_state.get(key)
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        return df
+    return pd.DataFrame()
+
+
+def save_session_cache(kind: str, index_name: str, interval: str, df: pd.DataFrame, day=None):
+    if df is None or getattr(df, "empty", True):
+        return
+    live, today, _, _ = market_session_state()
+    day = day or today
+    key = f"sess_cache_{kind}_{index_name}_{interval}_{day}"
+    st.session_state[key] = df
+    try:
+        df.to_pickle(_cache_path(kind, index_name, interval, day))
+    except Exception:
+        pass
+
+
+def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    parts = [x for x in (old, new) if x is not None and not getattr(x, "empty", True)]
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    out["time"] = series_to_ist(out["time"])
+    out = out.dropna(subset=["time"]).sort_values("time")
+    out = out.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+    return out
+
+
 def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bool = True) -> tuple:
     """Return (session_df, session_date, used_prior_session).
     During live hours prefer TODAY even with 1–2 bars (Mon 09:16 problem).
@@ -1266,9 +1342,16 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
     today = datetime.datetime.now(ist).date()
     chosen = None
     used_prior = True
+    live_now, _, _, _ = market_session_state()
     if prefer_today and today in counts.index and today.weekday() < 5 and int(counts.loc[today]) >= 1:
         chosen = today
         used_prior = False
+    elif live_now and prefer_today:
+        # Market open: do not walk back to Friday even if today is thin/missing
+        chosen = today if today in counts.index else None
+        used_prior = chosen is None
+        if chosen is None:
+            return empty
     else:
         for d, n in list(counts.items())[::-1]:
             if d.weekday() >= 5:
@@ -1347,15 +1430,16 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
     is_weekday = now_dt.weekday() < 5
     currently_closed = (not is_weekday) or (now_dt < market_open or now_dt > market_close)
 
+    cached = load_session_cache("fut", index_name, api_interval, now_dt.date())
     best_df = pd.DataFrame()
     best_offset = 0
+    offsets = [0] if not currently_closed else list(range(0, 16))
 
-    for offset in range(0, 16):
+    for offset in offsets:
         target_to = now_dt - datetime.timedelta(days=offset)
         if target_to.weekday() >= 5:
             continue
         target_from = target_to - datetime.timedelta(days=lookback_days)
-
         candle_param = {
             "exchange": fut_exch,
             "symboltoken": str(fut_token),
@@ -1363,25 +1447,28 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
             "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
             "todate": target_to.strftime("%Y-%m-%d 15:30")
         }
-
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
-        time.sleep(0.35)
-
+        time.sleep(0.20)
         if not (candle_res and candle_res.get("status") and candle_res.get("data")):
             continue
-
         df = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
         df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
-
-        if df.empty or len(df) < 5:
+        if df.empty:
             continue
-
         df["time"] = series_to_ist(df["time"])
+        if not currently_closed:
+            df = merge_candle_frames(cached, df)
+        min_need = 1 if not currently_closed else 5
+        if len(df) < min_need:
+            continue
         df = compute_technical_indicators(df)
         best_df = df
         best_offset = offset
         break
 
+    if best_df.empty and not cached.empty and not currently_closed:
+        best_df = compute_technical_indicators(cached.copy())
+        best_offset = 0
     if best_df.empty:
         return pd.DataFrame(), False, {}, "Could not fetch futures candles"
 
@@ -1418,6 +1505,9 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
 
     today_sess = sess_date == now_dt.date() if sess_date else False
     live_now = is_weekday and (market_open <= now_dt <= market_close)
+
+    if today_sess or (live_now and not best_df.empty):
+        save_session_cache("fut", index_name, api_interval, best_df, now_dt.date())
 
     if today_sess and live_now:
         fallback_msg = f"Live session • {session_date_str} IST"
