@@ -4019,7 +4019,24 @@ def live_dashboard_fragment():
         sigma_mult = 1.5
 
         with left_col:
-            fut_header_col, basis_col, band_col = st.columns([0.70, 0.16, 0.14])
+            fut_header_col, tf_col, basis_col, band_col = st.columns([0.52, 0.20, 0.14, 0.14])
+            with tf_col:
+                opts = ["3 min", "5 min", "15 min"]
+                cur = st.session_state.get("selected_timeframe", "5 min")
+                if cur not in opts:
+                    cur = "5 min"
+                new_tf = st.radio(
+                    "Bar", opts, index=opts.index(cur), horizontal=True,
+                    key="fut_tf_radio", label_visibility="collapsed",
+                )
+                if new_tf != st.session_state.get("selected_timeframe"):
+                    st.session_state["selected_timeframe"] = new_tf
+                    st.session_state["heatmap_timeframe"] = new_tf
+                    updated = fetch_live_data(new_tf)
+                    if updated:
+                        updated["selected_expiry"] = selected_expiry_str
+                        st.session_state["data_store"] = updated
+                    st.rerun()
             with fut_header_col:
                 expiry_txt = basis.get("fut_expiry", "N/A")
                 fb = str(fut_msg or "").replace("**", "").replace("⚠️ ", "")
