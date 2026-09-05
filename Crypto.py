@@ -1,33 +1,47 @@
+#!/usr/bin/env python3
+"""
+Crypto Options Technical Analysis Dashboard
+BTC / ETH — Deribit public API (no keys required)
+
+Mirrors the Indian-index Option Chain TA construct:
+  GEX / Δ-GEX / VEX / CEX, IV skew, VWAP + VP, OBV / EFI / CVD,
+  Superhuman regime engine, 81-state microstructure playbook,
+  limit-book Δ, block tape, strategy basket Greeks.
+
+Run:
+  pip install streamlit pandas numpy plotly scipy requests pytz
+  streamlit run Crypto_Options_Simulator.py
+"""
+
+from __future__ import annotations
+
 import os
-from pathlib import Path
+import math
+import time
+import json
+import datetime
 import logging
 import warnings
-import time
-import datetime
-import math
-import json
-import random
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import scipy.stats as si
-import pyotp
 import pytz
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 import plotly.express as px
 import plotly.graph_objects as plt_go
 from plotly.subplots import make_subplots
-from dotenv import load_dotenv
 from scipy.optimize import brentq
-from scipy.stats import norm
-from SmartApi import SmartConnect
+from scipy import stats as si
 
-# Setup .streamlit/config.toml programmatically for dark theme
+# ---------------------------------------------------------------------------
+# Theme
+# ---------------------------------------------------------------------------
 os.makedirs(".streamlit", exist_ok=True)
-config_path = os.path.join(".streamlit", "config.toml")
-if not os.path.exists(config_path):
-    with open(config_path, "w") as f:
+_cfg = os.path.join(".streamlit", "config.toml")
+if not os.path.exists(_cfg):
+    with open(_cfg, "w") as f:
         f.write(
             """[theme]
 base="dark"
@@ -38,390 +52,172 @@ textColor="#FAFAFA"
 """
         )
 
-logging.getLogger("streamlit.runtime.scriptrunner.script_runner").setLevel(logging.ERROR)
-logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
 
-load_dotenv()
-
 st.set_page_config(
-    page_title="Option Chain Technical Analysis",
-    page_icon="📈",
+    page_title="Crypto Option Chain Technical Analysis",
+    page_icon="₿",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom Styling
-custom_css = """
+st.markdown(
+    """
 <style>
 .stApp { opacity: 1 !important; }
 [data-testid="stStatusWidget"], .stSpinner { display: none !important; }
-div[data-testid="stFragment"] { opacity: 1 !important; }
 html, body, [data-testid="stAppViewContainer"] { background-color: #0E1117 !important; color: #FAFAFA !important; }
-section[data-testid="stSidebar"] { width: 310px !important; }
-.block-container { padding-top: 0.6rem !important; padding-bottom: 0.6rem !important; }
-header[data-testid="stHeader"] { background-color: rgba(0, 0, 0, 0) !important; }
-h1, h2, h3, .custom-heading { color: #00E676 !important; font-size: 18px !important; font-weight: 700 !important; margin-bottom: 0.15rem !important; }
-div[data-testid="stMetricValue"] { font-size: 15px !important; color: #00E676 !important; }
-div[data-testid="stMetricLabel"] { font-size: 11px !important; }
-div[data-testid="stMetricDelta"] { font-size: 11px !important; }
-.update-timestamp { font-size: 12px; color: #00E676; font-weight: 600; text-align: right; }
-div[data-baseweb="select"] > div { background-color: #1E222D !important; color: #FAFAFA !important; border-color: #363C4E !important; }
-.stButton>button { border-radius: 6px; font-weight: 600; }
+section[data-testid="stSidebar"] { width: 280px !important; }
+.block-container { padding-top: 0.25rem !important; padding-bottom: 0.25rem !important; padding-left: 0.8rem !important; padding-right: 0.8rem !important; max-width: 100% !important; }
+header[data-testid="stHeader"] { background-color: rgba(0,0,0,0) !important; height: 2.2rem !important; }
+h1, h2, h3, .custom-heading { color: #00E676 !important; font-size: 15px !important; font-weight: 700 !important; margin: 0 !important; }
+div[data-testid="stMetricValue"] { font-size: 13px !important; color: #00E676 !important; }
+div[data-testid="stMetricLabel"] { font-size: 10px !important; }
+div[data-testid="stVerticalBlock"] > div { gap: 0.2rem !important; }
+div[data-testid="stHorizontalBlock"] { gap: 0.35rem !important; }
+.stMarkdown { margin-bottom: 0 !important; }
+hr { margin: 0.25rem 0 !important; }
 .status-badge { padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; display: inline-block; margin-right: 6px; }
-.badge-bullish { background-color: rgba(0, 230, 118, 0.15); color: #00E676; border: 1px solid #00E676; }
-.badge-bearish { background-color: rgba(255, 82, 82, 0.15); color: #FF5252; border: 1px solid #FF5252; }
-.badge-neutral { background-color: rgba(255, 152, 0, 0.15); color: #FF9800; border: 1px solid #FF9800; }
-/* Sticky compact market-summary ribbon */
-.sticky-summary {
-    position: sticky; top: 0; z-index: 999;
-    background: #0E1117; border: 1px solid #2A2F3A; border-radius: 8px;
-    padding: 8px 12px 6px 12px; margin-bottom: 8px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.45);
-}
-.sticky-summary .stMetric { padding: 2px 0 !important; }
-.micro-hover { position: relative; display: block; cursor: help; }
+.badge-bullish { background-color: rgba(0,230,118,0.15); color: #00E676; border: 1px solid #00E676; }
+.badge-bearish { background-color: rgba(255,82,82,0.15); color: #FF5252; border: 1px solid #FF5252; }
+.badge-neutral { background-color: rgba(255,152,0,0.15); color: #FF9800; border: 1px solid #FF9800; }
+.sticky-summary { position: sticky; top: 0; z-index: 999; background: #0E1117; border: 1px solid #2A2F3A; border-radius: 6px; padding: 4px 8px; margin-bottom: 4px; }
+.micro-hover { position: relative; display: inline-block; cursor: help; }
 .micro-hover .micro-tip {
-    display: none; position: absolute; left: 104%; top: 0;
-    z-index: 4000; width: 340px; max-width: 42vw;
+    display: none; position: absolute; left: 0; top: calc(100% + 4px);
+    z-index: 5000; width: 360px; max-width: 70vw;
     background: #1A1F2B; color: #FAFAFA; border: 1px solid #00E676;
-    border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.4;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.55); text-align: left;
+    border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.45;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.55);
 }
 .micro-hover:hover .micro-tip { display: block; }
-.micro-float {
-    position: relative; z-index: 25;
-    margin-top: -355px; margin-bottom: 8px;
-    margin-left: auto; margin-right: 2px;
-    width: 200px; text-align: center;
+.peco-bar {
+    display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px;
+    margin: 4px 0 6px 0; padding: 6px 8px;
+    background: #11151C; border: 1px solid #2A3340; border-radius: 8px;
 }
-.micro-chip {
-    display: block; margin: 0 auto 6px auto; padding: 6px 8px;
-    background: #1A1F2B;
-    border: 1px solid #3A4150; border-radius: 8px;
-    width: 218px; text-align: center;
-    box-shadow: 0 1px 6px rgba(0,0,0,0.35);
+.peco-chip {
+    flex: 1 1 140px; min-width: 140px; text-align: left;
+    padding: 6px 8px; background: #1A1F2B; border: 1px solid #3A4150; border-radius: 8px;
 }
-.chart-card {
-    background: #11151C;
-    border: 1px solid #2A3340;
-    border-radius: 10px;
-    padding: 8px 8px 4px 8px;
-    margin: 0 0 8px 0;
-    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03);
-}
-.chart-card .card-title {
-    color: #8FA4B8; font-size: 11px; font-weight: 700;
-    letter-spacing: 0.04em; text-transform: uppercase;
-    margin: 0 0 4px 2px;
-}
+.chart-card { background: #11151C; border: 1px solid #2A3340; border-radius: 8px; padding: 4px 6px 2px 6px; margin: 0 0 4px 0; }
 </style>
-"""
-st.markdown(custom_css, unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-API_KEY = os.getenv("API_KEY", "")
-CLIENT_CODE = os.getenv("CLIENT_CODE", "")
-PIN = os.getenv("PIN", "")
-TOTP_SECRET = os.getenv("TOTP_SECRET", "")
-
-# Initialise Session State Variables
-if "basket_legs" not in st.session_state:
-    st.session_state["basket_legs"] = []
-if "selected_timeframe" not in st.session_state:
-    st.session_state["selected_timeframe"] = "5 min"
-if "enable_main_refresh" not in st.session_state:
-    st.session_state["enable_main_refresh"] = False
-if "enable_zscore_refresh" not in st.session_state:
-    st.session_state["enable_zscore_refresh"] = False
-if "zscore_data_store" not in st.session_state:
-    st.session_state["zscore_data_store"] = pd.DataFrame()
-if "heatmap_timeframe" not in st.session_state:
-    st.session_state["heatmap_timeframe"] = "5 min"
-if "gex_heatmap_history" not in st.session_state:
-    st.session_state["gex_heatmap_history"] = []
-if "alert_metrics_history" not in st.session_state:
-    st.session_state["alert_metrics_history"] = []  # snapshots for Exit / Long alert criteria
-if "liq_delta_history" not in st.session_state:
-    st.session_state["liq_delta_history"] = []
-if "tick_cvd_history" not in st.session_state:
-    st.session_state["tick_cvd_history"] = []
-if "flow_tape" not in st.session_state:
-    st.session_state["flow_tape"] = []
-
-# ---------- Loading status (sidebar) ----------
-def update_load_status(msg: str):
-    if "load_status_placeholder" not in st.session_state:
-        st.session_state["load_status_placeholder"] = st.sidebar.empty()
-    try:
-        st.session_state["load_status_placeholder"].info(f"⏳ {msg}")
-    except Exception:
-        pass
-
-def clear_load_status():
-    if "load_status_placeholder" in st.session_state:
-        try:
-            st.session_state["load_status_placeholder"].empty()
-        except Exception:
-            pass
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DERIBIT_HOSTS = (
+    "https://www.deribit.com/api/v2",
+    "https://www.deribit.com/api/v2",
+)
+DERIBIT = DERIBIT_HOSTS[0]
+LAST_API_ERROR = ""
+TZ = pytz.timezone("UTC")
+IST = pytz.timezone("Asia/Kolkata")
 
 
-# Streamlit Cache Persistence Handlers
-@st.cache_data(ttl=86400)
-def get_cached_basket():
-    return []
+def to_ist(series) -> pd.Series:
+    ts = pd.to_datetime(series, utc=True, errors="coerce")
+    return ts.dt.tz_convert(IST)
 
-def save_basket_to_cache(basket):
-    get_cached_basket.clear()
-    @st.cache_data(ttl=86400)
-    def _inner():
-        return basket
-    _inner()
 
-# LocalStorage Sync via HTML/JS Fragment
-def sync_local_storage():
-    basket_json = json.dumps(st.session_state["basket_legs"])
-    js_code = f"""
-    <script>
-        // Save current basket state to browser localStorage
-        localStorage.setItem("streamlit_strategy_basket", '{basket_json}');
-    </script>
-    """
-    components.html(js_code, height=0, width=0)
+def ist_label(series, with_date: bool = True) -> pd.Series:
+    t = to_ist(series)
+    return t.dt.strftime("%d-%b %H:%M" if with_date else "%H:%M")
+CONTRACT_SIZE = {"BTC": 1.0, "ETH": 1.0}  # 1 option contract = 1 coin
+PERP = {"BTC": "BTC-PERPETUAL", "ETH": "ETH-PERPETUAL"}
+DVOL = {"BTC": "BTCDVOL", "ETH": "ETHDVOL"}
+BIN_STEP = {"BTC": 250.0, "ETH": 25.0}
 
-LOT_SIZES = {
-    "NIFTY": 65,
-    "BANKNIFTY": 30,
-    "FINNIFTY": 60,
-    "MIDCPNIFTY": 120,
-    "SENSEX": 20
+SESSION_CACHE_DIR = Path("/home/workdir/artifacts/session_cache_crypto")
+try:
+    SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    SESSION_CACHE_DIR = Path("session_cache_crypto")
+    SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Session
+# ---------------------------------------------------------------------------
+for k, v in {
+    "basket_legs": [],
+    "selected_timeframe": "5 min",
+    "enable_main_refresh": False,
+    "liq_delta_history": [],
+    "flow_tape": [],
+    "heatmap_timeframe": "5 min",
+    "gex_heatmap_history": [],
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+INTERVAL_MS = {
+    "1 min": 60_000,
+    "3 min": 180_000,
+    "5 min": 300_000,
+    "15 min": 900_000,
+    "1 hour": 3_600_000,
 }
 
-INDEX_TOKEN_MAP = {
-    "NIFTY": ("99926000", "NSE", "NFO"),
-    "BANKNIFTY": ("99926009", "NSE", "NFO"),
-    "FINNIFTY": ("99926037", "NSE", "NFO"),
-    "MIDCPNIFTY": ("99926074", "NSE", "NFO"),
-    "SENSEX": ("99919000", "BSE", "BFO")
-}
-INDIA_VIX_TOKEN = "99926017"
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+_HTTP = requests.Session()
+_HTTP.headers.update({"User-Agent": "crypto-gex-dashboard/1.0"})
 
-# --- RATE LIMIT SAFEGUARD WRAPPER ---
-def safe_api_call(func, *args, max_retries=4, base_delay=0.6, **kwargs):
-    """Executes SmartAPI calls with dynamic retry logic and exponential backoff for rate limits."""
-    for attempt in range(max_retries):
-        try:
-            res = func(*args, **kwargs)
-            if isinstance(res, dict) and not res.get("status"):
-                msg = str(res.get("message", "")).lower()
-                if "access denied" in msg or "rate" in msg or "exceeding" in msg:
-                    raise Exception(f"Rate Limit Hit: {res.get('message')}")
-            return res
-        except Exception as e:
-            err_str = str(e).lower()
-            if "access denied" in err_str or "rate" in err_str or "exceeding" in err_str:
-                if attempt == max_retries - 1:
+
+def deribit_get(method: str, params: dict | None = None, timeout: int = 20):
+    """Public GET with retry. Does not cache 503 / maintenance as success."""
+    global LAST_API_ERROR
+    last = None
+    for attempt in range(3):
+        for base in DERIBIT_HOSTS:
+            url = f"{base}/{method}"
+            try:
+                r = _HTTP.get(url, params=params or {}, timeout=timeout)
+                try:
+                    js = r.json()
+                except Exception:
+                    last = f"HTTP {r.status_code} non-JSON"
+                    continue
+                err = js.get("error")
+                if err:
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    LAST_API_ERROR = f"Deribit: {msg}"
+                    last = LAST_API_ERROR
+                    if str(msg) == "system_maintenance" or r.status_code in (503, 429):
+                        time.sleep(0.6 * (attempt + 1))
+                        continue
                     return None
-                sleep_time = base_delay * (2 ** attempt) + random.uniform(0.1, 0.4)
-                time.sleep(sleep_time)
-            else:
-                return None
+                LAST_API_ERROR = ""
+                return js.get("result")
+            except Exception as e:
+                last = str(e)
+                continue
+        time.sleep(0.4 * (attempt + 1))
+    LAST_API_ERROR = last or "Deribit unreachable"
     return None
 
-# --- BETA MODULE HELPER FUNCTIONS ---
-def d1_d2(S, K, T, r, sigma):
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    return d1, d2
 
-def calculate_implied_volatility(price, S, K, T, r, option_type="CE"):
-    if T <= 1e-5 or price <= 0:
-        return 0.15
-    discounted_K = K * np.exp(-r * T)
-    
-    def bs_error(sigma):
-        d1, d2 = d1_d2(S, K, T, r, sigma)
-        if option_type == "CE":
-            bs_price = S * si.norm.cdf(d1) - discounted_K * si.norm.cdf(d2)
-        else:
-            bs_price = discounted_K * si.norm.cdf(-d2) - S * si.norm.cdf(-d1)
-        return bs_price - price
+def heading_ribbon(title: str, tip_html: str, size: int = 12):
+    """Named hover ribbon — title always visible, definition expands on hover."""
+    st.markdown(
+        f"<div class='micro-hover' style='padding:2px 8px;background:#1A1F2B;"
+        f"border:1px solid #3A4150;border-radius:6px;margin:0 0 3px 0;'>"
+        f"<span style='font-weight:700;color:#00E676;font-size:{size}px;'>{title}</span>"
+        f"<span style='color:#667;font-size:10px;margin-left:6px;'>hover</span>"
+        f"<div class='micro-tip'>{tip_html}</div></div>",
+        unsafe_allow_html=True,
+    )
 
-    try:
-        f_low = bs_error(0.0001)
-        f_high = bs_error(10.0)
-        if f_low * f_high <= 0:
-            return brentq(bs_error, a=0.0001, b=10.0, xtol=1e-5)
-        return 0.01 if f_low > 0 else 2.5
-    except Exception:
-        return 0.15
 
-def compute_greeks(row, K, r, option_type="CE"):
-    S = row['Spot_Price']
-    T = row['T']
-    price = row['Close']
-    
-    if T <= 1e-5 or S <= 0:
-        return pd.Series([0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False])
-    
-    discounted_K = K * np.exp(-r * T)
-    intrinsic = max(0.0, S - discounted_K) if option_type == "CE" else max(0.0, discounted_K - S)
-    extrinsic = max(0.0, price - intrinsic)
-    is_pure_intrinsic = extrinsic <= 1.0
-    
-    sigma = calculate_implied_volatility(price, S, K, T, r, option_type)
-    d1, d2 = d1_d2(S, K, T, r, sigma)
-    
-    if option_type == "CE":
-        theta = (- (S * sigma * si.norm.pdf(d1)) / (2 * np.sqrt(T)) 
-                 - r * K * np.exp(-r * T) * si.norm.cdf(d2)) / 365.0
-        charm = (si.norm.pdf(d1) * (2 * r * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))) / 365.0
-    else:
-        theta = (- (S * sigma * si.norm.pdf(d1)) / (2 * np.sqrt(T)) 
-                 + r * K * np.exp(-r * T) * si.norm.cdf(-d2)) / 365.0
-        charm = (-si.norm.pdf(d1) * (2 * r * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))) / 365.0
-                 
-    gamma = si.norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    vanna = - (si.norm.pdf(d1) * d2) / sigma
-    theta_decay_pct = (abs(theta) / price) * 100.0 if price > 0 else 0.0
-    
-    return pd.Series([sigma * 100.0, theta, theta_decay_pct, gamma, vanna, charm, extrinsic, is_pure_intrinsic])
-
-# MODIFIED: Updated to 1-hour interval for 1-hr data points while keeping daily greeks
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_history(_api, token, days, spot_token="99926000", spot_exchange="NSE"):
-    to_date = datetime.datetime.now()
-    from_date = to_date - datetime.timedelta(days=days)
-    
-    opt_params = {"exchange": "NFO", "symboltoken": str(token), "interval": "ONE_HOUR", 
-                  "fromdate": from_date.strftime("%Y-%m-%d 09:15"), "todate": to_date.strftime("%Y-%m-%d 15:30")}
-    opt_res = safe_api_call(_api.getCandleData, opt_params)
-    time.sleep(0.40)
-    
-    spot_params = {"exchange": spot_exchange, "symboltoken": str(spot_token), "interval": "ONE_HOUR", 
-                   "fromdate": from_date.strftime("%Y-%m-%d 09:15"), "todate": to_date.strftime("%Y-%m-%d 15:30")}
-    spot_res = safe_api_call(_api.getCandleData, spot_params)
-    time.sleep(0.40)
-    
-    if opt_res and opt_res.get('data') and spot_res and spot_res.get('data'):
-        df_opt = pd.DataFrame(opt_res['data'], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        df_spot = pd.DataFrame(spot_res['data'], columns=['Timestamp', 'Open', 'High', 'Low', 'Close_Spot', 'Vol_Spot'])
-        
-        df_opt['Timestamp'] = pd.to_datetime(df_opt['Timestamp'])
-        df_spot['Timestamp'] = pd.to_datetime(df_spot['Timestamp'])
-        
-        df = pd.merge(df_opt[['Timestamp', 'Close']], df_spot[['Timestamp', 'Close_Spot']], on='Timestamp', how='inner')
-        df.rename(columns={'Close_Spot': 'Spot_Price'}, inplace=True)
-        df['Date'] = df['Timestamp'].dt.strftime('%d-%b %H:%M')
-        df['Raw_Timestamp'] = df['Timestamp']
-        return df.sort_values('Raw_Timestamp', ascending=True).reset_index(drop=True)
-    return pd.DataFrame()
-
-# OPTIMIZED: Cached & Paced with BATCH API requests to prevent Rate Limit Exceeded
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_and_compute_full_chain_iv(_api, df_master, index_name, exchange, expiry_str, current_spot, r, strikes_below=10, strikes_above=10):
-    target_dt = pd.to_datetime(expiry_str, format="%d%b%Y", errors='coerce')
-    
-    # Filter strictly by Index Name, Exchange, and Selected Expiry
-    df_expiry = df_master[
-        (df_master['name'] == index_name) & 
-        (df_master['exch_seg'] == exchange) & 
-        (df_master['expiry_dt'] == target_dt) &
-        (df_master['instrumenttype'].isin(['OPTIDX', 'OPTSTK']))
-    ].copy()
-
-    if df_expiry.empty:
-        return pd.DataFrame()
-
-    df_expiry['strike_clean'] = pd.to_numeric(df_expiry['strike'], errors='coerce') / (100.0 if exchange == "NFO" else 1.0)
-    if df_expiry['strike_clean'].max() > 1000000:
-        df_expiry['strike_clean'] = df_expiry['strike_clean'] / 100.0
-
-    expiry_dt = df_expiry.iloc[0]['expiry_dt'].date()
-    today_dt = datetime.datetime.now().date()
-    dte = max((expiry_dt - today_dt).days, 0.001)
-    T = dte / 365.0
-
-    all_strikes = sorted(df_expiry['strike_clean'].dropna().unique())
-    if not all_strikes:
-        return pd.DataFrame()
-
-    atm_strike = min(all_strikes, key=lambda x: abs(x - current_spot))
-    atm_idx = all_strikes.index(atm_strike)
-
-    start_idx = max(0, atm_idx - strikes_below)
-    end_idx = min(len(all_strikes), atm_idx + strikes_above + 1)
-    target_strikes = set(all_strikes[start_idx:end_idx])
-
-    df_filtered = df_expiry[df_expiry['strike_clean'].isin(target_strikes)].copy()
-
-    # Optimized Batch Fetch via getMarketData to avoid hundreds of separate candle requests
-    tokens = [str(t) for t in df_filtered['token'].dropna().unique() if str(t) != "nan"]
-    market_data = {}
-    chunk_size = 40
-
-    for i in range(0, len(tokens), chunk_size):
-        chunk = tokens[i:i + chunk_size]
-        res = safe_api_call(_api.getMarketData, "FULL", {exchange: chunk})
-        if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
-            for item in res["data"]["fetched"]:
-                market_data[str(item["symbolToken"])] = float(item.get("ltp", 0.0))
-        time.sleep(0.40)
-
-    results = []
-    for idx, (_, row) in enumerate(df_filtered.iterrows()):
-        opt_type = "CE" if str(row['symbol']).endswith("CE") else "PE"
-        token = str(row['token'])
-        strike = row['strike_clean']
-
-        latest_ltp = market_data.get(token, 0.0)
-        if latest_ltp <= 1.0:
-            continue
-            
-        iv = calculate_implied_volatility(latest_ltp, current_spot, strike, T, r, option_type=opt_type)
-        iv_pct = iv * 100.0
-        
-        discounted_K = strike * np.exp(-r * T)
-        intrinsic = max(0.0, current_spot - discounted_K) if opt_type == "CE" else max(0.0, discounted_K - current_spot)
-        extrinsic = max(0.0, latest_ltp - intrinsic)
-        is_pure_intrinsic = extrinsic <= 1.0
-        is_vol_crash = is_pure_intrinsic or (iv_pct <= 2.0)
-
-        if 2.0 <= iv_pct <= 80.0 or is_vol_crash:
-            results.append({
-                'Strike': strike,
-                'Option_Type': opt_type,
-                'LTP': latest_ltp,
-                'IV_%': iv_pct,
-                'Extrinsic_Val': extrinsic,
-                'Is_Pure_Intrinsic': is_pure_intrinsic,
-                'Vol_Crash_Flag': is_vol_crash,
-                'Expiry': expiry_str,
-                'Token': token
-            })
-
-    df_chain_iv = pd.DataFrame(results)
-    if df_chain_iv.empty:
-        return pd.DataFrame()
-
-    return df_chain_iv.sort_values('Strike', ascending=True)
-
-def get_clean_otm_skew(df_chain_iv, current_spot):
-    puts_otm = df_chain_iv[(df_chain_iv['Option_Type'] == 'PE') & (df_chain_iv['Strike'] < current_spot)].copy()
-    calls_otm = df_chain_iv[(df_chain_iv['Option_Type'] == 'CE') & (df_chain_iv['Strike'] >= current_spot)].copy()
-    df_skew = pd.concat([puts_otm, calls_otm]).sort_values('Strike').reset_index(drop=True)
-    return df_skew
-
-def plot_line_chart(df, y_col, title, y_label, color="#1f77b4"):
-    fig = px.line(df, x='Date', y=y_col, title=title, markers=True,
-                  hover_data=['Date', 'Spot_Price', 'Close', 'Extrinsic_Val', 'Is_Pure_Intrinsic'])
-    fig.update_traces(line_color=color)
-    fig.update_xaxes(type="category", autorange=True, title="Date (Oldest ➔ Present/Today)")
-    fig.update_yaxes(title=y_label)
-    fig.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=40, b=20))
-    return fig
-
-# --- VOLATILITY & GREEKS ENGINE ---
+# ---------------------------------------------------------------------------
+# Black–Scholes / Volatility engine  (same construct as the index app)
+# ---------------------------------------------------------------------------
 class VolatilityEngine:
     @staticmethod
     def _norm_cdf(x: float) -> float:
@@ -429,311 +225,195 @@ class VolatilityEngine:
 
     @staticmethod
     def _norm_pdf(x: float) -> float:
-        return math.exp(-0.5 * x**2) / math.sqrt(2.0 * math.pi)
+        return math.exp(-0.5 * x ** 2) / math.sqrt(2.0 * math.pi)
 
     @classmethod
-    def black_scholes_price(cls, S: float, K: float, T: float, r: float, sigma: float, flag: str = "c") -> float:
-        if T <= 0 or sigma <= 0:
+    def black_scholes_price(cls, S, K, T, r, sigma, flag="c") -> float:
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
             return 0.0
-        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
         d2 = d1 - sigma * math.sqrt(T)
-        if flag.lower() == "c":
+        if flag.lower().startswith("c"):
             return S * cls._norm_cdf(d1) - K * math.exp(-r * T) * cls._norm_cdf(d2)
         return K * math.exp(-r * T) * cls._norm_cdf(-d2) - S * cls._norm_cdf(-d1)
 
     @classmethod
-    def calculate_greeks(cls, S: float, K: float, T: float, r: float, sigma: float, flag: str = "c") -> dict:
-        if T <= 0 or sigma <= 0:
-            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "charm": 0.0}
-
-        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+    def calculate_greeks(cls, S, K, T, r, sigma, flag="c") -> dict:
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "charm": 0.0, "vanna": 0.0}
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
         d2 = d1 - sigma * math.sqrt(T)
-        pdf_d1 = cls._norm_pdf(d1)
-
-        gamma = pdf_d1 / (S * sigma * math.sqrt(T))
-        vega = (S * pdf_d1 * math.sqrt(T)) / 100.0
-
-        if flag.lower() == "c":
+        pdf = cls._norm_pdf(d1)
+        gamma = pdf / (S * sigma * math.sqrt(T))
+        vega = (S * pdf * math.sqrt(T)) / 100.0
+        vanna = -(pdf * d2) / sigma
+        if flag.lower().startswith("c"):
             delta = cls._norm_cdf(d1)
-            theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * cls._norm_cdf(d2)) / 365.0
-            charm = (pdf_d1 * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))) / 365.0
+            theta = (-(S * pdf * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * cls._norm_cdf(d2)) / 365.0
+            charm = (pdf * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))) / 365.0
         else:
             delta = cls._norm_cdf(d1) - 1.0
-            theta = (-(S * pdf_d1 * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * cls._norm_cdf(-d2)) / 365.0
-            charm = (-pdf_d1 * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))) / 365.0
-
-        return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega, "charm": charm}
+            theta = (-(S * pdf * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * cls._norm_cdf(-d2)) / 365.0
+            charm = (-pdf * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))) / 365.0
+        return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega, "charm": charm, "vanna": vanna}
 
     @classmethod
-    def calculate_iv(cls, market_price: float, S: float, K: float, T: float, r: float = 0.10, flag: str = "c") -> float:
-        if market_price <= 0.05 or T <= 0:
+    def calculate_iv(cls, market_price, S, K, T, r=0.0, flag="c") -> float:
+        if market_price <= 0 or T <= 0 or S <= 0 or K <= 0:
             return 0.0
         df = math.exp(-r * T)
-        intrinsic = max(0.0, S - K * df) if flag.lower() == "c" else max(0.0, K * df - S)
-
-        if market_price <= intrinsic:
+        intrinsic = max(0.0, S - K * df) if flag.lower().startswith("c") else max(0.0, K * df - S)
+        if market_price <= intrinsic * 0.999:
             return 0.0
 
-        def objective_function(sigma: float) -> float:
-            return cls.black_scholes_price(S, K, T, r, sigma, flag) - market_price
+        def obj(sig):
+            return cls.black_scholes_price(S, K, T, r, sig, flag) - market_price
 
         try:
-            return float(brentq(objective_function, a=1e-4, b=10.0, xtol=1e-4))
-        except (ValueError, RuntimeError):
-            return 0.0
-
-    @classmethod
-    def calculate_hv(cls, smart_api, symbol_token: str, exchange: str = "NSE", days: int = 30) -> float:
-        try:
-            to_date = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-            from_date = to_date - datetime.timedelta(days=int(days * 1.6) + 10)
-
-            param = {
-                "exchange": exchange,
-                "symboltoken": symbol_token,
-                "interval": "ONE_DAY",
-                "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
-                "todate": to_date.strftime("%Y-%m-%d 15:30")
-            }
-            hist_data = safe_api_call(smart_api.getCandleData, param)
-            time.sleep(0.40)
-            if hist_data and hist_data.get("status") and hist_data.get("data"):
-                df_hist = pd.DataFrame(hist_data["data"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-                df_hist["close"] = df_hist["close"].astype(float)
-                df_hist = df_hist.tail(days + 1)
-                log_returns = np.log(df_hist["close"] / df_hist["close"].shift(1)).dropna()
-
-                if len(log_returns) >= 5:
-                    return float(np.std(log_returns, ddof=1) * np.sqrt(252))
+            return float(brentq(obj, 1e-4, 8.0, xtol=1e-4))
         except Exception:
-            pass
-        return 0.15
-
-    @staticmethod
-    def calculate_max_pain(chain_data: list) -> int:
-        strikes = [row["Strike"] for row in chain_data]
-        if not strikes:
-            return 0
-
-        losses = {}
-        for spot_hypo in strikes:
-            total_loss = 0.0
-            for row in chain_data:
-                k = row["Strike"]
-                c_oi = row["C_OI"]
-                p_oi = row["P_OI"]
-
-                if spot_hypo > k:
-                    total_loss += (spot_hypo - k) * c_oi
-                if spot_hypo < k:
-                    total_loss += (k - spot_hypo) * p_oi
-
-            losses[spot_hypo] = total_loss
-
-        return min(losses, key=losses.get)
-
-# --- OPTION CHAIN LEVEL CALCULATOR ---
-def calculate_support_resistance_targets(chain_data: list, spot_price: float, max_pain: int):
-    if not chain_data:
-        return {}
-
-    df = pd.DataFrame(chain_data)
-
-    res_df = df.sort_values(by="C_OI", ascending=False)
-    r1 = res_df.iloc[0]["Strike"] if len(res_df) > 0 else spot_price
-    r2 = res_df.iloc[1]["Strike"] if len(res_df) > 1 else r1
-
-    sup_df = df.sort_values(by="P_OI", ascending=False)
-    s1 = sup_df.iloc[0]["Strike"] if len(sup_df) > 0 else spot_price
-    s2 = sup_df.iloc[1]["Strike"] if len(sup_df) > 1 else s1
-
-    df_sorted = df.sort_values(by="Strike").reset_index(drop=True)
-
-    above_spot = df_sorted[df_sorted["Strike"] >= spot_price]
-    below_spot = df_sorted[df_sorted["Strike"] < spot_price]
-
-    gex_res_row = above_spot.sort_values(by="Net_GEX_OI", ascending=False).head(1) if not above_spot.empty else pd.DataFrame()
-    gex_resistance = gex_res_row.iloc[0]["Strike"] if not gex_res_row.empty and gex_res_row.iloc[0]["Net_GEX_OI"] > 0 else r1
-
-    gex_sup_row = below_spot.sort_values(by="Net_GEX_OI", ascending=False).head(1) if not below_spot.empty else pd.DataFrame()
-    gex_support = gex_sup_row.iloc[0]["Strike"] if not gex_sup_row.empty and gex_sup_row.iloc[0]["Net_GEX_OI"] > 0 else s1
-
-    neg_gex_row = df_sorted.sort_values(by="Net_GEX_OI", ascending=True).head(1)
-    gex_accelerator = neg_gex_row.iloc[0]["Strike"] if not neg_gex_row.empty and neg_gex_row.iloc[0]["Net_GEX_OI"] < 0 else None
-
-    flip_candidates = []
-    for i in range(1, len(df_sorted)):
-        prev_gex = df_sorted.loc[i-1, "Net_GEX_OI"]
-        curr_gex = df_sorted.loc[i, "Net_GEX_OI"]
-
-        if (prev_gex < 0 and curr_gex >= 0) or (prev_gex >= 0 and curr_gex < 0):
-            chosen_strike = df_sorted.loc[i, "Strike"] if abs(curr_gex) < abs(prev_gex) else df_sorted.loc[i-1, "Strike"]
-            flip_candidates.append(chosen_strike)
-
-    zero_gamma_strike = min(flip_candidates, key=lambda x: abs(x - spot_price)) if flip_candidates else spot_price
-
-    atm_row = df.iloc[(df['Strike'] - spot_price).abs().argsort()[:1]].iloc[0]
-    atm_straddle_cost = atm_row["C_LTP"] + atm_row["P_LTP"]
-
-    target_upside = round(spot_price + atm_straddle_cost, 2)
-    target_downside = round(spot_price - atm_straddle_cost, 2)
-
-    return {
-        "S1": s1, "S2": s2, "R1": r1, "R2": r2,
-        "GEX_Support": gex_support,
-        "GEX_Resistance": gex_resistance,
-        "GEX_Accelerator": gex_accelerator,
-        "Zero_Gamma_Flip": zero_gamma_strike,
-        "MaxPain": max_pain,
-        "Target_Up": target_upside,
-        "Target_Down": target_downside,
-        "Straddle_Cost": round(atm_straddle_cost, 2)
-    }
+            return 0.0
 
 
-# 81-state microstructure playbook: Price, EFI, CVD, OBV → (label, action)
-# arrows: u=up d=down f=flat
+# ---------------------------------------------------------------------------
+# Playbooks (identical state machines)
+# ---------------------------------------------------------------------------
 MICRO_PLAYBOOK = {
-    ("u","u","u","u"): ("Pure Institutional Aggression", "LONG BREAKOUT (Target: Upper 2.0σ)"),
-    ("u","u","u","f"): ("Thin-Book Impulse", "CAUTIOUS LONG (Trailing SL tight)"),
-    ("u","u","u","d"): ("Low-Volume Markup", "CAUTIOUS LONG / PREPARE TRAIL"),
-    ("u","u","f","u"): ("Passive Wall Sweeping", "HOLD LONG"),
-    ("u","u","f","f"): ("Steady Markup", "HOLD LONG"),
-    ("u","u","f","d"): ("Low-Volume Steady Drift", "NO ENTRY (Unstable move)"),
-    ("u","u","d","u"): ("Bullish Passive Limit Accumulation", "HOLD LONG (Institutional support)"),
-    ("u","u","d","f"): ("Absorbed Drift", "HOLD LONG"),
-    ("u","u","d","d"): ("Illiquid Short Squeeze", "NO ENTRY (High reversal risk)"),
-    ("u","f","u","u"): ("High-Volume Choke", "WARNING: Limit sell wall building"),
-    ("u","f","u","f"): ("Mild Buying Friction", "HOLD LONG / NO NEW ENTRIES"),
-    ("u","f","u","d"): ("Fading Buying Effort", "BLOCK LONG ENTRIES"),
-    ("u","f","f","u"): ("High Volume Neutral Drift", "HOLD LONG"),
-    ("u","f","f","f"): ("Low-Volatility Up-Drift", "HOLD EXISTING POSITIONS"),
-    ("u","f","f","d"): ("Volume Drying Upbeat", "PREPARE EXIT LONG"),
-    ("u","f","d","u"): ("Distribution under Cover", "EXIT LONG / PREPARE SHORT"),
-    ("u","f","d","f"): ("Passive Seller Pressure", "EXIT LONG"),
-    ("u","f","d","d"): ("Diverging Drift", "EXIT LONG"),
-    ("u","d","u","u"): ("Institutional Supply Absorption", "EXIT LONG / DYNAMIC ABSORPTION EXIT"),
-    ("u","d","u","f"): ("Buying Force Decay", "EXIT LONG"),
-    ("u","d","u","d"): ("Fading Bullish Push", "EXIT LONG"),
-    ("u","d","f","u"): ("High Volume Momentum Trap", "PREPARE SHORT"),
-    ("u","d","f","f"): ("Momentum Exhaustion", "EXIT LONG"),
-    ("u","d","f","d"): ("Low-Volume Top Building", "PREPARE SHORT"),
-    ("u","d","d","u"): ("Classic Bearish Institutional Distribution", "SHORT MEAN-REVERSION (At Upper Band)"),
-    ("u","d","d","f"): ("Bearish Divergence (Standard)", "SHORT MEAN-REVERSION"),
-    ("u","d","d","d"): ("Triple Bearish Divergence", "SHORT MEAN-REVERSION / SHORT ENTRY"),
-    ("f","u","u","u"): ("Coil Compression (Bullish Push)", "PRE-BREAKOUT LONG PREPARATION"),
-    ("f","u","u","f"): ("Hidden Aggressive Buying", "PRE-BREAKOUT LONG"),
-    ("f","u","u","d"): ("Selective Aggressive Buying", "WATCH FOR BREAKOUT"),
-    ("f","u","f","u"): ("Force Expansion in Consolidation", "WATCH FOR BREAKOUT"),
-    ("f","u","f","f"): ("Quiet Force Building", "NO ENTRY / NO EDGE"),
-    ("f","u","f","d"): ("Low-Volume Force Shift", "NO ENTRY"),
-    ("f","u","d","u"): ("Passive Limit Floor Building", "BULLISH ABSORPTION WATCH"),
-    ("f","u","d","f"): ("Mild Passive Support", "NO ENTRY"),
-    ("f","u","d","d"): ("Conflicted Consolidation", "NO ENTRY"),
-    ("f","f","u","u"): ("Institutional Accumulation Box", "ACCUMULATION WATCH"),
-    ("f","f","u","f"): ("Quiet Delta Accumulation", "ACCUMULATION WATCH"),
-    ("f","f","u","d"): ("Low-Volume Delta Push", "NO ENTRY"),
-    ("f","f","f","u"): ("High-Volume Equilibrium", "ORDER BOOK REBALANCING"),
-    ("f","f","f","f"): ("DEAD MARKET / LUNCH HOUR CHOP", "NO ENTRY (BLOCK ALL SIGNALS)"),
-    ("f","f","f","d"): ("Liquidity Drying Up", "NO ENTRY"),
-    ("f","f","d","u"): ("Institutional Distribution Box", "DISTRIBUTION WATCH"),
-    ("f","f","d","f"): ("Quiet Delta Distribution", "DISTRIBUTION WATCH"),
-    ("f","f","d","d"): ("Low-Volume Slippage", "NO ENTRY"),
-    ("f","d","u","u"): ("Passive Limit Wall Blocking Force", "NO ENTRY"),
-    ("f","d","u","f"): ("Fading Buying Impulse in Range", "NO ENTRY"),
-    ("f","d","u","d"): ("Low-Volume Friction", "NO ENTRY"),
-    ("f","d","f","u"): ("High-Volume Bearish Force", "WATCH FOR BREAKDOWN"),
-    ("f","d","f","f"): ("Quiet Force Decay", "NO ENTRY"),
-    ("f","d","f","d"): ("Low-Volume Force Breakdown", "NO ENTRY"),
-    ("f","d","d","u"): ("Coil Compression (Bearish Push)", "PRE-BREAKDOWN SHORT PREPARATION"),
-    ("f","d","d","f"): ("Hidden Aggressive Selling", "PRE-BREAKDOWN SHORT"),
-    ("f","d","d","d"): ("Triple Bearish Compression", "SHORT BREAKDOWN PREPARATION"),
-    ("d","u","u","u"): ("Triple Bullish Divergence", "LONG MEAN-REVERSION / LONG ENTRY"),
-    ("d","u","u","f"): ("Bullish Divergence (Standard)", "LONG MEAN-REVERSION"),
-    ("d","u","u","d"): ("Classic Bullish Institutional Accumulation", "LONG MEAN-REVERSION (At Lower Band)"),
-    ("d","u","f","u"): ("High-Volume Bottom Building", "PREPARE LONG"),
-    ("d","u","f","f"): ("Momentum Floor", "EXIT SHORT"),
-    ("d","u","f","d"): ("Low-Volume Bottom Building", "PREPARE LONG"),
-    ("d","u","d","u"): ("Institutional Demand Absorption", "EXIT SHORT / DYNAMIC ABSORPTION EXIT"),
-    ("d","u","d","f"): ("Selling Force Decay", "EXIT SHORT"),
-    ("d","u","d","d"): ("Fading Bearish Push", "EXIT SHORT"),
-    ("d","f","u","u"): ("Accumulation under Cover", "EXIT SHORT / PREPARE LONG"),
-    ("d","f","u","f"): ("Passive Buyer Pressure", "EXIT SHORT"),
-    ("d","f","u","d"): ("Diverging Down-Drift", "EXIT SHORT"),
-    ("d","f","f","u"): ("High Volume Neutral Down-Drift", "HOLD SHORT"),
-    ("d","f","f","f"): ("Low-Volatility Down-Drift", "HOLD EXISTING POSITIONS"),
-    ("d","f","f","d"): ("Volume Drying Downbeat", "PREPARE EXIT SHORT"),
-    ("d","f","d","u"): ("High-Volume Friction", "WARNING: Limit buy wall building"),
-    ("d","f","d","f"): ("Mild Selling Friction", "HOLD SHORT / NO NEW ENTRIES"),
-    ("d","f","d","d"): ("Fading Selling Effort", "BLOCK SHORT ENTRIES"),
-    ("d","d","u","u"): ("Bullish Passive Limit Absorption", "HOLD SHORT (Institutional resistance)"),
-    ("d","d","u","f"): ("Absorbed Down-Drift", "HOLD SHORT"),
-    ("d","d","u","d"): ("Illiquid Long Squeeze", "NO ENTRY (High reversal risk)"),
-    ("d","d","f","u"): ("Passive Wall Sweeping Down", "HOLD SHORT"),
-    ("d","d","f","f"): ("Steady Markdown", "HOLD SHORT"),
-    ("d","d","f","d"): ("Low-Volume Steady Down-Drift", "NO ENTRY (Unstable move)"),
-    ("d","d","d","u"): ("Low-Volume Markdown", "CAUTIOUS SHORT / PREPARE TRAIL"),
-    ("d","d","d","f"): ("Thin-Book Down-Impulse", "CAUTIOUS SHORT (Trailing SL tight)"),
-    ("d","d","d","d"): ("Pure Institutional Aggression (Bearish)", "SHORT BREAKOUT (Target: Lower 2.0σ)"),
+    ("u", "u", "u", "u"): ("Pure Institutional Aggression", "LONG BREAKOUT (Target: Upper 2.0σ)"),
+    ("u", "u", "u", "f"): ("Thin-Book Impulse", "CAUTIOUS LONG (Trailing SL tight)"),
+    ("u", "u", "u", "d"): ("Low-Volume Markup", "CAUTIOUS LONG / PREPARE TRAIL"),
+    ("u", "u", "f", "u"): ("Passive Wall Sweeping", "HOLD LONG"),
+    ("u", "u", "f", "f"): ("Steady Markup", "HOLD LONG"),
+    ("u", "u", "f", "d"): ("Low-Volume Steady Drift", "NO ENTRY (Unstable move)"),
+    ("u", "u", "d", "u"): ("Bullish Passive Limit Accumulation", "HOLD LONG (Institutional support)"),
+    ("u", "u", "d", "f"): ("Absorbed Drift", "HOLD LONG"),
+    ("u", "u", "d", "d"): ("Illiquid Short Squeeze", "NO ENTRY (High reversal risk)"),
+    ("u", "f", "u", "u"): ("High-Volume Choke", "WARNING: Limit sell wall building"),
+    ("u", "f", "u", "f"): ("Mild Buying Friction", "HOLD LONG / NO NEW ENTRIES"),
+    ("u", "f", "u", "d"): ("Fading Buying Effort", "BLOCK LONG ENTRIES"),
+    ("u", "f", "f", "u"): ("High Volume Neutral Drift", "HOLD LONG"),
+    ("u", "f", "f", "f"): ("Low-Volatility Up-Drift", "HOLD EXISTING POSITIONS"),
+    ("u", "f", "f", "d"): ("Volume Drying Upbeat", "PREPARE EXIT LONG"),
+    ("u", "f", "d", "u"): ("Distribution under Cover", "EXIT LONG / PREPARE SHORT"),
+    ("u", "f", "d", "f"): ("Passive Seller Pressure", "EXIT LONG"),
+    ("u", "f", "d", "d"): ("Diverging Drift", "EXIT LONG"),
+    ("u", "d", "u", "u"): ("Institutional Supply Absorption", "EXIT LONG / DYNAMIC ABSORPTION EXIT"),
+    ("u", "d", "u", "f"): ("Buying Force Decay", "EXIT LONG"),
+    ("u", "d", "u", "d"): ("Fading Bullish Push", "EXIT LONG"),
+    ("u", "d", "f", "u"): ("High Volume Momentum Trap", "PREPARE SHORT"),
+    ("u", "d", "f", "f"): ("Momentum Exhaustion", "EXIT LONG"),
+    ("u", "d", "f", "d"): ("Low-Volume Top Building", "PREPARE SHORT"),
+    ("u", "d", "d", "u"): ("Classic Bearish Institutional Distribution", "SHORT MEAN-REVERSION (At Upper Band)"),
+    ("u", "d", "d", "f"): ("Bearish Divergence (Standard)", "SHORT MEAN-REVERSION"),
+    ("u", "d", "d", "d"): ("Triple Bearish Divergence", "SHORT MEAN-REVERSION / SHORT ENTRY"),
+    ("f", "u", "u", "u"): ("Coil Compression (Bullish Push)", "PRE-BREAKOUT LONG PREPARATION"),
+    ("f", "u", "u", "f"): ("Hidden Aggressive Buying", "PRE-BREAKOUT LONG"),
+    ("f", "u", "u", "d"): ("Selective Aggressive Buying", "WATCH FOR BREAKOUT"),
+    ("f", "u", "f", "u"): ("Force Expansion in Consolidation", "WATCH FOR BREAKOUT"),
+    ("f", "u", "f", "f"): ("Quiet Force Building", "NO ENTRY / NO EDGE"),
+    ("f", "u", "f", "d"): ("Low-Volume Force Shift", "NO ENTRY"),
+    ("f", "u", "d", "u"): ("Passive Limit Floor Building", "BULLISH ABSORPTION WATCH"),
+    ("f", "u", "d", "f"): ("Mild Passive Support", "NO ENTRY"),
+    ("f", "u", "d", "d"): ("Conflicted Consolidation", "NO ENTRY"),
+    ("f", "f", "u", "u"): ("Institutional Accumulation Box", "ACCUMULATION WATCH"),
+    ("f", "f", "u", "f"): ("Quiet Delta Accumulation", "ACCUMULATION WATCH"),
+    ("f", "f", "u", "d"): ("Low-Volume Delta Push", "NO ENTRY"),
+    ("f", "f", "f", "u"): ("High-Volume Equilibrium", "ORDER BOOK REBALANCING"),
+    ("f", "f", "f", "f"): ("DEAD MARKET / CHOP", "NO ENTRY (BLOCK ALL SIGNALS)"),
+    ("f", "f", "f", "d"): ("Liquidity Drying Up", "NO ENTRY"),
+    ("f", "f", "d", "u"): ("Institutional Distribution Box", "DISTRIBUTION WATCH"),
+    ("f", "f", "d", "f"): ("Quiet Delta Distribution", "DISTRIBUTION WATCH"),
+    ("f", "f", "d", "d"): ("Low-Volume Slippage", "NO ENTRY"),
+    ("f", "d", "u", "u"): ("Passive Limit Wall Blocking Force", "NO ENTRY"),
+    ("f", "d", "u", "f"): ("Fading Buying Impulse in Range", "NO ENTRY"),
+    ("f", "d", "u", "d"): ("Low-Volume Friction", "NO ENTRY"),
+    ("f", "d", "f", "u"): ("High-Volume Bearish Force", "WATCH FOR BREAKDOWN"),
+    ("f", "d", "f", "f"): ("Quiet Force Decay", "NO ENTRY"),
+    ("f", "d", "f", "d"): ("Low-Volume Force Breakdown", "NO ENTRY"),
+    ("f", "d", "d", "u"): ("Coil Compression (Bearish Push)", "PRE-BREAKDOWN SHORT PREPARATION"),
+    ("f", "d", "d", "f"): ("Hidden Aggressive Selling", "PRE-BREAKDOWN SHORT"),
+    ("f", "d", "d", "d"): ("Triple Bearish Compression", "SHORT BREAKDOWN PREPARATION"),
+    ("d", "u", "u", "u"): ("Triple Bullish Divergence", "LONG MEAN-REVERSION / LONG ENTRY"),
+    ("d", "u", "u", "f"): ("Bullish Divergence (Standard)", "LONG MEAN-REVERSION"),
+    ("d", "u", "u", "d"): ("Classic Bullish Institutional Accumulation", "LONG MEAN-REVERSION (At Lower Band)"),
+    ("d", "u", "f", "u"): ("High-Volume Bottom Building", "PREPARE LONG"),
+    ("d", "u", "f", "f"): ("Momentum Floor", "EXIT SHORT"),
+    ("d", "u", "f", "d"): ("Low-Volume Bottom Building", "PREPARE LONG"),
+    ("d", "u", "d", "u"): ("Institutional Demand Absorption", "EXIT SHORT / DYNAMIC ABSORPTION EXIT"),
+    ("d", "u", "d", "f"): ("Selling Force Decay", "EXIT SHORT"),
+    ("d", "u", "d", "d"): ("Fading Bearish Push", "EXIT SHORT"),
+    ("d", "f", "u", "u"): ("Accumulation under Cover", "EXIT SHORT / PREPARE LONG"),
+    ("d", "f", "u", "f"): ("Passive Buyer Pressure", "EXIT SHORT"),
+    ("d", "f", "u", "d"): ("Diverging Down-Drift", "EXIT SHORT"),
+    ("d", "f", "f", "u"): ("High Volume Neutral Down-Drift", "HOLD SHORT"),
+    ("d", "f", "f", "f"): ("Low-Volatility Down-Drift", "HOLD EXISTING POSITIONS"),
+    ("d", "f", "f", "d"): ("Volume Drying Downbeat", "PREPARE EXIT SHORT"),
+    ("d", "f", "d", "u"): ("High-Volume Friction", "WARNING: Limit buy wall building"),
+    ("d", "f", "d", "f"): ("Mild Selling Friction", "HOLD SHORT / NO NEW ENTRIES"),
+    ("d", "f", "d", "d"): ("Fading Selling Effort", "BLOCK SHORT ENTRIES"),
+    ("d", "d", "u", "u"): ("Bullish Passive Limit Absorption", "HOLD SHORT (Institutional resistance)"),
+    ("d", "d", "u", "f"): ("Absorbed Down-Drift", "HOLD SHORT"),
+    ("d", "d", "u", "d"): ("Illiquid Long Squeeze", "NO ENTRY (High reversal risk)"),
+    ("d", "d", "f", "u"): ("Passive Wall Sweeping Down", "HOLD SHORT"),
+    ("d", "d", "f", "f"): ("Steady Markdown", "HOLD SHORT"),
+    ("d", "d", "f", "d"): ("Low-Volume Steady Down-Drift", "NO ENTRY (Unstable move)"),
+    ("d", "d", "d", "u"): ("Low-Volume Markdown", "CAUTIOUS SHORT / PREPARE TRAIL"),
+    ("d", "d", "d", "f"): ("Thin-Book Down-Impulse", "CAUTIOUS SHORT (Trailing SL tight)"),
+    ("d", "d", "d", "d"): ("Pure Institutional Aggression (Bearish)", "SHORT BREAKOUT (Target: Lower 2.0σ)"),
+}
+EFI_ZERO_PLAYBOOK = {
+    ("f", "u", "u"): ("Supply Absorption Trap", "EXIT LONG / PREPARE SHORT"),
+    ("f", "u", "f"): ("Aggressive Buyer Friction", "WARNING: No New Longs"),
+    ("f", "u", "d"): ("Fading Buying Effort", "BLOCK LONG ENTRIES"),
+    ("f", "f", "u"): ("Passive Wall Sweeping", "NEUTRAL WATCH"),
+    ("f", "f", "f"): ("Pure Market Stagnation", "NO ENTRY / CHOP"),
+    ("f", "f", "d"): ("Volume Drying Neutral", "NO ENTRY"),
+    ("f", "d", "u"): ("Covert Distribution", "EXIT LONG / PREPARE SHORT"),
+    ("f", "d", "f"): ("Aggressive Seller Friction", "WARNING: No New Shorts"),
+    ("f", "d", "d"): ("Demand Absorption Floor", "EXIT SHORT / PREPARE LONG"),
+    ("u", "u", "u"): ("Stealth Mark-Up", "CAUTIOUS LONG"),
+    ("u", "u", "f"): ("Delta-Driven Grind", "HOLD EXISTING LONGS"),
+    ("u", "u", "d"): ("Exhaustion Up-Drift", "TAKE PROFITS"),
+    ("u", "f", "u"): ("Passive Ask Pull", "HOLD LONGS"),
+    ("u", "f", "f"): ("Low-Volatility Up-Drift", "HOLD EXISTING LONGS"),
+    ("u", "f", "d"): ("Illiquid Drift Up", "PREPARE EXIT LONG"),
+    ("u", "d", "u"): ("Distribution Under Cover", "EXIT LONG / PREPARE SHORT"),
+    ("u", "d", "f"): ("Passive Seller Pressure", "EXIT LONG"),
+    ("u", "d", "d"): ("Bearish Diverging Drift", "EXIT LONG / PREPARE SHORT"),
+    ("d", "u", "u"): ("Bullish Diverging Slide", "EXIT SHORT / PREPARE LONG"),
+    ("d", "u", "f"): ("Passive Absorption Bleed", "WARNING: Downside stalling"),
+    ("d", "u", "d"): ("Fading Downside Effort", "EXIT SHORT"),
+    ("d", "f", "u"): ("Passive Bid Removal", "HOLD SHORTS"),
+    ("d", "f", "f"): ("Low-Volatility Bleed", "HOLD EXISTING SHORTS"),
+    ("d", "f", "d"): ("Illiquid Drift Down", "HOLD SHORTS"),
+    ("d", "d", "u"): ("Aggressive Mark-Down Friction", "HOLD SHORTS"),
+    ("d", "d", "f"): ("Stealth Mark-Down", "HOLD EXISTING SHORTS"),
+    ("d", "d", "d"): ("Clean Passive Mark-Down", "HOLD SHORTS (Target −2.0σ VWAP)"),
+}
+FLOW_PLAYBOOK = {
+    ("u", "u", "u", "u"): ("Pure Institutional Call Sweep", "LONG BREAKOUT"),
+    ("u", "f", "u", "f"): ("Gamma Squeeze Drift", "HOLD LONG"),
+    ("u", "u", "d", "d"): ("Distribution under Cover", "EXIT LONG / PREPARE SHORT"),
+    ("u", "d", "d", "d"): ("Institutional Call Liquidation", "PREPARE SHORT"),
+    ("f", "u", "u", "u"): ("Coil Compression (Bullish)", "PRE-BREAKOUT LONG"),
+    ("f", "f", "f", "f"): ("Gamma Pin / Quiet Regime", "NO ENTRY / SELL NEUTRAL STRADDLE"),
+    ("f", "d", "d", "u"): ("Institutional Distribution Box", "PRE-BREAKDOWN SHORT"),
+    ("d", "d", "d", "d"): ("Pure Institutional Markdown", "SHORT BREAKOUT"),
+    ("d", "f", "d", "f"): ("Short Gamma Drag", "HOLD SHORT"),
+    ("d", "d", "u", "u"): ("Institutional Demand Absorption", "EXIT SHORT / PREPARE LONG"),
+    ("d", "u", "u", "d"): ("Put Shorting / Floor Building", "PREPARE LONG"),
+    ("d", "f", "f", "f"): ("Low-Volume Slippage", "NO ENTRY"),
+    ("u", "d", "u", "u"): ("Short Gamma Squeeze", "RIDE LONG"),
+    ("d", "u", "d", "u"): ("Short Gamma Unwind", "RIDE SHORT"),
+    ("u", "u", "f", "d"): ("Perp-Driven Momentum", "CAUTIOUS LONG"),
+    ("u", "d", "u", "d"): ("Short Covering Ramp", "HOLD LONG"),
+    ("d", "u", "d", "d"): ("Long Unwinding Bleed", "HOLD SHORT"),
+    ("f", "u", "d", "u"): ("Cross / Strangle Creation", "STAND ASIDE (Vol expansion)"),
 }
 ARROW_GLYPH = {"u": "↑", "f": "→", "d": "↓"}
 
-# 27 states used ONLY when EFI is statistically near 0 (Price, CVD, OBV)
-EFI_ZERO_PLAYBOOK = {
-    ("f","u","u"): ("Supply Absorption Trap", "EXIT LONG / PREPARE SHORT (Reversal Watch)"),
-    ("f","u","f"): ("Aggressive Buyer Friction", "WARNING: Limit sell wall testing / No New Longs"),
-    ("f","u","d"): ("Fading Buying Effort", "BLOCK LONG ENTRIES / EXIT CALLS"),
-    ("f","f","u"): ("Passive Wall Sweeping", "NEUTRAL WATCH (Vol expansion coming)"),
-    ("f","f","f"): ("Pure Market Stagnation", "NO ENTRY / LUNCH CHOP"),
-    ("f","f","d"): ("Volume Drying Neutral", "NO ENTRY (High slippage)"),
-    ("f","d","u"): ("Covert Distribution", "EXIT LONG / PREPARE SHORT"),
-    ("f","d","f"): ("Aggressive Seller Friction", "WARNING: Limit buy floor testing / No New Shorts"),
-    ("f","d","d"): ("Demand Absorption Floor", "EXIT SHORT / PREPARE LONG"),
-    ("u","u","u"): ("Stealth Mark-Up", "CAUTIOUS LONG (Tight trail)"),
-    ("u","u","f"): ("Delta-Driven Grind", "HOLD EXISTING LONGS"),
-    ("u","u","d"): ("Exhaustion Up-Drift", "TAKE PROFITS / BLOCK NEW LONGS"),
-    ("u","f","u"): ("Passive Ask Pull", "HOLD LONGS"),
-    ("u","f","f"): ("Low-Volatility Up-Drift", "HOLD EXISTING LONGS (Do not chase)"),
-    ("u","f","d"): ("Illiquid Drift Up", "PREPARE EXIT LONG"),
-    ("u","d","u"): ("Distribution Under Cover", "EXIT LONG / PREPARE SHORT"),
-    ("u","d","f"): ("Passive Seller Pressure", "EXIT LONG"),
-    ("u","d","d"): ("Bearish Diverging Drift", "EXIT LONG / PREPARE SHORT"),
-    ("d","u","u"): ("Bullish Diverging Slide", "EXIT SHORT / PREPARE LONG"),
-    ("d","u","f"): ("Passive Absorption Bleed", "WARNING: Downside stalling"),
-    ("d","u","d"): ("Fading Downside Effort", "EXIT SHORT"),
-    ("d","f","u"): ("Passive Bid Removal", "HOLD SHORTS"),
-    ("d","f","f"): ("Low-Volatility Bleed", "HOLD EXISTING SHORTS"),
-    ("d","f","d"): ("Illiquid Drift Down", "HOLD SHORTS (Trail close)"),
-    ("d","d","u"): ("Aggressive Mark-Down Friction", "HOLD SHORTS"),
-    ("d","d","f"): ("Stealth Mark-Down", "HOLD EXISTING SHORTS"),
-    ("d","d","d"): ("Clean Passive Mark-Down", "HOLD SHORTS (Target −2.0σ VWAP)"),
-}
-
-# 18-state flow book: Price, CVD, DEX, Premium  (tape is a note, not a fake print)
-FLOW_PLAYBOOK = {
-    ("u","u","u","u"): ("Pure Institutional Call Sweep", "LONG BREAKOUT"),
-    ("u","f","u","f"): ("Gamma Squeeze Drift", "HOLD LONG"),
-    ("u","u","d","d"): ("Distribution under Cover", "EXIT LONG / PREPARE SHORT"),
-    ("u","d","d","d"): ("Institutional Call Liquidation", "PREPARE SHORT"),
-    ("f","u","u","u"): ("Coil Compression (Bullish)", "PRE-BREAKOUT LONG"),
-    ("f","f","f","f"): ("Gamma Pin / Quiet Regime", "NO ENTRY / SELL NEUTRAL STRADDLE"),
-    ("f","d","d","u"): ("Institutional Distribution Box", "PRE-BREAKDOWN SHORT"),
-    ("d","d","d","d"): ("Pure Institutional Markdown", "SHORT BREAKOUT"),
-    ("d","f","d","f"): ("Short Gamma Drag", "HOLD SHORT"),
-    ("d","d","u","u"): ("Institutional Demand Absorption", "EXIT SHORT / PREPARE LONG"),
-    ("d","u","u","d"): ("Put Shorting / Floor Building", "PREPARE LONG"),
-    ("d","f","f","f"): ("Low-Volume Slippage", "NO ENTRY / BLOCK SHORT ENTRIES"),
-    ("u","d","u","u"): ("Short Gamma Squeeze", "RIDE LONG"),
-    ("d","u","d","u"): ("Short Gamma Unwind", "RIDE SHORT"),
-    ("u","u","f","d"): ("Futures-Driven Momentum", "CAUTIOUS LONG"),
-    ("u","d","u","d"): ("Short Covering Ramp", "HOLD LONG"),
-    ("d","u","d","d"): ("Long Unwinding Bleed", "HOLD SHORT"),
-    ("f","u","d","u"): ("Cross / Strangle Creation", "STAND ASIDE (Vol expansion)"),
-}
-
 
 def _robust_arrow(series: pd.Series, z_th: float = 0.90, ema_span: int = 8) -> str:
-    """Require EMA agreement + z-score of last change vs its own noise. Flat if weak."""
     s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) < 10:
         return "f"
@@ -757,9 +437,9 @@ def _robust_arrow(series: pd.Series, z_th: float = 0.90, ema_span: int = 8) -> s
 
 
 def classify_microstructure(dfi: pd.DataFrame) -> dict:
-    """Live Price / EFI / CVD / OBV arrows + playbook row. Price uses close vs VWAP + return z."""
     empty = {"ok": False, "arrows": "→ → → →", "micro": "", "action": "NO ENTRY",
-             "key": ("f","f","f","f"), "hover": ""}
+             "key": ("f", "f", "f", "f"), "hover": "", "price": "f", "efi": "f", "cvd": "f", "obv": "f",
+             "efi_zero": False, "efi_note": ""}
     if dfi is None or dfi.empty:
         return empty
     d = dfi.copy()
@@ -767,12 +447,10 @@ def classify_microstructure(dfi: pd.DataFrame) -> dict:
     efi_s = d["efi13"] if "efi13" in d.columns else pd.Series(dtype=float)
     cvd_s = d["cvd"] if "cvd" in d.columns else pd.Series(dtype=float)
     obv_s = d["obv"] if "obv" in d.columns else pd.Series(dtype=float)
-
     p_arr = _robust_arrow(price_s, z_th=0.95)
     if "vwap" in d.columns and len(price_s):
         last_px = float(price_s.iloc[-1])
         last_vw = float(d["vwap"].iloc[-1])
-        # VWAP must agree for a non-flat price call (filters noise ticks)
         if p_arr == "u" and last_px <= last_vw:
             p_arr = "f"
         if p_arr == "d" and last_px >= last_vw:
@@ -787,22 +465,21 @@ def classify_microstructure(dfi: pd.DataFrame) -> dict:
         ev = pd.to_numeric(efi_s, errors="coerce").dropna()
         last_e = float(ev.iloc[-1])
         sd_e = float(ev.tail(20).std(ddof=1) or 0.0)
-        # Substantial: |EFI| small vs own noise AND robust arrow already flat
         if sd_e > 0 and abs(last_e) <= 0.40 * sd_e and e_arr == "f":
             efi_zero = True
             e_arr = "f"
             key = (p_arr, "f", c_arr, o_arr)
             zkey = (p_arr, c_arr, o_arr)
             micro, action = EFI_ZERO_PLAYBOOK.get(zkey, MICRO_PLAYBOOK.get(key, ("Unclassified", "NO ENTRY")))
-            efi_note = f"|EFI| {last_e:.0f} ≤ 0.40σ ({0.40*sd_e:.0f}) → 27-state EFI≈0 book"
+            efi_note = f"|EFI| {last_e:.0f} ≤ 0.40σ → 27-state EFI≈0 book"
         else:
             micro, action = MICRO_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
-            efi_note = f"|EFI| {last_e:.0f} vs 0.40σ={0.40*sd_e:.0f} → 81-state book"
+            efi_note = f"|EFI| {last_e:.0f} vs 0.40σ={0.40 * sd_e:.0f} → 81-state book"
     else:
         micro, action = MICRO_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
     glyphs = " ".join(ARROW_GLYPH[k] for k in key)
     hover = (
-        f"Spot/Fut {ARROW_GLYPH[p_arr]}  EFI {ARROW_GLYPH[e_arr]}  "
+        f"Perp {ARROW_GLYPH[p_arr]}  EFI {ARROW_GLYPH[e_arr]}  "
         f"CVD {ARROW_GLYPH[c_arr]}  OBV {ARROW_GLYPH[o_arr]}<br>"
         f"<b>{action}</b><br>{micro}<br>{efi_note}"
     )
@@ -813,2573 +490,49 @@ def classify_microstructure(dfi: pd.DataFrame) -> dict:
     }
 
 
-def classify_flow_playbook(dfi: pd.DataFrame, data: dict) -> dict:
-    empty = {"ok": False, "action": "", "micro": "", "hover": ""}
-    if dfi is None or dfi.empty:
-        return empty
-    p = _robust_arrow(dfi["close"].astype(float), z_th=0.95)
-    if "vwap" in dfi.columns:
-        last_px = float(dfi["close"].iloc[-1]); last_vw = float(dfi["vwap"].iloc[-1])
-        if p == "u" and last_px <= last_vw: p = "f"
-        if p == "d" and last_px >= last_vw: p = "f"
-    c = _robust_arrow(dfi["cvd"], z_th=0.85) if "cvd" in dfi.columns else "f"
-    tape = list(st.session_state.get("flow_tape") or [])
-    if len(tape) >= 6:
-        dex = pd.Series([t.get("dex", 0) for t in tape], dtype=float)
-        pc = pd.Series([t.get("prem_c", 0) for t in tape], dtype=float)
-        pp = pd.Series([t.get("prem_p", 0) for t in tape], dtype=float)
-        d_arr = _robust_arrow(dex, z_th=0.80)
-        net_p = pc - pp
-        prem_arr = _robust_arrow(net_p, z_th=0.80)
-    else:
-        d_arr = prem_arr = "f"
-    key = (p, c, d_arr, prem_arr)
-    micro, action = FLOW_PLAYBOOK.get(key, ("Unclassified flow", "NO ENTRY"))
-    hover = (
-        f"P{ARROW_GLYPH[p]} C{ARROW_GLYPH[c]} DEX{ARROW_GLYPH[d_arr]} Prem{ARROW_GLYPH[prem_arr]}<br>"
-        f"<b>{action}</b><br>{micro}<br>"
-        "DEX/premium arrows need ≥6 live tape snaps. Missing snaps stay →."
-    )
-    return {"ok": True, "action": action, "micro": micro, "hover": hover,
-            "price": p, "cvd": c, "dex": d_arr, "prem": prem_arr}
-
-
-
-def heading_ribbon(title: str, tip_html: str, size: int = 13):
-    """Compact hoverable chart-title ribbon."""
-    st.markdown(
-        f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
-        f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;margin:0 0 4px 0;'>"
-        f"<span style='font-weight:700;color:#00E676;font-size:{size}px;'>{title}</span>"
-        f"<div class='micro-tip'>{tip_html}</div></div>",
-        unsafe_allow_html=True,
-    )
-
-
-def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
-    """Long/short trigger from GEX location, VWAP, OBV, CVD, EFI."""
-    levels = data.get("levels", {}) or {}
-    spot = float(data.get("spot_price") or 0)
-    gex_sup = float(levels.get("GEX_Support") or spot or 0)
-    gex_res = float(levels.get("GEX_Resistance") or spot or 0)
-    checks = []
-    long_n = short_n = 0
-
-    px = None
-    vwap = None
-    obv = obv_ma = None
-    cvd = None
-    efi = None
-    lvn = []
-
-    df = pd.DataFrame()
-    if df_candles is not None and not df_candles.empty:
-        try:
-            df, _, _ = pick_last_nse_session(df_candles, min_bars=10)
-        except Exception:
-            df = df_candles.copy()
-            df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    if not df.empty and "close" in df.columns:
-        df = df.copy().reset_index(drop=True)
-        px = float(df["close"].iloc[-1])
-        if "volume" in df.columns:
-            tp = (df["high"] + df["low"] + df["close"]) / 3.0 if {"high", "low"}.issubset(df.columns) else df["close"]
-            vol = df["volume"].astype(float)
-            cum_v = vol.cumsum().replace(0, np.nan)
-            vwap = float((tp.astype(float) * vol).cumsum().iloc[-1] / cum_v.iloc[-1]) if cum_v.iloc[-1] == cum_v.iloc[-1] else px
-            direction = np.sign(df["close"].astype(float).diff().fillna(0.0))
-            obv_s = (direction * vol).cumsum()
-            obv = float(obv_s.iloc[-1])
-            obv_ma = float(obv_s.rolling(20, min_periods=5).mean().iloc[-1])
-            hl = (df["high"] - df["low"]).replace(0, np.nan)
-            loc = ((df["close"] - df["low"]) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
-            cvd_s = (vol * loc).cumsum()
-            cvd = float(cvd_s.iloc[-1])
-            efi = float((df["close"].astype(float).diff() * vol).ewm(span=13, adjust=False).mean().iloc[-1])
-            try:
-                vp = compute_session_volume_profile(df, bin_step=5.0, prominence_factor=0.35)
-                lvn = list(vp.get("lvn") or [])
-            except Exception:
-                lvn = []
-        else:
-            vwap = px
-
-    # 1 Location GEX — INDEX SPOT vs GEX walls (never futures)
-    loc_long = loc_short = False
-    loc_note = "GEX walls unavailable"
-    if spot > 0 and gex_sup and gex_res:
-        near_lvn = any(abs(spot - lv) <= 15 for lv in lvn)
-        near_call = abs(spot - gex_res) <= max(12.0, 0.0006 * spot)
-        if spot > gex_res:
-            loc_long, loc_short = True, False
-            loc_note = f"spot {spot:.0f} above call-wall {gex_res:.0f} (break)"
-        elif spot < gex_sup:
-            loc_long, loc_short = False, True
-            loc_note = f"spot {spot:.0f} below put-wall {gex_sup:.0f}"
-        elif near_call:
-            loc_long, loc_short = False, True
-            loc_note = f"spot {spot:.0f} rejected at call-wall {gex_res:.0f}"
-        else:
-            loc_long, loc_short = True, False
-            loc_note = f"spot {spot:.0f} above put-wall {gex_sup:.0f} · below call {gex_res:.0f}"
-        if near_lvn:
-            loc_long = True
-            loc_note += " · through LVN"
-    checks.append({"name": "Location (GEX)", "long": loc_long, "short": loc_short, "note": loc_note})
-
-    # 2 VWAP
-    vwap_long = vwap_short = False
-    vwap_note = "VWAP unavailable"
-    if px and vwap:
-        vwap_long = px > vwap
-        vwap_short = px < vwap
-        vwap_note = f"px {px:.1f} vs VWAP {vwap:.1f}"
-    checks.append({"name": "Trend (VWAP)", "long": vwap_long, "short": vwap_short, "note": vwap_note})
-
-    # 3 OBV
-    obv_long = obv_short = False
-    obv_note = "OBV unavailable"
-    if obv is not None and obv_ma is not None and not np.isnan(obv_ma):
-        obv_long = obv > obv_ma
-        obv_short = obv < obv_ma
-        obv_note = f"OBV {obv:.0f} vs MA20 {obv_ma:.0f}"
-    checks.append({"name": "Macro Flow (OBV)", "long": obv_long, "short": obv_short, "note": obv_note})
-
-    # 4 CVD structure
-    cvd_long = cvd_short = False
-    cvd_note = "CVD unavailable"
-    if cvd is not None and not df.empty and "volume" in df.columns:
-        half = max(len(df) // 2, 3)
-        cvd_s = (df["volume"].astype(float) * loc).cumsum() if "volume" in df.columns else None
-        if cvd_s is not None and len(cvd_s) >= 6:
-            early = float(cvd_s.iloc[:half].max())
-            late = float(cvd_s.iloc[half:].max())
-            early_lo = float(cvd_s.iloc[:half].min())
-            late_lo = float(cvd_s.iloc[half:].min())
-            cvd_long = late > early and cvd > 0
-            cvd_short = late_lo < early_lo and cvd < 0
-            cvd_note = f"CVD {cvd:.0f} · HH={cvd_long} LL={cvd_short}"
-    checks.append({"name": "Order Delta (CVD)", "long": cvd_long, "short": cvd_short, "note": cvd_note})
-
-    # 5 EFI execution
-    efi_long = efi_short = False
-    efi_note = "EFI unavailable"
-    if efi is not None and not np.isnan(efi):
-        efi_long = efi > 0
-        efi_short = efi < 0
-        efi_note = f"EFI13 {efi:.1f}"
-    checks.append({"name": "Execution (EFI 13)", "long": efi_long, "short": efi_short, "note": efi_note})
-
-    for ch in checks:
-        if ch["long"]:
-            long_n += 1
-        if ch["short"]:
-            short_n += 1
-
-    setup_l = sum(1 for ch in checks[:4] if ch["long"])
-    setup_s = sum(1 for ch in checks[:4] if ch["short"])
-    if setup_l >= 3 and efi_long:
-        trigger, colour = "LONG TRIGGER", "#00E676"
-        summary = f"Setup {setup_l}/4 long + EFI>0. Directional long."
-    elif setup_s >= 3 and efi_short:
-        trigger, colour = "SHORT TRIGGER", "#FF5252"
-        summary = f"Setup {setup_s}/4 short + EFI<0. Directional short."
-    elif setup_l >= 3 and not efi_long:
-        trigger, colour = "LONG BIAS (no fire)", "#80CBC4"
-        summary = f"Setup {setup_l}/4 long but EFI is not >0 — no entry yet."
-    elif setup_s >= 3 and not efi_short:
-        trigger, colour = "SHORT BIAS (no fire)", "#EF9A9A"
-        summary = f"Setup {setup_s}/4 short but EFI is not <0 — no entry yet."
-    elif setup_l > setup_s:
-        trigger, colour = "LONG LEAN (no fire)", "#80CBC4"
-        summary = f"Only {setup_l}/4 setup long (need 3). EFI already {'green' if efi_long else 'not green'}."
-    elif setup_s > setup_l:
-        trigger, colour = "SHORT LEAN (no fire)", "#EF9A9A"
-        summary = f"Only {setup_s}/4 setup short (need 3). EFI already {'red' if efi_short else 'not red'}."
-    else:
-        trigger, colour = "NO DIRECTIONAL TRIGGER", "#FF9800"
-        summary = f"Setup split {setup_l}L/{setup_s}S. No fire."
-
-    return {
-        "trigger": trigger,
-        "colour": colour,
-        "summary": summary,
-        "long_hits": long_n,
-        "short_hits": short_n,
-        "checks": checks,
-    }
-
-
-def compute_superhuman_scores(data: dict, df_candles: pd.DataFrame) -> dict:
-    """
-    Superhuman Decision Engine – v2
-    Clear labels: QUIET PIN / GAMMA REVERSION / TREND-BREAKOUT / MILD DIRECTIONAL / NO EDGE
-    Incorporates DTE, time-of-day, Flip distance, softened flow, clean realised range.
-    """
-    import datetime
-    import numpy as np
-    import pytz
-    import pandas as pd
-
-    levels = data.get("levels", {}) or {}
-    chain  = data.get("chain_results", []) or []
-    spot   = float(data.get("spot_price", 0) or 0)
-
-    if spot <= 0 or not chain:
-        return {"error": "Insufficient data for scoring"}
-
-    # ------------------------------------------------------------------
-    # Time & DTE
-    # ------------------------------------------------------------------
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
-    market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    is_weekday = now.weekday() < 5
-    is_market_hours = is_weekday and (market_open <= now <= market_close)
-
-    dte = 3.0
-    try:
-        T = float(data.get("T", 0) or 0)
-        if T > 0:
-            dte = max(T * 365.0, 0.05)
-    except Exception:
-        pass
-    dte = max(min(dte, 30.0), 0.05)
-
-    minutes_since_open = max((now - market_open).total_seconds() / 60.0, 0)
-    tod_factor = 1.0
-    if is_market_hours:
-        if minutes_since_open > 150:
-            tod_factor = max(1.0 - (minutes_since_open - 150) / 240.0, 0.25)
-    else:
-        tod_factor = 0.3
-
-    # ------------------------------------------------------------------
-    # A. Gamma Regime
-    # ------------------------------------------------------------------
-    total_delta_gex_cr = float(data.get("total_net_gex_oi", 0) or 0) / 1e7
-    gamma_raw = total_delta_gex_cr / max(abs(total_delta_gex_cr), 2.5) * 70
-    gamma_regime_score = float(np.clip(gamma_raw, -100, 100))
-
-    if dte <= 1.0:
-        gamma_regime_score = float(np.clip(gamma_regime_score * 1.25, -100, 100))
-    elif dte >= 7.0:
-        gamma_regime_score = float(np.clip(gamma_regime_score * 0.85, -100, 100))
-
-    # ------------------------------------------------------------------
-    # B. Expected vs Realised Move
-    # ------------------------------------------------------------------
-    straddle = float(levels.get("Straddle_Cost", 0) or 0)
-    expected_move_pct = (straddle / spot * 100.0) if spot > 0 else 0.0
-
-    realised_range_pct = 0.0
-    day_high = day_low = day_open = None
-    df_session = pd.DataFrame()
-
-    if df_candles is not None and not df_candles.empty:
-        df_tmp = df_candles.copy()
-        df_tmp["time"] = pd.to_datetime(df_tmp["time"])
-        latest_date = df_tmp["time"].dt.date.max()
-        df_session = df_tmp[df_tmp["time"].dt.date == latest_date].sort_values("time").reset_index(drop=True)
-        if not df_session.empty:
-            day_high = float(df_session["high"].max())
-            day_low  = float(df_session["low"].min())
-            day_open = float(df_session["open"].iloc[0])
-            if day_open > 0:
-                realised_range_pct = (day_high - day_low) / day_open * 100.0
-
-    if dte > 5:
-        expected_move_pct *= 0.85
-
-    if is_market_hours:
-        if expected_move_pct > 0.12:
-            move_score = float(np.clip(
-                (expected_move_pct - realised_range_pct * 1.15) / expected_move_pct * 80, -100, 100))
-        else:
-            move_score = 0.0
-        move_context = "Live session (Expected vs Realised-so-far)"
-    else:
-        if expected_move_pct > 0.10:
-            move_score = float(np.clip(
-                (expected_move_pct - realised_range_pct) / max(expected_move_pct, 0.15) * 60, -100, 100))
-        else:
-            move_score = 0.0
-        move_context = "Post-market (Priced Expected vs Full-day Realised)"
-
-    # ------------------------------------------------------------------
-    # C. Charm / Vanna Flow (soft scaling)
-    # ------------------------------------------------------------------
-    total_vex = sum(float(r.get("VEX", 0) or 0) for r in chain)
-    total_cex = sum(float(r.get("CEX", 0) or 0) for r in chain)
-    vanna_raw = total_vex / 1.2e6
-    charm_raw = total_cex / 2.5e6
-    flow_raw  = vanna_raw + charm_raw
-    flow_score = float(np.clip(np.tanh(flow_raw) * 85, -100, 100))
-
-    # ------------------------------------------------------------------
-    # D. Opening Range vs GEX Walls
-    # ------------------------------------------------------------------
-    or_score = 0.0
-    or_high = or_low = None
-    gex_sup = float(levels.get("GEX_Support") or spot)
-    gex_res = float(levels.get("GEX_Resistance") or spot)
-
-    if not df_session.empty and len(df_session) >= 5:
-        n_or = min(9, max(5, len(df_session) // 6))
-        or_bars = df_session.head(n_or)
-        or_high = float(or_bars["high"].max())
-        or_low  = float(or_bars["low"].min())
-        if spot > or_high and spot > gex_res:
-            or_score = 70.0
-        elif spot < or_low and spot < gex_sup:
-            or_score = -70.0
-        elif or_high < gex_res and or_low > gex_sup:
-            or_score = 45.0
-        elif spot > gex_res or spot < gex_sup:
-            or_score = -25.0
-        else:
-            or_score = 8.0
-    or_score *= tod_factor
-
-    # ------------------------------------------------------------------
-    # E. Distance from Zero-Gamma Flip
-    # ------------------------------------------------------------------
-    flip = float(levels.get("Zero_Gamma_Flip") or spot)
-    dist_pct = abs(spot - flip) / spot * 100.0 if spot > 0 else 0.0
-    if gamma_regime_score > 20 and dist_pct < 0.35:
-        flip_score = 40.0
-    elif gamma_regime_score < -20 and dist_pct > 0.6:
-        flip_score = -40.0
-    else:
-        flip_score = float(np.clip((0.4 - dist_pct) * 50, -30, 30))
-
-    # ------------------------------------------------------------------
-    # F. Composite
-    # ------------------------------------------------------------------
-    composite = (
-        0.38 * gamma_regime_score +
-        0.22 * move_score +
-        0.15 * flow_score +
-        0.15 * or_score +
-        0.10 * flip_score
-    )
-    composite = float(np.clip(composite, -100, 100))
-
-    # ------------------------------------------------------------------
-    # Final Decision – Super Clear Labels
-    # ------------------------------------------------------------------
-    strong_long_gamma  = gamma_regime_score >= 55
-    strong_short_gamma = gamma_regime_score <= -55
-    big_range   = realised_range_pct > expected_move_pct * 1.5 if expected_move_pct > 0.1 else realised_range_pct > 1.2
-    quiet_range = realised_range_pct < expected_move_pct * 0.85 if expected_move_pct > 0.1 else realised_range_pct < 0.7
-
-    if composite >= 42 and strong_long_gamma and quiet_range:
-        bias   = "QUIET PIN"
-        action = "Non-directional → Iron Condor / Short Straddle / Iron Fly (high confidence)"
-        colour = "#00E676"
-        clarity = "Strong long-gamma + quiet range. Classic pinning day."
-    elif composite >= 35 and strong_long_gamma and big_range:
-        bias   = "GAMMA REVERSION"
-        action = "Fade extended moves → fade breakouts, buy dips / sell rallies into close"
-        colour = "#26A69A"
-        clarity = "Strong long-gamma but price already travelled far. Expect mean-reversion after the trend."
-    elif composite <= -42 or (strong_short_gamma and big_range):
-        bias   = "TREND / BREAKOUT"
-        action = "Directional → Debit spreads / Futures / Naked options"
-        colour = "#FF5252"
-        clarity = "Short-gamma or clean wall break. Directional follow-through favoured."
-    elif abs(composite) <= 15:
-        bias   = "NO EDGE"
-        action = "Stay out or very tight range strategies only"
-        colour = "#FF9800"
-        clarity = "No clear dealer positioning or range edge."
-    else:
-        bias   = "MILD DIRECTIONAL"
-        action = "Mild directional → Credit spreads / Calendars with defined risk"
-        colour = "#2196F3"
-        clarity = "Moderate bias. Prefer defined-risk structures."
-
-    return {
-        "gamma_regime_score": round(gamma_regime_score, 1),
-        "move_score":         round(move_score, 1),
-        "flow_score":         round(flow_score, 1),
-        "or_score":           round(or_score, 1),
-        "flip_score":         round(flip_score, 1),
-        "composite":          round(composite, 1),
-        "bias":   bias,
-        "action": action,
-        "colour": colour,
-        "clarity": clarity,
-        "is_market_hours":    is_market_hours,
-        "move_context":       move_context,
-        "expected_move_pct":  round(expected_move_pct, 2),
-        "realised_range_pct": round(realised_range_pct, 2),
-        "straddle":           round(straddle, 1),
-        "total_delta_gex_cr": round(total_delta_gex_cr, 1),
-        "or_high":            or_high,
-        "or_low":             or_low,
-        "gex_support":        gex_sup,
-        "gex_resistance":     gex_res,
-        "dte":                round(dte, 2),
-        "dist_to_flip_pct":   round(dist_pct, 3),
-        "tod_factor":         round(tod_factor, 2),
-        "day_open":           day_open,
-        "day_high":           day_high,
-        "day_low":            day_low,
-        "big_range":          big_range,
-        "quiet_range":        quiet_range,
-        "timestamp_ist":      now.strftime("%d-%b-%Y %H:%M:%S IST"),
-        "dir_trigger":        evaluate_directional_trigger(data, df_candles),
-    }
-
-
-
-def compute_technical_indicators(df_candles: pd.DataFrame) -> pd.DataFrame:
-    df = df_candles.copy()
-    if df.empty or len(df) < 20:
-        return df
-
-    df["time"] = pd.to_datetime(df["time"])
-    df = df.sort_values("time").reset_index(drop=True)
-
-    df["bb_middle"] = df["close"].rolling(window=20, min_periods=20).mean()
-    df["bb_std"] = df["close"].rolling(window=20, min_periods=20).std()
-    df["bb_upper"] = df["bb_middle"] + (2 * df["bb_std"])
-    df["bb_lower"] = df["bb_middle"] - (2 * df["bb_std"])
-    df["bb_bandwidth"] = np.where(df["bb_middle"] > 0, (df["bb_upper"] - df["bb_lower"]) / df["bb_middle"], 0)
-
-    ema_12 = df["close"].ewm(span=12, adjust=False).mean()
-    ema_26 = df["close"].ewm(span=26, adjust=False).mean()
-    df["macd"] = ema_12 - ema_26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-    delta = df["close"].diff()
+# ---------------------------------------------------------------------------
+# Volume profile / indicators
+# ---------------------------------------------------------------------------
+def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or len(df) < 5:
+        return df if df is not None else pd.DataFrame()
+    d = df.copy()
+    d["time"] = pd.to_datetime(d["time"], utc=True)
+    d = d.sort_values("time").reset_index(drop=True)
+    d["bb_middle"] = d["close"].rolling(20, min_periods=5).mean()
+    d["bb_std"] = d["close"].rolling(20, min_periods=5).std()
+    d["bb_upper"] = d["bb_middle"] + 2 * d["bb_std"]
+    d["bb_lower"] = d["bb_middle"] - 2 * d["bb_std"]
+    d["bb_bandwidth"] = np.where(d["bb_middle"] > 0, (d["bb_upper"] - d["bb_lower"]) / d["bb_middle"], 0)
+    ema12 = d["close"].ewm(span=12, adjust=False).mean()
+    ema26 = d["close"].ewm(span=26, adjust=False).mean()
+    d["macd"] = ema12 - ema26
+    d["macd_signal"] = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_signal"]
+    delta = d["close"].diff()
     gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-
-    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=5, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=5, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-    df["rsi"] = df["rsi"].fillna(50)
-
-    df["date_group"] = df["time"].dt.date
-    df["tp"] = (df["high"] + df["low"] + df["close"]) / 3.0
-    df["tp_vol"] = df["tp"] * df["volume"]
-
-    df["cum_vol"] = df.groupby("date_group")["volume"].cumsum()
-    df["cum_tp_vol"] = df.groupby("date_group")["tp_vol"].cumsum()
-
-    raw_vwap = np.where(df["cum_vol"] > 0, df["cum_tp_vol"] / df["cum_vol"], np.nan)
-    df["vwap"] = pd.Series(raw_vwap, index=df.index).ffill().fillna(df["close"])
-
-    return df
-
-@st.cache_data(ttl=3600)
-def download_master_scrip():
-    scrip_url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    res = requests.get(scrip_url)
-    if res.status_code == 200:
-        df_master = pd.DataFrame(res.json())
-        df_master['strike_clean'] = pd.to_numeric(df_master['strike'], errors='coerce') / 100.0
-        df_master['expiry_dt'] = pd.to_datetime(df_master['expiry'], format='%d%b%Y', errors='coerce')
-        return df_master
-    return pd.DataFrame()
-
-def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
-    try:
-        exp_str = target_dt.strftime("%d%b%y").upper()
-        exact_symbol = f"{index_name}{exp_str}{int(strike)}{opt_type}"
-
-        sym_match = df_exp[df_exp["symbol"] == exact_symbol]
-        if not sym_match.empty:
-            return str(sym_match.iloc[0]["token"])
-
-        fallback_match = df_exp[(df_exp["strike_num"] == int(strike)) & (df_exp["symbol"].str.endswith(opt_type))]
-        if not fallback_match.empty:
-            return str(fallback_match.iloc[0]["token"])
-    except Exception:
-        pass
-    return ""
-
-# --- HOLIDAY / WEEKEND FALLBACK ENGINE FOR CANDLE CHARTS ---
-def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15):
-    ist_tz = pytz.timezone("Asia/Kolkata")
-    now_dt = datetime.datetime.now(ist_tz)
-    live, today, _, _ = market_session_state(now_dt)
-    cached = load_session_cache("spot", "IDX", api_interval, today)
-    offsets = [0] if live else list(range(0, 10))
-    for offset in offsets:
-        target_to = now_dt - datetime.timedelta(days=offset)
-        if live and target_to.date() != today:
-            continue
-        target_from = target_to - datetime.timedelta(days=lookback_days)
-        candle_param = {
-            "exchange": exchange,
-            "symboltoken": spot_token,
-            "interval": api_interval,
-            "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
-            "todate": target_to.strftime("%Y-%m-%d 15:30")
-        }
-        candle_res = safe_api_call(smart_api.getCandleData, candle_param)
-        time.sleep(0.20)
-        if candle_res and candle_res.get("status") and candle_res.get("data"):
-            df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
-            df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
-            if not df_candles.empty:
-                df_candles["time"] = series_to_ist(df_candles["time"])
-                if live:
-                    df_candles = merge_candle_frames(cached, df_candles)
-                    save_session_cache("spot", "IDX", api_interval, df_candles, today)
-                return compute_technical_indicators(df_candles), (offset > 0 and not live)
-    if live and not cached.empty:
-        return compute_technical_indicators(cached.copy()), False
-    return pd.DataFrame(), False
-
-
-def get_near_month_futures_token(df_scrip_master, index_name, fut_exch):
-    """Return token of the nearest active futures contract."""
-    try:
-        ist_now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-        fut_scrips = df_scrip_master[
-            (df_scrip_master["exch_seg"] == fut_exch) &
-            (df_scrip_master["name"] == index_name) &
-            (df_scrip_master["instrumenttype"].isin(["FUTIDX", "FUTSTK"]))
-        ].copy()
-        fut_scrips["expiry_dt"] = pd.to_datetime(fut_scrips["expiry"], format="%d%b%Y", errors="coerce")
-        active = fut_scrips[fut_scrips["expiry_dt"].dt.date >= ist_now.date()].sort_values("expiry_dt")
-        if not active.empty:
-            return str(active.iloc[0]["token"]), active.iloc[0]["expiry"]
-    except Exception:
-        pass
-    return None, None
-
-
-
-def series_to_ist(times) -> pd.Series:
-    """Coerce SmartAPI candle times to timezone-aware IST."""
-    ts = pd.to_datetime(times, errors="coerce", utc=False)
-    if getattr(ts.dt, "tz", None) is not None:
-        return ts.dt.tz_convert("Asia/Kolkata")
-    # Naive: if median hour is outside NSE cash session, treat as UTC
-    med = float(ts.dt.hour.median()) if ts.notna().any() else 12
-    if med < 7 or med > 18:
-        return ts.dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
-    return ts.dt.tz_localize("Asia/Kolkata")
-
-
-
-SESSION_CACHE_DIR = Path("/home/workdir/artifacts/session_cache")
-try:
-    SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    SESSION_CACHE_DIR = Path("session_cache")
-    SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _ist_now():
-    return datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-
-
-def market_session_state(now=None):
-    now = now or _ist_now()
-    open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    live = now.weekday() < 5 and open_t <= now <= close_t
-    return live, now.date(), open_t, close_t
-
-
-def _cache_path(kind: str, index_name: str, interval: str, day):
-    safe = f"{kind}_{index_name}_{interval}_{day}.pkl".replace(" ", "")
-    return SESSION_CACHE_DIR / safe
-
-
-def load_session_cache(kind: str, index_name: str, interval: str, day=None):
-    live, today, _, _ = market_session_state()
-    day = day or today
-    path = _cache_path(kind, index_name, interval, day)
-    if path.exists():
-        try:
-            df = pd.read_pickle(path)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                return df
-        except Exception:
-            pass
-    key = f"sess_cache_{kind}_{index_name}_{interval}_{day}"
-    df = st.session_state.get(key)
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        return df
-    return pd.DataFrame()
-
-
-def save_session_cache(kind: str, index_name: str, interval: str, df: pd.DataFrame, day=None):
-    if df is None or getattr(df, "empty", True):
-        return
-    live, today, _, _ = market_session_state()
-    day = day or today
-    key = f"sess_cache_{kind}_{index_name}_{interval}_{day}"
-    st.session_state[key] = df
-    try:
-        df.to_pickle(_cache_path(kind, index_name, interval, day))
-    except Exception:
-        pass
-
-
-def load_flow_tape(index_name: str, day):
-    path = SESSION_CACHE_DIR / f"flow_{index_name}_{day}.json"
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            pass
-    return list(st.session_state.get(f"flow_tape_{index_name}_{day}") or [])
-
-
-def save_flow_tape(index_name: str, day, tape):
-    st.session_state[f"flow_tape_{index_name}_{day}"] = tape
-    st.session_state["flow_tape"] = tape
-    try:
-        (SESSION_CACHE_DIR / f"flow_{index_name}_{day}.json").write_text(json.dumps(tape))
-    except Exception:
-        pass
-
-
-def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
-    parts = [x for x in (old, new) if x is not None and not getattr(x, "empty", True)]
-    if not parts:
-        return pd.DataFrame()
-    out = pd.concat(parts, ignore_index=True)
-    out["time"] = series_to_ist(out["time"])
-    out = out.dropna(subset=["time"]).sort_values("time")
-    out = out.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
-    return out
-
-
-def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bool = True) -> tuple:
-    """Return (session_df, session_date, used_prior_session).
-    During live hours prefer TODAY even with 1–2 bars (Mon 09:16 problem).
-    min_bars only applies when falling back to a completed prior session.
-    """
-    empty = (pd.DataFrame(), None, True)
-    if df is None or df.empty or "time" not in df.columns:
-        return empty
-    out = df.copy()
-    out["time"] = series_to_ist(out["time"])
-    out = out.dropna(subset=["time"]).sort_values("time")
-    mins = out["time"].dt.hour * 60 + out["time"].dt.minute
-    out = out[(mins >= 9 * 60 + 15) & (mins <= 15 * 60 + 30)]
-    if out.empty:
-        return empty
-    out["session_date"] = out["time"].dt.date
-    counts = out.groupby("session_date").size().sort_index()
-    ist = pytz.timezone("Asia/Kolkata")
-    today = datetime.datetime.now(ist).date()
-    chosen = None
-    used_prior = True
-    live_now, _, _, _ = market_session_state()
-    if prefer_today and today in counts.index and today.weekday() < 5 and int(counts.loc[today]) >= 1:
-        chosen = today
-        used_prior = False
-    elif live_now and prefer_today:
-        # Market open: do not walk back to Friday even if today is thin/missing
-        chosen = today if today in counts.index else None
-        used_prior = chosen is None
-        if chosen is None:
-            return empty
-    else:
-        for d, n in list(counts.items())[::-1]:
-            if d.weekday() >= 5:
-                continue
-            if d == today:
-                continue
-            if int(n) >= min_bars:
-                chosen = d
-                break
-        if chosen is None:
-            weekdays = [(d, n) for d, n in counts.items() if d.weekday() < 5]
-            if weekdays:
-                chosen = max(weekdays, key=lambda x: x[1])[0]
-            else:
-                chosen = counts.index[-1]
-            used_prior = chosen != today
-    sess = out[out["session_date"] == chosen].copy().reset_index(drop=True)
-    sess["time_str"] = sess["time"].dt.strftime("%H:%M")
-    return sess, chosen, used_prior
-
-
-def fetch_india_vix_sessions(smart_api, lookback_days=10):
-    """Last 3 NSE sessions of India VIX (5-min) + last-session % change."""
-    empty = (pd.DataFrame(), None, None)
-    if not smart_api:
-        return empty
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
-    candle_param = {
-        "exchange": "NSE",
-        "symboltoken": INDIA_VIX_TOKEN,
-        "interval": "FIVE_MINUTE",
-        "fromdate": (now - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d 09:15"),
-        "todate": now.strftime("%Y-%m-%d 15:30"),
-    }
-    res = safe_api_call(smart_api.getCandleData, candle_param)
-    if not (res and res.get("status") and res.get("data")):
-        return empty
-    df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
-    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-    df["time"] = series_to_ist(df["time"])
-    df = df.dropna(subset=["time"])
-    mins = df["time"].dt.hour * 60 + df["time"].dt.minute
-    df = df[(mins >= 9 * 60 + 15) & (mins <= 15 * 60 + 30)]
-    df["session"] = df["time"].dt.date
-    dates = [d for d in sorted(df["session"].unique()) if d.weekday() < 5][-3:]
-    if not dates:
-        return empty
-    df = df[df["session"].isin(dates)].sort_values("time")
-    last_d = dates[-1]
-    sess = df[df["session"] == last_d]
-    open_px = float(sess["open"].iloc[0])
-    last_px = float(sess["close"].iloc[-1])
-    pct = ((last_px - open_px) / open_px * 100.0) if open_px else 0.0
-    df["time_str"] = df["time"].dt.strftime("%d-%b %H:%M")
-    return df, pct, last_d
-
-
-def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15):
-    """
-    Fetch near-month futures candles + real VWAP.
-    Outside market hours → falls back to the most recent trading session and flags it.
-    Returns: (df, is_fallback, basis_info, fallback_msg)
-    """
-    spot_token, spot_exch, fut_exch = INDEX_TOKEN_MAP.get(index_name, ("99926000", "NSE", "NFO"))
-    fut_token, fut_expiry = get_near_month_futures_token(df_scrip_master, index_name, fut_exch)
-
-    if not fut_token:
-        return pd.DataFrame(), False, {}, "No active futures contract found"
-
-    ist_tz = pytz.timezone("Asia/Kolkata")
-    now_dt = datetime.datetime.now(ist_tz)
-
-    market_open = now_dt.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now_dt.replace(hour=15, minute=30, second=0, microsecond=0)
-    is_weekday = now_dt.weekday() < 5
-    currently_closed = (not is_weekday) or (now_dt < market_open or now_dt > market_close)
-
-    cached = load_session_cache("fut", index_name, api_interval, now_dt.date())
-    best_df = pd.DataFrame()
-    best_offset = 0
-    offsets = [0] if not currently_closed else list(range(0, 16))
-
-    for offset in offsets:
-        target_to = now_dt - datetime.timedelta(days=offset)
-        if target_to.weekday() >= 5:
-            continue
-        target_from = target_to - datetime.timedelta(days=lookback_days)
-        candle_param = {
-            "exchange": fut_exch,
-            "symboltoken": str(fut_token),
-            "interval": api_interval,
-            "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
-            "todate": target_to.strftime("%Y-%m-%d 15:30")
-        }
-        candle_res = safe_api_call(smart_api.getCandleData, candle_param)
-        time.sleep(0.20)
-        if not (candle_res and candle_res.get("status") and candle_res.get("data")):
-            continue
-        df = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
-        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
-        if df.empty:
-            continue
-        df["time"] = series_to_ist(df["time"])
-        if not currently_closed:
-            df = merge_candle_frames(cached, df)
-        min_need = 1 if not currently_closed else 5
-        if len(df) < min_need:
-            continue
-        df = compute_technical_indicators(df)
-        best_df = df
-        best_offset = offset
-        break
-
-    if best_df.empty and not cached.empty and not currently_closed:
-        best_df = compute_technical_indicators(cached.copy())
-        best_offset = 0
-    if best_df.empty:
-        return pd.DataFrame(), False, {}, "Could not fetch futures candles"
-
-    fut_ltp = float(best_df["close"].iloc[-1])
-
-    spot_ltp = None
-    try:
-        spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch,
-                                  tradingsymbol=index_name, symboltoken=spot_token)
-        time.sleep(0.25)
-        if spot_resp and spot_resp.get("status") and spot_resp.get("data"):
-            spot_ltp = float(spot_resp["data"]["ltp"])
-    except Exception:
-        pass
-
-    basis_info = {
-        "fut_token": fut_token,
-        "fut_expiry": str(fut_expiry) if fut_expiry is not None else "N/A",
-        "spot_ltp": spot_ltp,
-        "fut_ltp": fut_ltp,
-        "basis": round(fut_ltp - spot_ltp, 2) if (spot_ltp and fut_ltp) else None
-    }
-
-    sess_df, sess_date, used_prior = pick_last_nse_session(best_df, min_bars=20, prefer_today=True)
-    if sess_df.empty:
-        last_bar_time = pd.to_datetime(best_df["time"].iloc[-1])
-        session_date_str = last_bar_time.strftime("%d-%b-%Y")
-        used_prior = True
-    else:
-        # Keep today's live tape even if only a handful of bars (do not require 5)
-        if sess_date == now_dt.date() or len(sess_df) >= 5:
-            best_df = sess_df
-        session_date_str = sess_date.strftime("%d-%b-%Y") if sess_date else pd.to_datetime(best_df["time"].iloc[-1]).strftime("%d-%b-%Y")
-
-    today_sess = sess_date == now_dt.date() if sess_date else False
-    live_now = is_weekday and (market_open <= now_dt <= market_close)
-
-    if today_sess or (live_now and not best_df.empty):
-        save_session_cache("fut", index_name, api_interval, best_df, now_dt.date())
-
-    if today_sess and live_now:
-        fallback_msg = f"Live session • {session_date_str} IST"
-        is_fallback = False
-    elif live_now and used_prior:
-        fallback_msg = (
-            f"Today's candles not in yet — showing last session {session_date_str} IST"
-        )
-        is_fallback = True
-    elif currently_closed:
-        fallback_msg = (
-            f"Market closed. Last session: {session_date_str} IST (fallback)"
-        )
-        is_fallback = True
-    else:
-        fallback_msg = f"Session {session_date_str} IST"
-        is_fallback = used_prior
-
-    return best_df, is_fallback, basis_info, fallback_msg
-
-
-# --- METHOD 1: FUTURES VOLUME & PROXY Z-SCORE COMPUTATION ---
-def fetch_futures_zscores_method1(smart_api, symbol, days, df_scrip_master, progress_container=None):
-    try:
-        if progress_container is not None:
-            progress_container.caption("⏳ Fetching continuous historical data for Z-score window...")
-
-        ist_now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-        spot_token, spot_exch, fut_exch = INDEX_TOKEN_MAP.get(symbol, ("99926000", "NSE", "NFO"))
-
-        window_sz = int(days)
-        from_date = (ist_now - datetime.timedelta(days=window_sz * 3 + 30)).strftime("%Y-%m-%d 09:15")
-        to_date = ist_now.strftime("%Y-%m-%d 15:30")
-
-        spot_param = {
-            "exchange": spot_exch,
-            "symboltoken": spot_token,
-            "interval": "ONE_DAY",
-            "fromdate": from_date,
-            "todate": to_date
-        }
-        s_res = safe_api_call(smart_api.getCandleData, spot_param)
-        time.sleep(0.40)
-        if not (s_res and s_res.get('status') and s_res.get('data')):
-            return pd.DataFrame()
-
-        df_spot = pd.DataFrame(s_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        df_spot['date'] = df_spot['time'].str.split('T').str[0]
-        df_spot['spot_close'] = df_spot['close'].astype(float)
-        df_spot = df_spot.set_index('date')
-
-        df_spot['log_ret'] = np.log(df_spot['spot_close'] / df_spot['spot_close'].shift(1))
-        df_spot['HV_Lookback'] = df_spot['log_ret'].rolling(window=window_sz).std() * np.sqrt(252)
-
-        fut_scrips = df_scrip_master[
-            (df_scrip_master['exch_seg'] == fut_exch) & 
-            (df_scrip_master['name'] == symbol) & 
-            (df_scrip_master['instrumenttype'].isin(['FUTIDX', 'FUTSTK']))
-        ].copy()
-
-        fut_scrips['expiry_dt'] = pd.to_datetime(fut_scrips['expiry'], format='%d%b%Y', errors='coerce')
-        active_futs = fut_scrips[fut_scrips['expiry_dt'].dt.date >= ist_now.date()].sort_values('expiry_dt')
-        
-        if not active_futs.empty:
-            near_fut_token = str(active_futs.iloc[0]['token'])
-            fut_param = {
-                "exchange": fut_exch,
-                "symboltoken": near_fut_token,
-                "interval": "ONE_DAY",
-                "fromdate": from_date,
-                "todate": to_date
-            }
-            f_res = safe_api_call(smart_api.getCandleData, fut_param)
-            time.sleep(0.40)
-            if f_res and f_res.get('status') and f_res.get('data'):
-                df_fut = pd.DataFrame(f_res['data'], columns=['time', 'open', 'high', 'low', 'close', 'fut_volume'])
-                df_fut['date'] = df_fut['time'].str.split('T').str[0]
-                df_fut['fut_volume'] = df_fut['fut_volume'].astype(float)
-                df_fut = df_fut.set_index('date')
-                df_spot = df_spot.join(df_fut['fut_volume'], how='left').fillna(0.0)
-            else:
-                df_spot['fut_volume'] = 0.0
-        else:
-            df_spot['fut_volume'] = 0.0
-
-        min_p = max(5, window_sz // 2)
-        
-        df_spot['Vol_Mean'] = df_spot['fut_volume'].rolling(window=window_sz, min_periods=min_p).mean()
-        df_spot['Vol_Std'] = df_spot['fut_volume'].rolling(window=window_sz, min_periods=min_p).std()
-        df_spot['Futures_Volume_Z'] = (df_spot['fut_volume'] - df_spot['Vol_Mean']) / df_spot['Vol_Std'].replace(0, np.nan)
-
-        df_spot['HV_Mean'] = df_spot['HV_Lookback'].rolling(window=window_sz, min_periods=min_p).mean()
-        df_spot['HV_Std'] = df_spot['HV_Lookback'].rolling(window=window_sz, min_periods=min_p).std()
-        df_spot['Volatility_Proxy_Z'] = (df_spot['HV_Lookback'] - df_spot['HV_Mean']) / df_spot['HV_Std'].replace(0, np.nan)
-
-        df_res = pd.DataFrame({
-            'Futures_Close': df_spot['spot_close'],
-            'Futures_Volume': df_spot['fut_volume'],
-            'Vol_Mean': df_spot['Vol_Mean'],
-            'Vol_Std': df_spot['Vol_Std'],
-            'Futures_Volume_Z': df_spot['Futures_Volume_Z'],
-            'Volatility_Proxy': df_spot['HV_Lookback'],
-            'HV_Mean': df_spot['HV_Mean'],
-            'HV_Std': df_spot['HV_Std'],
-            'Volatility_Proxy_Z': df_spot['Volatility_Proxy_Z']
-        })
-
-        if progress_container is not None:
-            progress_container.empty()
-
-        return df_res.dropna(subset=['Futures_Volume_Z', 'Volatility_Proxy_Z'])
-
-    except Exception:
-        if progress_container is not None:
-            progress_container.empty()
-        return pd.DataFrame()
-
-# --- SIDEBAR SETUP ---
-st.sidebar.markdown("### ⚙️ Parameters & Strategy Builder")
-
-df_master = download_master_scrip()
-
-with st.sidebar.expander("1. Market Parameters", expanded=True):
-    c1, c2 = st.columns(2)
-    with c1:
-        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"])
-    
-    default_token, spot_exchange, Exchange = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
-    
-    with c2:
-        st.text_input("Exchange", value=Exchange, disabled=True)
-
-    rate_param = st.number_input("Risk Free Rate (r)", min_value=0.0, max_value=0.15, value=0.07, step=0.01)
-
-    df_options = df_master[
-        (df_master["exch_seg"] == Exchange)
-        & (df_master["name"] == Index_Name)
-        & (df_master["instrumenttype"].isin(["OPTIDX", "OPTSTK"]))
-    ].copy()
-
-    df_options["expiry_dt"] = pd.to_datetime(df_options["expiry"], format="%d%b%Y", errors='coerce')
-    ist_tz = pytz.timezone("Asia/Kolkata")
-    today_dt = pd.to_datetime(datetime.datetime.now(ist_tz).date())
-
-    valid_expiries = sorted(df_options[df_options["expiry_dt"] >= today_dt]["expiry_dt"].unique())
-    expiry_options_str = [pd.to_datetime(exp).strftime("%d%b%Y").upper() for exp in valid_expiries]
-
-    selected_expiry_str = st.selectbox("Expiry Date", expiry_options_str if expiry_options_str else ["N/A"])
-
-    c3, c4 = st.columns(2)
-    with c3:
-        strikes_below = st.number_input("Below ATM", min_value=1, max_value=50, value=10, step=1)
-    with c4:
-        strikes_above = st.number_input("Above ATM", min_value=1, max_value=50, value=10, step=1)
-
-    hv_days = st.slider("HV Lookback (Days)", min_value=10, max_value=90, value=30, step=5)
-    heatmap_timeframe = st.selectbox(
-        "GEX Heatmap Timeframe",
-        ["3 min", "5 min", "10 min"],
-        index=["3 min", "5 min", "10 min"].index(st.session_state["heatmap_timeframe"])
-        if st.session_state.get("heatmap_timeframe") in ["3 min", "5 min", "10 min"] else 1
-    )
-    st.session_state["heatmap_timeframe"] = heatmap_timeframe
-
-target_expiry_dt = pd.to_datetime(selected_expiry_str, format="%d%b%Y") if selected_expiry_str != "N/A" else today_dt
-df_expiry = df_options[df_options["expiry_dt"] == target_expiry_dt].copy()
-
-df_expiry["strike_num"] = pd.to_numeric(df_expiry["strike"], errors="coerce") / (100.0 if Exchange == "NFO" else 1.0)
-if df_expiry["strike_num"].max() > 1000000:
-    df_expiry["strike_num"] = df_expiry["strike_num"] / 100.0
-
-all_expiry_strikes = sorted([int(s) for s in df_expiry["strike_num"].dropna().unique()])
-
-with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
-    selected_strike = st.selectbox("Option Strike Price", all_expiry_strikes if all_expiry_strikes else [24500], format_func=lambda x: f"{int(x)}")
-
-    b_col1, b_col2 = st.columns(2)
-    with b_col1:
-        opt_type = st.selectbox("Option Type", ["CE", "PE"])
-    with b_col2:
-        trade_action = st.selectbox("Trade Action", ["BUY", "SELL"])
-
-    entry_price_input = st.number_input("Entry Price (₹) [0 for LTP]", min_value=0.0, value=0.0, step=0.5)
-    default_qty = LOT_SIZES.get(Index_Name, 65)
-    qty_lots = st.number_input("Quantity / Units", min_value=1, value=default_qty, step=1)
-
-    c_btn1, c_btn2 = st.columns(2)
-    with c_btn1:
-        if st.button("+ Add Leg", use_container_width=True):
-            st.session_state["basket_legs"].append({
-                "strike": int(selected_strike),
-                "type": opt_type,
-                "action": trade_action,
-                "entry_price": entry_price_input,
-                "qty": qty_lots
-            })
-            sync_local_storage()
-            st.success("Leg Added!")
-            st.rerun()
-    with c_btn2:
-        if st.button("Clear Basket", use_container_width=True):
-            st.session_state["basket_legs"] = []
-            sync_local_storage()
-            st.rerun()
-
-    # Cache Control Panel
-    st.markdown("---")
-    st.caption("💾 **Cache Strategy Storage**")
-    cache_c1, cache_c2 = st.columns(2)
-    with cache_c1:
-        if st.button("Save to Cache", use_container_width=True):
-            save_basket_to_cache(st.session_state["basket_legs"])
-            st.success("Basket Cached!")
-    with cache_c2:
-        if st.button("Load Cache", use_container_width=True):
-            cached_legs = get_cached_basket()
-            if cached_legs:
-                st.session_state["basket_legs"] = cached_legs
-                sync_local_storage()
-                st.success("Basket Restored!")
-                st.rerun()
-            else:
-                st.info("Cache is empty.")
-
-run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
-
-interval_mapping = {
-    "1 min": ("ONE_MINUTE", 7),
-    "3 min": ("THREE_MINUTE", 10),
-    "5 min": ("FIVE_MINUTE", 15),
-    "10 min": ("TEN_MINUTE", 20),
-    "15 min": ("FIFTEEN_MINUTE", 30)
-}
-
-# --- SECURE SESSION HANDLER (CACHE PERSISTENT TO PREVENT RATE LIMITS) ---
-@st.cache_resource(ttl=3600, show_spinner=False)
-def get_smart_api_client():
-    if not all([API_KEY, CLIENT_CODE, PIN, TOTP_SECRET]):
-        return None
-
-    try:
-        smart_api = SmartConnect(api_key=API_KEY)
-        totp_token = pyotp.TOTP(TOTP_SECRET).now()
-        session = safe_api_call(smart_api.generateSession, CLIENT_CODE, PIN, totp_token)
-
-        if session and session.get("status"):
-            return smart_api
-    except Exception:
-        pass
-    return None
-
-main_top_progress_holder = st.container()
-
-# --- DATA FETCHING ENGINE ---
-def fetch_live_data(selected_interval_label="5 min", progress_container=None):
-    p_bar = None
-    p_status = None
-    if progress_container is not None:
-        p_bar = progress_container.progress(0.0)
-        p_status = progress_container.empty()
-
-    def update_p(pct, msg):
-        if p_bar is not None:
-            p_bar.progress(min(1.0, max(0.0, pct)))
-        if p_status is not None:
-            p_status.caption(f"⏳ {msg}")
-        try:
-            update_load_status(msg)
-        except Exception:
-            pass
-
-    update_p(0.10, "Authenticating SmartAPI Session...")
-
-    smart_api = get_smart_api_client()
-    if not smart_api:
-        if p_bar: p_bar.empty()
-        if p_status: p_status.empty()
-        st.error("Missing credentials or failed to generate SmartAPI session!")
-        return None
-
-    try:
-        update_p(0.20, f"Fetching Live Spot & Volatility for {Index_Name}...")
-        spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
-
-        spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=Index_Name, symboltoken=spot_token)
-        time.sleep(0.40)
-        spot_price = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") and spot_resp.get("data") else 80000.0 if Index_Name == "SENSEX" else 24500.0
-
-        index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, spot_exch, days=hv_days)
-
-        update_p(0.35, "Fetching Historical Underlying Candles (with Holiday Fallback)...")
-        api_interval, lookback_days = interval_mapping.get(selected_interval_label, ("FIVE_MINUTE", 15))
-
-        df_candles, is_holiday_fallback = fetch_candles_with_holiday_fallback(
-            smart_api, spot_token, spot_exch, api_interval, lookback_days
-        )
-
-        # ----- Near-month Futures candles + real VWAP -----
-        update_p(0.42, "Fetching Near-Month Futures candles for VWAP...")
-        df_futures, fut_is_fallback, basis_info, fut_fallback_msg = fetch_futures_candles_with_vwap(
-            smart_api, Index_Name, df_master, api_interval, lookback_days
-        )
-
-        now_dt = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-        expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
-        time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
-        T = max(time_diff_seconds / (365.0 * 24 * 3600), 1e-5)
-
-        atm_strike = min(all_expiry_strikes, key=lambda x: abs(x - spot_price)) if all_expiry_strikes else spot_price
-        atm_idx = all_expiry_strikes.index(atm_strike) if all_expiry_strikes else 0
-        filtered_strikes = all_expiry_strikes[max(0, atm_idx - strikes_below): min(len(all_expiry_strikes), atm_idx + strikes_above + 1)] if all_expiry_strikes else []
-
-        tokens_to_fetch = set()
-        strike_mapping = []
-
-        update_p(0.50, "Mapping Option Chain Tokens...")
-        for strike in filtered_strikes:
-            strike_int = int(strike)
-            c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "CE")
-            p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike_int, "PE")
-
-            if c_tok: tokens_to_fetch.add(c_tok)
-            if p_tok: tokens_to_fetch.add(p_tok)
-
-            strike_mapping.append({
-                "strike": strike_int,
-                "call_tok": c_tok,
-                "put_tok": p_tok
-            })
-
-        basket_tokens_info = {}
-        for leg in st.session_state.get("basket_legs", []):
-            k = int(leg["strike"])
-            t = leg["type"]
-            tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
-            if tok:
-                tokens_to_fetch.add(tok)
-                basket_tokens_info[f"{k}_{t}"] = tok
-
-        tokens_to_fetch_list = [t for t in tokens_to_fetch if t and t != "nan"]
-
-        update_p(0.65, "Fetching Live Market Depth & Prices...")
-        market_data = {}
-        chunk_size = 40
-        for i in range(0, len(tokens_to_fetch_list), chunk_size):
-            chunk = tokens_to_fetch_list[i:i + chunk_size]
-            res = safe_api_call(smart_api.getMarketData, "FULL", {opt_exch: chunk})
-            if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
-                for item in res["data"]["fetched"]:
-                    vol_val = (
-                        item.get("tradeVolume")
-                        or item.get("volume")
-                        or item.get("v")
-                        or item.get("vol")
-                        or item.get("volumeTraded")
-                        or 0
-                    )
-
-                    market_data[str(item["symbolToken"])] = {
-                        "ltp": float(item.get("ltp", 0.0)),
-                        "oi": int(item.get("opnInterest", 0)),
-                        "volume": int(vol_val),
-                        "best_bid": float(item.get("bestBidPrice", item.get("ltp", 0.0))),
-                        "best_ask": float(item.get("bestAskPrice", item.get("ltp", 0.0)))
-                    }
-            time.sleep(0.40)
-
-        update_p(0.85, "Calculating Option Greeks & Gamma Exposure Profile...")
-        atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE")
-        atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE")
-
-        atm_c_ltp = market_data.get(atm_c_tok, {}).get("ltp", 0.0)
-        atm_p_ltp = market_data.get(atm_p_tok, {}).get("ltp", 0.0)
-
-        F = atm_strike + math.exp(rate_param * T) * (atm_c_ltp - atm_p_ltp) if (atm_c_ltp > 0 and atm_p_ltp > 0) else spot_price
-
-        lot_size = LOT_SIZES.get(Index_Name, 65)
-        chain_results = []
-        total_call_oi = total_put_oi = 0
-        total_net_gex_oi = 0.0
-        total_net_gex_vol = 0.0
-        all_ivs = []
-
-        for row in strike_mapping:
-            K = row["strike"]
-            c_info = market_data.get(row["call_tok"], {"ltp": 0.0, "oi": 0, "volume": 0, "best_bid": 0.0, "best_ask": 0.0})
-            p_info = market_data.get(row["put_tok"], {"ltp": 0.0, "oi": 0, "volume": 0, "best_bid": 0.0, "best_ask": 0.0})
-
-            # Solve CE and PE IV independently. Do NOT substitute HV into deep ITM
-            # options — that invents gamma on almost-intrinsic contracts and paints
-            # low strikes (ITM calls) as large positive / green GEX.
-            c_iv = VolatilityEngine.calculate_iv(c_info["ltp"], F, K, T, rate_param, "c")
-            p_iv = VolatilityEngine.calculate_iv(p_info["ltp"], F, K, T, rate_param, "p")
-
-            strike_step = 50.0
-            if len(all_expiry_strikes) >= 2:
-                strike_step = float(abs(all_expiry_strikes[1] - all_expiry_strikes[0]))
-            near_atm = abs(K - F) <= (2.0 * strike_step)
-
-            c_sigma = c_iv if c_iv > 0 else (index_hv if near_atm and c_info["ltp"] > 0 else 0.0)
-            p_sigma = p_iv if p_iv > 0 else (index_hv if near_atm and p_info["ltp"] > 0 else 0.0)
-
-            c_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, c_sigma, "c")
-            p_greeks = VolatilityEngine.calculate_greeks(F, K, T, rate_param, p_sigma, "p")
-
-            gex_scale = lot_size * (spot_price ** 2) * 0.01
-            call_gex_oi = c_greeks["gamma"] * c_info["oi"] * gex_scale
-            put_gex_oi = p_greeks["gamma"] * p_info["oi"] * gex_scale
-            net_gex_oi = call_gex_oi - put_gex_oi
-            total_net_gex_oi += net_gex_oi
-
-            # Delta-adjusted GEX: weight each wing by its own delta, keep put sign
-            # negative. After the ITM-IV fix this matches published GEX maps
-            # (red / short-gamma below spot, green / long-gamma above spot).
-            call_delta_gex_oi = call_gex_oi * max(c_greeks["delta"], 0.0)
-            put_delta_gex_oi = put_gex_oi * abs(p_greeks["delta"])
-            net_delta_gex_oi = call_delta_gex_oi - put_delta_gex_oi
-
-            call_gex_vol = c_greeks["gamma"] * c_info["volume"] * lot_size * (spot_price ** 2) * 0.01
-            put_gex_vol = p_greeks["gamma"] * p_info["volume"] * lot_size * (spot_price ** 2) * 0.01
-            net_gex_vol = call_gex_vol - put_gex_vol
-            total_net_gex_vol += net_gex_vol
-
-            vex_val = (c_greeks["vega"] * c_info["oi"] - p_greeks["vega"] * p_info["oi"]) * lot_size * 0.01
-            cex_val = (c_greeks["charm"] * c_info["oi"] - p_greeks["charm"] * p_info["oi"]) * lot_size * spot_price * 0.01
-
-            if c_iv > 0:
-                all_ivs.append(c_iv)
-            if p_iv > 0:
-                all_ivs.append(p_iv)
-            total_call_oi += c_info["oi"]
-            total_put_oi += p_info["oi"]
-
-            c_iv_disp = c_iv if c_iv > 0 else c_sigma
-            p_iv_disp = p_iv if p_iv > 0 else p_sigma
-
-            chain_results.append({
-                "C_Vol": c_info["volume"], "C_OI": c_info["oi"],
-                "C_Δ": round(c_greeks["delta"], 2), "C_γ": round(c_greeks["gamma"], 4),
-                "C_θ": round(c_greeks["theta"], 2), "C_ν": round(c_greeks["vega"], 2),
-                "C_IV_val": c_iv_disp, "C_IV": f"{c_iv_disp * 100:.1f}%", "C_LTP": c_info["ltp"],
-                "C_Bid": c_info.get("best_bid", 0.0), "C_Ask": c_info.get("best_ask", 0.0),
-                "Strike": K,
-                "Net_GEX_OI": round(net_gex_oi, 2),
-                "Net_Delta_GEX_OI": round(net_delta_gex_oi, 2),
-                "Net_GEX_Vol": round(net_gex_vol, 2),
-                "VEX": round(vex_val, 2),
-                "CEX": round(cex_val, 2),
-                "P_LTP": p_info["ltp"], "P_IV_val": p_iv_disp, "P_IV": f"{p_iv_disp * 100:.1f}%",
-                "P_Bid": p_info.get("best_bid", 0.0), "P_Ask": p_info.get("best_ask", 0.0),
-                "P_Δ": round(p_greeks["delta"], 2), "P_γ": round(p_greeks["gamma"], 4),
-                "P_θ": round(p_greeks["theta"], 2), "P_ν": round(p_greeks["vega"], 2),
-                "P_OI": p_info["oi"], "P_Vol": p_info["volume"]
-            })
-
-        update_p(0.95, "Finalizing Level Calculations & Dashboard View...")
-        pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else 0.0
-        iv_percentile = 0.0
-        if all_ivs:
-            min_iv, max_iv = min(all_ivs), max(all_ivs)
-            atm_c_iv = VolatilityEngine.calculate_iv(atm_c_ltp, F, atm_strike, T, rate_param, "c")
-            if max_iv > min_iv and atm_c_iv > 0:
-                iv_percentile = ((atm_c_iv - min_iv) / (max_iv - min_iv)) * 100.0
-
-        max_pain_strike = VolatilityEngine.calculate_max_pain(chain_results)
-        levels = calculate_support_resistance_targets(chain_results, spot_price, max_pain_strike)
-
-        try:
-            live_now, today, _, _ = market_session_state(now_dt)
-            sess_day = today
-            if df_futures is not None and not df_futures.empty and "time" in df_futures.columns:
-                ft = series_to_ist(df_futures["time"])
-                sess_day = pd.to_datetime(ft.iloc[-1]).date()
-            lot = LOT_SIZES.get(Index_Name, 65)
-            dex = prem_c = prem_p = 0.0
-            for r in chain_results:
-                dex += float(r.get("C_Δ") or 0) * float(r.get("C_Vol") or 0) * lot
-                dex -= abs(float(r.get("P_Δ") or 0)) * float(r.get("P_Vol") or 0) * lot
-                prem_c += float(r.get("C_LTP") or 0) * float(r.get("C_Vol") or 0) * lot
-                prem_p += float(r.get("P_LTP") or 0) * float(r.get("P_Vol") or 0) * lot
-            tape = load_flow_tape(Index_Name, sess_day)
-            if live_now and sess_day == today:
-                tape.append({
-                    "ts": now_dt.strftime("%H:%M"),
-                    "dex": dex, "prem_c": prem_c, "prem_p": prem_p,
-                    "day": str(sess_day),
-                })
-                tape = tape[-300:]
-                save_flow_tape(Index_Name, sess_day, tape)
-            else:
-                st.session_state["flow_tape"] = tape
-                st.session_state["flow_tape_day"] = str(sess_day)
-        except Exception:
-            pass
-
-        update_p(1.0, "Done!")
-        if p_bar: p_bar.empty()
-        if p_status: p_status.empty()
-
-        return {
-            "spot_price": spot_price, "F": F, "T": T, "index_hv": index_hv, "iv_percentile": iv_percentile,
-            "pcr": pcr, "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
-            "total_net_gex_oi": total_net_gex_oi, "total_net_gex_vol": total_net_gex_vol,
-            "max_pain_strike": max_pain_strike, "levels": levels, "df_candles": df_candles,
-            "df_futures": df_futures,
-            "basis_info": basis_info,
-            "fut_is_fallback": fut_is_fallback,
-            "fut_fallback_msg": fut_fallback_msg,
-            "chain_results": chain_results, "market_data": market_data, "basket_tokens_info": basket_tokens_info,
-            "is_holiday_fallback": is_holiday_fallback,
-            "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST")
-        }
-
-    except Exception:
-        if p_bar: p_bar.empty()
-        if p_status: p_status.empty()
-        st.warning("API Rate limit / sync notice: Retrying on next cycle...")
-        return None
-
-if run_btn or "data_store" not in st.session_state:
-    new_data = fetch_live_data(st.session_state["selected_timeframe"], progress_container=main_top_progress_holder)
-    if new_data:
-        new_data["selected_expiry"] = selected_expiry_str
-        st.session_state["data_store"] = new_data
-
-# --- Z-SCORE ANALYSIS FRAGMENT ---
-@st.fragment(run_every=300 if st.session_state.get("enable_zscore_refresh", False) else None)
-def zscore_analysis_fragment(mode="full"):
-    """mode: 'highlights' = compact table only | 'raw' = inspect expander only | 'full' = both"""
-    def _style_z(val):
-        if val >= 1.5 or val <= -1.5:
-            return 'background-color: #ff4d4d; color: white; font-weight: bold;'
-        elif 0.5 <= val < 1.5 or -1.5 < val <= -0.5:
-            return 'background-color: #ffea80; color: black;'
-        else:
-            return 'background-color: #b3ffb3; color: black;'
-
-    if mode in ("highlights", "full"):
-        heading_ribbon(f"📊 Z-Scores ({Index_Name})",
-            "z = (x − μ) / σ over the lookback window. Used for unusual OI/volume and index z.")
-        st.caption("HV + Futures Volume Z")
-        enable_z_ref = st.checkbox("Auto-Refresh 5 min", value=st.session_state["enable_zscore_refresh"], key="cb_zscore_refresh")
-        if enable_z_ref != st.session_state["enable_zscore_refresh"]:
-            st.session_state["enable_zscore_refresh"] = enable_z_ref
-            st.rerun()
-        calc_z_btn = st.button("🔄 Compute / Refresh Z-Scores", use_container_width=True, key="btn_zscore_compute")
-        progress_holder = st.container()
-        smart_api = get_smart_api_client()
-        if calc_z_btn or st.session_state["zscore_data_store"].empty:
-            if smart_api:
-                z_df = fetch_futures_zscores_method1(smart_api, Index_Name, hv_days, df_master, progress_container=progress_holder)
-                st.session_state["zscore_data_store"] = z_df
-            else:
-                st.error("SmartAPI Session uninitialized.")
-        z_df = st.session_state["zscore_data_store"]
-        if not z_df.empty:
-            st.caption("Recent Highlights (Last 5 Days)")
-            last_5 = z_df.tail(5).copy()
-            summary_cols = ["Futures_Volume_Z", "Volatility_Proxy_Z"]
-            styled_z_df = last_5[summary_cols].sort_index(ascending=False).style.map(
-                _style_z, subset=summary_cols
-            ).format({col: "{:.2f}" for col in summary_cols})
-            st.dataframe(styled_z_df, use_container_width=True)
-        else:
-            st.info("Click Compute to load Z-Scores.")
-
-    if mode in ("raw", "full"):
-        z_df = st.session_state.get("zscore_data_store", pd.DataFrame())
-        if not z_df.empty:
-            with st.expander("🔍 Inspect Raw Calculated Daily Totals & HV Details (All Evaluated Dates)", expanded=False):
-                st.info(f"Showing all **{len(z_df)}** trading days used in evaluating rolling averages and std dev.")
-                display_cols = [
-                    "Futures_Close", "Futures_Volume", "Vol_Mean", "Vol_Std", "Futures_Volume_Z",
-                    "Volatility_Proxy", "HV_Mean", "HV_Std", "Volatility_Proxy_Z",
-                ]
-                st.dataframe(
-                    z_df[display_cols].sort_index(ascending=False).style.format({
-                        "Futures_Close": "{:,.2f}",
-                        "Futures_Volume": "{:,.0f}",
-                        "Vol_Mean": "{:,.0f}",
-                        "Vol_Std": "{:,.0f}",
-                        "Futures_Volume_Z": "{:.2f}",
-                        "Volatility_Proxy": "{:.4f}",
-                        "HV_Mean": "{:.4f}",
-                        "HV_Std": "{:.4f}",
-                        "Volatility_Proxy_Z": "{:.2f}",
-                    }),
-                    use_container_width=True,
-                )
-        elif mode == "raw":
-            st.info("Compute Z-Scores first (from the panel above) to inspect raw daily totals.")
-
-# --- INSTITUTIONAL ORDER FLOW SCANNER MODULE ---
-def institutional_order_flow_scanner_fragment():
-    st.markdown("---")
-    hdr_l, hdr_r = st.columns([0.72, 0.28])
-    with hdr_l:
-        heading_ribbon(
-            f"🏛️ Institutional Order Flow ({Index_Name})",
-            "Flags strikes where premium (LTP×OI×lot) ≥ ₹10L or volume ≥ 500 lots.<br>"
-            "Unusual vol = session volume well above that strike’s typical print.<br>"
-            "Use as flow tape, not a standalone entry.",
-        )
-        st.caption("High-conviction flow · Premium ≥ ₹10L or Vol ≥ 500 lots")
-    with hdr_r:
-        show_all_flow = st.checkbox("Show all rows", value=False, key="iof_show_all",
-                                    help="Off = only High Vol flagged rows")
-
-    if "data_store" not in st.session_state or not st.session_state["data_store"].get("chain_results"):
-        st.info("No option chain data available. Run the main fetch process to enable scanning.")
-        return
-
-    chain_data = st.session_state["data_store"]["chain_results"]
-    spot_price = st.session_state["data_store"].get("spot_price", 0.0)
-    lot_size = LOT_SIZES.get(Index_Name, 65)
-
-    scanned_trades = []
-    all_volumes = [r["C_Vol"] for r in chain_data] + [r["P_Vol"] for r in chain_data]
-    avg_daily_vol = np.mean(all_volumes) if all_volumes and np.mean(all_volumes) > 0 else 1.0
-
-    for row in chain_data:
-        strike = row["Strike"]
-
-        c_ltp = row["C_LTP"]
-        c_vol = row["C_Vol"]
-        c_premium = c_ltp * c_vol * lot_size
-        c_lots = c_vol
-        if c_premium >= 1000000 or c_lots >= 500:
-            vol_ratio = c_vol / avg_daily_vol if avg_daily_vol > 0 else 0.0
-            unusual_flag = vol_ratio > 3.0
-            strike_role = "Resistance Level" if strike >= spot_price else "Support / In-The-Money Level"
-            scanned_trades.append({
-                "Strike": strike,
-                "Option_Type": "CE",
-                "LTP (₹)": c_ltp,
-                "Volume (Lots)": c_lots,
-                "Total Premium (₹)": round(c_premium, 2),
-                "Key Level Classification": strike_role,
-                "Volume Ratio": round(vol_ratio, 2),
-                "Unusual Vol Flag": "🚨 High Vol" if unusual_flag else "Normal"
-            })
-
-        p_ltp = row["P_LTP"]
-        p_vol = row["P_Vol"]
-        p_premium = p_ltp * p_vol * lot_size
-        p_lots = p_vol
-        if p_premium >= 1000000 or p_lots >= 500:
-            vol_ratio = p_vol / avg_daily_vol if avg_daily_vol > 0 else 0.0
-            unusual_flag = vol_ratio > 3.0
-            strike_role = "Support Level" if strike <= spot_price else "Resistance / In-The-Money Level"
-            scanned_trades.append({
-                "Strike": strike,
-                "Option_Type": "PE",
-                "LTP (₹)": p_ltp,
-                "Volume (Lots)": p_lots,
-                "Total Premium (₹)": round(p_premium, 2),
-                "Key Level Classification": strike_role,
-                "Volume Ratio": round(vol_ratio, 2),
-                "Unusual Vol Flag": "🚨 High Vol" if unusual_flag else "Normal"
-            })
-
-    if scanned_trades:
-        df_scanner = pd.DataFrame(scanned_trades)
-        if not show_all_flow:
-            df_scanner = df_scanner[df_scanner["Unusual Vol Flag"].astype(str).str.contains("High Vol", na=False)]
-            if df_scanner.empty:
-                st.info("No High Vol rows right now. Check **Show all rows** to see full institutional flow.")
-                return
-
-        def style_classification(val):
-            if "Resistance" in str(val):
-                return 'background-color: rgba(255, 82, 82, 0.2); color: #FF5252; font-weight: bold;'
-            elif "Support" in str(val):
-                return 'background-color: rgba(0, 230, 118, 0.2); color: #00E676; font-weight: bold;'
-            else:
-                return 'color: #FAFAFA;'
-
-        def style_unusual(val):
-            if "High Vol" in str(val):
-                return 'background-color: rgba(255, 152, 0, 0.25); color: #FF9800; font-weight: bold;'
-            return 'color: #FAFAFA;'
-
-        styled_df = df_scanner.style.map(
-            style_classification, subset=['Key Level Classification']
-        ).map(
-            style_unusual, subset=['Unusual Vol Flag']
-        ).format({
-            "LTP (₹)": "{:,.2f}",
-            "Volume (Lots)": "{:,.0f}",
-            "Total Premium (₹)": "₹{:,.2f}",
-            "Volume Ratio": "{:.2f}x"
-        })
-
-        st.dataframe(styled_df, use_container_width=True)
-    else:
-        st.info("No trades currently meeting the institutional threshold criteria (Premium ≥ ₹10 Lakhs or Volume ≥ 500 lots).")
-
-# --- DELTA-ADJUSTED GEX HEATMAP (session-time vs strike) ---
-def _prepare_session_candles(df_candles: pd.DataFrame) -> pd.DataFrame:
-    """Keep only the latest trading session between 09:15–15:30 IST."""
-    if df_candles is None or df_candles.empty:
-        return pd.DataFrame()
-
-    df = df_candles.copy()
-    time_col = "time" if "time" in df.columns else ("date" if "date" in df.columns else None)
-    if time_col is None:
-        return pd.DataFrame()
-
-    parsed = pd.to_datetime(df[time_col], errors="coerce")
-    df = df.loc[parsed.notna()].copy()
-    parsed = parsed.dropna()
-    if parsed.empty:
-        return pd.DataFrame()
-
-    ist_tz = pytz.timezone("Asia/Kolkata")
-    if getattr(parsed.dt, "tz", None) is None:
-        parsed = parsed.dt.tz_localize(ist_tz)
-    else:
-        parsed = parsed.dt.tz_convert(ist_tz)
-    df[time_col] = parsed
-    session_start = datetime.datetime.strptime("09:15", "%H:%M").time()
-    session_end = datetime.datetime.strptime("15:30", "%H:%M").time()
-    df = df[(df[time_col].dt.time >= session_start) & (df[time_col].dt.time <= session_end)]
-    if df.empty:
-        return pd.DataFrame()
-
-    latest_date = df[time_col].dt.date.max()
-    df = df[df[time_col].dt.date == latest_date].sort_values(time_col).reset_index(drop=True)
-    df.rename(columns={time_col: "time"}, inplace=True)
-    return df
-# ============================================================
-# GEX Heatmap History – Disk Persistence
-# ============================================================
-
-# ============================================================
-# Superhuman Decision Log – Disk Persistence
-# ============================================================
-DECISION_LOG_FILE = "superhuman_decision_log.json"
-
-def _load_decision_log(index_name: str) -> list:
-    if not os.path.exists(DECISION_LOG_FILE):
-        return []
-    try:
-        with open(DECISION_LOG_FILE, "r") as f:
-            raw = json.load(f)
-        ist = pytz.timezone("Asia/Kolkata")
-        today = datetime.datetime.now(ist).date()
-        log = []
-        for e in raw:
-            if e.get("index") != index_name:
-                continue
-            ts = pd.to_datetime(e["ts"])
-            if ts.tzinfo is None:
-                ts = ist.localize(ts)
-            if ts.date() != today:
-                continue
-            log.append({
-                "ts": ts,
-                "bias": e["bias"],
-                "composite": e["composite"],
-                "clarity": e.get("clarity", ""),
-            })
-        log.sort(key=lambda x: x["ts"])
-        return log
-    except Exception:
-        return []
-
-
-def _save_decision_log(log: list, index_name: str):
-    try:
-        existing = []
-        if os.path.exists(DECISION_LOG_FILE):
-            with open(DECISION_LOG_FILE, "r") as f:
-                existing = json.load(f)
-        existing = [e for e in existing if e.get("index") != index_name]
-        for e in log:
-            existing.append({
-                "index": index_name,
-                "ts": e["ts"].isoformat(),
-                "bias": e["bias"],
-                "composite": e["composite"],
-                "clarity": e.get("clarity", ""),
-            })
-        ist = pytz.timezone("Asia/Kolkata")
-        cutoff = datetime.datetime.now(ist) - datetime.timedelta(days=2)
-        cleaned = []
-        for e in existing:
-            ts = pd.to_datetime(e["ts"])
-            if ts.tzinfo is None:
-                ts = ist.localize(ts)
-            if ts >= cutoff:
-                cleaned.append(e)
-        with open(DECISION_LOG_FILE, "w") as f:
-            json.dump(cleaned, f)
-    except Exception:
-        pass
-
-
-GEX_HISTORY_FILE = "gex_heatmap_history.json"
-
-def _load_gex_history(index_name: str, expiry_str: str) -> list:
-    """Load today's GEX history from disk. Returns list of dicts."""
-    if not os.path.exists(GEX_HISTORY_FILE):
-        return []
-    try:
-        with open(GEX_HISTORY_FILE, "r") as f:
-            raw = json.load(f)
-        # Keep only matching index + expiry + today's date
-        ist = pytz.timezone("Asia/Kolkata")
-        today = datetime.datetime.now(ist).date()
-        history = []
-        for h in raw:
-            if h.get("index") != index_name or h.get("expiry") != expiry_str:
-                continue
-            ts = pd.to_datetime(h["ts"])
-            if ts.tzinfo is None:
-                ts = ist.localize(ts)
-            if ts.date() != today:
-                continue
-            history.append({
-                "ts": ts,
-                "strikes": h["strikes"],
-                "gex_cr": h["gex_cr"],
-            })
-        # Sort by time
-        history.sort(key=lambda x: x["ts"])
-        return history
-    except Exception:
-        return []
-
-
-def _save_gex_history(history: list, index_name: str, expiry_str: str):
-    """Save history to disk (only today's data for this index/expiry)."""
-    try:
-        # Load existing file (may contain other indices/expiries)
-        existing = []
-        if os.path.exists(GEX_HISTORY_FILE):
-            with open(GEX_HISTORY_FILE, "r") as f:
-                existing = json.load(f)
-
-        # Remove old entries for this index+expiry
-        existing = [
-            e for e in existing
-            if not (e.get("index") == index_name and e.get("expiry") == expiry_str)
-        ]
-
-        # Add current history
-        for h in history:
-            existing.append({
-                "index": index_name,
-                "expiry": expiry_str,
-                "ts": h["ts"].isoformat(),
-                "strikes": h["strikes"],
-                "gex_cr": h["gex_cr"],
-            })
-
-        # Keep only last 2 calendar days to avoid unbounded growth
-        ist = pytz.timezone("Asia/Kolkata")
-        cutoff = datetime.datetime.now(ist) - datetime.timedelta(days=2)
-        cleaned = []
-        for e in existing:
-            ts = pd.to_datetime(e["ts"])
-            if ts.tzinfo is None:
-                ts = ist.localize(ts)
-            if ts >= cutoff:
-                cleaned.append(e)
-
-        with open(GEX_HISTORY_FILE, "w") as f:
-            json.dump(cleaned, f)
-    except Exception:
-        pass
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def compute_multi_expiry_delta_gex(_api, index_name: str, exchange: str, spot: float, rate: float,
-                                   lot_size: int, strike_lo: float, strike_hi: float, months: int = 6):
-    """Aggregate Delta-Adjusted GEX (OI) across all expiries within `months` for the index."""
-    try:
-        df_m = download_master_scrip()
-        if df_m is None or df_m.empty or spot <= 0:
-            return pd.DataFrame()
-
-        today = datetime.datetime.now().date()
-        cutoff = today + datetime.timedelta(days=int(months * 31))
-        df_opt = df_m[
-            (df_m["name"] == index_name) &
-            (df_m["exch_seg"] == exchange) &
-            (df_m["instrumenttype"].isin(["OPTIDX", "OPTSTK"]))
-        ].copy()
-        if df_opt.empty:
-            return pd.DataFrame()
-
-        if "expiry_dt" not in df_opt.columns:
-            df_opt["expiry_dt"] = pd.to_datetime(df_opt["expiry"], format="%d%b%Y", errors="coerce")
-        df_opt = df_opt[df_opt["expiry_dt"].notna()]
-        df_opt = df_opt[(df_opt["expiry_dt"].dt.date >= today) & (df_opt["expiry_dt"].dt.date <= cutoff)]
-
-        if "strike_clean" not in df_opt.columns:
-            df_opt["strike_clean"] = pd.to_numeric(df_opt["strike"], errors="coerce") / 100.0
-        # NFO strikes are in paise; if still huge, divide again
-        if df_opt["strike_clean"].median() > spot * 5:
-            df_opt["strike_clean"] = df_opt["strike_clean"] / 100.0
-
-        df_opt = df_opt[(df_opt["strike_clean"] >= strike_lo) & (df_opt["strike_clean"] <= strike_hi)]
-        if df_opt.empty:
-            return pd.DataFrame()
-
-        tokens = [str(t) for t in df_opt["token"].dropna().astype(str).unique()]
-        market = {}
-        for i in range(0, len(tokens), 50):
-            chunk = tokens[i:i + 50]
-            res = safe_api_call(_api.getMarketData, "FULL", {exchange: chunk})
-            if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
-                for item in res["data"]["fetched"]:
-                    # Angel SmartAPI uses opnInterest for OI
-                    oi_val = item.get("opnInterest", item.get("opInterest", item.get("oi", 0)))
-                    market[str(item["symbolToken"])] = {
-                        "ltp": float(item.get("ltp", 0) or 0),
-                        "oi": float(oi_val or 0),
-                    }
-            time.sleep(0.25)
-
-        rows = []
-        for _, r in df_opt.iterrows():
-            tok = str(r["token"])
-            md = market.get(tok)
-            if not md:
-                continue
-            oi = float(md.get("oi", 0) or 0)
-            ltp = float(md.get("ltp", 0) or 0)
-            if oi <= 0 or ltp <= 0:
-                continue
-            sym = str(r.get("symbol", "") or "")
-            opt = "CE" if sym.upper().endswith("CE") else "PE"
-            exp_dt = r["expiry_dt"].date() if hasattr(r["expiry_dt"], "date") else pd.to_datetime(r["expiry_dt"]).date()
-            dte = max((exp_dt - today).days, 0.05)
-            T = dte / 365.0
-            K = float(r["strike_clean"])
-            flag = "c" if opt == "CE" else "p"
-            iv = VolatilityEngine.calculate_iv(ltp, spot, K, T, rate, flag)
-            if iv is None or iv <= 0:
-                continue
-            greeks = VolatilityEngine.calculate_greeks(spot, K, T, rate, iv, flag)
-            gex_scale = lot_size * (spot ** 2) * 0.01
-            raw_gex = greeks["gamma"] * oi * gex_scale
-            if opt == "CE":
-                delta_gex = raw_gex * max(float(greeks["delta"]), 0.0)
-            else:
-                delta_gex = -raw_gex * abs(float(greeks["delta"]))
-            rows.append({"Strike": K, "Net_Delta_GEX_OI": delta_gex})
-
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows)
-        agg = df.groupby("Strike", as_index=False)["Net_Delta_GEX_OI"].sum()
-        return agg.sort_values("Strike").reset_index(drop=True)
-    except Exception as e:
-        return pd.DataFrame()
-
-
-
-def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatmap_tf_label: str):
-    """Render strike × session-time Delta-Adjusted GEX heatmap with persistent history."""
-    chain_results = data.get("chain_results") or []
-    if not chain_results:
-        st.info("No option chain data available for GEX heatmap.")
-        return
-
-    df_chain = pd.DataFrame(chain_results)
-    if df_chain.empty or "Net_Delta_GEX_OI" not in df_chain.columns:
-        st.info("Delta-adjusted GEX is not available to build the heatmap.")
-        return
-
-    df_chain = df_chain.sort_values("Strike").reset_index(drop=True)
-    strikes = df_chain["Strike"].astype(float).tolist()
-    gex_cr = (df_chain["Net_Delta_GEX_OI"].astype(float) / 1e7).tolist()
-    spot = float(data.get("spot_price", 0.0))
-    flip = float(data.get("levels", {}).get("Zero_Gamma_Flip", spot) or spot)
-
-    # ---- derive metrics needed by the two alert modules ----
-    pos_gex_above = float(df_chain.loc[
-        (df_chain["Strike"] >= spot) & (df_chain["Net_Delta_GEX_OI"] > 0), "Net_Delta_GEX_OI"
-    ].sum() / 1e7)
-    neg_gex_above = float(df_chain.loc[
-        (df_chain["Strike"] >= spot) & (df_chain["Net_Delta_GEX_OI"] < 0), "Net_Delta_GEX_OI"
-    ].sum() / 1e7)
-
-    otm_calls = df_chain[(df_chain["Strike"] >= spot)].copy()
-    otm_puts = df_chain[(df_chain["Strike"] < spot)].copy()
-    otm_call_iv = 0.0
-    otm_put_iv = 0.0
-    if not otm_calls.empty and "C_IV_val" in otm_calls.columns:
-        nearest_c = otm_calls.iloc[(otm_calls["Strike"] - spot).abs().argsort()[:1]]
-        otm_call_iv = float(nearest_c["C_IV_val"].iloc[0]) * 100.0 if not nearest_c.empty else 0.0
-    if not otm_puts.empty and "P_IV_val" in otm_puts.columns:
-        nearest_p = otm_puts.iloc[(otm_puts["Strike"] - spot).abs().argsort()[:1]]
-        otm_put_iv = float(nearest_p["P_IV_val"].iloc[0]) * 100.0 if not nearest_p.empty else 0.0
-
-    df_candles = data.get("df_candles", pd.DataFrame())
-    vol_ratio = 0.0
-    if not df_candles.empty and "volume" in df_candles.columns and len(df_candles) >= 21:
-        recent_vol = float(df_candles["volume"].iloc[-1])
-        ma20 = float(df_candles["volume"].iloc[-21:-1].mean())
-        vol_ratio = recent_vol / ma20 if ma20 > 0 else 0.0
-
-    # ---- Load persistent history from disk ----
-    now_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-    gex_hist = _load_gex_history(index_name, expiry_str)
-    alert_hist = st.session_state.get("alert_metrics_history", [])
-
-    # Reset if strike window changed significantly
-    if gex_hist and (len(gex_hist[-1]["strikes"]) != len(strikes) or
-                     abs(gex_hist[-1]["strikes"][0] - strikes[0]) > 1 or
-                     abs(gex_hist[-1]["strikes"][-1] - strikes[-1]) > 1):
-        gex_hist = []
-        alert_hist = []
-
-    # ---- Append new snapshot ----
-    market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-    is_market_hours = (now_ist.weekday() < 5) and (market_open <= now_ist <= market_close)
-
-    # Always define cutoff so it is in scope
-    cutoff = now_ist - datetime.timedelta(hours=8)
-
-    should_append = False
-    if is_market_hours:
-        if not gex_hist:
-            should_append = True
-        else:
-            last_ts = gex_hist[-1]["ts"]
-            if (now_ist - last_ts).total_seconds() >= 150:
-                should_append = True
-    else:
-        if not gex_hist:
-            should_append = True
-
-    if should_append:
-        gex_hist.append({"ts": now_ist, "strikes": list(strikes), "gex_cr": list(gex_cr)})
-        gex_hist = [h for h in gex_hist if h["ts"] >= cutoff]
-        _save_gex_history(gex_hist, index_name, expiry_str)
-
-        alert_hist.append({
-            "ts": now_ist,
-            "spot": spot,
-            "flip": flip,
-            "pos_gex_above": pos_gex_above,
-            "neg_gex_above": neg_gex_above,
-            "otm_call_iv": otm_call_iv,
-            "otm_put_iv": otm_put_iv,
-            "vol_ratio": vol_ratio,
-        })
-        alert_hist = [h for h in alert_hist if h["ts"] >= cutoff]
-        st.session_state["alert_metrics_history"] = alert_hist
-
-    # Also keep a copy in session_state for the rest of the app
-    st.session_state["gex_heatmap_history"] = gex_hist
-
-    # ---- session candles ----
-    heatmap_tf_label = heatmap_tf_label or st.session_state.get("heatmap_timeframe", "5 min")
-    chart_tf = st.session_state.get("selected_timeframe", "5 min")
-    df_session = pd.DataFrame()
-
-    if heatmap_tf_label == chart_tf:
-        df_session = _prepare_session_candles(data.get("df_candles", pd.DataFrame()))
-
-    if df_session.empty:
-        smart_api = get_smart_api_client()
-        spot_token, spot_exch, _ = INDEX_TOKEN_MAP.get(index_name, ("99926000", "NSE", "NFO"))
-        api_interval, lookback_days = interval_mapping.get(heatmap_tf_label, ("FIVE_MINUTE", 15))
-        if smart_api:
-            df_hm, _ = fetch_candles_with_holiday_fallback(
-                smart_api, spot_token, spot_exch, api_interval, lookback_days
-            )
-            df_session = _prepare_session_candles(df_hm)
-
-    if df_session.empty:
-        st.info("Unable to load session candles for the GEX heatmap.")
-        return
-
-    time_labels = pd.to_datetime(df_session["time"]).dt.strftime("%H:%M").tolist()
-    spot_path = df_session["close"].astype(float).tolist()
-    session_date_str = pd.to_datetime(df_session["time"].iloc[-1]).strftime("%d %B %Y")
-    session_times = pd.to_datetime(df_session["time"]).tolist()
-
-    n_strikes = len(strikes)
-    n_times = len(time_labels)
-    if n_strikes == 0 or n_times == 0:
-        st.info("Insufficient strike/time points for the GEX heatmap.")
-        return
-
-    # ---- Build evolving GEX matrix (no longer paints latest GEX on whole day) ----
-    gex_matrix = np.full((n_strikes, n_times), np.nan, dtype=float)
-    current_vec = np.array(gex_cr, dtype=float)
-
-    if len(gex_hist) <= 1:
-        # Only one (or zero) snapshot → paint it uniformly across the whole session
-        # so the user always sees a proper coloured band.
-        paint_vec = current_vec if not gex_hist else np.array(gex_hist[-1]["gex_cr"], dtype=float)
-        # Align length just in case
-        if len(paint_vec) != n_strikes:
-            paint_vec = current_vec
-        gex_matrix[:] = paint_vec[:, None]
-
-    else:
-        # Multiple snapshots → build true time evolution
-        hist_times = []
-        hist_vecs = []
-        for h in gex_hist:
-            ht = h["ts"]
-            if getattr(ht, "tzinfo", None) is None:
-                ht = pytz.timezone("Asia/Kolkata").localize(ht)
-
-            src_strikes = h["strikes"]
-            src_gex = np.array(h["gex_cr"], dtype=float)
-
-            if len(src_strikes) == n_strikes and abs(src_strikes[0] - strikes[0]) < 1:
-                vec = src_gex
-            else:
-                src_map = dict(zip(src_strikes, src_gex))
-                vec = np.array([
-                    src_map.get(min(src_strikes, key=lambda x: abs(x - s)), 0.0)
-                    for s in strikes
-                ])
-            hist_times.append(ht)
-            hist_vecs.append(vec)
-
-        for t_idx, t in enumerate(session_times):
-            if getattr(t, "tzinfo", None) is None:
-                t = pytz.timezone("Asia/Kolkata").localize(t)
-
-            # Find the latest snapshot that is <= this candle time
-            chosen_idx = None
-            for i in range(len(hist_times) - 1, -1, -1):
-                if hist_times[i] <= t:
-                    chosen_idx = i
-                    break
-
-            if chosen_idx is not None:
-                gex_matrix[:, t_idx] = hist_vecs[chosen_idx]
-            else:
-                # Before the first snapshot → use the first snapshot
-                gex_matrix[:, t_idx] = hist_vecs[0]
-
-        # Forward-fill any remaining gaps
-        last_valid = gex_matrix[:, 0].copy()
-        for t_idx in range(n_times):
-            if not np.isnan(gex_matrix[0, t_idx]):
-                last_valid = gex_matrix[:, t_idx].copy()
-            else:
-                gex_matrix[:, t_idx] = last_valid
-    # Colour scale
-    finite_vals = gex_matrix[np.isfinite(gex_matrix)]
-    if len(finite_vals) > 0:
-        p95 = float(np.nanpercentile(np.abs(finite_vals), 95))
-        max_abs_gex = max(p95, 0.05)
-    else:
-        max_abs_gex = 0.05
-
-    gex_colorscale = [
-        [0.0, "#b71c1c"],
-        [0.25, "#e53935"],
-        [0.45, "#ffee58"],
-        [0.55, "#ffee58"],
-        [0.75, "#43a047"],
-        [1.0, "#1b5e20"],
-    ]
-
-    hm_c1, hm_c2 = st.columns([0.65, 0.35])
-    with hm_c1:
-        heading_ribbon(
-            f"🔥 Delta-Adjusted GEX Heatmap ({index_name})",
-            "Strike × session time. Each snapshot stores delta-adjusted GEX (OI) per strike.<br>"
-            "GEX_i × |Δ_i|. Green = long-gamma; red = short-gamma. Cyan = spot path.<br>"
-            "Enable Auto-Refresh so the band evolves instead of one snapshot painted all day.",
-        )
-    with hm_c2:
-        st.markdown(
-            f"<div class='update-timestamp'>Expiry: {expiry_str} | Session: {session_date_str} | "
-            f"{heatmap_tf_label} | Snapshots: {len(gex_hist)}</div>",
-            unsafe_allow_html=True,
-        )
-
-    n_snap = len(gex_hist)
-    if n_snap <= 1:
-        st.caption(
-            "Strike vs IST session time. Currently showing the **latest live GEX snapshot**. "
-            "Enable **Auto-Refresh** and leave the dashboard open – new snapshots will be saved to disk "
-            "and the heatmap will start showing true evolution of GEX through the day. "
-            "Green = long-gamma; red = short-gamma. Cyan = spot path."
-        )
-    else:
-        first_ts = gex_hist[0]["ts"].strftime("%H:%M")
-        last_ts = gex_hist[-1]["ts"].strftime("%H:%M")
-        st.caption(
-            f"Strike vs IST session time. Colour = live Delta-Adjusted Net GEX (₹ Cr) from "
-            f"**{n_snap} snapshots** ({first_ts} → {last_ts}). "
-            "History is persisted to disk and survives browser refresh. "
-            "Green = long-gamma / pinning; red = short-gamma / acceleration. Cyan line = spot path."
-        )
-
-    fig_hm = plt_go.Figure()
-    fig_hm.add_trace(
-        plt_go.Heatmap(
-            z=gex_matrix,
-            x=time_labels,
-            y=strikes,
-            zmin=-max_abs_gex,
-            zmax=max_abs_gex,
-            zmid=0,
-            colorscale=gex_colorscale,
-            colorbar=dict(title="Net Δ-GEX (₹ Cr)"),
-            hovertemplate="Time: %{x}<br>Strike: %{y}<br>Net Δ-GEX: %{z:.2f} Cr<extra></extra>",
-        )
-    )
-    fig_hm.add_trace(
-        plt_go.Scatter(
-            x=time_labels,
-            y=spot_path,
-            mode="lines+markers",
-            name=f"{index_name} Spot",
-            line=dict(color="cyan", width=2),
-            marker=dict(size=4),
-            hovertemplate="Time: %{x}<br>Spot: %{y:,.2f}<extra></extra>",
-        )
-    )
-    fig_hm.update_layout(
-        title=dict(
-            text=f"<b>{index_name} Delta-Adjusted GEX Heatmap</b> ({heatmap_tf_label}) | "
-                 f"Session: {session_date_str} | Expiry: {expiry_str}",
-            x=0.01,
-        ),
-        xaxis_title="IST Time",
-        yaxis_title="Strike Price",
-        height=520,
-        template="plotly_dark",
-        paper_bgcolor="#0E1117",
-        plot_bgcolor="#0E1117",
-        margin=dict(l=20, r=20, t=60, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    fig_hm.update_xaxes(type="category")
-    fig_hm.update_yaxes(tickformat="d")
-    st.plotly_chart(fig_hm, use_container_width=True)
-    # =====================================================================
-    #  ALERT MODULES – Situation 1 (Exit / Risk-Off) & Situation 2 (Long Entry)
-    # =====================================================================
-    def _pct_drop(old, new):
-        if old is None or old <= 0:
-            return 0.0
-        return max(0.0, (old - new) / old * 100.0)
-
-    def _iv_change_bps(old_iv, new_iv):
-        if old_iv is None:
-            return 0.0
-        return (new_iv - old_iv)  # already in percentage points → ×100 for bps later if needed
-
-    # Look back ~10 min and ~5 min in the alert history
-    t_10 = now_ist - datetime.timedelta(minutes=10)
-    t_5 = now_ist - datetime.timedelta(minutes=5)
-
-    snap_10 = None
-    snap_5 = None
-    for h in alert_hist:
-        if h["ts"] <= t_10:
-            snap_10 = h
-        if h["ts"] <= t_5:
-            snap_5 = h
-
-    cur = alert_hist[-1] if alert_hist else {
-        "pos_gex_above": pos_gex_above,
-        "neg_gex_above": neg_gex_above,
-        "otm_call_iv": otm_call_iv,
-        "otm_put_iv": otm_put_iv,
-        "vol_ratio": vol_ratio,
-        "spot": spot,
-        "flip": flip,
-    }
-
-    # ---------- Situation 1: Non-Directional Exit / Risk-Off ----------
-    # A – Wall Collapse: cumulative positive GEX above spot drops ≥ 25% in 10 min
-    wall_drop = _pct_drop(snap_10["pos_gex_above"] if snap_10 else None, cur["pos_gex_above"])
-    crit_a_exit = wall_drop >= 25.0
-
-    # B – Vol Expansion: OTM Call IV or Put IV rises ≥ +0.8% (80 bps) in 5 min
-    call_iv_chg = _iv_change_bps(snap_5["otm_call_iv"] if snap_5 else None, cur["otm_call_iv"])
-    put_iv_chg = _iv_change_bps(snap_5["otm_put_iv"] if snap_5 else None, cur["otm_put_iv"])
-    crit_b_exit = (call_iv_chg >= 0.8) or (put_iv_chg >= 0.8)
-
-    # C – GEX Flip: spot within 0.3% of flip level OR already inside a negative-GEX strike zone
-    dist_to_flip_pct = abs(cur["spot"] - cur["flip"]) / cur["spot"] * 100.0 if cur["spot"] > 0 else 999.0
-    in_neg_zone = cur["neg_gex_above"] < 0 and abs(cur["neg_gex_above"]) > 0.01
-    crit_c_exit = (dist_to_flip_pct <= 0.3) or in_neg_zone
-
-    exit_alert = crit_a_exit or crit_b_exit or crit_c_exit
-
-    # ---------- Situation 2: Long Position Entry (Directional Breakout) ----------
-    # A – Gamma Fuel: negative GEX present directly above spot OR positive GEX collapsed ≥ 40% in 10 min
-    has_neg_above = cur["neg_gex_above"] < -0.01
-    pos_collapse = _pct_drop(snap_10["pos_gex_above"] if snap_10 else None, cur["pos_gex_above"])
-    crit_a_long = has_neg_above or (pos_collapse >= 40.0)
-
-    # B – Aggressive Demand: OTM Call IV spikes ≥ +1.5% (150 bps) in 5 min
-    crit_b_long = call_iv_chg >= 1.5
-
-    # C – Volume Confirmation: current 5-min volume ≥ 1.5× its 20-period MA
-    crit_c_long = cur["vol_ratio"] >= 1.5
-
-    long_alert = crit_a_long and crit_b_long and crit_c_long   # high-confirmation: all three required
-
-    # Alert criteria computed above; store for full-width 3-col ribbon rendered outside this column
-    st.session_state["_live_alert_snapshot"] = {
-        "exit_alert": exit_alert, "long_alert": long_alert,
-        "crit_a_exit": crit_a_exit, "crit_b_exit": crit_b_exit, "crit_c_exit": crit_c_exit,
-        "crit_a_long": crit_a_long, "crit_b_long": crit_b_long, "crit_c_long": crit_c_long,
-        "wall_drop": wall_drop, "call_iv_chg": call_iv_chg, "put_iv_chg": put_iv_chg,
-        "dist_to_flip_pct": dist_to_flip_pct, "pos_collapse": pos_collapse, "cur": cur,
-    }
-
-
-def _compute_basket_live_totals(data: dict):
-    """Return (totals_dict, legs_list) for current basket."""
-    if not st.session_state.get("basket_legs"):
-        return None, []
-    market_data_store = data.get("market_data", {})
-    basket_tokens_info = data.get("basket_tokens_info", {})
-    F_val = data.get("F", data["spot_price"])
-    T_val = data.get("T", 1e-5)
-    hv_val = data.get("index_hv", 0.15)
-    calculated_legs = []
-    tot_pnl = tot_delta = tot_gamma = tot_theta = tot_vega = 0.0
-    for idx, leg in enumerate(st.session_state["basket_legs"]):
-        k, t, act, qty = leg["strike"], leg["type"], leg["action"], leg["qty"]
-        tok = basket_tokens_info.get(f"{k}_{t}", "")
-        ltp = market_data_store.get(tok, {}).get("ltp", 0.0) if tok else 0.0
-        entry_p = leg["entry_price"] if leg["entry_price"] > 0 else ltp
-        pricing_p = ltp if ltp > 0 else entry_p
-        leg_iv = VolatilityEngine.calculate_iv(pricing_p, F_val, k, T_val, rate_param, "c" if t == "CE" else "p")
-        if leg_iv == 0.0:
-            leg_iv = hv_val
-        greeks = VolatilityEngine.calculate_greeks(F_val, k, T_val, rate_param, leg_iv, "c" if t == "CE" else "p")
-        mult = 1.0 if act == "BUY" else -1.0
-        pnl_per_unit = (ltp - entry_p) if act == "BUY" else (entry_p - ltp)
-        leg_pnl = pnl_per_unit * qty if ltp > 0 else 0.0
-        pos_delta = greeks["delta"] * qty * mult
-        pos_gamma = greeks["gamma"] * qty * mult
-        pos_theta = greeks["theta"] * qty * mult
-        pos_vega = greeks["vega"] * qty * mult
-        tot_pnl += leg_pnl
-        tot_delta += pos_delta
-        tot_gamma += pos_gamma
-        tot_theta += pos_theta
-        tot_vega += pos_vega
-        calculated_legs.append({
-            "Leg": idx + 1, "Action": act, "Strike": k, "Type": t, "Qty": qty,
-            "Entry (₹)": round(entry_p, 2), "LTP (₹)": round(ltp, 2), "P&L (₹)": round(leg_pnl, 2),
-            "Delta (Δ)": round(pos_delta, 2), "Gamma (γ)": round(pos_gamma, 4),
-            "Theta (θ/Day)": round(pos_theta, 2), "Vega (ν)": round(pos_vega, 2),
-        })
-    totals = {"pnl": tot_pnl, "delta": tot_delta, "gamma": tot_gamma, "theta": tot_theta, "vega": tot_vega}
-    return totals, calculated_legs
-
-
-def render_basket_metrics_block(data: dict):
-    """Compact P&L / Greeks metrics only (for left of Z-Scores under alerts)."""
-    heading_ribbon("🧺 Basket Greeks",
-            "Sum of Δ, Γ, Θ, Vega across strategy legs × qty × lot. Net exposure of the basket.")
-    totals, _ = _compute_basket_live_totals(data)
-    if totals is None:
-        st.caption("No legs – add from sidebar")
-        return
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("P&L", f"₹{totals['pnl']:,.0f}")
-    m2.metric("Δ", f"{totals['delta']:,.1f}")
-    m3.metric("γ", f"{totals['gamma']:.4f}")
-    m4.metric("θ/d", f"{totals['theta']:,.1f}")
-    m5.metric("ν", f"{totals['vega']:,.1f}")
-
-
-def render_basket_table_fullwidth(data: dict):
-    """Full-width legs table + remove buttons + fixed historical analytics."""
-    totals, calculated_legs = _compute_basket_live_totals(data)
-    if totals is None:
-        return
-
-    st.markdown("---")
-    heading_ribbon("🧺 Strategy Basket – Legs",
-            "Each listed option leg with strike, type, side, qty. Greeks from BS on live LTP / IV.")
-    df_b = pd.DataFrame(calculated_legs)
-    tbl_c, del_c = st.columns([0.92, 0.08])
-    with tbl_c:
-        st.dataframe(df_b, use_container_width=True, hide_index=True)
-    with del_c:
-        st.caption("Del")
-        for idx in range(len(st.session_state["basket_legs"])):
-            if st.button("✕", key=f"del_leg_full_{idx}", help=f"Remove leg #{idx+1}"):
-                st.session_state["basket_legs"].pop(idx)
-                sync_local_storage()
-                st.rerun()
-
-    with st.expander("📊 Basket Historical Analytics (Cum. Θ Decay %, Daily Θ, Vanna, Charm)", expanded=False):
-        st.caption(
-            "Cum. Θ Decay % = time-integrated |θ| as % of initial extrinsic (smooth accrual). "
-            "Daily Θ = signed position theta (long options are negative by design). "
-            "Deep-ITM bars use HV fallback to avoid IV-solver spikes."
-        )
-        smart_api = get_smart_api_client()
-        if not (smart_api and not df_master.empty and st.session_state["basket_legs"]):
-            st.info("API session needed for historical basket charts.")
-            return
-
-        hv_val = data.get("index_hv", 0.15)
-        b_hist_dfs = []
-        for leg in st.session_state["basket_legs"]:
-            k, t, act, qty = leg["strike"], leg["type"], leg["action"], leg["qty"]
-            mult = 1.0 if act == "BUY" else -1.0
-            tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, k, t)
-            if not tok:
-                continue
-            leg_df = fetch_history(smart_api, tok, days=30, spot_token=default_token, spot_exchange=spot_exchange)
-            if leg_df.empty or len(leg_df) < 3:
-                continue
-
-            leg_df = leg_df.copy()
-            leg_df["Expiry_Date"] = target_expiry_dt.date()
-            expiry = pd.to_datetime(leg_df["Expiry_Date"])
-            timestamp = pd.to_datetime(leg_df["Raw_Timestamp"])
-            try:
-                if timestamp.dt.tz is not None:
-                    timestamp = timestamp.dt.tz_localize(None)
-            except Exception:
-                pass
-            try:
-                if getattr(expiry.dt, "tz", None) is not None:
-                    expiry = expiry.dt.tz_localize(None)
-            except Exception:
-                pass
-            leg_df["DTE"] = ((expiry - timestamp).dt.total_seconds() / 86400.0).clip(lower=0.001)
-            leg_df["T"] = leg_df["DTE"] / 365.0
-
-            greeks_df = leg_df.apply(compute_greeks, axis=1, K=k, r=rate_param, option_type=t)
-            greeks_df.columns = ["IV_%", "Theta", "Theta_Decay_Pct", "Gamma", "Vanna", "Charm", "Extrinsic_Val", "Is_Pure_Intrinsic"]
-
-            # Fallback pure-intrinsic / failed IV → HV-based greeks
-            for i in range(len(greeks_df)):
-                if bool(greeks_df.iloc[i]["Is_Pure_Intrinsic"]) or float(greeks_df.iloc[i]["IV_%"]) <= 0.5:
-                    S = float(leg_df.iloc[i]["Spot_Price"])
-                    T = float(leg_df.iloc[i]["T"])
-                    if T > 1e-5 and S > 0:
-                        g = VolatilityEngine.calculate_greeks(S, k, T, rate_param, hv_val, "c" if t == "CE" else "p")
-                        greeks_df.iat[i, 1] = g["theta"]
-                        greeks_df.iat[i, 3] = g["gamma"]
-                        # keep vanna/charm from BS if available; else 0
-                        if "vanna" in g:
-                            greeks_df.iat[i, 4] = g["vanna"]
-                        if "charm" in g:
-                            greeks_df.iat[i, 5] = g["charm"]
-
-            leg_df["Theta_Scaled"] = greeks_df["Theta"].values * qty * mult
-            leg_df["Vanna_Scaled"] = greeks_df["Vanna"].values * qty * mult
-            leg_df["Charm_Scaled"] = greeks_df["Charm"].values * qty * mult
-            leg_df["Extrinsic"] = greeks_df["Extrinsic_Val"].values * qty
-
-            ts = pd.to_datetime(leg_df["Raw_Timestamp"])
-            try:
-                if ts.dt.tz is not None:
-                    ts = ts.dt.tz_localize(None)
-            except Exception:
-                pass
-            dt_days = ts.diff().dt.total_seconds().fillna(0.0) / 86400.0
-            dt_days = dt_days.clip(lower=0.0, upper=3.0)
-
-            # Midpoint integration of signed theta over each bar
-            theta_mid = (leg_df["Theta_Scaled"] + leg_df["Theta_Scaled"].shift(1).fillna(leg_df["Theta_Scaled"].iloc[0])) / 2.0
-            bar_theta_pnl = theta_mid * dt_days
-            # Decay cost: positive when time hurts the position (longs)
-            bar_decay_cost = (-bar_theta_pnl).clip(lower=0.0)
-            leg_df["Bar_Decay_Cost"] = bar_decay_cost
-            leg_df["Cum_Decay_Cost"] = leg_df["Bar_Decay_Cost"].cumsum()
-
-            init_extrinsic = max(
-                float(leg_df["Extrinsic"].iloc[0]),
-                abs(float(leg_df["Theta_Scaled"].iloc[0])) * max(float(leg_df["DTE"].iloc[0]), 1.0),
-                1.0,
-            )
-            leg_df["Init_Extrinsic"] = init_extrinsic
-
-            b_hist_dfs.append(leg_df[["Date", "Raw_Timestamp", "Theta_Scaled", "Vanna_Scaled", "Charm_Scaled", "Cum_Decay_Cost", "Init_Extrinsic"]])
-
-        if not b_hist_dfs:
-            st.info("Unable to fetch historical data for strategy basket contracts.")
-            return
-
-        combined = b_hist_dfs[0].copy()
-        for nxt in b_hist_dfs[1:]:
-            combined = pd.merge(combined, nxt, on=["Date", "Raw_Timestamp"], how="inner", suffixes=("", "_sub"))
-            for c_col in ["Theta_Scaled", "Vanna_Scaled", "Charm_Scaled", "Cum_Decay_Cost", "Init_Extrinsic"]:
-                combined[c_col] = combined[c_col] + combined[f"{c_col}_sub"]
-                combined.drop(columns=[f"{c_col}_sub"], inplace=True)
-        combined = combined.sort_values("Raw_Timestamp", ascending=True).reset_index(drop=True)
-
-        init_ext = max(float(combined["Init_Extrinsic"].iloc[0]), 1.0)
-        combined["Cum_Theta_Decay_Pct"] = (combined["Cum_Decay_Cost"] / init_ext * 100.0).clip(0, 100)
-
-        # Clip single-bar IV-solver spikes on higher-order greeks
-        for col in ["Vanna_Scaled", "Charm_Scaled", "Theta_Scaled"]:
-            s = combined[col]
-            mu, sd = float(s.median()), float(s.std()) if len(s) > 2 else 0.0
-            if sd and sd > 0:
-                combined[col] = s.clip(mu - 4 * sd, mu + 4 * sd)
-
-        def _plot_bm(df, y, title, color, is_pct=False):
-            fig = px.line(df, x="Date", y=y, title=title, markers=True)
-            fig.update_traces(line_color=color, marker=dict(size=4))
-            fig.update_xaxes(type="category", title="", nticks=10)
-            if is_pct:
-                ymax = max(5.0, float(df[y].max()) * 1.15)
-                fig.update_yaxes(range=[0, ymax], ticksuffix="%")
-            fig.update_layout(template="plotly_dark", height=240, margin=dict(l=10, r=10, t=30, b=10))
-            return fig
-
-        bc1, bc2 = st.columns(2)
-        with bc1:
-            st.plotly_chart(_plot_bm(combined, "Cum_Theta_Decay_Pct", "Cum. Θ Decay % (time-integrated)", "#00E676", True), use_container_width=True)
-        with bc2:
-            st.plotly_chart(_plot_bm(combined, "Theta_Scaled", "Daily Θ P&L (₹/Day, signed)", "#FF9800"), use_container_width=True)
-        bc3, bc4 = st.columns(2)
-        with bc3:
-            st.plotly_chart(_plot_bm(combined, "Vanna_Scaled", "Vanna (scaled)", "#00BFFF"), use_container_width=True)
-        with bc4:
-            st.plotly_chart(_plot_bm(combined, "Charm_Scaled", "Charm (scaled)", "#E040FB"), use_container_width=True)
-
-
-
-def render_futures_cvd_chart(data: dict):
-    """Cumulative Volume Delta proxy from near-month futures candles.
-    SmartAPI does not provide buy/sell volume for index futures, so we use a
-    standard directional proxy: +volume when close >= open (up bar), -volume otherwise.
-    """
-    df_fut = data.get("df_futures", pd.DataFrame())
-    if df_fut is None or df_fut.empty or len(df_fut) < 5:
-        st.info("Futures CVD not available – need futures candles with volume.")
-        return
-
-    df = df_fut.copy()
-    df["time"] = pd.to_datetime(df["time"])
-    df["session_date"] = df["time"].dt.date
-    # Latest session only for a clean CVD
-    latest = sorted(df["session_date"].unique())[-1]
-    df = df[df["session_date"] == latest].sort_values("time").reset_index(drop=True)
-    if df.empty or "volume" not in df.columns:
-        st.info("No volume on futures candles for CVD.")
-        return
-
-    # Directional volume proxy
-    df["signed_vol"] = np.where(df["close"] >= df["open"], df["volume"], -df["volume"])
-    df["cvd"] = df["signed_vol"].cumsum()
-    df["time_str"] = df["time"].dt.strftime("%H:%M")
-
-    latest_cvd = float(df["cvd"].iloc[-1])
-    colour = "#00E676" if latest_cvd >= 0 else "#FF5252"
-
-    st.markdown(
-        f"<span style='font-weight:700;color:#00E676;font-size:14px;'>"
-        f"📉 Futures CVD (proxy) — latest session {latest}</span>",
-        unsafe_allow_html=True
-    )
-    st.caption(
-        "Cumulative Volume Delta from near-month futures. "
-        "SmartAPI does not supply buy/sell side volume for index futures, "
-        "so each bar’s volume is signed + if close≥open, − otherwise. "
-        "This is a widely used institutional proxy."
-    )
-
-    fig = plt_go.Figure()
-    fig.add_trace(plt_go.Scatter(
-        x=df["time_str"], y=df["cvd"],
-        mode="lines", name="CVD",
-        line=dict(color=colour, width=2),
-        fill="tozeroy",
-        fillcolor="rgba(0,230,118,0.08)" if latest_cvd >= 0 else "rgba(255,82,82,0.08)",
-    ))
-    fig.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
-    fig.update_layout(
-        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-        height=280, margin=dict(l=10, r=10, t=30, b=10),
-        title=dict(text=f"CVD: {latest_cvd:,.0f}", x=0.01, font=dict(size=12)),
-        xaxis=dict(type="category", nticks=10),
-        yaxis=dict(title="Cumulative signed volume"),
-        showlegend=False,
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
-
-def fetch_futures_book_snapshot(smart_api, index_name: str, fut_token: str) -> dict:
-    """One FULL snapshot of near-month futures book. SmartAPI fields vary by version."""
-    empty = {"bid_qty": 0.0, "ask_qty": 0.0, "bid_qty_lots": 0.0, "ask_qty_lots": 0.0,
-             "best_bid": 0.0, "best_ask": 0.0, "ok": False}
-    if not smart_api or not fut_token:
-        return empty
-    try:
-        _, _, fut_exch = INDEX_TOKEN_MAP.get(index_name, ("99926000", "NSE", "NFO"))
-        lot = float(LOT_SIZES.get(index_name, 65) or 65)
-        res = safe_api_call(smart_api.getMarketData, "FULL", {fut_exch: [str(fut_token)]})
-        if not (res and res.get("status") and res.get("data") and res["data"].get("fetched")):
-            return empty
-        item = res["data"]["fetched"][0]
-        depth = item.get("depth") or {}
-        buy_lvls = depth.get("buy") or depth.get("Buy") or []
-        sell_lvls = depth.get("sell") or depth.get("Sell") or []
-
-        def _sum_qty(levels):
-            tot = 0.0
-            for lv in levels or []:
-                tot += float(lv.get("quantity", lv.get("qty", 0)) or 0)
-            return tot
-
-        bid_qty = float(item.get("totBuyQuan", item.get("totalBuyQuantity", 0)) or 0)
-        ask_qty = float(item.get("totSellQuan", item.get("totalSellQuantity", 0)) or 0)
-        if bid_qty <= 0:
-            bid_qty = _sum_qty(buy_lvls)
-        if ask_qty <= 0:
-            ask_qty = _sum_qty(sell_lvls)
-        if bid_qty <= 0:
-            bid_qty = float(item.get("bestBidQty", item.get("bidQty", 0)) or 0)
-        if ask_qty <= 0:
-            ask_qty = float(item.get("bestAskQty", item.get("askQty", 0)) or 0)
-
-        best_bid = float(item.get("bestBidPrice", item.get("bidPrice", 0)) or 0)
-        best_ask = float(item.get("bestAskPrice", item.get("askPrice", 0)) or 0)
-
-        # Angel often reports quantity in units. Convert to lots for alert thresholds.
-        bid_lots = bid_qty / lot if lot > 0 else bid_qty
-        ask_lots = ask_qty / lot if lot > 0 else ask_qty
-        # If already looks like lots (small vs units), keep raw
-        if bid_qty > 0 and bid_qty < 20000:
-            bid_lots, ask_lots = bid_qty, ask_qty
-
-        ltp = float(item.get("ltp", item.get("lastPrice", 0)) or 0)
-        traded_vol = float(
-            item.get("tradeVolume") or item.get("volume") or item.get("vol") or 0
-        )
-        return {
-            "bid_qty": bid_qty, "ask_qty": ask_qty,
-            "bid_qty_lots": bid_lots, "ask_qty_lots": ask_lots,
-            "best_bid": best_bid, "best_ask": best_ask,
-            "ltp": ltp, "traded_vol": traded_vol,
-            "ok": (bid_qty > 0 or ask_qty > 0 or ltp > 0),
-        }
-    except Exception:
-        return empty
-
-
-def update_liq_delta_history(snap: dict, index_name: str) -> list:
-    """Append book snapshot, bid/ask change, and tick-rule incremental CVD."""
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.datetime.now(ist)
-    hist = list(st.session_state.get("liq_delta_history") or [])
-    prev = hist[-1] if hist else None
-    bid = float(snap.get("bid_qty_lots") or 0)
-    ask = float(snap.get("ask_qty_lots") or 0)
-    bid_chg = bid - float(prev["bid_qty_lots"]) if prev else 0.0
-    ask_chg = ask - float(prev["ask_qty_lots"]) if prev else 0.0
-    net = bid_chg - ask_chg
-
-    ltp = float(snap.get("ltp") or 0)
-    vol = float(snap.get("traded_vol") or 0)
-    best_bid = float(snap.get("best_bid") or 0)
-    best_ask = float(snap.get("best_ask") or 0)
-    mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else ltp
-
-    # Tick rule: incremental printed volume since last snapshot
-    dvol = 0.0
-    if prev and vol > 0:
-        prev_vol = float(prev.get("traded_vol") or 0)
-        dvol = max(vol - prev_vol, 0.0)
-        if dvol == 0 and vol < prev_vol:
-            dvol = 0.0  # session volume reset
-    signed = 0.0
-    if dvol > 0 and ltp > 0:
-        prev_ltp = float(prev.get("ltp") or 0) if prev else 0.0
-        if best_ask > 0 and ltp >= best_ask:
-            signed = dvol          # lift the offer
-        elif best_bid > 0 and ltp <= best_bid:
-            signed = -dvol         # hit the bid
-        elif prev_ltp > 0:
-            signed = dvol if ltp >= prev_ltp else -dvol
-        elif mid > 0:
-            signed = dvol if ltp >= mid else -dvol
-    prev_cvd = float(prev.get("tick_cvd") or 0) if prev else 0.0
-    tick_cvd = prev_cvd + signed
-
-    rec = {
-        "ts": now,
-        "index": index_name,
-        "bid_qty_lots": bid,
-        "ask_qty_lots": ask,
-        "bid_change": bid_chg,
-        "ask_change": ask_chg,
-        "net_liq": net,
-        "best_bid": best_bid,
-        "best_ask": best_ask,
-        "ltp": ltp,
-        "traded_vol": vol,
-        "dvol": dvol,
-        "signed_vol": signed,
-        "tick_cvd": tick_cvd,
-    }
-    hist.append(rec)
-    cutoff = now - datetime.timedelta(minutes=90)
-    cleaned = []
-    for h in hist:
-        ts = h["ts"]
-        if getattr(ts, "tzinfo", None) is None:
-            ts = ist.localize(ts) if hasattr(ist, "localize") else ts
-        if ts >= cutoff and h.get("index", index_name) == index_name:
-            cleaned.append(h)
-    st.session_state["liq_delta_history"] = cleaned[-180:]
-    return st.session_state["liq_delta_history"]
-
-
-
-def _prominence_nodes(vol_at: np.ndarray, mids: np.ndarray, prominence_factor: float = 0.35):
-    """HVN = peaks on volume. LVN = peaks on inverted volume, kept if valley depth
-    vs nearest surrounding HVNs is >= prominence_factor * surrounding peak volume."""
+    d["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
+    d["date_group"] = d["time"].dt.date
+    d["tp"] = (d["high"] + d["low"] + d["close"]) / 3.0
+    d["tp_vol"] = d["tp"] * d["volume"]
+    d["cum_vol"] = d.groupby("date_group")["volume"].cumsum()
+    d["cum_tp_vol"] = d.groupby("date_group")["tp_vol"].cumsum()
+    raw = np.where(d["cum_vol"] > 0, d["cum_tp_vol"] / d["cum_vol"], np.nan)
+    d["vwap"] = pd.Series(raw, index=d.index).ffill().fillna(d["close"])
+    return d
+
+
+def _prominence_nodes(vol_at, mids, prominence_factor=0.35):
     n = len(vol_at)
     if n < 3:
         return [], []
     vmax = float(np.max(vol_at)) or 1.0
-    hvn_idx = []
-    for i in range(1, n - 1):
-        if vol_at[i] >= vol_at[i - 1] and vol_at[i] >= vol_at[i + 1] and vol_at[i] >= 0.20 * vmax:
-            hvn_idx.append(i)
+    hvn_idx = [i for i in range(1, n - 1)
+               if vol_at[i] >= vol_at[i - 1] and vol_at[i] >= vol_at[i + 1] and vol_at[i] >= 0.20 * vmax]
     if not hvn_idx:
         hvn_idx = [int(np.argmax(vol_at))]
     inverted = vmax - vol_at
@@ -3391,19 +544,13 @@ def _prominence_nodes(vol_at: np.ndarray, mids: np.ndarray, prominence_factor: f
         right = [j for j in hvn_idx if j > i]
         if not left or not right:
             continue
-        left_p = vol_at[left[-1]]
-        right_p = vol_at[right[0]]
-        surround = min(float(left_p), float(right_p))
-        depth = surround - float(vol_at[i])
-        if surround > 0 and depth >= prominence_factor * surround:
+        surround = min(float(vol_at[left[-1]]), float(vol_at[right[0]]))
+        if surround > 0 and (surround - float(vol_at[i])) >= prominence_factor * surround:
             lvn_idx.append(i)
-    hvn = [float(mids[i]) for i in hvn_idx]
-    lvn = [float(mids[i]) for i in lvn_idx]
-    return hvn, lvn
+    return [float(mids[i]) for i in hvn_idx], [float(mids[i]) for i in lvn_idx]
 
 
-def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prominence_factor: float = 0.35) -> dict:
-    """Volume-at-price with tick-size bins, POC, ±1σ/±1.5σ VA, prominence HVN/LVN."""
+def compute_session_volume_profile(df, bin_step=250.0, prominence_factor=0.35) -> dict:
     empty = {"ok": False}
     if df is None or df.empty or "volume" not in df.columns:
         return empty
@@ -3411,19 +558,18 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prom
     hi = float(max(df["high"].max(), df["close"].max()))
     if hi <= lo:
         hi = lo + bin_step
-    bin_step = float(bin_step) if bin_step and bin_step > 0 else 5.0
     lo = np.floor(lo / bin_step) * bin_step
     hi = np.ceil(hi / bin_step) * bin_step
     edges = np.arange(lo, hi + bin_step * 0.5, bin_step)
     if len(edges) < 3:
         edges = np.array([lo, lo + bin_step, lo + 2 * bin_step])
     n_bins = len(edges) - 1
-    vol_at = np.zeros(n_bins, dtype=float)
+    vol_at = np.zeros(n_bins)
     for _, r in df.iterrows():
         v = float(r.get("volume") or 0)
         if v <= 0:
             continue
-        l = float(r["low"]); h = float(r["high"])
+        l, h = float(r["low"]), float(r["high"])
         if h <= l:
             h = l + 1e-6
         span = h - l
@@ -3439,1206 +585,1312 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prom
     poc_i = int(np.argmax(vol_at))
     wmean = float(np.sum(mids * vol_at) / tot)
     wstd = float(np.sqrt(max(np.sum(vol_at * (mids - wmean) ** 2) / tot, 0.0)))
-    hvn, lvn = _prominence_nodes(vol_at, mids, prominence_factor=prominence_factor)
+    hvn, lvn = _prominence_nodes(vol_at, mids, prominence_factor)
     return {
-        "ok": True,
-        "mids": mids,
-        "vol": vol_at,
-        "poc": float(mids[poc_i]),
-        "poc_vol": float(vol_at[poc_i]),
-        "wmean": wmean,
-        "wstd": wstd,
-        "vah1": wmean + wstd,
-        "val1": wmean - wstd,
-        "vah15": wmean + 1.5 * wstd,
-        "val15": wmean - 1.5 * wstd,
-        "hvn": hvn,
-        "lvn": lvn,
-        "bin_step": bin_step,
+        "ok": True, "mids": mids, "vol": vol_at, "poc": float(mids[poc_i]),
+        "poc_vol": float(vol_at[poc_i]), "wmean": wmean, "wstd": wstd,
+        "vah1": wmean + wstd, "val1": wmean - wstd,
+        "vah15": wmean + 1.5 * wstd, "val15": wmean - 1.5 * wstd,
+        "hvn": hvn, "lvn": lvn, "bin_step": bin_step,
     }
 
-def book_change_sigmas(hist: list, min_n: int = 8):
-    """Std of bid/ask lot changes from the live tape. Returns (bid_sigma, ask_sigma)."""
-    bids = [float(h.get("bid_change") or 0) for h in hist]
-    asks = [float(h.get("ask_change") or 0) for h in hist]
-    if len(bids) < min_n:
-        return None, None
-    bid_s = float(np.std(bids, ddof=1)) if len(bids) > 1 else 0.0
-    ask_s = float(np.std(asks, ddof=1)) if len(asks) > 1 else 0.0
-    bid_s = max(bid_s, 1.0)
-    ask_s = max(ask_s, 1.0)
-    return bid_s, ask_s
+
+def calculate_max_pain(chain: list) -> float:
+    strikes = [row["Strike"] for row in chain]
+    if not strikes:
+        return 0
+    losses = {}
+    for hypo in strikes:
+        tot = 0.0
+        for row in chain:
+            k = row["Strike"]
+            if hypo > k:
+                tot += (hypo - k) * row["C_OI"]
+            if hypo < k:
+                tot += (k - hypo) * row["P_OI"]
+        losses[hypo] = tot
+    return min(losses, key=losses.get)
 
 
-def classify_liq_alert(bid_change: float, ask_change: float, bid_sigma=None, ask_sigma=None, k=1.5) -> dict:
-    """Flag pull/stack when |Δ| exceeds k × rolling σ of that side's book changes."""
-    if bid_sigma is None or ask_sigma is None:
-        return {"code": "NONE", "label": "NO SIGNAL", "color": "#888888",
-                "hint": "Need more snapshots to estimate σ. Keep Auto-Refresh on.",
-                "bid_thr": None, "ask_thr": None, "k": k}
-    bid_thr = k * float(bid_sigma)
-    ask_thr = k * float(ask_sigma)
-    if bid_change <= -bid_thr:
-        return {"code": "BIDS_PULLED", "label": "BIDS PULLED", "color": "#FF5252",
-                "hint": f"Bid Δ {bid_change:+.0f} ≤ −{k:g}σ ({-bid_thr:.0f} lots). Liquidity vacuum.",
-                "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
-    if ask_change <= -ask_thr:
-        return {"code": "ASKS_PULLED", "label": "ASKS PULLED", "color": "#00E676",
-                "hint": f"Ask Δ {ask_change:+.0f} ≤ −{k:g}σ ({-ask_thr:.0f} lots). Offers lifted.",
-                "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
-    if bid_change >= bid_thr:
-        return {"code": "BIDS_STACKED", "label": "BIDS STACKED", "color": "#2196F3",
-                "hint": f"Bid Δ {bid_change:+.0f} ≥ +{k:g}σ ({bid_thr:.0f} lots). Passive absorption.",
-                "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
-    return {"code": "NONE", "label": "NO SIGNAL", "color": "#888888",
-            "hint": f"Inside ±{k:g}σ  (bid {bid_thr:.0f} / ask {ask_thr:.0f} lots).",
-            "bid_thr": bid_thr, "ask_thr": ask_thr, "k": k}
+def calculate_support_resistance_targets(chain, spot, max_pain):
+    if not chain:
+        return {}
+    df = pd.DataFrame(chain)
+    res_df = df.sort_values("C_OI", ascending=False)
+    r1 = res_df.iloc[0]["Strike"] if len(res_df) else spot
+    r2 = res_df.iloc[1]["Strike"] if len(res_df) > 1 else r1
+    sup_df = df.sort_values("P_OI", ascending=False)
+    s1 = sup_df.iloc[0]["Strike"] if len(sup_df) else spot
+    s2 = sup_df.iloc[1]["Strike"] if len(sup_df) > 1 else s1
+    df_sorted = df.sort_values("Strike").reset_index(drop=True)
+    above = df_sorted[df_sorted["Strike"] >= spot]
+    below = df_sorted[df_sorted["Strike"] < spot]
+    gex_res_row = above.sort_values("Net_GEX_OI", ascending=False).head(1) if not above.empty else pd.DataFrame()
+    gex_resistance = gex_res_row.iloc[0]["Strike"] if not gex_res_row.empty else r1
+    gex_sup_row = below.sort_values("Net_GEX_OI", ascending=False).head(1) if not below.empty else pd.DataFrame()
+    gex_support = gex_sup_row.iloc[0]["Strike"] if not gex_sup_row.empty else s1
+    neg = df_sorted.sort_values("Net_GEX_OI", ascending=True).head(1)
+    gex_acc = neg.iloc[0]["Strike"] if not neg.empty and neg.iloc[0]["Net_GEX_OI"] < 0 else None
+    flips = []
+    for i in range(1, len(df_sorted)):
+        prev_g, curr_g = df_sorted.loc[i - 1, "Net_GEX_OI"], df_sorted.loc[i, "Net_GEX_OI"]
+        if (prev_g < 0 <= curr_g) or (prev_g >= 0 > curr_g):
+            chosen = df_sorted.loc[i, "Strike"] if abs(curr_g) < abs(prev_g) else df_sorted.loc[i - 1, "Strike"]
+            flips.append(chosen)
+    flip = min(flips, key=lambda x: abs(x - spot)) if flips else spot
+    atm = df.iloc[(df["Strike"] - spot).abs().argsort()[:1]].iloc[0]
+    straddle = float(atm["C_LTP"]) + float(atm["P_LTP"])
+    return {
+        "S1": s1, "S2": s2, "R1": r1, "R2": r2,
+        "GEX_Support": gex_support, "GEX_Resistance": gex_resistance,
+        "GEX_Accelerator": gex_acc, "Zero_Gamma_Flip": flip,
+        "MaxPain": max_pain,
+        "Target_Up": round(spot + straddle, 2),
+        "Target_Down": round(spot - straddle, 2),
+        "Straddle_Cost": round(straddle, 4),
+    }
 
 
+# ---------------------------------------------------------------------------
+# Deribit data
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=180, show_spinner=False)
+def _fetch_instruments_ok(currency: str) -> pd.DataFrame:
+    res = deribit_get("public/get_instruments", {"currency": currency, "kind": "option", "expired": "false"})
+    if not res:
+        raise RuntimeError(LAST_API_ERROR or "no instruments")
+    df = pd.DataFrame(res)
+    if df.empty:
+        raise RuntimeError("empty instrument list")
+    df["expiry_dt"] = pd.to_datetime(df["expiration_timestamp"], unit="ms", utc=True)
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df["opt_type"] = df["option_type"].str.lower().map({"call": "C", "put": "P"})
+    return df
 
-def render_block_tape(data: dict, index_name: str):
-    """Credible tape: only Δsession-volume between two chain snapshots.
 
-    Not exchange TBT. Side is inferred only when LTP is outside the same-snap bid/ask.
-    Cumulative volume is never shown as 'lots'.
-    """
-    heading_ribbon(
-        "📜 Block tape (Δ volume)",
-        "REST chain differencing — <b>not</b> NSE tick tape.<br>"
-        "Δlots = (Vol_now − Vol_prev) / lot. Ignore ΔVol ≤ 0.<br>"
-        "Side only if LTP ≥ ask (LIFT) or LTP ≤ bid (HIT) on <b>that</b> snapshot; else —.<br>"
-        "Premium = Δlots × lot × LTP. Time = snapshot clock, not exchange match time.<br>"
-        "Cutoff = max(8 lots, median Δlots, mean+1.5σ of positive Δlots). Cap 40 rows.",
-    )
-    chain = data.get("chain_results") or []
-    lot = max(int(LOT_SIZES.get(index_name, 65)), 1)
-    ts = str(data.get("timestamp") or "")
-    live, today, _, _ = market_session_state()
-    sess_day = today
-    df_fut = data.get("df_futures")
-    if isinstance(df_fut, pd.DataFrame) and not df_fut.empty and "time" in df_fut.columns:
+def fetch_instruments(currency: str) -> pd.DataFrame:
+    try:
+        return _fetch_instruments_ok(currency)
+    except Exception:
         try:
-            sess_day = pd.to_datetime(series_to_ist(df_fut["time"]).iloc[-1]).date()
+            _fetch_instruments_ok.clear()
         except Exception:
             pass
-    prev_key = f"chain_vol_{index_name}_{sess_day}"
-    tape_key = f"block_events_{index_name}_{sess_day}"
-    prev = dict(st.session_state.get(prev_key) or {})
-    events = list(st.session_state.get(tape_key) or [])
-    now_map = {}
-    new_deltas = []
-    for r in chain:
-        K = int(r.get("Strike") or 0)
-        for typ, vol_k, ltp_k, d_k, bid_k, ask_k in (
-            ("CE", "C_Vol", "C_LTP", "C_Δ", "C_Bid", "C_Ask"),
-            ("PE", "P_Vol", "P_LTP", "P_Δ", "P_Bid", "P_Ask"),
-        ):
-            key = f"{K}{typ}"
-            vol = float(r.get(vol_k) or 0)
-            now_map[key] = vol
-            if not live or sess_day != today:
-                continue
-            if key not in prev:
-                continue
-            dvol = vol - float(prev[key])
-            if dvol <= 0:
-                continue
-            dlots = dvol / lot
-            ltp = float(r.get(ltp_k) or 0)
-            bid = float(r.get(bid_k) or 0)
-            ask = float(r.get(ask_k) or 0)
-            side = "—"
-            if ltp > 0 and ask > 0 and ltp >= ask:
-                side = "LIFT"
-            elif ltp > 0 and bid > 0 and ltp <= bid:
-                side = "HIT"
-            new_deltas.append(dlots)
-            events.append({
-                "Time": ts[-12:] if ts else "",
-                "Contract": f"{K} {typ}",
-                "Side": side,
-                "ΔLots": round(dlots, 1),
-                "LTP": round(ltp, 2),
-                "Δ": round(float(r.get(d_k) or 0), 2),
-                "Prem ₹L": round(dlots * lot * ltp / 1e5, 2),
-            })
-    st.session_state[prev_key] = now_map
-    if new_deltas:
-        s = pd.Series(new_deltas, dtype=float)
-        thr = max(8.0, float(s.median()), float(s.mean() + 1.5 * (s.std(ddof=0) or 0)))
-    else:
-        thr = 8.0
-    events = [e for e in events if float(e.get("ΔLots") or 0) >= thr]
-    events = events[-40:]
-    st.session_state[tape_key] = events
-    if not live:
-        st.caption(f"Replay {sess_day} · {len(events)} stored Δ prints (no new diffs off-hours).")
-    elif not prev:
-        st.caption("Baseline stored. Next refresh will emit Δlots. Keep Auto-Refresh on.")
-        return
-    if not events:
-        st.caption(f"No Δlots ≥ {thr:.0f} since baseline.")
-        return
-    df = pd.DataFrame(events[::-1])
-    st.dataframe(df, use_container_width=True, hide_index=True, height=220)
+        return pd.DataFrame()
 
 
-def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name: str, compact: bool = False):
-    """Middle panel: futures limit-book liquidity delta + imbalance alerts."""
-    basis = data.get("basis_info") or {}
-    fut_token = basis.get("fut_token")
-    smart_api = get_smart_api_client()
-    snap = fetch_futures_book_snapshot(smart_api, index_name, fut_token) if smart_api else {"ok": False}
-    hist = update_liq_delta_history(snap, index_name) if snap.get("ok") else list(st.session_state.get("liq_delta_history") or [])
-    hist = [h for h in hist if h.get("index", index_name) == index_name]
+def _coingecko_spot(currency: str) -> float:
+    ids = {"BTC": "bitcoin", "ETH": "ethereum"}
+    try:
+        r = _HTTP.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ids.get(currency, "bitcoin"), "vs_currencies": "usd"},
+            timeout=10,
+        )
+        js = r.json()
+        return float(js[ids[currency]]["usd"])
+    except Exception:
+        return 0.0
 
-    if not hist:
-        h1, h2 = st.columns([0.78, 0.22])
-        with h1:
-            heading_ribbon(
-                "📘 Limit Book Liquidity Δ",
-                "<b>Resting book size only</b> — not executed prints. ΔBid=Bid_t-Bid_t-1.",
-            )
-            st.caption("NO SIGNAL — need snapshots. Enable Auto-Refresh.")
-        with h2:
-            st.session_state["liq_sigma_k"] = st.selectbox(
-                "σ flag", options=[1.5, 2.0], index=0,
-                format_func=lambda x: f"±{x}σ", key="liq_sigma_select",
-                label_visibility="collapsed",
-            )
-        return
 
-    last = hist[-1]
-    liq_k = float(st.session_state.get("liq_sigma_k", 1.5))
-    bid_s, ask_s = book_change_sigmas(hist)
-    alert = classify_liq_alert(
-        float(last.get("bid_change") or 0),
-        float(last.get("ask_change") or 0),
-        bid_s, ask_s, k=liq_k,
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_index_price(currency: str) -> float:
+    res = deribit_get("public/get_index_price", {"index_name": f"{currency.lower()}_usd"})
+    if res and "index_price" in res:
+        return float(res["index_price"])
+    t = deribit_get("public/ticker", {"instrument_name": PERP[currency]})
+    if t:
+        return float(t.get("index_price") or t.get("last_price") or 0)
+    return _coingecko_spot(currency)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_book_summaries(currency: str, kind: str = "option") -> list:
+    res = deribit_get("public/get_book_summary_by_currency", {"currency": currency, "kind": kind})
+    return res or []
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_candles(instrument: str, resolution_ms: int, lookback_hours: int = 72) -> pd.DataFrame:
+    now = int(time.time() * 1000)
+    start = now - lookback_hours * 3600 * 1000
+    res = deribit_get(
+        "public/get_tradingview_chart_data",
+        {
+            "instrument_name": instrument,
+            "start_timestamp": start,
+            "end_timestamp": now,
+            "resolution": str(max(int(resolution_ms / 60_000), 1)),
+        },
     )
-    h1, h2, h3, h4, h5 = st.columns([0.26, 0.24, 0.16, 0.20, 0.14])
-    with h1:
-        heading_ribbon(
-            "📘 Limit Book Liquidity Δ",
-            "<b>Resting book size only</b> — not executed prints.<br>"
-            "ΔBid = BidQty_t − BidQty_t-1 · Net = ΔBid − ΔAsk<br>"
-            "<b>Imbalance</b> = (BidLots − AskLots) / (BidLots + AskLots)<br>"
-            "Range −1…+1. + → bid-heavy (support). − → ask-heavy (supply).<br>"
-            "A size drop can be a pull or a hit; the feed does not tag which.",
-        )
-    with h2:
-        bq = float(last.get('bid_qty_lots') or 0)
-        aq = float(last.get('ask_qty_lots') or 0)
-        imb = (bq - aq) / (bq + aq) if (bq + aq) else 0.0
-        st.caption(
-            f"Book Bid {bq:,.0f} / Ask {aq:,.0f} · Imb {imb:+.2f}"
-        )
-    with h3:
-        st.caption(f"ΔBid {last.get('bid_change', 0):+.0f} · ΔAsk {last.get('ask_change', 0):+.0f}")
-    with h4:
-        st.markdown(
-            f"<div style='border:1px solid {alert['color']};border-radius:6px;padding:3px 8px;'>"
-            f"<span style='color:{alert['color']};font-weight:800;font-size:12px;'>{alert['label']}</span></div>",
-            unsafe_allow_html=True
-        )
-    with h5:
-        st.session_state["liq_sigma_k"] = st.selectbox(
-            "σ flag", options=[1.5, 2.0], index=0,
-            format_func=lambda x: f"±{x}σ", key="liq_sigma_select",
-            label_visibility="collapsed",
-        )
-
-    times = [h["ts"].strftime("%H:%M:%S") if hasattr(h["ts"], "strftime") else str(h["ts"]) for h in hist]
-    nets = [float(h.get("net_liq") or 0) for h in hist]
-    bid_d = [float(h.get("bid_change") or 0) for h in hist]
-    ask_d = [float(h.get("ask_change") or 0) for h in hist]
-    bar_colors = ["#00E676" if v >= 0 else "#FF5252" for v in nets]
-
-    fig = plt_go.Figure()
-    fig.add_trace(plt_go.Bar(x=times, y=nets, name="Net Δ", marker_color=bar_colors, opacity=0.7, showlegend=True))
-    fig.add_trace(plt_go.Scatter(x=times, y=bid_d, name="Bid Δ", line=dict(color="#2196F3", width=1.6), showlegend=True))
-    fig.add_trace(plt_go.Scatter(x=times, y=ask_d, name="Ask Δ", line=dict(color="#FF9800", width=1.6), showlegend=True))
-    fig.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
-    if alert.get("bid_thr"):
-        fig.add_hline(y=alert["bid_thr"], line_width=1, line_color="#2196F3", line_dash="dash")
-        fig.add_hline(y=-alert["bid_thr"], line_width=1, line_color="#FF5252", line_dash="dash")
-    fig.update_layout(
-        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-        height=170 if compact else 240, margin=dict(l=4, r=4, t=4, b=28),
-        legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.0, xanchor="left",
-                    font=dict(size=9), bgcolor="rgba(14,17,23,0.85)"),
-        hovermode="x unified", showlegend=True,
-        title=None,
+    if not res or res.get("status") not in ("ok", "OK", None) and not res.get("ticks"):
+        # some responses wrap under status=ok
+        pass
+    ticks = (res or {}).get("ticks") or []
+    if not ticks:
+        return pd.DataFrame()
+    df = pd.DataFrame(
+        {
+            "time": pd.to_datetime(res["ticks"], unit="ms", utc=True),
+            "open": res.get("open"),
+            "high": res.get("high"),
+            "low": res.get("low"),
+            "close": res.get("close"),
+            "volume": res.get("volume"),
+        }
     )
-    fig.update_xaxes(type="category", nticks=5, tickfont=dict(size=8))
-    fig.update_yaxes(title="", tickfont=dict(size=9))
-    st.plotly_chart(fig, use_container_width=True)
-    if bid_s and ask_s:
-        st.caption(f"Flag at ±{liq_k:g}σ · bid σ={bid_s:.0f} ask σ={ask_s:.0f} lots")
-    else:
-        st.caption("σ estimated after ~8 snapshots. Keep Auto-Refresh on.")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return compute_technical_indicators(df)
 
 
-def render_live_alert_ribbon(data: dict = None):
-    """Compact layout: left = Basket Greeks | right = Z-Scores. (Live alerts removed)"""
-    st.markdown("---")
-    left_blk, right_blk = st.columns([0.40, 0.60])
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_dvol_candles(currency: str, lookback_hours: int = 72) -> pd.DataFrame:
+    # DVOL is an index; use index chart if available, else skip
+    name = f"{currency}_DVOL"  # not a tradeable instrument on all endpoints
+    # Fallback: public/get_volatility_index_data
+    now = int(time.time() * 1000)
+    start = now - lookback_hours * 3600 * 1000
+    res = deribit_get(
+        "public/get_volatility_index_data",
+        {
+            "currency": currency,
+            "start_timestamp": start,
+            "end_timestamp": now,
+            "resolution": "60",
+        },
+    )
+    if not res:
+        return pd.DataFrame()
+    data = res.get("data") if isinstance(res, dict) else res
+    if not data:
+        return pd.DataFrame()
+    # [timestamp, open, high, low, close]
+    rows = []
+    for row in data:
+        if isinstance(row, (list, tuple)) and len(row) >= 5:
+            rows.append({"time": pd.to_datetime(row[0], unit="ms", utc=True), "close": float(row[4])})
+        elif isinstance(row, dict):
+            rows.append({"time": pd.to_datetime(row.get("timestamp"), unit="ms", utc=True), "close": float(row.get("close", 0))})
+    return pd.DataFrame(rows)
 
-    with left_blk:
-        if data is not None:
-            render_basket_metrics_block(data)
+
+def fetch_order_book(instrument: str, depth: int = 20) -> dict:
+    res = deribit_get("public/get_order_book", {"instrument_name": instrument, "depth": depth})
+    return res or {}
+
+
+def fetch_last_trades(instrument: str, count: int = 50) -> list:
+    res = deribit_get("public/get_last_trades_by_instrument", {"instrument_name": instrument, "count": count})
+    if not res:
+        return []
+    return res.get("trades") or []
+
+
+def coin_price_from_option(mark_or_last: float, index_price: float) -> float:
+    """Deribit option prices are in the coin (BTC/ETH). Convert to USD."""
+    if mark_or_last is None:
+        return 0.0
+    return float(mark_or_last) * float(index_price)
+
+
+# ---------------------------------------------------------------------------
+# Chain builder
+# ---------------------------------------------------------------------------
+def build_chain(currency: str, expiry_ts: int, spot: float, r: float, strikes_below: int, strikes_above: int):
+    inst = fetch_instruments(currency)
+    if inst.empty:
+        return [], 0.0, 0.0
+    exp_df = inst[inst["expiration_timestamp"] == expiry_ts].copy()
+    if exp_df.empty:
+        return [], 0.0, 0.0
+
+    summaries = {s["instrument_name"]: s for s in fetch_book_summaries(currency, "option")}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    exp_dt = datetime.datetime.fromtimestamp(expiry_ts / 1000.0, tz=datetime.timezone.utc)
+    T = max((exp_dt - now).total_seconds() / (365.0 * 24 * 3600), 1e-6)
+
+    strikes = sorted(exp_df["strike"].dropna().unique().tolist())
+    atm = min(strikes, key=lambda x: abs(x - spot)) if strikes else spot
+    atm_idx = strikes.index(atm)
+    window = strikes[max(0, atm_idx - strikes_below): min(len(strikes), atm_idx + strikes_above + 1)]
+
+    lot = CONTRACT_SIZE.get(currency, 1.0)
+    by_strike = {}
+    for _, row in exp_df.iterrows():
+        k = float(row["strike"])
+        if k not in window:
+            continue
+        name = row["instrument_name"]
+        sm = summaries.get(name, {})
+        flag = "c" if row["opt_type"] == "C" else "p"
+        mark_coin = float(sm.get("mark_price") or sm.get("last") or sm.get("mid_price") or 0)
+        last_coin = float(sm.get("last") or mark_coin)
+        bid_coin = float(sm.get("bid_price") or 0)
+        ask_coin = float(sm.get("ask_price") or 0)
+        oi = float(sm.get("open_interest") or 0)
+        vol = float(sm.get("volume") or 0)
+        usd = coin_price_from_option(mark_coin if mark_coin > 0 else last_coin, spot)
+        mark_iv = sm.get("mark_iv")
+        if mark_iv is not None:
+            try:
+                iv = float(mark_iv) / 100.0 if float(mark_iv) > 2 else float(mark_iv)
+            except Exception:
+                iv = 0.0
         else:
-            st.caption("Basket Greeks – no data")
+            iv = VolatilityEngine.calculate_iv(usd, spot, k, T, r, flag)
+        if iv <= 0:
+            iv = VolatilityEngine.calculate_iv(usd, spot, k, T, r, flag)
+        g = VolatilityEngine.calculate_greeks(spot, k, T, r, max(iv, 1e-4), flag)
+        rec = by_strike.setdefault(k, {
+            "Strike": k,
+            "C_LTP": 0.0, "P_LTP": 0.0,
+            "C_OI": 0.0, "P_OI": 0.0,
+            "C_Vol": 0.0, "P_Vol": 0.0,
+            "C_IV": 0.0, "P_IV": 0.0,
+            "C_Δ": 0.0, "P_Δ": 0.0,
+            "C_γ": 0.0, "P_γ": 0.0,
+            "C_Bid": 0.0, "C_Ask": 0.0, "P_Bid": 0.0, "P_Ask": 0.0,
+            "C_Name": "", "P_Name": "",
+        })
+        if flag == "c":
+            rec.update({
+                "C_LTP": usd, "C_OI": oi, "C_Vol": vol, "C_IV": iv * 100.0,
+                "C_Δ": g["delta"], "C_γ": g["gamma"],
+                "C_Bid": coin_price_from_option(bid_coin, spot),
+                "C_Ask": coin_price_from_option(ask_coin, spot),
+                "C_Name": name, "C_theta": g["theta"], "C_vega": g["vega"],
+                "C_vanna": g["vanna"], "C_charm": g["charm"],
+            })
+        else:
+            rec.update({
+                "P_LTP": usd, "P_OI": oi, "P_Vol": vol, "P_IV": iv * 100.0,
+                "P_Δ": g["delta"], "P_γ": g["gamma"],
+                "P_Bid": coin_price_from_option(bid_coin, spot),
+                "P_Ask": coin_price_from_option(ask_coin, spot),
+                "P_Name": name, "P_theta": g["theta"], "P_vega": g["vega"],
+                "P_vanna": g["vanna"], "P_charm": g["charm"],
+            })
 
-    with right_blk:
-        zscore_analysis_fragment(mode="highlights")
+    chain = []
+    total_call_oi = total_put_oi = 0.0
+    total_net_gex_oi = total_net_gex_vol = 0.0
+    ivs = []
+    for k in sorted(by_strike):
+        r0 = by_strike[k]
+        # Dealer GEX convention: call gamma long dealers if they are short calls? Standard retail GEX:
+        # Net GEX ≈ (Call_γ * Call_OI − Put_γ * Put_OI) * S^2 * 0.01 * contract
+        gex_oi = (r0["C_γ"] * r0["C_OI"] - r0["P_γ"] * r0["P_OI"]) * lot * (spot ** 2) * 0.01
+        gex_vol = (r0["C_γ"] * r0["C_Vol"] - r0["P_γ"] * r0["P_Vol"]) * lot * (spot ** 2) * 0.01
+        d_gex = gex_oi * (abs(r0["C_Δ"]) + abs(r0["P_Δ"])) / 2.0
+        vex = ((r0.get("C_vanna", 0) or 0) * r0["C_OI"] + (r0.get("P_vanna", 0) or 0) * r0["P_OI"]) * lot
+        cex = ((r0.get("C_charm", 0) or 0) * r0["C_OI"] + (r0.get("P_charm", 0) or 0) * r0["P_OI"]) * lot
+        r0.update({
+            "Net_GEX_OI": gex_oi, "Net_GEX_Vol": gex_vol,
+            "Net_Delta_GEX_OI": d_gex, "VEX": vex, "CEX": cex,
+        })
+        chain.append(r0)
+        total_call_oi += r0["C_OI"]
+        total_put_oi += r0["P_OI"]
+        total_net_gex_oi += gex_oi
+        total_net_gex_vol += gex_vol
+        if r0["C_IV"] > 1:
+            ivs.append(r0["C_IV"])
+        if r0["P_IV"] > 1:
+            ivs.append(r0["P_IV"])
+
+    return chain, T, float(np.median(ivs) if ivs else 50.0), total_call_oi, total_put_oi, total_net_gex_oi, total_net_gex_vol
 
 
+def hv_from_candles(df: pd.DataFrame, days: int = 30) -> float:
+    if df is None or df.empty or "close" not in df.columns:
+        return 0.55
+    # resample daily
+    d = df.copy()
+    d = d.set_index("time")["close"].resample("1D").last().dropna()
+    if len(d) < 6:
+        rets = np.log(df["close"] / df["close"].shift(1)).dropna()
+        if len(rets) < 5:
+            return 0.55
+        # scale 5-min to annual
+        bars_day = 288
+        return float(rets.std(ddof=1) * np.sqrt(bars_day * 365))
+    lr = np.log(d / d.shift(1)).dropna()
+    return float(lr.tail(days).std(ddof=1) * np.sqrt(365)) if len(lr) >= 5 else 0.55
 
-# --- LIVE DASHBOARD FRAGMENT ---
-@st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
-def live_dashboard_fragment():
-    if "data_store" not in st.session_state:
-        st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
-        return
 
-    if st.session_state.get("enable_main_refresh", False):
-        refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
-        if refreshed_data:
-            refreshed_data["selected_expiry"] = selected_expiry_str
-            st.session_state["data_store"] = refreshed_data
+# ---------------------------------------------------------------------------
+# Superhuman + directional trigger (same scoring weights)
+# ---------------------------------------------------------------------------
+def evaluate_directional_trigger(data, df_candles):
+    levels = data.get("levels", {}) or {}
+    spot = float(data.get("spot_price") or 0)
+    gex_sup = float(levels.get("GEX_Support") or spot or 0)
+    gex_res = float(levels.get("GEX_Resistance") or spot or 0)
+    checks = []
+    px = vwap = obv = obv_ma = cvd = efi = None
+    lvn = []
+    df = pd.DataFrame()
+    if df_candles is not None and not getattr(df_candles, "empty", True):
+        df = df_candles.copy()
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        if "close" in df.columns:
+            px = float(df["close"].iloc[-1])
+            if "volume" in df.columns:
+                tp = (df["high"] + df["low"] + df["close"]) / 3.0 if {"high", "low"}.issubset(df.columns) else df["close"]
+                vol = df["volume"].astype(float)
+                cum_v = vol.cumsum().replace(0, np.nan)
+                vwap = float((tp.astype(float) * vol).cumsum().iloc[-1] / cum_v.iloc[-1]) if len(cum_v) else px
+                direction = np.sign(df["close"].astype(float).diff().fillna(0.0))
+                obv_s = (direction * vol).cumsum()
+                obv = float(obv_s.iloc[-1])
+                obv_ma = float(obv_s.rolling(20, min_periods=5).mean().iloc[-1])
+                hl = (df["high"] - df["low"]).replace(0, np.nan)
+                loc = ((df["close"] - df["low"]) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
+                cvd = float((vol * loc).cumsum().iloc[-1])
+                efi = float((df["close"].astype(float).diff() * vol).ewm(span=13, adjust=False).mean().iloc[-1])
+                try:
+                    vp = compute_session_volume_profile(df, bin_step=BIN_STEP.get(data.get("currency", "BTC"), 250))
+                    lvn = list(vp.get("lvn") or [])
+                except Exception:
+                    lvn = []
+            else:
+                vwap = px
 
-    data = st.session_state["data_store"]
-    lvls = data.get("levels", {})
+    loc_long = loc_short = False
+    loc_note = "GEX walls unavailable"
+    if spot > 0 and gex_sup and gex_res:
+        near_lvn = any(abs(spot - lv) <= spot * 0.002 for lv in lvn)
+        near_call = abs(spot - gex_res) <= max(50.0, 0.0015 * spot)
+        if spot > gex_res:
+            loc_long, loc_short = True, False
+            loc_note = f"spot {spot:.0f} above call-wall {gex_res:.0f}"
+        elif spot < gex_sup:
+            loc_long, loc_short = False, True
+            loc_note = f"spot {spot:.0f} below put-wall {gex_sup:.0f}"
+        elif near_call:
+            loc_long, loc_short = False, True
+            loc_note = f"spot {spot:.0f} rejected at call-wall {gex_res:.0f}"
+        else:
+            loc_long, loc_short = True, False
+            loc_note = f"spot {spot:.0f} between walls {gex_sup:.0f}/{gex_res:.0f}"
+        if near_lvn:
+            loc_long = True
+            loc_note += " · through LVN"
+    checks.append({"name": "Location (GEX)", "long": loc_long, "short": loc_short, "note": loc_note})
 
-    # UI is loading data – clear any previous status
-    clear_load_status()
+    vwap_long = vwap_short = False
+    vwap_note = "VWAP unavailable"
+    if px and vwap:
+        vwap_long, vwap_short = px > vwap, px < vwap
+        vwap_note = f"px {px:.1f} vs VWAP {vwap:.1f}"
+    checks.append({"name": "Trend (VWAP)", "long": vwap_long, "short": vwap_short, "note": vwap_note})
 
-    # ========== STICKY COMPACT MARKET SUMMARY (cleaned) ==========
-    st.markdown("<div class='sticky-summary'>", unsafe_allow_html=True)
-    head_l, head_r = st.columns([0.72, 0.28])
-    with head_l:
-        st.markdown(
-            f"<div style='display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;'>"
-            f"<h1 class='custom-heading' style='margin:0;font-size:17px;'>📊 Market Summary</h1>"
-            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')}</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-        if data.get("is_holiday_fallback", False):
-            st.caption("⚠️ Non-trading day – showing last session")
-    with head_r:
-        cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
-        if cb_main != st.session_state["enable_main_refresh"]:
-            st.session_state["enable_main_refresh"] = cb_main
+    obv_long = obv_short = False
+    obv_note = "OBV unavailable"
+    if obv is not None and obv_ma is not None and not np.isnan(obv_ma):
+        obv_long, obv_short = obv > obv_ma, obv < obv_ma
+        obv_note = f"OBV {obv:.0f} vs MA20 {obv_ma:.0f}"
+    checks.append({"name": "Macro Flow (OBV)", "long": obv_long, "short": obv_short, "note": obv_note})
+
+    cvd_long = cvd_short = False
+    cvd_note = "CVD unavailable"
+    if cvd is not None and not df.empty and "volume" in df.columns:
+        cvd_long, cvd_short = cvd > 0, cvd < 0
+        cvd_note = f"CVD {cvd:.0f}"
+    checks.append({"name": "Order Delta (CVD)", "long": cvd_long, "short": cvd_short, "note": cvd_note})
+
+    efi_long = efi_short = False
+    efi_note = "EFI unavailable"
+    if efi is not None and not np.isnan(efi):
+        efi_long, efi_short = efi > 0, efi < 0
+        efi_note = f"EFI13 {efi:.1f}"
+    checks.append({"name": "Execution (EFI 13)", "long": efi_long, "short": efi_short, "note": efi_note})
+
+    setup_l = sum(1 for ch in checks[:4] if ch["long"])
+    setup_s = sum(1 for ch in checks[:4] if ch["short"])
+    if setup_l >= 3 and efi_long:
+        trigger, colour, summary = "LONG TRIGGER", "#00E676", f"Setup {setup_l}/4 long + EFI>0."
+    elif setup_s >= 3 and efi_short:
+        trigger, colour, summary = "SHORT TRIGGER", "#FF5252", f"Setup {setup_s}/4 short + EFI<0."
+    elif setup_l >= 3:
+        trigger, colour, summary = "LONG BIAS (no fire)", "#80CBC4", f"Setup {setup_l}/4 long but EFI not >0."
+    elif setup_s >= 3:
+        trigger, colour, summary = "SHORT BIAS (no fire)", "#EF9A9A", f"Setup {setup_s}/4 short but EFI not <0."
+    elif setup_l > setup_s:
+        trigger, colour, summary = "LONG LEAN (no fire)", "#80CBC4", f"Only {setup_l}/4 setup long."
+    elif setup_s > setup_l:
+        trigger, colour, summary = "SHORT LEAN (no fire)", "#EF9A9A", f"Only {setup_s}/4 setup short."
+    else:
+        trigger, colour, summary = "NO DIRECTIONAL TRIGGER", "#FF9800", f"Setup split {setup_l}L/{setup_s}S."
+    return {
+        "trigger": trigger, "colour": colour, "summary": summary,
+        "long_hits": sum(1 for c in checks if c["long"]),
+        "short_hits": sum(1 for c in checks if c["short"]),
+        "checks": checks,
+    }
+
+
+def compute_superhuman_scores(data, df_candles):
+    levels = data.get("levels", {}) or {}
+    chain = data.get("chain_results", []) or []
+    spot = float(data.get("spot_price", 0) or 0)
+    if spot <= 0 or not chain:
+        return {"error": "Insufficient data for scoring"}
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    T = float(data.get("T", 0) or 0)
+    dte = max(min(T * 365.0 if T > 0 else 3.0, 30.0), 0.05)
+    tod_factor = 1.0  # 24/7 market — no cash-session decay
+
+    total_delta_gex = float(data.get("total_net_gex_oi", 0) or 0)
+    # scale: BTC GEX is in $ terms via S^2
+    gamma_raw = total_delta_gex / max(abs(total_delta_gex), 1e7) * 70
+    gamma_regime_score = float(np.clip(gamma_raw, -100, 100))
+    if dte <= 1.0:
+        gamma_regime_score = float(np.clip(gamma_regime_score * 1.25, -100, 100))
+    elif dte >= 7.0:
+        gamma_regime_score = float(np.clip(gamma_regime_score * 0.85, -100, 100))
+
+    straddle = float(levels.get("Straddle_Cost", 0) or 0)
+    expected_move_pct = (straddle / spot * 100.0) if spot > 0 else 0.0
+    realised_range_pct = 0.0
+    day_high = day_low = day_open = None
+    df_session = pd.DataFrame()
+    if df_candles is not None and not getattr(df_candles, "empty", True):
+        df_tmp = df_candles.copy()
+        df_tmp["time"] = pd.to_datetime(df_tmp["time"], utc=True)
+        latest_date = df_tmp["time"].dt.date.max()
+        df_session = df_tmp[df_tmp["time"].dt.date == latest_date].sort_values("time")
+        if not df_session.empty:
+            day_high = float(df_session["high"].max())
+            day_low = float(df_session["low"].min())
+            day_open = float(df_session["open"].iloc[0])
+            if day_open > 0:
+                realised_range_pct = (day_high - day_low) / day_open * 100.0
+    if expected_move_pct > 0.12:
+        move_score = float(np.clip((expected_move_pct - realised_range_pct * 1.15) / expected_move_pct * 80, -100, 100))
+    else:
+        move_score = 0.0
+
+    total_vex = sum(float(r.get("VEX", 0) or 0) for r in chain)
+    total_cex = sum(float(r.get("CEX", 0) or 0) for r in chain)
+    flow_score = float(np.clip(np.tanh((total_vex / 50.0) + (total_cex / 50.0)) * 85, -100, 100))
+
+    or_score = 0.0
+    or_high = or_low = None
+    gex_sup = float(levels.get("GEX_Support") or spot)
+    gex_res = float(levels.get("GEX_Resistance") or spot)
+    if not df_session.empty and len(df_session) >= 5:
+        n_or = min(12, max(5, len(df_session) // 6))
+        or_bars = df_session.head(n_or)
+        or_high = float(or_bars["high"].max())
+        or_low = float(or_bars["low"].min())
+        if spot > or_high and spot > gex_res:
+            or_score = 70.0
+        elif spot < or_low and spot < gex_sup:
+            or_score = -70.0
+        elif or_high < gex_res and or_low > gex_sup:
+            or_score = 45.0
+        elif spot > gex_res or spot < gex_sup:
+            or_score = -25.0
+        else:
+            or_score = 8.0
+
+    flip = float(levels.get("Zero_Gamma_Flip") or spot)
+    dist_pct = abs(spot - flip) / spot * 100.0 if spot else 0.0
+    if gamma_regime_score > 20 and dist_pct < 0.35:
+        flip_score = 40.0
+    elif gamma_regime_score < -20 and dist_pct > 0.6:
+        flip_score = -40.0
+    else:
+        flip_score = float(np.clip((0.4 - dist_pct) * 50, -30, 30))
+
+    composite = float(np.clip(
+        0.38 * gamma_regime_score + 0.22 * move_score + 0.15 * flow_score + 0.15 * or_score + 0.10 * flip_score,
+        -100, 100,
+    ))
+    big_range = realised_range_pct > expected_move_pct * 1.5 if expected_move_pct > 0.1 else realised_range_pct > 3.0
+    quiet_range = realised_range_pct < expected_move_pct * 0.85 if expected_move_pct > 0.1 else realised_range_pct < 1.5
+    strong_long_g = gamma_regime_score >= 55
+    strong_short_g = gamma_regime_score <= -55
+
+    if composite >= 42 and strong_long_g and quiet_range:
+        bias, action, colour, clarity = "QUIET PIN", "Non-directional → short straddle / iron fly", "#00E676", "Strong long-gamma + quiet range."
+    elif composite >= 35 and strong_long_g and big_range:
+        bias, action, colour, clarity = "GAMMA REVERSION", "Fade extended moves into close of UTC day", "#26A69A", "Long-gamma but already travelled far."
+    elif composite <= -42 or (strong_short_g and big_range):
+        bias, action, colour, clarity = "TREND / BREAKOUT", "Directional → debit spreads / perps", "#FF5252", "Short-gamma or wall break."
+    elif abs(composite) <= 15:
+        bias, action, colour, clarity = "NO EDGE", "Stay out or tight range only", "#FF9800", "No clear dealer positioning."
+    else:
+        bias, action, colour, clarity = "MILD DIRECTIONAL", "Defined-risk spreads / calendars", "#2196F3", "Moderate bias."
+
+    return {
+        "gamma_regime_score": round(gamma_regime_score, 1),
+        "move_score": round(move_score, 1),
+        "flow_score": round(flow_score, 1),
+        "or_score": round(or_score, 1),
+        "flip_score": round(flip_score, 1),
+        "composite": round(composite, 1),
+        "bias": bias, "action": action, "colour": colour, "clarity": clarity,
+        "expected_move_pct": round(expected_move_pct, 2),
+        "realised_range_pct": round(realised_range_pct, 2),
+        "straddle": round(straddle, 2),
+        "total_delta_gex_cr": round(total_delta_gex / 1e6, 2),
+        "or_high": or_high, "or_low": or_low,
+        "gex_support": gex_sup, "gex_resistance": gex_res,
+        "dte": round(dte, 2), "dist_to_flip_pct": round(dist_pct, 3),
+        "tod_factor": tod_factor,
+        "day_open": day_open, "day_high": day_high, "day_low": day_low,
+        "big_range": big_range, "quiet_range": quiet_range,
+        "timestamp_ist": now.strftime("%d-%b-%Y %H:%M:%S UTC"),
+        "dir_trigger": evaluate_directional_trigger(data, df_candles),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+st.sidebar.markdown("### ⚙️ Parameters & Strategy Builder")
+st.sidebar.caption("Public Deribit REST · no API key")
+
+currency = st.sidebar.selectbox("Underlying", ["BTC", "ETH"])
+r_rate = st.sidebar.number_input("Risk-free rate (r)", 0.0, 0.15, 0.04, 0.01)
+
+if st.sidebar.button("↻ Refresh instruments", use_container_width=True):
+    try:
+        _fetch_instruments_ok.clear()
+        fetch_index_price.clear()
+    except Exception:
+        pass
+    st.rerun()
+
+inst_df = fetch_instruments(currency)
+spot_live = fetch_index_price(currency)
+if inst_df.empty:
+    st.sidebar.warning(LAST_API_ERROR or "Deribit instruments unavailable")
+
+expiries = []
+if not inst_df.empty:
+    exp_uniq = sorted(inst_df["expiration_timestamp"].unique())
+    now_ms = int(time.time() * 1000)
+    exp_uniq = [e for e in exp_uniq if e >= now_ms]
+    expiries = exp_uniq
+
+def _exp_label(ts):
+    dt = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc)
+    return dt.strftime("%d%b%Y %H:%M UTC")
+
+exp_choice = st.sidebar.selectbox(
+    "Expiry",
+    expiries if expiries else [0],
+    format_func=lambda x: _exp_label(x) if x else "N/A",
+)
+
+c3, c4 = st.sidebar.columns(2)
+with c3:
+    strikes_below = st.number_input("Below ATM", 1, 40, 12, 1)
+with c4:
+    strikes_above = st.number_input("Above ATM", 1, 40, 12, 1)
+hv_days = st.sidebar.slider("HV lookback (days)", 10, 90, 30, 5)
+
+exp_df = inst_df[inst_df["expiration_timestamp"] == exp_choice] if not inst_df.empty else pd.DataFrame()
+all_strikes = sorted(exp_df["strike"].dropna().unique().tolist()) if not exp_df.empty else []
+
+with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
+    sel_k = st.selectbox("Strike", all_strikes if all_strikes else [spot_live or 100000], format_func=lambda x: f"{int(x)}")
+    b1, b2 = st.columns(2)
+    with b1:
+        opt_type = st.selectbox("Type", ["C", "P"])
+    with b2:
+        trade_action = st.selectbox("Action", ["BUY", "SELL"])
+    entry_px = st.number_input("Entry USD (0 = mark)", 0.0, value=0.0, step=10.0)
+    qty = st.number_input("Contracts", 0.1, value=1.0, step=0.1)
+    a1, a2 = st.columns(2)
+    with a1:
+        if st.button("+ Add Leg", use_container_width=True):
+            st.session_state["basket_legs"].append({
+                "strike": float(sel_k), "type": opt_type, "action": trade_action,
+                "entry_price": entry_px, "qty": qty,
+            })
+            st.rerun()
+    with a2:
+        if st.button("Clear Basket", use_container_width=True):
+            st.session_state["basket_legs"] = []
             st.rerun()
 
-    # Core metrics only
+run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
+tf_label = st.session_state["selected_timeframe"]
+
+
+# ---------------------------------------------------------------------------
+# Fetch live bundle
+# ---------------------------------------------------------------------------
+def fetch_live_bundle(tf_label: str):
+    spot = fetch_index_price(currency)
+    if spot <= 0:
+        return None
+    res_ms = INTERVAL_MS.get(tf_label, 300_000)
+    df_perp = fetch_candles(PERP[currency], res_ms, lookback_hours=96)
+    df_spot = df_perp.copy()  # index ≈ perp for crypto; both shown
+    hv = hv_from_candles(df_perp, hv_days)
+
+    built = build_chain(currency, exp_choice, spot, r_rate, strikes_below, strikes_above)
+    if not built or not built[0]:
+        return None
+    chain, T, med_iv, tcoi, tpoi, tgex_oi, tgex_vol = built
+    max_pain = calculate_max_pain(chain)
+    levels = calculate_support_resistance_targets(chain, spot, max_pain)
+    pcr = (tpoi / tcoi) if tcoi else 0.0
+
+    # ATM IV percentile vs chain
+    ivs = [r["C_IV"] for r in chain if r["C_IV"] > 1] + [r["P_IV"] for r in chain if r["P_IV"] > 1]
+    atm = min(chain, key=lambda r: abs(r["Strike"] - spot))
+    atm_iv = (atm["C_IV"] + atm["P_IV"]) / 2.0
+    iv_pct = float(si.percentileofscore(ivs, atm_iv)) if ivs else 50.0
+
+    perp_book = fetch_order_book(PERP[currency], 20)
+    perp_ticker = deribit_get("public/ticker", {"instrument_name": PERP[currency]}) or {}
+    fut_ltp = float(perp_ticker.get("last_price") or perp_ticker.get("mark_price") or spot)
+    basis = fut_ltp - spot
+
+    dvol = fetch_dvol_candles(currency)
+
+    return {
+        "currency": currency,
+        "spot_price": spot,
+        "F": fut_ltp,
+        "T": T,
+        "index_hv": hv,
+        "chain_results": chain,
+        "levels": levels,
+        "max_pain_strike": int(max_pain) if max_pain else 0,
+        "total_call_oi": tcoi,
+        "total_put_oi": tpoi,
+        "total_net_gex_oi": tgex_oi,
+        "total_net_gex_vol": tgex_vol,
+        "pcr": pcr,
+        "iv_percentile": iv_pct,
+        "df_candles": df_spot,
+        "df_futures": df_perp,
+        "dvol": dvol,
+        "perp_book": perp_book,
+        "basis_info": {
+            "fut_token": PERP[currency],
+            "fut_expiry": "PERPETUAL",
+            "spot_ltp": spot,
+            "fut_ltp": fut_ltp,
+            "basis": round(basis, 2),
+        },
+        "timestamp": datetime.datetime.now(IST).strftime("%d-%b %H:%M:%S IST"),
+        "selected_expiry": _exp_label(exp_choice) if exp_choice else "",
+        "fut_fallback_msg": "24/7 Deribit perpetual",
+        "fut_is_fallback": False,
+        "market_data": {},
+    }
+
+
+if run_btn or "data_store" not in st.session_state:
+    with st.spinner("Fetching Deribit chain + perp candles…"):
+        bundle = fetch_live_bundle(st.session_state["selected_timeframe"])
+        if bundle:
+            st.session_state["data_store"] = bundle
+        elif "data_store" not in st.session_state:
+            why = LAST_API_ERROR or "no chain for this expiry"
+            st.error(
+                f"Deribit public API failed: **{why}**.\n\n"
+                "If the message is `system_maintenance`, Deribit is down globally "
+                "(HTTP 503) — not a Render env-var problem. Wait and click "
+                "**↻ Refresh instruments** in the sidebar."
+            )
+            st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Liquidity Δ from perp book
+# ---------------------------------------------------------------------------
+def update_liq_from_book(book: dict, ccy: str):
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    bid_qty = sum(float(x[1]) for x in bids if isinstance(x, (list, tuple)) and len(x) >= 2)
+    ask_qty = sum(float(x[1]) for x in asks if isinstance(x, (list, tuple)) and len(x) >= 2)
+    best_bid = float(bids[0][0]) if bids else 0.0
+    best_ask = float(asks[0][0]) if asks else 0.0
+    ltp = float(book.get("last_price") or book.get("mark_price") or 0)
+    hist = list(st.session_state.get("liq_delta_history") or [])
+    prev = hist[-1] if hist else None
+    rec = {
+        "ts": datetime.datetime.now(datetime.timezone.utc),
+        "index": ccy,
+        "bid_qty_lots": bid_qty,
+        "ask_qty_lots": ask_qty,
+        "bid_change": bid_qty - float(prev["bid_qty_lots"]) if prev else 0.0,
+        "ask_change": ask_qty - float(prev["ask_qty_lots"]) if prev else 0.0,
+        "net_liq": 0.0,
+        "best_bid": best_bid, "best_ask": best_ask, "ltp": ltp,
+    }
+    rec["net_liq"] = rec["bid_change"] - rec["ask_change"]
+    hist.append(rec)
+    st.session_state["liq_delta_history"] = hist[-180:]
+    return st.session_state["liq_delta_history"]
+
+
+def classify_liq_alert(bid_change, ask_change, bid_s, ask_s, k=1.5):
+    if bid_s is None or ask_s is None:
+        return {"label": "NO SIGNAL", "color": "#888888", "hint": "Need more snapshots", "bid_thr": None}
+    bid_thr, ask_thr = k * bid_s, k * ask_s
+    if bid_change <= -bid_thr:
+        return {"label": "BIDS PULLED", "color": "#FF5252", "hint": "Liquidity vacuum", "bid_thr": bid_thr}
+    if ask_change <= -ask_thr:
+        return {"label": "ASKS PULLED", "color": "#00E676", "hint": "Offers lifted", "bid_thr": bid_thr}
+    if bid_change >= bid_thr:
+        return {"label": "BIDS STACKED", "color": "#2196F3", "hint": "Passive absorption", "bid_thr": bid_thr}
+    return {"label": "NO SIGNAL", "color": "#888888", "hint": f"Inside ±{k}σ", "bid_thr": bid_thr}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+@st.fragment(run_every=8 if st.session_state.get("enable_main_refresh") else None)
+def live_dashboard():
+    if st.session_state.get("enable_main_refresh"):
+        refreshed = fetch_live_bundle(st.session_state["selected_timeframe"])
+        if refreshed:
+            st.session_state["data_store"] = refreshed
+    data = st.session_state["data_store"]
+    lvls = data.get("levels", {}) or {}
+    chain = data.get("chain_results") or []
+    df_chain = pd.DataFrame(chain)
+    df_fut = data.get("df_futures", pd.DataFrame())
+    df_full = data.get("df_candles", pd.DataFrame())
+
+    st.markdown("<div class='sticky-summary'>", unsafe_allow_html=True)
+    h_l, h_r = st.columns([0.72, 0.28])
+    with h_l:
+        st.markdown(
+            f"<div style='display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;'>"
+            f"<h1 class='custom-heading' style='margin:0;font-size:17px;'>₿ {data.get('currency')} Market Summary</h1>"
+            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')} · Deribit</span></div>",
+            unsafe_allow_html=True,
+        )
+    with h_r:
+        cb = st.checkbox("Auto-Refresh 8s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
+        if cb != st.session_state["enable_main_refresh"]:
+            st.session_state["enable_main_refresh"] = cb
+            st.rerun()
+
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-    c1.metric("Spot (Fut)", f"{data['spot_price']:.0f} ({data['F']:.0f})")
+    c1.metric("Index (Perp)", f"{data['spot_price']:.0f} ({data['F']:.0f})")
     c2.metric("Max Pain", f"{data['max_pain_strike']}")
-    c3.metric("Net GEX (OI)", f"₹{data['total_net_gex_oi']/1e7:.1f} Cr")
+    c3.metric("Net GEX (OI)", f"${data['total_net_gex_oi']/1e6:.1f}M")
     c4.metric("ATM IV Rank", f"{data['iv_percentile']:.0f}%")
     c5.metric("PCR", f"{data['pcr']:.2f}")
-    c6.metric("C/P OI", f"{data['total_call_oi']//1000}k/{data['total_put_oi']//1000}k")
+    c6.metric("C/P OI", f"{data['total_call_oi']:.0f}/{data['total_put_oi']:.0f}")
     c7.metric("Flip", f"{lvls.get('Zero_Gamma_Flip', '–')}")
-    straddle_val = lvls.get("Straddle_Cost", 0)
-    c8.metric("Straddle", f"₹{straddle_val:.0f}" if straddle_val else "–")
-
+    c8.metric("Straddle $", f"{lvls.get('Straddle_Cost', 0):.0f}")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ========== SUPERHUMAN DECISION ENGINE ==========
-    scores = compute_superhuman_scores(data, data.get("df_futures") if data.get("df_futures") is not None and not data.get("df_futures").empty else data.get("df_candles", pd.DataFrame()))
-
+    scores = compute_superhuman_scores(data, df_fut if df_fut is not None and not df_fut.empty else df_full)
     if "error" not in scores:
-        # ----- Decision Log (persist bias changes during the day) -----
-        decision_log = _load_decision_log(Index_Name)
-        now_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-        should_log = False
-        if not decision_log:
-            should_log = True
-        else:
-            last = decision_log[-1]
-            if last["bias"] != scores["bias"] or (now_ist - last["ts"]).total_seconds() >= 900:
-                should_log = True
-        if should_log:
-            decision_log.append({
-                "ts": now_ist,
-                "bias": scores["bias"],
-                "composite": scores["composite"],
-                "clarity": scores.get("clarity", ""),
-            })
-            day_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-            decision_log = [e for e in decision_log if e["ts"] >= day_start]
-            _save_decision_log(decision_log, Index_Name)
-
         trig = scores.get("dir_trigger") or {}
         st.markdown(
             f"<div style='background:#1A1F2B;border:1px solid #2A2F3A;border-radius:8px;"
             f"padding:6px 12px;margin:6px 0 8px 0;display:flex;flex-wrap:wrap;align-items:center;gap:14px;'>"
             f"<span style='font-weight:700;color:#00E676;font-size:13px;'>🧠 Superhuman</span>"
-            f"<span style='font-weight:800;color:{scores['colour']};font-size:14px;'>"
-            f"{scores['bias']} ({scores['composite']:+.0f})</span>"
+            f"<span style='font-weight:800;color:{scores['colour']};font-size:14px;'>{scores['bias']} ({scores['composite']:+.0f})</span>"
             f"<span style='color:#AAA;font-size:12px;'>{scores.get('clarity','')}</span>"
-            f"<span style='font-weight:800;color:{trig.get('colour','#FF9800')};font-size:13px;'>"
-            f"⚡ {trig.get('trigger','NO TRIGGER')}</span>"
-            f"<span style='color:#CCC;font-size:12px;'>{trig.get('summary','')}</span>"
-            f"<span style='color:#888;font-size:11px;margin-left:auto;'>"
-            f"L {trig.get('long_hits',0)}/5 · S {trig.get('short_hits',0)}/5</span>"
-            f"</div>",
-            unsafe_allow_html=True
+            f"<span style='font-weight:800;color:{trig.get('colour','#FF9800')};font-size:13px;'>⚡ {trig.get('trigger','NO TRIGGER')}</span>"
+            f"<span style='color:#CCC;font-size:12px;'>{trig.get('summary','')}</span></div>",
+            unsafe_allow_html=True,
         )
-        with st.expander("▼ Trigger · Decision tree · Intraday log", expanded=False):
-            trig = scores.get("dir_trigger") or {}
-            st.caption(
-                "LONG TRIGGER = ≥3 of GEX/VWAP/OBV/CVD bullish AND EFI>0. "
-                "SHORT TRIGGER = ≥3 bearish AND EFI<0. "
-                "BIAS (no fire) = 3/4 setup aligned but EFI has not confirmed. "
-                "LEAN (no fire) = fewer than 3/4 setup checks; EFI does not matter yet. "
-                "NO DIRECTIONAL TRIGGER = setup split."
+        with st.expander("▼ Trigger · Decision tree", expanded=False):
+            st.caption("LONG TRIGGER = ≥3 of GEX/VWAP/OBV/CVD bullish AND EFI>0. Same construct as the index desk.")
+            lines = ["| Metric | Now |", "|---|---|"]
+            for ch in trig.get("checks") or []:
+                side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
+                lines.append(f"| {ch['name']} | **{side}** {ch.get('note','')} |")
+            st.markdown("\n".join(lines))
+            st.markdown(
+                f"**{scores['bias']} ({scores['composite']:+.0f})** — {scores['action']}"
             )
-            t1, t2, t3 = st.columns([1.35, 0.90, 0.75])
-            with t1:
-                rules = {
-                    "Location (GEX)": ("Above put wall / LVN", "Below call wall"),
-                    "Trend (VWAP)": ("Price > VWAP", "Price < VWAP"),
-                    "Macro Flow (OBV)": ("OBV > MA20", "OBV < MA20"),
-                    "Order Delta (CVD)": ("CVD HH", "CVD LL"),
-                    "Execution (EFI 13)": ("EFI > 0", "EFI < 0"),
-                }
-                lines = ["| Metric | L | S | Now |", "|---|---|---|---|"]
-                for ch in trig.get("checks") or []:
-                    side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
-                    lr, sr = rules.get(ch["name"], ("", ""))
-                    lines.append(f"| {ch['name']} | {lr} | {sr} | **{side}** {ch.get('note','')} |")
-                st.markdown("\n".join(lines))
-            with t2:
-                st.markdown(
-                    f"**{scores['bias']} ({scores['composite']:+.0f})**  \n"
-                    f"- Quiet + long γ → PIN  \n"
-                    f"- Big range + long γ → REVERSION  \n"
-                    f"- Short γ / wall break → TREND  \n"
-                    f"- |C|≤15 → NO EDGE  \n"
-                    f"- else → MILD DIR"
-                )
-            with t3:
-                st.markdown("**Log**")
-                if not decision_log:
-                    st.caption("No log yet.")
-                else:
-                    for e in decision_log[-8:]:
-                        st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
 
-        with st.expander("▼ Micro Playbook (81 + EFI≈0 27 + Flow 18)", expanded=False):
-            items = list(MICRO_PLAYBOOK.items())
-            cols = st.columns(3)
-            for ci, col in enumerate(cols):
-                chunk = items[ci * 27:(ci + 1) * 27]
-                rows = ["| # | P EFI CVD OBV | Micro · Action |", "|---|---|---|"]
-                for i, (k, v) in enumerate(chunk, start=ci * 27 + 1):
-                    g = "".join(ARROW_GLYPH[x] for x in k)
-                    rows.append(f"| {i} | {g} | {v[0]} — {v[1]} |")
-                with col:
-                    st.markdown(chr(10).join(rows))
-            st.caption("81-state: P vs VWAP+z; EFI/CVD/OBV EMA+z.")
-            st.markdown("**EFI ≈ 0 book (27)** — used only if |EFI| ≤ 0.40 × 20-bar σ(EFI) and EFI arrow is flat.")
-            zrows = ["| P CVD OBV | Micro · Action |", "|---|---|"]
-            for k, v in EFI_ZERO_PLAYBOOK.items():
-                zrows.append(f"| {''.join(ARROW_GLYPH[x] for x in k)} | {v[0]} — {v[1]} |")
-            st.markdown(chr(10).join(zrows))
-            st.markdown("**Flow book (18)** — P, CVD, DEX tape, net call−put premium. DEX/prem stay → until ≥6 snaps.")
-            frows = ["| P C DEX Prem | Micro · Action |", "|---|---|"]
-            for k, v in FLOW_PLAYBOOK.items():
-                frows.append(f"| {''.join(ARROW_GLYPH[x] for x in k)} | {v[0]} — {v[1]} |")
-            st.markdown(chr(10).join(frows))
-
-        # Score Breakdown
-        with st.expander("▼ Score Breakdown & Details", expanded=False):
-            or_txt = f"{scores['or_low']:.0f}-{scores['or_high']:.0f}" if scores.get("or_low") is not None else "N/A"
-            s1, s2, s3 = st.columns(3)
-            with s1:
-                st.markdown(f"**Gamma** {scores['gamma_regime_score']:+.0f}")
-                st.caption(f"OI GEX Rs {scores['total_delta_gex_cr']:.0f} Cr · DTE {scores.get('dte','-')}")
-                st.markdown(f"**Exp vs Real** {scores['move_score']:+.0f}")
-                st.caption(f"{scores['expected_move_pct']:.2f}% vs {scores['realised_range_pct']:.2f}%")
-            with s2:
-                st.markdown(f"**Vanna/Charm** {scores['flow_score']:+.0f}")
-                st.caption("tanh(VEX+CEX) · pin vs accel")
-                st.markdown(f"**OR vs Walls** {scores['or_score']:+.0f}")
-                st.caption(f"OR {or_txt} · tod {scores.get('tod_factor',1):.2f}")
-            with s3:
-                st.markdown(f"**Flip dist** {scores.get('flip_score',0):+.0f}")
-                st.caption(f"{scores.get('dist_to_flip_pct',0):.3f}% from flip")
-                st.markdown(f"**Composite** {scores['composite']:+.0f} → {scores['bias']}")
-                st.caption("0.38g + 0.22 move + 0.15 flow + 0.15 OR + 0.10 flip")
-
-    else:
-        st.warning("Could not compute Superhuman scores – insufficient data.")
-
-    # ========== UNDERLYING TECHNICALS – SPOT + FUTURES VWAP ==========
-    df_full = data.get("df_candles", pd.DataFrame())
-    df_fut  = data.get("df_futures", pd.DataFrame())
-    basis   = data.get("basis_info", {})
-
+    # Technicals header
+    badge_html = ""
     if not df_full.empty and len(df_full) >= 20:
         latest_row = df_full.iloc[-1]
-        rsi_val = latest_row["rsi"]
+        rsi_val = float(latest_row.get("rsi") or 50)
         rsi_status = "Oversold" if rsi_val < 30 else ("Overbought" if rsi_val > 70 else "Neutral")
-        rsi_badge_cls = "badge-bearish" if rsi_val > 70 else ("badge-bullish" if rsi_val < 30 else "badge-neutral")
-        macd_val = latest_row["macd"]
-        macd_sig = latest_row["macd_signal"]
+        rsi_cls = "badge-bearish" if rsi_val > 70 else ("badge-bullish" if rsi_val < 30 else "badge-neutral")
+        macd_val = float(latest_row.get("macd") or 0)
+        macd_sig = float(latest_row.get("macd_signal") or 0)
         macd_status = "Bullish XO" if macd_val > macd_sig else "Bearish XO"
-        macd_badge_cls = "badge-bullish" if macd_val > macd_sig else "badge-bearish"
+        macd_cls = "badge-bullish" if macd_val > macd_sig else "badge-bearish"
         recent_bw = df_full["bb_bandwidth"].tail(20)
-        bw_threshold = recent_bw.quantile(0.20)
-        is_sqz = latest_row["bb_bandwidth"] <= bw_threshold
-        sqz_status = "Squeeze" if is_sqz else "Expand"
-        sqz_badge_cls = "badge-neutral" if is_sqz else "badge-bullish"
+        is_sqz = float(latest_row.get("bb_bandwidth") or 0) <= float(recent_bw.quantile(0.20) or 0)
+        sqz_cls = "badge-neutral" if is_sqz else "badge-bullish"
         badge_html = (
-            f"<span class='status-badge {sqz_badge_cls}'>BB: {sqz_status}</span>"
-            f"<span class='status-badge {macd_badge_cls}'>MACD: {macd_status}</span>"
-            f"<span class='status-badge {rsi_badge_cls}'>RSI: {rsi_val:.0f} ({rsi_status})</span>"
+            f"<span class='status-badge {sqz_cls}'>BB: {'Squeeze' if is_sqz else 'Expand'}</span>"
+            f"<span class='status-badge {macd_cls}'>MACD: {macd_status}</span>"
+            f"<span class='status-badge {rsi_cls}'>RSI: {rsi_val:.0f} ({rsi_status})</span>"
         )
-    else:
-        badge_html = ""
 
     tech_h, tech_b, tf_col = st.columns([0.28, 0.52, 0.20])
     with tech_h:
-        heading_ribbon("📈 Underlying Technicals",
-            "Spot + Bollinger (20,2). MACD 12/26/9. RSI 14. Squeeze = BB width ≤ 20th pct of last 20 bars.")
+        heading_ribbon("📈 Underlying Technicals", "Perp + Bollinger(20,2). MACD 12/26/9. RSI 14.")
     with tech_b:
         if badge_html:
-            st.markdown(f"<div style='padding-top:2px;'>{badge_html}</div>", unsafe_allow_html=True)
+            st.markdown(badge_html, unsafe_allow_html=True)
     with tf_col:
-        selected_tf = st.selectbox("TF", ["1 min", "3 min", "5 min", "15 min"],
-                                   index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"]),
-                                   key="tf_select_frag", label_visibility="collapsed")
+        selected_tf = st.selectbox(
+            "TF", ["1 min", "3 min", "5 min", "15 min"],
+            index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"])
+            if st.session_state["selected_timeframe"] in ["1 min", "3 min", "5 min", "15 min"] else 2,
+            key="tf_select_frag", label_visibility="collapsed",
+        )
         if selected_tf != st.session_state["selected_timeframe"]:
             st.session_state["selected_timeframe"] = selected_tf
-            updated_chart_data = fetch_live_data(selected_tf)
-            if updated_chart_data:
-                st.session_state["data_store"] = updated_chart_data
+            upd = fetch_live_bundle(selected_tf)
+            if upd:
+                st.session_state["data_store"] = upd
                 st.rerun()
 
-    if not df_full.empty and len(df_full) >= 20:
-
-        # Spot chart (no VWAP)
-        df_full["session_date"] = pd.to_datetime(df_full["time"]).dt.date
-        last_3_dates = sorted(df_full["session_date"].unique())[-3:]
-        df_chart = df_full[df_full["session_date"].isin(last_3_dates)].copy()
-        df_chart["time_str"] = pd.to_datetime(df_chart["time"]).dt.strftime("%d-%b %H:%M")
-
+    if not df_full.empty and len(df_full) >= 10:
+        df_chart = df_full.tail(400).copy()
+        df_chart["time_str"] = ist_label(df_chart["time"], with_date=True)
         min_p = min(df_chart["close"].min(), df_chart["bb_lower"].min())
         max_p = max(df_chart["close"].max(), df_chart["bb_upper"].max())
-        padding = (max_p - min_p) * 0.05
-
+        pad = (max_p - min_p) * 0.05
         tech_left, tech_right = st.columns([0.58, 0.42])
-
         with tech_left:
             fig_px = plt_go.Figure()
-            fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot", line=dict(color="#00E676", width=2)))
+            fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Index/Perp", line=dict(color="#00E676", width=2)))
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper", line=dict(color="rgba(33,150,243,0.5)", width=1)))
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_lower"], mode="lines", name="BB Lower", line=dict(color="rgba(33,150,243,0.5)", width=1), fill="tonexty", fillcolor="rgba(33,150,243,0.05)"))
-            fig_px.update_layout(
-                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=320, margin=dict(l=10, r=10, t=20, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
-                hovermode="x unified", yaxis=dict(range=[min_p - padding, max_p + padding], tickformat="d"),
-                xaxis=dict(type="category", nticks=8),
-            )
-            st.plotly_chart(fig_px, use_container_width=True)
-
+            fig_px.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                 height=220, margin=dict(l=8, r=8, t=12, b=8), hovermode="x unified",
+                                 legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                                 yaxis=dict(range=[min_p - pad, max_p + pad]), xaxis=dict(type="category", nticks=8))
+            st.plotly_chart(fig_px, use_container_width=True, key="chart_spot_bb")
         with tech_right:
             fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.55, 0.45])
             colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
-            fig_ind.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="Hist", marker_color=colors_macd, showlegend=False))
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD [{macd_val:.1f}]", line=dict(color="#2196F3", width=1.3)))
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Sig [{macd_sig:.1f}]", line=dict(color="#FF9800", width=1.3)))
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name=f"RSI [{rsi_val:.0f}]", line=dict(color="#E040FB", width=1.3)), row=2, col=1)
+            fig_ind.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], marker_color=colors_macd, showlegend=False))
+            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name="MACD", line=dict(color="#2196F3", width=1.3)))
+            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name="Sig", line=dict(color="#FF9800", width=1.3)))
+            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name="RSI", line=dict(color="#E040FB", width=1.3)), row=2, col=1)
             fig_ind.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=2, col=1)
             fig_ind.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=2, col=1)
-            fig_ind.update_layout(
-                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=320, margin=dict(l=10, r=10, t=20, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
-                hovermode="x unified",
-            )
+            fig_ind.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                  height=220, margin=dict(l=8, r=8, t=12, b=8), hovermode="x unified",
+                                  legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)))
             fig_ind.update_xaxes(type="category", nticks=6)
-            st.plotly_chart(fig_ind, use_container_width=True)
+            st.plotly_chart(fig_ind, use_container_width=True, key="chart_macd_rsi")
 
-        # ========== ROW1: Futures 50% | Liq Δ 20% | GEX OI 30% ==========
-        # ========== ROW2: CVD 50%     | Liq Δ 20% | GEX Vol 30% ==========
-        st.markdown("---")
-        df_fut = data.get("df_futures", pd.DataFrame())
-        df_chain = pd.DataFrame(data.get("chain_results") or [])
-        basis = data.get("basis_info", {}) or {}
+    left_col, right_col = st.columns([0.70, 0.30])
 
-        def calculate_synced_ranges(primary, secondary):
-            """Align zero line of primary & secondary y-axes at the same vertical position."""
-            p = pd.Series(primary).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-            s = pd.Series(secondary).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-            p_max = max(float(p.max()) if len(p) else 0.0, 0.0) or 1.0
-            p_min = min(float(p.min()) if len(p) else 0.0, 0.0) or -1.0
-            s_max = max(float(s.max()) if len(s) else 0.0, 0.0) or 1.0
-            s_min = min(float(s.min()) if len(s) else 0.0, 0.0) or -1.0
-            p_frac = abs(p_min) / (abs(p_min) + p_max)
-            s_frac = abs(s_min) / (abs(s_min) + s_max)
-            frac = min(max(max(p_frac, s_frac), 0.15), 0.85)
-            p_total = (abs(p_min) + p_max) * 1.10
-            s_total = (abs(s_min) + s_max) * 1.10
-            return [-p_total * frac, p_total * (1.0 - frac)], [-s_total * frac, s_total * (1.0 - frac)]
-
-        df_fchart = pd.DataFrame()
-        fut_times = []
-        latest_session = None
-        if not df_fut.empty and len(df_fut) >= 1:
-            df_fchart, latest_session, _ = pick_last_nse_session(df_fut, min_bars=20, prefer_today=True)
-            if df_fchart.empty:
-                df_fut = df_fut.copy()
-                df_fut["time"] = series_to_ist(df_fut["time"])
-                df_fut["session_date"] = df_fut["time"].dt.date
-                latest_session = sorted(df_fut["session_date"].unique())[-1]
-                df_fchart = df_fut[df_fut["session_date"] == latest_session].copy().reset_index(drop=True)
-                df_fchart["time_str"] = df_fchart["time"].dt.strftime("%H:%M")
-            fut_times = df_fchart["time_str"].tolist()
-
-        if not df_chain.empty:
-            min_strike_val = float(df_chain["Strike"].min()) - 50
-            max_strike_val = float(df_chain["Strike"].max()) + 50
-            df_chain["Total_Vol"] = df_chain["C_Vol"] + df_chain["P_Vol"]
-            df_chain["Total_OI"] = df_chain["C_OI"] + df_chain["P_OI"]
-        else:
-            min_strike_val = float(data.get("spot_price", 0) or 0) - 500
-            max_strike_val = float(data.get("spot_price", 0) or 0) + 500
-
-        # ----- Compact: Futures+VP+OBV+EFI+CVD | GEX OI + GEX Vol -----
-        fut_msg = data.get("fut_fallback_msg", "")
-        left_col, right_col = st.columns([0.70, 0.30])
-        vp = {"ok": False}
-        y0 = y1 = None
-        sigma_mult = 1.5
-
-        with left_col:
-            fut_header_col, basis_col, band_col = st.columns([0.70, 0.16, 0.14])
-            with fut_header_col:
-                expiry_txt = basis.get("fut_expiry", "N/A")
-                fb = str(fut_msg or "").replace("**", "").replace("⚠️ ", "")
-                fb_html = ""
-                if data.get("fut_is_fallback") or "closed" in fb.lower():
-                    fb_html = (
-                        f"<span style='color:#FFD54F;font-size:11px;white-space:nowrap;'>"
-                        f"{fb}</span>"
-                    )
-                elif fb:
-                    fb_html = f"<span style='color:#7CB342;font-size:11px;white-space:nowrap;'>{fb}</span>"
+    with left_col:
+        hdr1, hdr2, hdr3 = st.columns([0.52, 0.20, 0.28])
+        with hdr1:
+            heading_ribbon(
+                f"PERP · VWAP · VP  ({currency})",
+                "<b>PERP</b> — Deribit perpetual last.<br>"
+                "<b>VWAP</b> — session Σ(TP×Vol)/ΣVol, TP=(H+L+C)/3. Orange line + ±σ bands.<br>"
+                "<b>VP</b> — volume-at-price histogram (right). Yellow bar = POC.<br>"
+                "<b>Basis</b> — Perp − Index. Contango +, backwardation −.",
+            )
+        with hdr2:
+            basis = data.get("basis_info") or {}
+            if basis.get("basis") is not None:
+                bc = "#00E676" if basis["basis"] >= 0 else "#FF5252"
                 st.markdown(
-                    f"<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;'>"
-                    f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
-                    f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
-                    f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
-                    f"📉 Near-Month Futures + VWAP + VP ({expiry_txt})</span>"
-                    f"<div class='micro-tip'><b>Futures</b> near-month LTP.<br>"
-                    f"<b>VWAP</b> = Σ(TP×V)/ΣV, TP=(H+L+C)/3.<br>"
-                    f"<b>VP</b> volume-by-price · POC / VA / HVN / LVN.</div></div>"
-                    f"<div class='micro-hover' style='display:inline-block;padding:3px 8px;"
-                    f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
-                    f"<span style='font-weight:700;color:#00E676;font-size:11px;'>OBV</span>"
-                    f"<div class='micro-tip'><b>OBV</b> = Σ sign(ΔClose)×Volume. Executed net volume.</div></div>"
-                    f"<div class='micro-hover' style='display:inline-block;padding:3px 8px;"
-                    f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
-                    f"<span style='font-weight:700;color:#00E676;font-size:11px;'>EFI13</span>"
-                    f"<div class='micro-tip'><b>EFI13</b> = EMA13((C−prev)×V). Force / execution.</div></div>"
-                    f"<div class='micro-hover' style='display:inline-block;padding:3px 8px;"
-                    f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
-                    f"<span style='font-weight:700;color:#00E676;font-size:11px;'>CVD</span>"
-                    f"<div class='micro-tip'><b>CVD</b> = Σ V×(2(C−L)/(H−L)−1). Market-order-like proxy.</div></div>"
-                    f"{fb_html}"
-                    f"</div>",
+                    f"<div style='font-size:12px;padding-top:2px;'>Basis "
+                    f"<span style='color:{bc};font-weight:800;'>{basis['basis']:+.1f}</span></div>",
                     unsafe_allow_html=True,
                 )
-            with basis_col:
-                if basis.get("basis") is not None:
-                    basis_color = "#00E676" if basis["basis"] >= 0 else "#FF5252"
-                    st.markdown(
-                        f"<div style='text-align:right;font-size:14px;padding-top:2px;'>"
-                        f"Basis: <span style='color:{basis_color};font-weight:800;'>"
-                        f"{basis['basis']:+.1f}</span></div>",
-                        unsafe_allow_html=True
-                    )
-            with band_col:
-                sigma_mult = st.selectbox(
-                    "VWAP Bands", options=[1.0, 1.5, 2.0], index=1,
-                    format_func=lambda x: f"±{x}σ", key="vwap_sigma_select",
-                    label_visibility="collapsed"
-                )
+        with hdr3:
+            sigma_mult = st.selectbox(
+                "VWAP bands", [1.0, 1.5, 2.0], index=1,
+                format_func=lambda x: f"±{x}σ", key="vwap_sigma",
+                label_visibility="collapsed",
+            )
+        if df_fut is not None and not df_fut.empty:
+            dfi = df_fut.tail(400).copy().reset_index(drop=True)
+            dfi["time"] = to_ist(dfi["time"])
+            dfi["ist_date"] = dfi["time"].dt.date
+            # Keep last two IST days max, but VWAP resets each IST day
+            last_days = sorted(dfi["ist_date"].dropna().unique())[-2:]
+            dfi = dfi[dfi["ist_date"].isin(last_days)].reset_index(drop=True)
+            dfi["tp"] = (dfi["high"] + dfi["low"] + dfi["close"]) / 3.0
 
-            if not df_fchart.empty:
-                df_fchart = df_fchart.copy()
-                df_fchart["tp"] = (df_fchart["high"] + df_fchart["low"] + df_fchart["close"]) / 3.0
+            vwaps, stds = [], []
+            prev_day = None
+            cum_vol = cum_tp = cum_sq = 0.0
+            for i in range(len(dfi)):
+                day = dfi.loc[i, "ist_date"]
+                if day != prev_day:
+                    cum_vol = cum_tp = cum_sq = 0.0
+                    prev_day = day
+                vol = float(dfi.loc[i, "volume"] or 0)
+                tp = float(dfi.loc[i, "tp"])
+                cum_vol += vol
+                cum_tp += tp * vol
+                vwap = cum_tp / cum_vol if cum_vol > 0 else tp
+                cum_sq += vol * (tp - vwap) ** 2
+                vwaps.append(vwap)
+                stds.append(math.sqrt(max(cum_sq / cum_vol if cum_vol else 0.0, 0.0)))
+            dfi["vwap"] = vwaps
+            dfi["vwap_std"] = stds
+            dfi["vwap_upper"] = dfi["vwap"] + sigma_mult * dfi["vwap_std"]
+            dfi["vwap_lower"] = dfi["vwap"] - sigma_mult * dfi["vwap_std"]
+            close = dfi["close"].astype(float)
+            vol = dfi["volume"].astype(float)
+            dfi["obv"] = (np.sign(close.diff().fillna(0)) * vol).cumsum()
+            dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
+            dfi["efi13"] = (close.diff() * vol).ewm(span=13, adjust=False).mean()
+            hl = (dfi["high"] - dfi["low"]).replace(0, np.nan)
+            loc = ((dfi["close"] - dfi["low"]) / hl * 2 - 1).fillna(0).clip(-1, 1)
+            dfi["cvd"] = (vol * loc).cumsum()
+            dfi["time_str"] = dfi["time"].dt.strftime("%d-%b %H:%M")
+            vp = compute_session_volume_profile(dfi, bin_step=BIN_STEP.get(currency, 250))
+            y0 = float(min(dfi["close"].min(), dfi["vwap_lower"].min())) * 0.998
+            y1 = float(max(dfi["close"].max(), dfi["vwap_upper"].max())) * 1.002
 
-                def _calc_session_vwap_bands(group, k):
-                    group = group.copy().reset_index(drop=True)
-                    cum_vol = cum_tp_vol = cum_sq_dev = 0.0
-                    vwaps, stds = [], []
-                    for i in range(len(group)):
-                        vol = float(group.loc[i, "volume"])
-                        tp = float(group.loc[i, "tp"])
-                        cum_vol += vol
-                        cum_tp_vol += tp * vol
-                        vwap = cum_tp_vol / cum_vol if cum_vol > 0 else tp
-                        cum_sq_dev += vol * (tp - vwap) ** 2
-                        variance = cum_sq_dev / cum_vol if cum_vol > 0 else 0.0
-                        vwaps.append(vwap)
-                        stds.append(np.sqrt(max(variance, 0.0)))
-                    group["vwap"] = vwaps
-                    group["vwap_std"] = stds
-                    group["vwap_upper"] = group["vwap"] + k * group["vwap_std"]
-                    group["vwap_lower"] = group["vwap"] - k * group["vwap_std"]
-                    return group
-
-                df_fchart = _calc_session_vwap_bands(df_fchart, sigma_mult)
-                latest_vwap = float(df_fchart["vwap"].iloc[-1])
-                latest_fut = float(df_fchart["close"].iloc[-1])
-                fmin = min(df_fchart["close"].min(), df_fchart["vwap_lower"].min())
-                fmax = max(df_fchart["close"].max(), df_fchart["vwap_upper"].max())
-                fpad = (fmax - fmin) * 0.06
-                y0, y1 = fmin - fpad, fmax + fpad
-                vp = compute_session_volume_profile(df_fchart, bin_step=5.0, prominence_factor=0.35)
-
-                dfi = df_fchart.copy().reset_index(drop=True)
-                dfi["spot_px"] = np.nan
-                df_sp = data.get("df_candles")
-                if df_sp is not None and not getattr(df_sp, "empty", True) and "close" in df_sp.columns:
-                    try:
-                        sp = df_sp.copy()
-                        sp["time"] = pd.to_datetime(sp["time"], utc=True, errors="coerce")
-                        if getattr(sp["time"].dt, "tz", None) is not None:
-                            sp["time"] = sp["time"].dt.tz_convert("Asia/Kolkata")
-                        sp["tmin"] = sp["time"].dt.floor("min")
-                        tmp = dfi.copy()
-                        tmp["tmin"] = pd.to_datetime(tmp["time"], utc=True, errors="coerce")
-                        if getattr(tmp["tmin"].dt, "tz", None) is not None:
-                            tmp["tmin"] = tmp["tmin"].dt.tz_convert("Asia/Kolkata")
-                        tmp["tmin"] = tmp["tmin"].dt.floor("min")
-                        merged = tmp.merge(sp[["tmin", "close"]].rename(columns={"close": "spot_px"}), on="tmin", how="left")
-                        dfi["spot_px"] = pd.to_numeric(merged["spot_px"], errors="coerce")
-                    except Exception:
-                        pass
-                if dfi["spot_px"].isna().all() and data.get("spot_price"):
-                    dfi["spot_px"] = float(data["spot_price"])
-                close = dfi["close"].astype(float)
-                vol = dfi["volume"].astype(float)
-                direction = np.sign(close.diff().fillna(0.0))
-                dfi["obv"] = (direction * vol).cumsum()
-                dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
-                dfi["efi13"] = (close.diff() * vol).ewm(span=13, adjust=False).mean()
-                hl = (dfi["high"] - dfi["low"]).replace(0, np.nan)
-                loc = ((dfi["close"] - dfi["low"]) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
-                dfi["cvd"] = (dfi["volume"] * loc).cumsum()
-
-                fig_stack = make_subplots(
-                    rows=4, cols=2,
-                    column_widths=[0.84, 0.16],
-                    row_heights=[0.46, 0.16, 0.16, 0.22],
-                    shared_xaxes=True,
-                    shared_yaxes=False,
-                    horizontal_spacing=0.01,
-                    vertical_spacing=0.018,
-                    specs=[
-                        [{}, {}],
-                        [{}, None],
-                        [{}, None],
-                        [{}, None],
-                    ],
-                )
-                # price
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["vwap_upper"], mode="lines", showlegend=False, hoverinfo="skip",
-                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["vwap_lower"], mode="lines", showlegend=False, hoverinfo="skip",
-                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                    fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
-                    line=dict(color="#FF9800", width=2),
-                    hoverinfo="skip"), row=1, col=1)
-                cd = np.column_stack([
-                    dfi["vwap"].astype(float).values,
-                    dfi["spot_px"].astype(float).values,
-                ])
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
-                    line=dict(color="#2196F3", width=2),
-                    customdata=cd,
-                    hovertemplate="NIFTY %{customdata[1]:.1f}<br>Fut %{y:.1f}<br>VWAP %{customdata[0]:.1f}<extra></extra>",
-                ), row=1, col=1)
-                last_fut = float(dfi["close"].iloc[-1])
-                last_sp = dfi["spot_px"].iloc[-1]
-                last_sp = float(last_sp) if pd.notna(last_sp) else float(data.get("spot_price") or 0)
-                fig_stack.add_annotation(
-                    x=dfi["time_str"].iloc[-1], y=last_fut,
-                    text=f"{last_fut:.0f} ({last_sp:.0f})",
-                    showarrow=False, xanchor="left", font=dict(size=11, color="#00E676"),
-                    row=1, col=1,
-                )
-                if vp.get("ok"):
-                    mids, vols, colors = [], [], []
-                    for m, v in zip(vp["mids"], vp["vol"]):
-                        if y0 is not None and not (y0 <= float(m) <= y1):
-                            continue
+            fig_stack = make_subplots(
+                rows=4, cols=2, column_widths=[0.86, 0.14],
+                row_heights=[0.48, 0.16, 0.16, 0.20],
+                shared_xaxes=True, horizontal_spacing=0.008, vertical_spacing=0.012,
+                specs=[[{}, {}], [{}, None], [{}, None], [{}, None]],
+            )
+            fig_stack.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["vwap_upper"], mode="lines", showlegend=False, hoverinfo="skip",
+                                               line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
+            fig_stack.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["vwap_lower"], mode="lines", showlegend=False, hoverinfo="skip",
+                                               line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                                               fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
+            fig_stack.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP", line=dict(color="#FF9800", width=2)), row=1, col=1)
+            fig_stack.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["close"], mode="lines", name="Perp", line=dict(color="#2196F3", width=2)), row=1, col=1)
+            if vp.get("ok"):
+                mids, vols, colors = [], [], []
+                for m, v in zip(vp["mids"], vp["vol"]):
+                    if y0 <= float(m) <= y1:
                         mids.append(float(m)); vols.append(float(v))
                         colors.append("#FFD54F" if abs(m - vp["poc"]) < 1e-6 else "rgba(100,181,246,0.7)")
-                    fig_stack.add_trace(plt_go.Bar(
-                        x=vols, y=mids, orientation="h", showlegend=False, name="VP",
-                        marker=dict(color=colors),
-                        hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
-                    ), row=1, col=2)
-
-                # OBV
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] >= 0), mode="lines", showlegend=False,
-                    line=dict(color="#00E676", width=1.5), fill="tozeroy", fillcolor="rgba(0,230,118,0.16)",
-                ), row=2, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0), mode="lines", showlegend=False,
-                    line=dict(color="#FF5252", width=1.5), fill="tozeroy", fillcolor="rgba(255,82,82,0.16)",
-                ), row=2, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", name="OBV MA20",
-                    line=dict(color="#FFF176", width=1.6), showlegend=False,
-                ), row=2, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
-                # EFI
-                efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
-                fig_stack.add_trace(plt_go.Bar(
-                    x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
-                ), row=3, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
-                # CVD
-                cvd_last = float(dfi["cvd"].iloc[-1])
-                cvd_col = "#00E676" if cvd_last >= 0 else "#FF5252"
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
-                    line=dict(color=cvd_col, width=1.8), fill="tozeroy",
-                    fillcolor="rgba(0,230,118,0.08)" if cvd_last >= 0 else "rgba(255,82,82,0.08)",
-                ), row=4, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
-
-                def _sess_chg(src):
-                    if src is None or getattr(src, "empty", True):
-                        return None
-                    try:
-                        sess, _, _ = pick_last_nse_session(src, min_bars=5)
-                    except Exception:
-                        sess = src
-                    if sess is None or sess.empty:
-                        return None
-                    o = float(sess["open"].iloc[0]); cl = float(sess["close"].iloc[-1])
-                    return cl, cl - o, (cl - o) / o * 100.0 if o else 0.0
-
-                spot_chg = _sess_chg(data.get("df_candles"))
-                fut_chg = _sess_chg(df_fchart if not df_fchart.empty else data.get("df_futures"))
-                trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
-                micro = classify_microstructure(dfi)
-
-                xr = [-0.5, max(len(fut_times) - 0.5, 0.5)]
-                fig_stack.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=620, margin=dict(l=40, r=6, t=8, b=18),
-                    legend=dict(orientation="h", yanchor="top", y=1.0, x=0.0, font=dict(size=10),
-                                bgcolor="rgba(14,17,23,0.4)"),
-                    hovermode="x unified", bargap=0.15,
-                )
-                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", row=1, col=1)
-                fig_stack.update_yaxes(range=[y0, y1], type="linear", showticklabels=False, row=1, col=2)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
-                                       range=xr, showticklabels=False, row=1, col=1)
-                fig_stack.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=2)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
-                                       range=xr, showticklabels=False, row=2, col=1)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
-                                       range=xr, showticklabels=False, row=3, col=1)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
-                                       range=xr, nticks=8, row=4, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
-                tab_flow, tab_dex, tab_fp = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Effort vs Result"])
-                with tab_flow:
-                    st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
-                    st.plotly_chart(fig_stack, use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with tab_dex:
-                    sess_day = latest_session or _ist_now().date()
-                    tape = load_flow_tape(Index_Name, sess_day) or list(st.session_state.get("flow_tape") or [])
-                    fig_dex = make_subplots(
-                        rows=3, cols=2,
-                        column_widths=[0.84, 0.16],
-                        row_heights=[0.46, 0.27, 0.27],
-                        shared_xaxes=False,
-                        vertical_spacing=0.06,
-                        horizontal_spacing=0.01,
-                        specs=[[{}, {}], [{}, None], [{}, None]],
-                    )
-                    if "vwap_upper" in dfi.columns:
-                        fig_dex.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap_upper"], mode="lines", showlegend=False, hoverinfo="skip",
-                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
-                        fig_dex.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap_lower"], mode="lines", showlegend=False, hoverinfo="skip",
-                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                            fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
-                    fig_dex.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
-                        line=dict(color="#FF9800", width=2), hoverinfo="skip"), row=1, col=1)
-                    fig_dex.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
-                        line=dict(color="#2196F3", width=2)), row=1, col=1)
-                    if vp.get("ok"):
-                        fig_dex.add_trace(plt_go.Bar(
-                            x=vols if vp.get("ok") else [], y=mids if vp.get("ok") else [],
-                            orientation="h", showlegend=False,
-                            marker=dict(color=colors if vp.get("ok") else "#64B5F6"),
-                        ), row=1, col=2)
-                    if tape:
-                        txs = [t["ts"] for t in tape]
-                        dex_s = pd.Series([t["dex"] for t in tape], dtype=float)
-                        dex_ema = dex_s.ewm(span=8, adjust=False).mean()
-                        bar_c = np.where(dex_s >= 0, "#00E676", "#FF5252")
-                        fig_dex.add_trace(plt_go.Bar(
-                            x=txs, y=dex_s, name="DEX", marker_color=bar_c, opacity=0.75, showlegend=False,
-                        ), row=2, col=1)
-                        fig_dex.add_trace(plt_go.Scatter(
-                            x=txs, y=dex_ema, name="DEX EMA8",
-                            line=dict(color="#FFD54F", width=2),
-                        ), row=2, col=1)
-                        fig_dex.add_trace(plt_go.Scatter(
-                            x=txs, y=[t["prem_c"]/1e7 for t in tape], name="Call prem Cr",
-                            line=dict(color="#00E676", width=2),
-                        ), row=3, col=1)
-                        fig_dex.add_trace(plt_go.Scatter(
-                            x=txs, y=[t["prem_p"]/1e7 for t in tape], name="Put prem Cr",
-                            line=dict(color="#FF5252", width=2),
-                        ), row=3, col=1)
-                    fig_dex.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
-                    fig_dex.update_layout(
-                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=620, margin=dict(l=40, r=6, t=8, b=18),
-                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
-                        hovermode="x unified",
-                    )
-                    fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=2, col=1)
-                    fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=3, col=1)
-                    st.markdown("<div class='chart-card'><div class='card-title'>DEX flow &amp; net premium</div>", unsafe_allow_html=True)
-                    if tape:
-                        st.caption(f"DEX / premium · {sess_day} · {len(tape)} snaps")
-                    st.plotly_chart(fig_dex, use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with tab_fp:
-                    lot = max(int(LOT_SIZES.get(Index_Name, 65)), 1)
-                    rng = (dfi["high"] - dfi["low"]).replace(0, np.nan)
-                    bar_cvd = dfi["cvd"].diff().fillna(dfi["cvd"])
-                    lots = (dfi["volume"].astype(float) / lot).clip(lower=0)
-                    # result: signed close vs open; effort: lots
-                    up = dfi["close"] >= dfi["open"]
-                    colors = np.where(up, "#00E676", "#FF5252")
-                    # absorption: high lots, small range vs session median
-                    med_r = float(rng.median()) if rng.notna().any() else 1.0
-                    med_l = float(lots.median()) if len(lots) else 1.0
-                    absorb = (lots >= 1.5 * med_l) & (rng <= 0.7 * med_r)
-                    fig_fp = plt_go.Figure()
-                    fig_fp.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
-                        line=dict(color="#90A4AE", width=1.2), hoverinfo="skip"))
-                    if "vwap" in dfi.columns:
-                        fig_fp.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
-                            line=dict(color="#FF9800", width=1.5), hoverinfo="skip"))
-                    sizes = (20 + 70 * (lots / max(float(lots.max()), 1.0))).clip(12, 90)
-                    cd = np.column_stack([lots, bar_cvd, rng.fillna(0)])
-                    fig_fp.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["close"], mode="markers", name="Bar lots",
-                        marker=dict(size=sizes, color=colors, opacity=0.72),
-                        customdata=cd,
-                        hovertemplate="Lots %{customdata[0]:.0f}<br>ΔCVD %{customdata[1]:.0f}<br>Range %{customdata[2]:.1f}<br>Px %{y:.1f}<extra></extra>",
-                    ))
-                    if absorb.any():
-                        fig_fp.add_trace(plt_go.Scatter(
-                            x=dfi.loc[absorb, "time_str"], y=dfi.loc[absorb, "close"],
-                            mode="markers", name="Absorption",
-                            marker=dict(size=sizes[absorb.values] + 6, color="rgba(0,0,0,0)",
-                                        line=dict(width=2, color="#FFD54F")),
-                            hoverinfo="skip",
-                        ))
-                    fig_fp.update_layout(
-                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=520, margin=dict(l=40, r=8, t=8, b=18),
-                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
-                        hovermode="closest",
-                    )
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    heading_ribbon(
-                        "Effort vs result (not footprint)",
-                        "SmartAPI has no bid/ask volume-at-price.<br>"
-                        "Bubble <b>size</b> = futures bar volume / lot.<br>"
-                        "Green = close ≥ open · Red = close < open.<br>"
-                        "Gold ring = absorption: lots ≥ 1.5× median and range ≤ 0.7× median range "
-                        "(effort without result → fade risk).<br>"
-                        "Big bubble + large range in same direction → effort is moving price (breakout risk).",
-                    )
-                    st.plotly_chart(fig_fp, use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
-                if vp.get("ok"):
-                    cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
-                st.caption(cap)
-                def _chip(body, tip, color="#00E676"):
-                    return (
-                        f"<div class='micro-hover micro-chip'>"
-                        f"<div style='color:{color};font-weight:800;font-size:12px;line-height:1.3;text-align:center;'>{body}</div>"
-                        f"<div class='micro-tip'>{tip}</div></div>"
-                    )
-                chips = []
-                sc = f"NIFTY {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else "NIFTY —"
-                fc = f"FUT {fut_chg[0]:,.0f} {fut_chg[1]:+.0f} {fut_chg[2]:+.2f}%" if fut_chg else "FUT —"
-                chips.append(_chip(
-                    f"{sc}<br>{fc}",
-                    "Index spot and near-month futures session open→close. GEX walls use spot; VWAP uses futures.",
-                    "#00E676" if (spot_chg and spot_chg[2] >= 0) else "#FF5252",
-                ))
-                if isinstance(scores, dict) and "error" not in scores:
-                    chips.append(_chip(
-                        f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})",
-                        f"<b>Superhuman</b><br>{scores.get('clarity','')}<br>{scores.get('action','')}<br>"
-                        f"Quiet + long γ → PIN<br>Big range + long γ → REVERSION<br>"
-                        f"Short γ / wall break → TREND<br>|C|≤15 → NO EDGE<br>else → MILD DIR",
-                        scores.get("colour", "#00E676"),
-                    ))
-                tname = (trig or {}).get("trigger", "NO TRIGGER")
-                tbits = []
-                for ch in (trig or {}).get("checks") or []:
-                    side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
-                    tbits.append(f"{ch.get('name','')} <b>{side}</b> · {ch.get('note','')}")
-                chips.append(_chip(
-                    tname,
-                    f"<b>{tname}</b><br>{(trig or {}).get('summary','')}<br><br>" + "<br>".join(tbits),
-                    (trig or {}).get("colour", "#FF9800"),
-                ))
-                if micro.get("ok"):
-                    act = micro["action"]
-                    tag = " EFI≈0" if micro.get("efi_zero") else ""
-                    chips.append(_chip(
-                        f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} "
-                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}{tag}<br>{act}",
-                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br>"
-                        f"{micro.get('efi_note','')}<br><b>Algo action:</b> {act}",
-                        "#00E676",
-                    ))
-                    flow = classify_flow_playbook(dfi, data)
-                    if flow.get("ok"):
-                        chips.append(_chip(
-                            f"P{ARROW_GLYPH[flow['price']]} C{ARROW_GLYPH[flow['cvd']]} "
-                            f"D{ARROW_GLYPH[flow['dex']]} $ {ARROW_GLYPH[flow['prem']]}<br>{flow['action']}",
-                            f"<b>Flow playbook (18)</b><br>{flow['hover']}",
-                            "#90CAF9",
-                        ))
-                st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
-            else:
-                st.info("Futures / VWAP not available.")
-
-        with right_col:
-            heading_ribbon(
-                "📈 GEX vs OI / Volume",
-                "<b>GEX (OI)</b> = (Call_γ − Put_γ) × OI × lot × S² × 0.01<br>"
-                "Dealer gamma inventory from open interest. Positive GEX = long-gamma pin.<br>"
-                "<b>GEX (Volume)</b> same formula with session trade volume instead of OI — "
-                "today’s printed flow, not overnight positioning.<br>"
-                "Call OI/Vol up, Put OI/Vol down on the same strike axis. Zero lines aligned.",
+                fig_stack.add_trace(plt_go.Bar(x=vols, y=mids, orientation="h", showlegend=False, marker=dict(color=colors)), row=1, col=2)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] >= 0),
+                mode="lines", showlegend=False, name="OBV+",
+                line=dict(color="#00E676", width=1.5),
+                fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
+            ), row=2, col=1)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0),
+                mode="lines", showlegend=False, name="OBV-",
+                line=dict(color="#FF5252", width=1.5),
+                fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
+            ), row=2, col=1)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", showlegend=False,
+                line=dict(color="#FFF176", width=1.4),
+            ), row=2, col=1)
+            efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
+            fig_stack.add_trace(plt_go.Bar(x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False), row=3, col=1)
+            cvd_last = float(dfi["cvd"].iloc[-1])
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] >= 0),
+                mode="lines", showlegend=False, name="CVD+",
+                line=dict(color="#00E676", width=1.8),
+                fill="tozeroy", fillcolor="rgba(0,230,118,0.20)",
+            ), row=4, col=1)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] < 0),
+                mode="lines", showlegend=False, name="CVD-",
+                line=dict(color="#FF5252", width=1.8),
+                fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
+            ), row=4, col=1)
+            for rr in (2, 3, 4):
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=rr, col=1)
+            fig_stack.update_layout(
+                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                height=480, margin=dict(l=36, r=4, t=4, b=12), hovermode="x unified",
+                legend=dict(orientation="h", y=1.02, x=0, font=dict(size=9)),
             )
-            if not df_chain.empty and lvls:
-                def _one_gex(c_col, p_col, net_col, h):
-                    fig = make_subplots(specs=[[{"secondary_y": True}]])
-                    cols = np.where(df_chain[net_col] >= 0, "#006400", "#8B0000")
-                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain[c_col], name="Call",
-                                            marker_color="#2E7D32", opacity=0.55, showlegend=False), secondary_y=False)
-                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain[p_col], name="Put",
-                                            marker_color="#C62828", opacity=0.55, showlegend=False), secondary_y=False)
-                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain[net_col], name="Net GEX",
-                                            marker_color=cols, opacity=0.85, width=25, showlegend=False), secondary_y=True)
-                    fig.add_hline(y=0, line_width=1, line_color="#FFFFFF")
-                    fig.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
-                    prim = pd.concat([df_chain[c_col].astype(float), -df_chain[p_col].astype(float)])
-                    r1, r2 = calculate_synced_ranges(prim, df_chain[net_col].astype(float))
-                    fig.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                                      height=h, barmode="overlay", margin=dict(l=8, r=8, t=8, b=18), hovermode="x unified")
-                    fig.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
-                    fig.update_yaxes(range=r1, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
-                    fig.update_yaxes(range=r2, secondary_y=True, showgrid=False)
-                    return fig
-                g_oi, g_vol = st.tabs(["GEX / OI", "GEX / Volume"])
-                with g_oi:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 340), use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with g_vol:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 340), use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                heading_ribbon(
-                    f"🎯 Δ-GEX (OI) — {selected_expiry_str}",
-                    "<b>Delta-adjusted GEX (OI)</b><br>"
-                    "GEX_i × |Δ_i| so far OTM wings are down-weighted.<br>"
-                    "Expiry = selected chain only. Built from <b>OI</b>, not trade volume.<br>"
-                    "Flip line = zero-gamma strike.",
-                )
-                delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
-                fig_delta_gex = plt_go.Figure()
-                fig_delta_gex.add_trace(plt_go.Bar(
-                    x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], name="Δ-GEX",
-                    marker_color=delta_gex_colors, opacity=0.85, width=25,
-                ))
-                fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-                fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-                fig_delta_gex.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
-                st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                fig_delta_gex.update_layout(
-                    template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                    height=260, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
-                    showlegend=False,
-                )
-                fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
-                fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
-                st.plotly_chart(fig_delta_gex, use_container_width=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-            else:
-                st.info("GEX unavailable.")
+            fig_stack.update_yaxes(range=[y0, y1], title_text="PX", title_font=dict(size=9), tickfont=dict(size=8), row=1, col=1)
+            fig_stack.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
+            fig_stack.update_yaxes(title_text="OBV", title_font=dict(size=9), tickfont=dict(size=8), row=2, col=1)
+            fig_stack.update_yaxes(title_text="EFI13", title_font=dict(size=9), tickfont=dict(size=8), row=3, col=1)
+            fig_stack.update_yaxes(title_text="CVD", title_font=dict(size=9), tickfont=dict(size=8), row=4, col=1)
+            fig_stack.update_xaxes(
+                type="category",
+                categoryorder="array",
+                categoryarray=dfi["time_str"].tolist(),
+                nticks=8, tickfont=dict(size=8), row=4, col=1,
+            )
+            st.plotly_chart(fig_stack, use_container_width=True, key="chart_perp_stack")
+            cap = (
+                f"IST · Perp {float(dfi['close'].iloc[-1]):,.1f} · VWAP {float(dfi['vwap'].iloc[-1]):,.1f} "
+                f"· CVD {cvd_last:,.0f}"
+            )
+            if vp.get("ok"):
+                cap += f" · POC {vp['poc']:.0f} · VA {vp['val1']:.0f}–{vp['vah1']:.0f}"
+            st.caption(cap)
 
-        book_l, tape_r = st.columns([0.50, 0.50])
-        with book_l:
-            st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-            render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-        with tape_r:
-            st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-            render_block_tape(data, Index_Name)
-            st.markdown("</div>", unsafe_allow_html=True)
+            # PECO trigger sits directly under VP / price stack
+            micro = classify_microstructure(dfi)
+            trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
+            peco_arrows = (
+                f"P{ARROW_GLYPH[micro.get('price','f')]} "
+                f"E{ARROW_GLYPH[micro.get('efi','f')]} "
+                f"C{ARROW_GLYPH[micro.get('cvd','f')]} "
+                f"O{ARROW_GLYPH[micro.get('obv','f')]}"
+            )
+            act_col = "#00E676" if "LONG" in str(micro.get("action", "")) else (
+                "#FF5252" if "SHORT" in str(micro.get("action", "")) else "#FF9800"
+            )
+            tcol = (trig or {}).get("colour", "#FF9800")
+            st.markdown(
+                f"<div class='peco-bar'>"
+                f"<div class='micro-hover peco-chip'>"
+                f"<div style='color:#8FA4B8;font-size:10px;font-weight:700;letter-spacing:.04em;'>PECO TRIGGER</div>"
+                f"<div style='color:{act_col};font-weight:800;font-size:13px;'>{peco_arrows}</div>"
+                f"<div style='color:#EEE;font-size:11px;font-weight:700;'>{micro.get('action','NO ENTRY')}</div>"
+                f"<div class='micro-tip'><b>PECO = Price · EFI · CVD · OBV</b><br>"
+                f"{micro.get('micro','')}<br>{micro.get('efi_note','')}<br>"
+                f"↑ up · → flat · ↓ down. EFI≈0 uses the 27-state book.</div></div>"
+                f"<div class='micro-hover peco-chip'>"
+                f"<div style='color:#8FA4B8;font-size:10px;font-weight:700;letter-spacing:.04em;'>SUPERHUMAN</div>"
+                f"<div style='color:{scores.get('colour','#FF9800') if isinstance(scores, dict) else '#FF9800'};font-weight:800;font-size:13px;'>"
+                f"{scores.get('bias','—') if isinstance(scores, dict) else '—'} "
+                f"({scores.get('composite',0):+.0f})</div>"
+                f"<div style='color:#AAA;font-size:11px;'>{scores.get('clarity','') if isinstance(scores, dict) else ''}</div>"
+                f"<div class='micro-tip'>Quiet+long γ → PIN · big range+long γ → REVERSION · "
+                f"short γ / wall break → TREND · |C|≤15 → NO EDGE.</div></div>"
+                f"<div class='micro-hover peco-chip'>"
+                f"<div style='color:#8FA4B8;font-size:10px;font-weight:700;letter-spacing:.04em;'>DIR TRIGGER</div>"
+                f"<div style='color:{tcol};font-weight:800;font-size:13px;'>{(trig or {}).get('trigger','NO TRIGGER')}</div>"
+                f"<div style='color:#AAA;font-size:11px;'>{(trig or {}).get('summary','')}</div>"
+                f"<div class='micro-tip'>LONG = ≥3 of GEX/VWAP/OBV/CVD bullish AND EFI&gt;0.<br>"
+                f"SHORT = ≥3 bearish AND EFI&lt;0.</div></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("Perp candles unavailable.")
 
-        # Delta-GEX (selected) | Heatmap
-        # Multi-exp Delta-GEX   | VEX/CEX
-        # IV Skew 50%           | Z-Scores 50%
-        # Basket Greeks then Strategy Basket Legs
-        if not df_chain.empty and lvls:
-            st.markdown("---")
-            d_left, d_right = st.columns([0.40, 0.60])
-            with d_left:
-                heading_ribbon(
-                    "⚡ VEX / CEX Profile",
-                    "<b>VEX (vanna)</b> ≈ −pdf(d1)×d2/σ × OI × lot — dealer vanna vs spot/IV.<br>"
-                    "<b>CEX (charm)</b> ≈ ∂Δ/∂t × OI × lot — delta decay into expiry.<br>"
-                    "Positive vanna/charm often supports a pin; large negative supports acceleration.",
-                )
-                fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
-                fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20), secondary_y=False)
-                fig_vex_cex.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4)), secondary_y=True)
-                fig_vex_cex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-                fig_vex_cex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-                vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].astype(float), df_chain["CEX"].astype(float))
-                fig_vex_cex.update_layout(
-                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=520, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
-                )
-                fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
-                fig_vex_cex.update_yaxes(range=vex_range, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
-                fig_vex_cex.update_yaxes(range=cex_range, secondary_y=True, showgrid=False)
-                st.plotly_chart(fig_vex_cex, use_container_width=True)
+    with right_col:
+        heading_ribbon(
+            "GEX / OI  ·  GEX / Volume",
+            "<b>GEX</b> = (Call γ × Call OI − Put γ × Put OI) × 1 coin × S² × 0.01.<br>"
+            "Green net bar = long-gamma pin. Red = short-gamma accelerator.<br>"
+            "Left axis: call OI up / put OI down. Right axis: net GEX $.<br>"
+            "<b>Volume tab</b> swaps session volume for OI — today's prints, not inventory.",
+        )
+        if not df_chain.empty:
+            min_s = float(df_chain["Strike"].min()) - 200
+            max_s = float(df_chain["Strike"].max()) + 200
 
-            with d_right:
-                render_delta_gex_heatmap(
-                    data, Index_Name, selected_expiry_str,
-                    st.session_state.get("heatmap_timeframe", "5 min"),
-                )
+            def _one_gex(c_col, p_col, net_col, h):
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                cols = np.where(df_chain[net_col] >= 0, "#006400", "#8B0000")
+                fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain[c_col], marker_color="#2E7D32", opacity=0.55, showlegend=False), secondary_y=False)
+                fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain[p_col], marker_color="#C62828", opacity=0.55, showlegend=False), secondary_y=False)
+                fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain[net_col], marker_color=cols, opacity=0.85, width=25, showlegend=False), secondary_y=True)
+                fig.add_hline(y=0, line_width=1, line_color="#FFFFFF")
+                fig.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
+                fig.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                                  height=h, barmode="overlay", margin=dict(l=8, r=8, t=8, b=18), hovermode="x unified")
+                fig.update_xaxes(type="linear", tickformat="d", range=[min_s, max_s])
+                return fig
 
-            # IV Skew 50% | Z-Scores 50%
-            st.markdown("---")
-            skew_col, z_col = st.columns([0.50, 0.50])
-            with skew_col:
-                heading_ribbon(f"📉 IV Skew ({selected_expiry_str})",
-            "IV from LTP via Black-Scholes (Brent). OTM tab = puts below spot + calls at/above. "
-            "Raw tab = full CE and PE IV curves. VIX tab = India VIX 5-min, last 3 sessions.")
-                smart_api = get_smart_api_client()
-                if smart_api and not df_master.empty:
-                    latest_spot = data["spot_price"]
-                    df_chain_iv = fetch_and_compute_full_chain_iv(
-                        smart_api, df_master, Index_Name, Exchange, selected_expiry_str,
-                        latest_spot, rate_param, strikes_below=strikes_below, strikes_above=strikes_above,
-                    )
-                    if not df_chain_iv.empty:
-                        tab1, tab2, tab3 = st.tabs(["OTM Skew (Puts & Calls)", "Both Raw Curves (CE vs PE)", "INDIA VIX"])
-                        with tab1:
-                            df_skew = get_clean_otm_skew(df_chain_iv, latest_spot)
-                            fig_skew = px.line(df_skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"])
-                            fig_skew.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
-                            fig_skew.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
-                            st.plotly_chart(fig_skew, use_container_width=True)
-                        with tab2:
-                            fig_raw = px.line(df_chain_iv, x="Strike", y="IV_%", color="Option_Type", markers=True, color_discrete_map={"CE": "#00cc96", "PE": "#ff4136"}, hover_data=["LTP"])
-                            fig_raw.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
-                            fig_raw.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
-                            st.plotly_chart(fig_raw, use_container_width=True)
-                        with tab3:
-                            df_vix, vix_pct, vix_day = fetch_india_vix_sessions(smart_api)
-                            if df_vix.empty:
-                                st.info("India VIX candles unavailable.")
-                            else:
-                                colr = "#00E676" if (vix_pct or 0) >= 0 else "#FF5252"
-                                st.markdown(
-                                    f"<div style='font-size:18px;font-weight:800;color:{colr};'>"
-                                    f"INDIA VIX {float(df_vix['close'].iloc[-1]):.2f}  "
-                                    f"{vix_pct:+.2f}% <span style='font-size:12px;font-weight:500;color:#AAA;'>"
-                                    f"({vix_day} session)</span></div>",
-                                    unsafe_allow_html=True
-                                )
-                                fig_vix = plt_go.Figure()
-                                fig_vix.add_trace(plt_go.Scatter(
-                                    x=df_vix["time_str"], y=df_vix["close"], mode="lines",
-                                    line=dict(color="#FFD54F", width=2), name="VIX",
-                                ))
-                                fig_vix.update_layout(
-                                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                                    height=320, margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
-                                )
-                                fig_vix.update_xaxes(type="category", nticks=8)
-                                fig_vix.update_yaxes(title="VIX")
-                                st.plotly_chart(fig_vix, use_container_width=True)
-                                st.caption("% is last session open→close. Chart = last 3 trading sessions.")
-                    else:
-                        st.info("Skew data unavailable.")
-                else:
-                    st.info("API session needed for skew.")
-            with z_col:
-                zscore_analysis_fragment(mode="highlights")
+            g_oi, g_vol = st.tabs(["GEX / OI", "GEX / Volume"])
+            with g_oi:
+                st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 250), use_container_width=True, key="chart_gex_oi")
+            with g_vol:
+                st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 250), use_container_width=True, key="chart_gex_vol")
 
-        elif not df_chain.empty:
-            st.info("Key levels not available – GEX charts skipped.")
+            heading_ribbon(
+                "Δ-GEX (OI)",
+                "<b>Delta-weighted GEX</b> = Net GEX × average |Δ| at the strike.<br>"
+                "Far OTM wings shrink. White dash = index. Orange dot = zero-gamma flip.",
+            )
+            cols = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
+            fig_dg = plt_go.Figure()
+            fig_dg.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], marker_color=cols, width=25))
+            fig_dg.add_hline(y=0, line_color="#FFFFFF")
+            fig_dg.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
+            fig_dg.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800")
+            fig_dg.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                                 height=200, margin=dict(l=6, r=6, t=8, b=6), showlegend=False)
+            fig_dg.update_xaxes(range=[min_s, max_s])
+            st.plotly_chart(fig_dg, use_container_width=True, key="chart_delta_gex")
+        else:
+            st.info("GEX unavailable.")
 
-        # Basket Greeks ABOVE Strategy Basket Legs
+    # Book + tape
+    book_l, tape_r = st.columns(2)
+    with book_l:
+        heading_ribbon("📘 Perp Limit Book Δ", "Resting book size on BTC/ETH-PERPETUAL. Δ = this snap − last snap.")
+        book = data.get("perp_book") or {}
+        hist = update_liq_from_book(book, currency) if book else list(st.session_state.get("liq_delta_history") or [])
+        if hist:
+            last = hist[-1]
+            bids = [float(h.get("bid_change") or 0) for h in hist]
+            asks = [float(h.get("ask_change") or 0) for h in hist]
+            bid_s = float(np.std(bids, ddof=1)) if len(bids) > 8 else None
+            ask_s = float(np.std(asks, ddof=1)) if len(asks) > 8 else None
+            alert = classify_liq_alert(last["bid_change"], last["ask_change"], bid_s, ask_s)
+            bq, aq = last["bid_qty_lots"], last["ask_qty_lots"]
+            imb = (bq - aq) / (bq + aq) if (bq + aq) else 0
+            st.caption(f"Bid {bq:,.1f} / Ask {aq:,.1f} · Imb {imb:+.2f} · {alert['label']}")
+            times = [h["ts"].strftime("%H:%M:%S") if hasattr(h["ts"], "strftime") else str(h["ts"]) for h in hist]
+            fig = plt_go.Figure()
+            nets = [h["net_liq"] for h in hist]
+            fig.add_trace(plt_go.Bar(x=times, y=nets, marker_color=["#00E676" if v >= 0 else "#FF5252" for v in nets], opacity=0.7))
+            fig.add_trace(plt_go.Scatter(x=times, y=[h["bid_change"] for h in hist], name="Bid Δ", line=dict(color="#2196F3", width=1.5)))
+            fig.add_trace(plt_go.Scatter(x=times, y=[h["ask_change"] for h in hist], name="Ask Δ", line=dict(color="#FF9800", width=1.5)))
+            fig.add_hline(y=0, line_dash="dot", line_color="#FFF")
+            fig.update_layout(template="plotly_dark", height=170, margin=dict(l=4, r=4, t=4, b=24),
+                              paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", hovermode="x unified",
+                              legend=dict(orientation="h", y=-0.25, font=dict(size=9)))
+            fig.update_xaxes(type="category", nticks=5)
+            st.plotly_chart(fig, use_container_width=True, key="chart_liq_delta")
+        else:
+            st.caption("Enable Auto-Refresh to accumulate book snapshots.")
+
+    with tape_r:
+        heading_ribbon("📜 Perp tape (last prints)", "public/get_last_trades_by_instrument on the perpetual.")
+        trades = fetch_last_trades(PERP[currency], 40)
+        if trades:
+            rows = []
+            for t in trades:
+                rows.append({
+                    "Time": datetime.datetime.fromtimestamp(t["timestamp"] / 1000, tz=datetime.timezone.utc).astimezone(IST).strftime("%H:%M:%S"),
+                    "Side": (t.get("direction") or "—").upper(),
+                    "Px": t.get("price"),
+                    "Amt": t.get("amount"),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=170)
+        else:
+            st.caption("No trades returned.")
+
+    # VEX/CEX + IV
+    if not df_chain.empty:
         st.markdown("---")
-        render_basket_metrics_block(data)
-        render_basket_table_fullwidth(data)
+        d_left, d_right = st.columns([0.45, 0.55])
+        with d_left:
+            heading_ribbon(
+                "VEX / CEX",
+                "<b>VEX (vanna)</b> ≈ −pdf(d1)×d2/σ × OI — dealer vanna vs spot/IV.<br>"
+                "<b>CEX (charm)</b> ≈ ∂Δ/∂t × OI — delta decay into expiry.<br>"
+                "Positive often supports a pin; large negative supports acceleration.",
+            )
+            fig_vc = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_vc.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75), secondary_y=False)
+            fig_vc.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4)), secondary_y=True)
+            fig_vc.add_hline(y=0, line_color="#FFF")
+            fig_vc.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
+            fig_vc.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                 height=280, margin=dict(l=8, r=8, t=10, b=8), hovermode="x unified",
+                                 legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)))
+            st.plotly_chart(fig_vc, use_container_width=True, key="chart_vex_cex")
+        with d_right:
+            heading_ribbon(
+                f"IV SKEW  ·  {data.get('selected_expiry','')}",
+                "<b>OTM</b> — puts below spot + calls at/above (clean smile).<br>"
+                "<b>Raw</b> — full CE and PE IV curves.<br>"
+                "<b>DVOL</b> — Deribit volatility index (VIX analog).<br>"
+                "IV from Deribit mark_iv when present, else Brent inversion on USD premium.",
+            )
+            tab1, tab2, tab3 = st.tabs(["OTM Skew", "Raw CE vs PE", "DVOL"])
+            with tab1:
+                puts = df_chain[df_chain["Strike"] < data["spot_price"]][["Strike", "P_IV"]].rename(columns={"P_IV": "IV_%"})
+                calls = df_chain[df_chain["Strike"] >= data["spot_price"]][["Strike", "C_IV"]].rename(columns={"C_IV": "IV_%"})
+                skew = pd.concat([puts, calls]).sort_values("Strike")
+                fig_s = px.line(skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"])
+                fig_s.add_vline(x=data["spot_price"], line_dash="dash", line_color="white")
+                fig_s.update_layout(template="plotly_dark", height=260, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                    margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
+                st.plotly_chart(fig_s, use_container_width=True, key="chart_iv_otm")
+            with tab2:
+                raw = pd.concat([
+                    df_chain[["Strike", "C_IV"]].assign(Option_Type="C").rename(columns={"C_IV": "IV_%"}),
+                    df_chain[["Strike", "P_IV"]].assign(Option_Type="P").rename(columns={"P_IV": "IV_%"}),
+                ])
+                fig_r = px.line(raw, x="Strike", y="IV_%", color="Option_Type", markers=True,
+                                color_discrete_map={"C": "#00cc96", "P": "#ff4136"})
+                fig_r.add_vline(x=data["spot_price"], line_dash="dash", line_color="white")
+                fig_r.update_layout(template="plotly_dark", height=280, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                    margin=dict(l=10, r=10, t=20, b=10))
+                st.plotly_chart(fig_r, use_container_width=True, key="chart_iv_raw")
+            with tab3:
+                dv = data.get("dvol", pd.DataFrame())
+                if dv is None or dv.empty:
+                    st.info("DVOL series unavailable from Deribit volatility-index endpoint.")
+                else:
+                    last = float(dv["close"].iloc[-1])
+                    st.markdown(f"<div style='font-size:18px;font-weight:800;color:#FFD54F;'>{currency} DVOL {last:.2f}</div>", unsafe_allow_html=True)
+                    fig_v = plt_go.Figure()
+                    fig_v.add_trace(plt_go.Scatter(x=dv["time"], y=dv["close"], mode="lines", line=dict(color="#FFD54F", width=2)))
+                    fig_v.update_layout(template="plotly_dark", height=240, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                        margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
+                    st.plotly_chart(fig_v, use_container_width=True, key="chart_dvol")
+
+    # Basket
+    st.markdown("---")
+    heading_ribbon("🧺 Basket Greeks", "Δ Γ Θ Vega across legs × contracts. Premiums in USD (coin price × index).")
+    if not st.session_state.get("basket_legs"):
+        st.caption("No legs — add from the sidebar.")
+    else:
+        F_val = data.get("F", data["spot_price"])
+        T_val = data.get("T", 1e-5)
+        hv_val = data.get("index_hv", 0.55)
+        rows = []
+        tot = dict(pnl=0, delta=0, gamma=0, theta=0, vega=0)
+        by_k = {r["Strike"]: r for r in chain}
+        for i, leg in enumerate(st.session_state["basket_legs"]):
+            k, t, act, q = leg["strike"], leg["type"], leg["action"], leg["qty"]
+            rec = min(chain, key=lambda r: abs(r["Strike"] - k)) if chain else {}
+            ltp = rec.get("C_LTP" if t == "C" else "P_LTP", 0.0)
+            entry = leg["entry_price"] if leg["entry_price"] > 0 else ltp
+            iv = (rec.get("C_IV") if t == "C" else rec.get("P_IV", 0)) / 100.0 or hv_val
+            g = VolatilityEngine.calculate_greeks(F_val, k, T_val, r_rate, max(iv, 1e-4), "c" if t == "C" else "p")
+            mult = 1.0 if act == "BUY" else -1.0
+            pnl = ((ltp - entry) if act == "BUY" else (entry - ltp)) * q
+            rows.append({
+                "Leg": i + 1, "Action": act, "Strike": int(k), "Type": t, "Qty": q,
+                "Entry $": round(entry, 2), "Mark $": round(ltp, 2), "P&L $": round(pnl, 2),
+                "Δ": round(g["delta"] * q * mult, 3),
+                "γ": round(g["gamma"] * q * mult, 6),
+                "θ/d": round(g["theta"] * q * mult, 2),
+                "ν": round(g["vega"] * q * mult, 2),
+            })
+            tot["pnl"] += pnl
+            tot["delta"] += g["delta"] * q * mult
+            tot["gamma"] += g["gamma"] * q * mult
+            tot["theta"] += g["theta"] * q * mult
+            tot["vega"] += g["vega"] * q * mult
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("P&L $", f"{tot['pnl']:,.0f}")
+        m2.metric("Δ", f"{tot['delta']:,.2f}")
+        m3.metric("γ", f"{tot['gamma']:.6f}")
+        m4.metric("θ/d", f"{tot['theta']:,.1f}")
+        m5.metric("ν", f"{tot['vega']:,.1f}")
+        tbl, dels = st.columns([0.92, 0.08])
+        with tbl:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        with dels:
+            for i in range(len(st.session_state["basket_legs"])):
+                if st.button("✕", key=f"del_{i}"):
+                    st.session_state["basket_legs"].pop(i)
+                    st.rerun()
 
 
-live_dashboard_fragment()
+live_dashboard()
 
-# --- Full-width: Institutional Order Flow, then Raw Z-Score details ---
-st.markdown("---")
-institutional_order_flow_scanner_fragment()
-st.markdown("---")
-zscore_analysis_fragment(mode="raw")
-
-# Clear loading status once full UI has rendered
-try:
-    clear_load_status()
-except Exception:
-    pass
+st.caption(
+    "Data: Deribit public REST (`get_instruments`, `get_book_summary_by_currency`, "
+    "`get_tradingview_chart_data`, `get_order_book`, `get_last_trades_by_instrument`, "
+    "`get_volatility_index_data`, `get_index_price`). "
+    "Option marks are coin-denominated on Deribit and converted to USD via the index. "
+    "GEX sign convention matches the attached index desk (call γ×OI − put γ×OI). "
+    "Not exchange TBT. Not investment advice."
+)
