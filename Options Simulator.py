@@ -4264,7 +4264,7 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
-                tab_flow, tab_dex = st.tabs(["Futures · OBV · EFI · CVD", "Futures · DEX · Premium"])
+                tab_flow, tab_dex, tab_fp = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Effort vs Result"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
@@ -4334,6 +4334,60 @@ def live_dashboard_fragment():
                     if tape:
                         st.caption(f"DEX / premium · {sess_day} · {len(tape)} snaps")
                     st.plotly_chart(fig_dex, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tab_fp:
+                    lot = max(int(LOT_SIZES.get(Index_Name, 65)), 1)
+                    rng = (dfi["high"] - dfi["low"]).replace(0, np.nan)
+                    bar_cvd = dfi["cvd"].diff().fillna(dfi["cvd"])
+                    lots = (dfi["volume"].astype(float) / lot).clip(lower=0)
+                    # result: signed close vs open; effort: lots
+                    up = dfi["close"] >= dfi["open"]
+                    colors = np.where(up, "#00E676", "#FF5252")
+                    # absorption: high lots, small range vs session median
+                    med_r = float(rng.median()) if rng.notna().any() else 1.0
+                    med_l = float(lots.median()) if len(lots) else 1.0
+                    absorb = (lots >= 1.5 * med_l) & (rng <= 0.7 * med_r)
+                    fig_fp = plt_go.Figure()
+                    fig_fp.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
+                        line=dict(color="#90A4AE", width=1.2), hoverinfo="skip"))
+                    if "vwap" in dfi.columns:
+                        fig_fp.add_trace(plt_go.Scatter(
+                            x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
+                            line=dict(color="#FF9800", width=1.5), hoverinfo="skip"))
+                    sizes = (20 + 70 * (lots / max(float(lots.max()), 1.0))).clip(12, 90)
+                    cd = np.column_stack([lots, bar_cvd, rng.fillna(0)])
+                    fig_fp.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi["close"], mode="markers", name="Bar lots",
+                        marker=dict(size=sizes, color=colors, opacity=0.72),
+                        customdata=cd,
+                        hovertemplate="Lots %{customdata[0]:.0f}<br>ΔCVD %{customdata[1]:.0f}<br>Range %{customdata[2]:.1f}<br>Px %{y:.1f}<extra></extra>",
+                    ))
+                    if absorb.any():
+                        fig_fp.add_trace(plt_go.Scatter(
+                            x=dfi.loc[absorb, "time_str"], y=dfi.loc[absorb, "close"],
+                            mode="markers", name="Absorption",
+                            marker=dict(size=sizes[absorb.values] + 6, color="rgba(0,0,0,0)",
+                                        line=dict(width=2, color="#FFD54F")),
+                            hoverinfo="skip",
+                        ))
+                    fig_fp.update_layout(
+                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                        height=520, margin=dict(l=40, r=8, t=8, b=18),
+                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                        hovermode="closest",
+                    )
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    heading_ribbon(
+                        "Effort vs result (not footprint)",
+                        "SmartAPI has no bid/ask volume-at-price.<br>"
+                        "Bubble <b>size</b> = futures bar volume / lot.<br>"
+                        "Green = close ≥ open · Red = close < open.<br>"
+                        "Gold ring = absorption: lots ≥ 1.5× median and range ≤ 0.7× median range "
+                        "(effort without result → fade risk).<br>"
+                        "Big bubble + large range in same direction → effort is moving price (breakout risk).",
+                    )
+                    st.plotly_chart(fig_fp, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                 cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
                 if vp.get("ok"):
