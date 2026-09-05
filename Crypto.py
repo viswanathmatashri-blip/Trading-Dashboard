@@ -110,7 +110,12 @@ hr { margin: 0.25rem 0 !important; }
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DERIBIT = "https://www.deribit.com/api/v2"
+DERIBIT_HOSTS = (
+    "https://www.deribit.com/api/v2",
+    "https://www.deribit.com/api/v2",
+)
+DERIBIT = DERIBIT_HOSTS[0]
+LAST_API_ERROR = ""
 TZ = pytz.timezone("UTC")
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -166,16 +171,36 @@ _HTTP.headers.update({"User-Agent": "crypto-gex-dashboard/1.0"})
 
 
 def deribit_get(method: str, params: dict | None = None, timeout: int = 20):
-    url = f"{DERIBIT}/{method}"
-    try:
-        r = _HTTP.get(url, params=params or {}, timeout=timeout)
-        r.raise_for_status()
-        js = r.json()
-        if "error" in js and js["error"]:
-            return None
-        return js.get("result")
-    except Exception:
-        return None
+    """Public GET with retry. Does not cache 503 / maintenance as success."""
+    global LAST_API_ERROR
+    last = None
+    for attempt in range(3):
+        for base in DERIBIT_HOSTS:
+            url = f"{base}/{method}"
+            try:
+                r = _HTTP.get(url, params=params or {}, timeout=timeout)
+                try:
+                    js = r.json()
+                except Exception:
+                    last = f"HTTP {r.status_code} non-JSON"
+                    continue
+                err = js.get("error")
+                if err:
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    LAST_API_ERROR = f"Deribit: {msg}"
+                    last = LAST_API_ERROR
+                    if str(msg) == "system_maintenance" or r.status_code in (503, 429):
+                        time.sleep(0.6 * (attempt + 1))
+                        continue
+                    return None
+                LAST_API_ERROR = ""
+                return js.get("result")
+            except Exception as e:
+                last = str(e)
+                continue
+        time.sleep(0.4 * (attempt + 1))
+    LAST_API_ERROR = last or "Deribit unreachable"
+    return None
 
 
 def heading_ribbon(title: str, tip_html: str, size: int = 12):
@@ -629,18 +654,43 @@ def calculate_support_resistance_targets(chain, spot, max_pain):
 # ---------------------------------------------------------------------------
 # Deribit data
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_instruments(currency: str) -> pd.DataFrame:
+@st.cache_data(ttl=180, show_spinner=False)
+def _fetch_instruments_ok(currency: str) -> pd.DataFrame:
     res = deribit_get("public/get_instruments", {"currency": currency, "kind": "option", "expired": "false"})
     if not res:
-        return pd.DataFrame()
+        raise RuntimeError(LAST_API_ERROR or "no instruments")
     df = pd.DataFrame(res)
     if df.empty:
-        return df
+        raise RuntimeError("empty instrument list")
     df["expiry_dt"] = pd.to_datetime(df["expiration_timestamp"], unit="ms", utc=True)
     df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
     df["opt_type"] = df["option_type"].str.lower().map({"call": "C", "put": "P"})
     return df
+
+
+def fetch_instruments(currency: str) -> pd.DataFrame:
+    try:
+        return _fetch_instruments_ok(currency)
+    except Exception:
+        try:
+            _fetch_instruments_ok.clear()
+        except Exception:
+            pass
+        return pd.DataFrame()
+
+
+def _coingecko_spot(currency: str) -> float:
+    ids = {"BTC": "bitcoin", "ETH": "ethereum"}
+    try:
+        r = _HTTP.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ids.get(currency, "bitcoin"), "vs_currencies": "usd"},
+            timeout=10,
+        )
+        js = r.json()
+        return float(js[ids[currency]]["usd"])
+    except Exception:
+        return 0.0
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -651,7 +701,7 @@ def fetch_index_price(currency: str) -> float:
     t = deribit_get("public/ticker", {"instrument_name": PERP[currency]})
     if t:
         return float(t.get("index_price") or t.get("last_price") or 0)
-    return 0.0
+    return _coingecko_spot(currency)
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -1108,8 +1158,18 @@ st.sidebar.caption("Public Deribit REST · no API key")
 currency = st.sidebar.selectbox("Underlying", ["BTC", "ETH"])
 r_rate = st.sidebar.number_input("Risk-free rate (r)", 0.0, 0.15, 0.04, 0.01)
 
+if st.sidebar.button("↻ Refresh instruments", use_container_width=True):
+    try:
+        _fetch_instruments_ok.clear()
+        fetch_index_price.clear()
+    except Exception:
+        pass
+    st.rerun()
+
 inst_df = fetch_instruments(currency)
 spot_live = fetch_index_price(currency)
+if inst_df.empty:
+    st.sidebar.warning(LAST_API_ERROR or "Deribit instruments unavailable")
 
 expiries = []
 if not inst_df.empty:
@@ -1237,7 +1297,13 @@ if run_btn or "data_store" not in st.session_state:
         if bundle:
             st.session_state["data_store"] = bundle
         elif "data_store" not in st.session_state:
-            st.error("Could not reach Deribit public API or no chain for this expiry. Retry.")
+            why = LAST_API_ERROR or "no chain for this expiry"
+            st.error(
+                f"Deribit public API failed: **{why}**.\n\n"
+                "If the message is `system_maintenance`, Deribit is down globally "
+                "(HTTP 503) — not a Render env-var problem. Wait and click "
+                "**↻ Refresh instruments** in the sidebar."
+            )
             st.stop()
 
 
