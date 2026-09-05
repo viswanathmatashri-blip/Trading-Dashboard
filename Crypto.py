@@ -68,23 +68,40 @@ st.markdown(
 .stApp { opacity: 1 !important; }
 [data-testid="stStatusWidget"], .stSpinner { display: none !important; }
 html, body, [data-testid="stAppViewContainer"] { background-color: #0E1117 !important; color: #FAFAFA !important; }
-section[data-testid="stSidebar"] { width: 310px !important; }
-.block-container { padding-top: 0.6rem !important; padding-bottom: 0.6rem !important; }
-header[data-testid="stHeader"] { background-color: rgba(0,0,0,0) !important; }
-h1, h2, h3, .custom-heading { color: #00E676 !important; font-size: 18px !important; font-weight: 700 !important; }
-div[data-testid="stMetricValue"] { font-size: 15px !important; color: #00E676 !important; }
+section[data-testid="stSidebar"] { width: 280px !important; }
+.block-container { padding-top: 0.25rem !important; padding-bottom: 0.25rem !important; padding-left: 0.8rem !important; padding-right: 0.8rem !important; max-width: 100% !important; }
+header[data-testid="stHeader"] { background-color: rgba(0,0,0,0) !important; height: 2.2rem !important; }
+h1, h2, h3, .custom-heading { color: #00E676 !important; font-size: 15px !important; font-weight: 700 !important; margin: 0 !important; }
+div[data-testid="stMetricValue"] { font-size: 13px !important; color: #00E676 !important; }
+div[data-testid="stMetricLabel"] { font-size: 10px !important; }
+div[data-testid="stVerticalBlock"] > div { gap: 0.2rem !important; }
+div[data-testid="stHorizontalBlock"] { gap: 0.35rem !important; }
+.stMarkdown { margin-bottom: 0 !important; }
+hr { margin: 0.25rem 0 !important; }
 .status-badge { padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; display: inline-block; margin-right: 6px; }
 .badge-bullish { background-color: rgba(0,230,118,0.15); color: #00E676; border: 1px solid #00E676; }
 .badge-bearish { background-color: rgba(255,82,82,0.15); color: #FF5252; border: 1px solid #FF5252; }
 .badge-neutral { background-color: rgba(255,152,0,0.15); color: #FF9800; border: 1px solid #FF9800; }
-.sticky-summary { position: sticky; top: 0; z-index: 999; background: #0E1117; border: 1px solid #2A2F3A; border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; }
-.micro-hover { position: relative; display: block; cursor: help; }
-.micro-hover .micro-tip { display: none; position: absolute; left: 104%; top: 0; z-index: 4000; width: 340px; max-width: 42vw; background: #1A1F2B; color: #FAFAFA; border: 1px solid #00E676; border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.4; }
+.sticky-summary { position: sticky; top: 0; z-index: 999; background: #0E1117; border: 1px solid #2A2F3A; border-radius: 6px; padding: 4px 8px; margin-bottom: 4px; }
+.micro-hover { position: relative; display: inline-block; cursor: help; }
+.micro-hover .micro-tip {
+    display: none; position: absolute; left: 0; top: calc(100% + 4px);
+    z-index: 5000; width: 360px; max-width: 70vw;
+    background: #1A1F2B; color: #FAFAFA; border: 1px solid #00E676;
+    border-radius: 8px; padding: 10px 12px; font-size: 12px; line-height: 1.45;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.55);
+}
 .micro-hover:hover .micro-tip { display: block; }
-.micro-chip { display: block; margin: 0 auto 6px auto; padding: 6px 8px; background: #1A1F2B; border: 1px solid #3A4150; border-radius: 8px; width: 218px; text-align: center; }
-.micro-float { position: relative; z-index: 25; margin-top: -355px; margin-bottom: 8px; margin-left: auto; margin-right: 2px; width: 200px; text-align: center; }
-.chart-card { background: #11151C; border: 1px solid #2A3340; border-radius: 10px; padding: 8px 8px 4px 8px; margin: 0 0 8px 0; }
-.chart-card .card-title { color: #8FA4B8; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; margin: 0 0 4px 2px; }
+.peco-bar {
+    display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px;
+    margin: 4px 0 6px 0; padding: 6px 8px;
+    background: #11151C; border: 1px solid #2A3340; border-radius: 8px;
+}
+.peco-chip {
+    flex: 1 1 140px; min-width: 140px; text-align: left;
+    padding: 6px 8px; background: #1A1F2B; border: 1px solid #3A4150; border-radius: 8px;
+}
+.chart-card { background: #11151C; border: 1px solid #2A3340; border-radius: 8px; padding: 4px 6px 2px 6px; margin: 0 0 4px 0; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -150,11 +167,13 @@ def deribit_get(method: str, params: dict | None = None, timeout: int = 20):
         return None
 
 
-def heading_ribbon(title: str, tip_html: str, size: int = 13):
+def heading_ribbon(title: str, tip_html: str, size: int = 12):
+    """Named hover ribbon — title always visible, definition expands on hover."""
     st.markdown(
-        f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
-        f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;margin:0 0 4px 0;'>"
+        f"<div class='micro-hover' style='padding:2px 8px;background:#1A1F2B;"
+        f"border:1px solid #3A4150;border-radius:6px;margin:0 0 3px 0;'>"
         f"<span style='font-weight:700;color:#00E676;font-size:{size}px;'>{title}</span>"
+        f"<span style='color:#667;font-size:10px;margin-left:6px;'>hover</span>"
         f"<div class='micro-tip'>{tip_html}</div></div>",
         unsafe_allow_html=True,
     )
@@ -1372,7 +1391,7 @@ def live_dashboard():
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper", line=dict(color="rgba(33,150,243,0.5)", width=1)))
             fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_lower"], mode="lines", name="BB Lower", line=dict(color="rgba(33,150,243,0.5)", width=1), fill="tonexty", fillcolor="rgba(33,150,243,0.05)"))
             fig_px.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                                 height=320, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+                                 height=220, margin=dict(l=8, r=8, t=12, b=8), hovermode="x unified",
                                  legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
                                  yaxis=dict(range=[min_p - pad, max_p + pad]), xaxis=dict(type="category", nticks=8))
             st.plotly_chart(fig_px, use_container_width=True)
@@ -1386,25 +1405,38 @@ def live_dashboard():
             fig_ind.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=2, col=1)
             fig_ind.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=2, col=1)
             fig_ind.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                                  height=320, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+                                  height=220, margin=dict(l=8, r=8, t=12, b=8), hovermode="x unified",
                                   legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)))
             fig_ind.update_xaxes(type="category", nticks=6)
             st.plotly_chart(fig_ind, use_container_width=True)
 
-    st.markdown("---")
     left_col, right_col = st.columns([0.70, 0.30])
 
     with left_col:
-        heading_ribbon(
-            f"📉 {currency}-PERPETUAL + VWAP + VP",
-            "<b>VWAP</b> = Σ(TP×V)/ΣV, TP=(H+L+C)/3.<br><b>VP</b> volume-by-price · POC / VA / HVN / LVN.",
-        )
-        basis = data.get("basis_info") or {}
-        if basis.get("basis") is not None:
-            bc = "#00E676" if basis["basis"] >= 0 else "#FF5252"
-            st.markdown(f"Basis: <span style='color:{bc};font-weight:800;'>{basis['basis']:+.1f}</span>", unsafe_allow_html=True)
-
-        sigma_mult = st.selectbox("VWAP Bands", [1.0, 1.5, 2.0], index=1, format_func=lambda x: f"±{x}σ", key="vwap_sigma")
+        hdr1, hdr2, hdr3 = st.columns([0.52, 0.20, 0.28])
+        with hdr1:
+            heading_ribbon(
+                f"PERP · VWAP · VP  ({currency})",
+                "<b>PERP</b> — Deribit perpetual last.<br>"
+                "<b>VWAP</b> — session Σ(TP×Vol)/ΣVol, TP=(H+L+C)/3. Orange line + ±σ bands.<br>"
+                "<b>VP</b> — volume-at-price histogram (right). Yellow bar = POC.<br>"
+                "<b>Basis</b> — Perp − Index. Contango +, backwardation −.",
+            )
+        with hdr2:
+            basis = data.get("basis_info") or {}
+            if basis.get("basis") is not None:
+                bc = "#00E676" if basis["basis"] >= 0 else "#FF5252"
+                st.markdown(
+                    f"<div style='font-size:12px;padding-top:2px;'>Basis "
+                    f"<span style='color:{bc};font-weight:800;'>{basis['basis']:+.1f}</span></div>",
+                    unsafe_allow_html=True,
+                )
+        with hdr3:
+            sigma_mult = st.selectbox(
+                "VWAP bands", [1.0, 1.5, 2.0], index=1,
+                format_func=lambda x: f"±{x}σ", key="vwap_sigma",
+                label_visibility="collapsed",
+            )
         if df_fut is not None and not df_fut.empty:
             dfi = df_fut.tail(300).copy().reset_index(drop=True)
             dfi["tp"] = (dfi["high"] + dfi["low"] + dfi["close"]) / 3.0
@@ -1437,9 +1469,9 @@ def live_dashboard():
             y1 = float(max(dfi["close"].max(), dfi["vwap_upper"].max())) * 1.002
 
             fig_stack = make_subplots(
-                rows=4, cols=2, column_widths=[0.84, 0.16],
-                row_heights=[0.46, 0.16, 0.16, 0.22],
-                shared_xaxes=True, horizontal_spacing=0.01, vertical_spacing=0.018,
+                rows=4, cols=2, column_widths=[0.86, 0.14],
+                row_heights=[0.48, 0.16, 0.16, 0.20],
+                shared_xaxes=True, horizontal_spacing=0.008, vertical_spacing=0.012,
                 specs=[[{}, {}], [{}, None], [{}, None], [{}, None]],
             )
             fig_stack.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["vwap_upper"], mode="lines", showlegend=False, hoverinfo="skip",
@@ -1466,31 +1498,73 @@ def live_dashboard():
                                                line=dict(color="#00E676" if cvd_last >= 0 else "#FF5252", width=1.8), fill="tozeroy"), row=4, col=1)
             for rr in (2, 3, 4):
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=rr, col=1)
-            fig_stack.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                                    height=620, margin=dict(l=40, r=6, t=8, b=18), hovermode="x unified")
-            fig_stack.update_yaxes(range=[y0, y1], row=1, col=1)
+            fig_stack.update_layout(
+                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                height=480, margin=dict(l=36, r=4, t=4, b=12), hovermode="x unified",
+                legend=dict(orientation="h", y=1.02, x=0, font=dict(size=9)),
+            )
+            fig_stack.update_yaxes(range=[y0, y1], title_text="PX", title_font=dict(size=9), tickfont=dict(size=8), row=1, col=1)
             fig_stack.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
-            fig_stack.update_xaxes(type="category", nticks=8, row=4, col=1)
+            fig_stack.update_yaxes(title_text="OBV", title_font=dict(size=9), tickfont=dict(size=8), row=2, col=1)
+            fig_stack.update_yaxes(title_text="EFI13", title_font=dict(size=9), tickfont=dict(size=8), row=3, col=1)
+            fig_stack.update_yaxes(title_text="CVD", title_font=dict(size=9), tickfont=dict(size=8), row=4, col=1)
+            fig_stack.update_xaxes(type="category", nticks=8, tickfont=dict(size=8), row=4, col=1)
             st.plotly_chart(fig_stack, use_container_width=True)
             cap = f"Perp {float(dfi['close'].iloc[-1]):,.1f} · VWAP {float(dfi['vwap'].iloc[-1]):,.1f} · CVD {cvd_last:,.0f}"
             if vp.get("ok"):
-                cap += f" · POC {vp['poc']:.0f}"
+                cap += f" · POC {vp['poc']:.0f} · VA {vp['val1']:.0f}–{vp['vah1']:.0f}"
             st.caption(cap)
 
+            # PECO trigger sits directly under VP / price stack
             micro = classify_microstructure(dfi)
-            if micro.get("ok"):
-                st.markdown(
-                    f"<div class='micro-chip'><div style='color:#00E676;font-weight:800;font-size:12px;'>"
-                    f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} "
-                    f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}<br>{micro['action']}</div></div>",
-                    unsafe_allow_html=True,
-                )
-                st.caption(micro["micro"])
+            trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
+            peco_arrows = (
+                f"P{ARROW_GLYPH[micro.get('price','f')]} "
+                f"E{ARROW_GLYPH[micro.get('efi','f')]} "
+                f"C{ARROW_GLYPH[micro.get('cvd','f')]} "
+                f"O{ARROW_GLYPH[micro.get('obv','f')]}"
+            )
+            act_col = "#00E676" if "LONG" in str(micro.get("action", "")) else (
+                "#FF5252" if "SHORT" in str(micro.get("action", "")) else "#FF9800"
+            )
+            tcol = (trig or {}).get("colour", "#FF9800")
+            st.markdown(
+                f"<div class='peco-bar'>"
+                f"<div class='micro-hover peco-chip'>"
+                f"<div style='color:#8FA4B8;font-size:10px;font-weight:700;letter-spacing:.04em;'>PECO TRIGGER</div>"
+                f"<div style='color:{act_col};font-weight:800;font-size:13px;'>{peco_arrows}</div>"
+                f"<div style='color:#EEE;font-size:11px;font-weight:700;'>{micro.get('action','NO ENTRY')}</div>"
+                f"<div class='micro-tip'><b>PECO = Price · EFI · CVD · OBV</b><br>"
+                f"{micro.get('micro','')}<br>{micro.get('efi_note','')}<br>"
+                f"↑ up · → flat · ↓ down. EFI≈0 uses the 27-state book.</div></div>"
+                f"<div class='micro-hover peco-chip'>"
+                f"<div style='color:#8FA4B8;font-size:10px;font-weight:700;letter-spacing:.04em;'>SUPERHUMAN</div>"
+                f"<div style='color:{scores.get('colour','#FF9800') if isinstance(scores, dict) else '#FF9800'};font-weight:800;font-size:13px;'>"
+                f"{scores.get('bias','—') if isinstance(scores, dict) else '—'} "
+                f"({scores.get('composite',0):+.0f})</div>"
+                f"<div style='color:#AAA;font-size:11px;'>{scores.get('clarity','') if isinstance(scores, dict) else ''}</div>"
+                f"<div class='micro-tip'>Quiet+long γ → PIN · big range+long γ → REVERSION · "
+                f"short γ / wall break → TREND · |C|≤15 → NO EDGE.</div></div>"
+                f"<div class='micro-hover peco-chip'>"
+                f"<div style='color:#8FA4B8;font-size:10px;font-weight:700;letter-spacing:.04em;'>DIR TRIGGER</div>"
+                f"<div style='color:{tcol};font-weight:800;font-size:13px;'>{(trig or {}).get('trigger','NO TRIGGER')}</div>"
+                f"<div style='color:#AAA;font-size:11px;'>{(trig or {}).get('summary','')}</div>"
+                f"<div class='micro-tip'>LONG = ≥3 of GEX/VWAP/OBV/CVD bullish AND EFI&gt;0.<br>"
+                f"SHORT = ≥3 bearish AND EFI&lt;0.</div></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
         else:
             st.info("Perp candles unavailable.")
 
     with right_col:
-        heading_ribbon("📈 GEX vs OI / Volume", "GEX = (Call_γ − Put_γ) × OI × contract × S² × 0.01")
+        heading_ribbon(
+            "GEX / OI  ·  GEX / Volume",
+            "<b>GEX</b> = (Call γ × Call OI − Put γ × Put OI) × 1 coin × S² × 0.01.<br>"
+            "Green net bar = long-gamma pin. Red = short-gamma accelerator.<br>"
+            "Left axis: call OI up / put OI down. Right axis: net GEX $.<br>"
+            "<b>Volume tab</b> swaps session volume for OI — today's prints, not inventory.",
+        )
         if not df_chain.empty:
             min_s = float(df_chain["Strike"].min()) - 200
             max_s = float(df_chain["Strike"].max()) + 200
@@ -1510,11 +1584,15 @@ def live_dashboard():
 
             g_oi, g_vol = st.tabs(["GEX / OI", "GEX / Volume"])
             with g_oi:
-                st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 340), use_container_width=True)
+                st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 250), use_container_width=True)
             with g_vol:
-                st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 340), use_container_width=True)
+                st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 250), use_container_width=True)
 
-            heading_ribbon("🎯 Δ-GEX (OI)", "GEX × |Δ| so far-OTM wings are down-weighted.")
+            heading_ribbon(
+                "Δ-GEX (OI)",
+                "<b>Delta-weighted GEX</b> = Net GEX × average |Δ| at the strike.<br>"
+                "Far OTM wings shrink. White dash = index. Orange dot = zero-gamma flip.",
+            )
             cols = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
             fig_dg = plt_go.Figure()
             fig_dg.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], marker_color=cols, width=25))
@@ -1522,7 +1600,7 @@ def live_dashboard():
             fig_dg.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
             fig_dg.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800")
             fig_dg.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                                 height=260, margin=dict(l=8, r=8, t=18, b=8), showlegend=False)
+                                 height=200, margin=dict(l=6, r=6, t=8, b=6), showlegend=False)
             fig_dg.update_xaxes(range=[min_s, max_s])
             st.plotly_chart(fig_dg, use_container_width=True)
         else:
@@ -1551,7 +1629,7 @@ def live_dashboard():
             fig.add_trace(plt_go.Scatter(x=times, y=[h["bid_change"] for h in hist], name="Bid Δ", line=dict(color="#2196F3", width=1.5)))
             fig.add_trace(plt_go.Scatter(x=times, y=[h["ask_change"] for h in hist], name="Ask Δ", line=dict(color="#FF9800", width=1.5)))
             fig.add_hline(y=0, line_dash="dot", line_color="#FFF")
-            fig.update_layout(template="plotly_dark", height=220, margin=dict(l=4, r=4, t=4, b=28),
+            fig.update_layout(template="plotly_dark", height=170, margin=dict(l=4, r=4, t=4, b=24),
                               paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", hovermode="x unified",
                               legend=dict(orientation="h", y=-0.25, font=dict(size=9)))
             fig.update_xaxes(type="category", nticks=5)
@@ -1571,7 +1649,7 @@ def live_dashboard():
                     "Px": t.get("price"),
                     "Amt": t.get("amount"),
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=220)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=170)
         else:
             st.caption("No trades returned.")
 
@@ -1580,18 +1658,29 @@ def live_dashboard():
         st.markdown("---")
         d_left, d_right = st.columns([0.45, 0.55])
         with d_left:
-            heading_ribbon("⚡ VEX / CEX Profile", "VEX = vanna × OI · CEX = charm × OI. Same construct as the index desk.")
+            heading_ribbon(
+                "VEX / CEX",
+                "<b>VEX (vanna)</b> ≈ −pdf(d1)×d2/σ × OI — dealer vanna vs spot/IV.<br>"
+                "<b>CEX (charm)</b> ≈ ∂Δ/∂t × OI — delta decay into expiry.<br>"
+                "Positive often supports a pin; large negative supports acceleration.",
+            )
             fig_vc = make_subplots(specs=[[{"secondary_y": True}]])
             fig_vc.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75), secondary_y=False)
             fig_vc.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4)), secondary_y=True)
             fig_vc.add_hline(y=0, line_color="#FFF")
             fig_vc.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
             fig_vc.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                                 height=420, margin=dict(l=10, r=10, t=20, b=10), hovermode="x unified",
+                                 height=280, margin=dict(l=8, r=8, t=10, b=8), hovermode="x unified",
                                  legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)))
             st.plotly_chart(fig_vc, use_container_width=True)
         with d_right:
-            heading_ribbon(f"📉 IV Skew ({data.get('selected_expiry','')})", "Mark IV from Deribit when present, else Brent BS inversion on USD premium.")
+            heading_ribbon(
+                f"IV SKEW  ·  {data.get('selected_expiry','')}",
+                "<b>OTM</b> — puts below spot + calls at/above (clean smile).<br>"
+                "<b>Raw</b> — full CE and PE IV curves.<br>"
+                "<b>DVOL</b> — Deribit volatility index (VIX analog).<br>"
+                "IV from Deribit mark_iv when present, else Brent inversion on USD premium.",
+            )
             tab1, tab2, tab3 = st.tabs(["OTM Skew", "Raw CE vs PE", "DVOL"])
             with tab1:
                 puts = df_chain[df_chain["Strike"] < data["spot_price"]][["Strike", "P_IV"]].rename(columns={"P_IV": "IV_%"})
@@ -1599,7 +1688,7 @@ def live_dashboard():
                 skew = pd.concat([puts, calls]).sort_values("Strike")
                 fig_s = px.line(skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"])
                 fig_s.add_vline(x=data["spot_price"], line_dash="dash", line_color="white")
-                fig_s.update_layout(template="plotly_dark", height=360, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                fig_s.update_layout(template="plotly_dark", height=260, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                                     margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
                 st.plotly_chart(fig_s, use_container_width=True)
             with tab2:
@@ -1610,7 +1699,7 @@ def live_dashboard():
                 fig_r = px.line(raw, x="Strike", y="IV_%", color="Option_Type", markers=True,
                                 color_discrete_map={"C": "#00cc96", "P": "#ff4136"})
                 fig_r.add_vline(x=data["spot_price"], line_dash="dash", line_color="white")
-                fig_r.update_layout(template="plotly_dark", height=360, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                fig_r.update_layout(template="plotly_dark", height=280, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                                     margin=dict(l=10, r=10, t=20, b=10))
                 st.plotly_chart(fig_r, use_container_width=True)
             with tab3:
@@ -1622,7 +1711,7 @@ def live_dashboard():
                     st.markdown(f"<div style='font-size:18px;font-weight:800;color:#FFD54F;'>{currency} DVOL {last:.2f}</div>", unsafe_allow_html=True)
                     fig_v = plt_go.Figure()
                     fig_v.add_trace(plt_go.Scatter(x=dv["time"], y=dv["close"], mode="lines", line=dict(color="#FFD54F", width=2)))
-                    fig_v.update_layout(template="plotly_dark", height=320, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    fig_v.update_layout(template="plotly_dark", height=240, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                                         margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
                     st.plotly_chart(fig_v, use_container_width=True)
 
