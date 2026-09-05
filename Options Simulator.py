@@ -2155,7 +2155,9 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             "fut_fallback_msg": fut_fallback_msg,
             "chain_results": chain_results, "market_data": market_data, "basket_tokens_info": basket_tokens_info,
             "is_holiday_fallback": is_holiday_fallback,
-            "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST")
+            "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST"),
+            "bar_tf": selected_interval_label,
+            "fut_bars": 0 if df_futures is None else int(len(df_futures)),
         }
 
     except Exception:
@@ -3702,10 +3704,14 @@ def live_dashboard_fragment():
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
 
-    if st.session_state.get("enable_main_refresh", False):
-        refreshed_data = fetch_live_data(st.session_state["selected_timeframe"])
+    want_tf = st.session_state.get("selected_timeframe", "5 min")
+    stored = st.session_state.get("data_store") or {}
+    need_tf = stored.get("bar_tf") != want_tf
+    if st.session_state.get("enable_main_refresh", False) or need_tf:
+        refreshed_data = fetch_live_data(want_tf)
         if refreshed_data:
             refreshed_data["selected_expiry"] = selected_expiry_str
+            refreshed_data["bar_tf"] = want_tf
             st.session_state["data_store"] = refreshed_data
 
     data = st.session_state["data_store"]
@@ -3991,6 +3997,24 @@ def live_dashboard_fragment():
         df_fchart = pd.DataFrame()
         fut_times = []
         latest_session = None
+        want_tf = st.session_state.get("selected_timeframe", "5 min")
+        tf_min = {"3 min": 3, "5 min": 5, "15 min": 15, "1 min": 1, "10 min": 10}.get(want_tf, 5)
+        if not df_fut.empty and "time" in df_fut.columns and len(df_fut) >= 8:
+            try:
+                t = series_to_ist(df_fut["time"])
+                dt = t.diff().dt.total_seconds().median()
+                if pd.notna(dt) and dt > 0 and abs(dt/60.0 - tf_min) > 1.5 and tf_min >= 5 and dt/60.0 < tf_min:
+                    g = df_fut.copy()
+                    g["time"] = t
+                    g = g.set_index("time").sort_index()
+                    ohlc = g.resample(f"{tf_min}min").agg({
+                        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
+                    }).dropna(subset=["close"])
+                    if len(ohlc) >= 5:
+                        df_fut = ohlc.reset_index()
+                        data["df_futures"] = df_fut
+            except Exception:
+                pass
         if not df_fut.empty and len(df_fut) >= 1:
             df_fchart, latest_session, _ = pick_last_nse_session(df_fut, min_bars=20, prefer_today=True)
             if df_fchart.empty:
@@ -4411,7 +4435,8 @@ def live_dashboard_fragment():
                     )
                     st.plotly_chart(fig_fp, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
-                cap = f"Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}"
+                cap = (f"{st.session_state.get('selected_timeframe','?')} · "
+                       f"{len(dfi)} bars · Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}")
                 if vp.get("ok"):
                     cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
                 st.caption(cap)
