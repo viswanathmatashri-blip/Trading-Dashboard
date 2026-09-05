@@ -1405,7 +1405,7 @@ def live_dashboard():
                                  height=220, margin=dict(l=8, r=8, t=12, b=8), hovermode="x unified",
                                  legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
                                  yaxis=dict(range=[min_p - pad, max_p + pad]), xaxis=dict(type="category", nticks=8))
-            st.plotly_chart(fig_px, use_container_width=True)
+            st.plotly_chart(fig_px, use_container_width=True, key="chart_spot_bb")
         with tech_right:
             fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.55, 0.45])
             colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
@@ -1419,7 +1419,7 @@ def live_dashboard():
                                   height=220, margin=dict(l=8, r=8, t=12, b=8), hovermode="x unified",
                                   legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)))
             fig_ind.update_xaxes(type="category", nticks=6)
-            st.plotly_chart(fig_ind, use_container_width=True)
+            st.plotly_chart(fig_ind, use_container_width=True, key="chart_macd_rsi")
 
     left_col, right_col = st.columns([0.70, 0.30])
 
@@ -1559,7 +1559,7 @@ def live_dashboard():
                 categoryarray=dfi["time_str"].tolist(),
                 nticks=8, tickfont=dict(size=8), row=4, col=1,
             )
-            st.plotly_chart(fig_stack, use_container_width=True)
+            st.plotly_chart(fig_stack, use_container_width=True, key="chart_perp_stack")
             cap = (
                 f"IST · Perp {float(dfi['close'].iloc[-1]):,.1f} · VWAP {float(dfi['vwap'].iloc[-1]):,.1f} "
                 f"· CVD {cvd_last:,.0f}"
@@ -1637,9 +1637,9 @@ def live_dashboard():
 
             g_oi, g_vol = st.tabs(["GEX / OI", "GEX / Volume"])
             with g_oi:
-                st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 250), use_container_width=True)
+                st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 250), use_container_width=True, key="chart_gex_oi")
             with g_vol:
-                st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 250), use_container_width=True)
+                st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 250), use_container_width=True, key="chart_gex_vol")
 
             heading_ribbon(
                 "Δ-GEX (OI)",
@@ -1655,7 +1655,7 @@ def live_dashboard():
             fig_dg.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
                                  height=200, margin=dict(l=6, r=6, t=8, b=6), showlegend=False)
             fig_dg.update_xaxes(range=[min_s, max_s])
-            st.plotly_chart(fig_dg, use_container_width=True)
+            st.plotly_chart(fig_dg, use_container_width=True, key="chart_delta_gex")
         else:
             st.info("GEX unavailable.")
 
@@ -1686,7 +1686,7 @@ def live_dashboard():
                               paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", hovermode="x unified",
                               legend=dict(orientation="h", y=-0.25, font=dict(size=9)))
             fig.update_xaxes(type="category", nticks=5)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="chart_liq_delta")
         else:
             st.caption("Enable Auto-Refresh to accumulate book snapshots.")
 
@@ -1725,7 +1725,7 @@ def live_dashboard():
             fig_vc.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                                  height=280, margin=dict(l=8, r=8, t=10, b=8), hovermode="x unified",
                                  legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)))
-            st.plotly_chart(fig_vc, use_container_width=True)
+            st.plotly_chart(fig_vc, use_container_width=True, key="chart_vex_cex")
         with d_right:
             heading_ribbon(
                 f"IV SKEW  ·  {data.get('selected_expiry','')}",
@@ -1743,7 +1743,7 @@ def live_dashboard():
                 fig_s.add_vline(x=data["spot_price"], line_dash="dash", line_color="white")
                 fig_s.update_layout(template="plotly_dark", height=260, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                                     margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
-                st.plotly_chart(fig_s, use_container_width=True)
+                st.plotly_chart(fig_s, use_container_width=True, key="chart_iv_otm")
             with tab2:
                 raw = pd.concat([
                     df_chain[["Strike", "C_IV"]].assign(Option_Type="C").rename(columns={"C_IV": "IV_%"}),
@@ -1754,7 +1754,7 @@ def live_dashboard():
                 fig_r.add_vline(x=data["spot_price"], line_dash="dash", line_color="white")
                 fig_r.update_layout(template="plotly_dark", height=280, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                                     margin=dict(l=10, r=10, t=20, b=10))
-                st.plotly_chart(fig_r, use_container_width=True)
+                st.plotly_chart(fig_r, use_container_width=True, key="chart_iv_raw")
             with tab3:
                 dv = data.get("dvol", pd.DataFrame())
                 if dv is None or dv.empty:
@@ -1766,7 +1766,7 @@ def live_dashboard():
                     fig_v.add_trace(plt_go.Scatter(x=dv["time"], y=dv["close"], mode="lines", line=dict(color="#FFD54F", width=2)))
                     fig_v.update_layout(template="plotly_dark", height=240, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                                         margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
-                    st.plotly_chart(fig_v, use_container_width=True)
+                    st.plotly_chart(fig_v, use_container_width=True, key="chart_dvol")
 
     # Basket
     st.markdown("---")
