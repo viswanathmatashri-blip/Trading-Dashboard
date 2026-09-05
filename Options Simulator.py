@@ -4355,7 +4355,7 @@ def live_dashboard_fragment():
                         fig_fp.add_trace(plt_go.Scatter(
                             x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
                             line=dict(color="#FF9800", width=1.5), hoverinfo="skip"))
-                    sizes = (20 + 70 * (lots / max(float(lots.max()), 1.0))).clip(12, 90)
+                    sizes = (14 + 48 * (lots / max(float(lots.max()), 1.0))).clip(10, 56)
                     cd = np.column_stack([lots, bar_cvd, rng.fillna(0)])
                     fig_fp.add_trace(plt_go.Scatter(
                         x=dfi["time_str"], y=dfi["close"], mode="markers", name="Bar lots",
@@ -4371,12 +4371,17 @@ def live_dashboard_fragment():
                                         line=dict(width=2, color="#FFD54F")),
                             hoverinfo="skip",
                         ))
+                    xr = [-0.5, max(len(dfi) - 0.5, 0.5)]
                     fig_fp.update_layout(
                         template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=520, margin=dict(l=40, r=8, t=8, b=18),
+                        height=520, margin=dict(l=52, r=228, t=10, b=36),
                         legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
                         hovermode="closest",
                     )
+                    fig_fp.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=list(dfi["time_str"]), range=xr,
+                                        tickangle=0, nticks=10)
+                    fig_fp.update_yaxes(side="left", automargin=True)
                     st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
                     heading_ribbon(
                         "Effort vs result (not footprint)",
