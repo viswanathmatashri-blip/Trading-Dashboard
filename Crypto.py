@@ -112,6 +112,17 @@ hr { margin: 0.25rem 0 !important; }
 # ---------------------------------------------------------------------------
 DERIBIT = "https://www.deribit.com/api/v2"
 TZ = pytz.timezone("UTC")
+IST = pytz.timezone("Asia/Kolkata")
+
+
+def to_ist(series) -> pd.Series:
+    ts = pd.to_datetime(series, utc=True, errors="coerce")
+    return ts.dt.tz_convert(IST)
+
+
+def ist_label(series, with_date: bool = True) -> pd.Series:
+    t = to_ist(series)
+    return t.dt.strftime("%d-%b %H:%M" if with_date else "%H:%M")
 CONTRACT_SIZE = {"BTC": 1.0, "ETH": 1.0}  # 1 option contract = 1 coin
 PERP = {"BTC": "BTC-PERPETUAL", "ETH": "ETH-PERPETUAL"}
 DVOL = {"BTC": "BTCDVOL", "ETH": "ETHDVOL"}
@@ -1212,7 +1223,7 @@ def fetch_live_bundle(tf_label: str):
             "fut_ltp": fut_ltp,
             "basis": round(basis, 2),
         },
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%d-%b %H:%M:%S UTC"),
+        "timestamp": datetime.datetime.now(IST).strftime("%d-%b %H:%M:%S IST"),
         "selected_expiry": _exp_label(exp_choice) if exp_choice else "",
         "fut_fallback_msg": "24/7 Deribit perpetual",
         "fut_is_fallback": False,
@@ -1380,7 +1391,7 @@ def live_dashboard():
 
     if not df_full.empty and len(df_full) >= 10:
         df_chart = df_full.tail(400).copy()
-        df_chart["time_str"] = pd.to_datetime(df_chart["time"]).dt.strftime("%d-%b %H:%M")
+        df_chart["time_str"] = ist_label(df_chart["time"], with_date=True)
         min_p = min(df_chart["close"].min(), df_chart["bb_lower"].min())
         max_p = max(df_chart["close"].max(), df_chart["bb_upper"].max())
         pad = (max_p - min_p) * 0.05
@@ -1438,11 +1449,22 @@ def live_dashboard():
                 label_visibility="collapsed",
             )
         if df_fut is not None and not df_fut.empty:
-            dfi = df_fut.tail(300).copy().reset_index(drop=True)
+            dfi = df_fut.tail(400).copy().reset_index(drop=True)
+            dfi["time"] = to_ist(dfi["time"])
+            dfi["ist_date"] = dfi["time"].dt.date
+            # Keep last two IST days max, but VWAP resets each IST day
+            last_days = sorted(dfi["ist_date"].dropna().unique())[-2:]
+            dfi = dfi[dfi["ist_date"].isin(last_days)].reset_index(drop=True)
             dfi["tp"] = (dfi["high"] + dfi["low"] + dfi["close"]) / 3.0
-            cum_vol = cum_tp = cum_sq = 0.0
+
             vwaps, stds = [], []
+            prev_day = None
+            cum_vol = cum_tp = cum_sq = 0.0
             for i in range(len(dfi)):
+                day = dfi.loc[i, "ist_date"]
+                if day != prev_day:
+                    cum_vol = cum_tp = cum_sq = 0.0
+                    prev_day = day
                 vol = float(dfi.loc[i, "volume"] or 0)
                 tp = float(dfi.loc[i, "tp"])
                 cum_vol += vol
@@ -1450,7 +1472,7 @@ def live_dashboard():
                 vwap = cum_tp / cum_vol if cum_vol > 0 else tp
                 cum_sq += vol * (tp - vwap) ** 2
                 vwaps.append(vwap)
-                stds.append(math.sqrt(max(cum_sq / cum_vol if cum_vol else 0, 0)))
+                stds.append(math.sqrt(max(cum_sq / cum_vol if cum_vol else 0.0, 0.0)))
             dfi["vwap"] = vwaps
             dfi["vwap_std"] = stds
             dfi["vwap_upper"] = dfi["vwap"] + sigma_mult * dfi["vwap_std"]
@@ -1463,7 +1485,7 @@ def live_dashboard():
             hl = (dfi["high"] - dfi["low"]).replace(0, np.nan)
             loc = ((dfi["close"] - dfi["low"]) / hl * 2 - 1).fillna(0).clip(-1, 1)
             dfi["cvd"] = (vol * loc).cumsum()
-            dfi["time_str"] = pd.to_datetime(dfi["time"]).dt.strftime("%H:%M")
+            dfi["time_str"] = dfi["time"].dt.strftime("%d-%b %H:%M")
             vp = compute_session_volume_profile(dfi, bin_step=BIN_STEP.get(currency, 250))
             y0 = float(min(dfi["close"].min(), dfi["vwap_lower"].min())) * 0.998
             y1 = float(max(dfi["close"].max(), dfi["vwap_upper"].max())) * 1.002
@@ -1488,14 +1510,37 @@ def live_dashboard():
                         mids.append(float(m)); vols.append(float(v))
                         colors.append("#FFD54F" if abs(m - vp["poc"]) < 1e-6 else "rgba(100,181,246,0.7)")
                 fig_stack.add_trace(plt_go.Bar(x=vols, y=mids, orientation="h", showlegend=False, marker=dict(color=colors)), row=1, col=2)
-            fig_stack.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["obv"], mode="lines", showlegend=False,
-                                               line=dict(color="#00E676", width=1.5), fill="tozeroy", fillcolor="rgba(0,230,118,0.12)"), row=2, col=1)
-            fig_stack.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", showlegend=False, line=dict(color="#FFF176", width=1.4)), row=2, col=1)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] >= 0),
+                mode="lines", showlegend=False, name="OBV+",
+                line=dict(color="#00E676", width=1.5),
+                fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
+            ), row=2, col=1)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0),
+                mode="lines", showlegend=False, name="OBV-",
+                line=dict(color="#FF5252", width=1.5),
+                fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
+            ), row=2, col=1)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", showlegend=False,
+                line=dict(color="#FFF176", width=1.4),
+            ), row=2, col=1)
             efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
             fig_stack.add_trace(plt_go.Bar(x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False), row=3, col=1)
             cvd_last = float(dfi["cvd"].iloc[-1])
-            fig_stack.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False,
-                                               line=dict(color="#00E676" if cvd_last >= 0 else "#FF5252", width=1.8), fill="tozeroy"), row=4, col=1)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] >= 0),
+                mode="lines", showlegend=False, name="CVD+",
+                line=dict(color="#00E676", width=1.8),
+                fill="tozeroy", fillcolor="rgba(0,230,118,0.20)",
+            ), row=4, col=1)
+            fig_stack.add_trace(plt_go.Scatter(
+                x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] < 0),
+                mode="lines", showlegend=False, name="CVD-",
+                line=dict(color="#FF5252", width=1.8),
+                fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
+            ), row=4, col=1)
             for rr in (2, 3, 4):
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=rr, col=1)
             fig_stack.update_layout(
@@ -1508,9 +1553,17 @@ def live_dashboard():
             fig_stack.update_yaxes(title_text="OBV", title_font=dict(size=9), tickfont=dict(size=8), row=2, col=1)
             fig_stack.update_yaxes(title_text="EFI13", title_font=dict(size=9), tickfont=dict(size=8), row=3, col=1)
             fig_stack.update_yaxes(title_text="CVD", title_font=dict(size=9), tickfont=dict(size=8), row=4, col=1)
-            fig_stack.update_xaxes(type="category", nticks=8, tickfont=dict(size=8), row=4, col=1)
+            fig_stack.update_xaxes(
+                type="category",
+                categoryorder="array",
+                categoryarray=dfi["time_str"].tolist(),
+                nticks=8, tickfont=dict(size=8), row=4, col=1,
+            )
             st.plotly_chart(fig_stack, use_container_width=True)
-            cap = f"Perp {float(dfi['close'].iloc[-1]):,.1f} · VWAP {float(dfi['vwap'].iloc[-1]):,.1f} · CVD {cvd_last:,.0f}"
+            cap = (
+                f"IST · Perp {float(dfi['close'].iloc[-1]):,.1f} · VWAP {float(dfi['vwap'].iloc[-1]):,.1f} "
+                f"· CVD {cvd_last:,.0f}"
+            )
             if vp.get("ok"):
                 cap += f" · POC {vp['poc']:.0f} · VA {vp['val1']:.0f}–{vp['vah1']:.0f}"
             st.caption(cap)
@@ -1644,7 +1697,7 @@ def live_dashboard():
             rows = []
             for t in trades:
                 rows.append({
-                    "Time": datetime.datetime.fromtimestamp(t["timestamp"] / 1000, tz=datetime.timezone.utc).strftime("%H:%M:%S"),
+                    "Time": datetime.datetime.fromtimestamp(t["timestamp"] / 1000, tz=datetime.timezone.utc).astimezone(IST).strftime("%H:%M:%S"),
                     "Side": (t.get("direction") or "—").upper(),
                     "Px": t.get("price"),
                     "Amt": t.get("amount"),
