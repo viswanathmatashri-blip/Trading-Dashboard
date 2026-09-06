@@ -1552,7 +1552,42 @@ def cvd_price_stats(df: pd.DataFrame, window: int = 20) -> dict:
     return out
 
 
+def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
+    """Rising-edge divergence marks on THIS TF. No look-ahead: window ends at bar i."""
+    ev = []
+    if df is None or df.empty or "cvd" not in df.columns:
+        return ev
+    n = len(df)
+    if n < window + 2:
+        return ev
+    prev = None
+    keep = {
+        "BEARISH DIVERGENCE", "BULLISH DIVERGENCE",
+        "BEARISH SLOPE ONLY", "BULLISH SLOPE ONLY",
+    }
+    for i in range(window - 1, n):
+        sl = df.iloc[i - window + 1:i + 1]
+        stt = cvd_price_stats(sl, window=window)
+        lab = stt.get("div") or ""
+        if lab in keep and lab != prev:
+            ts = sl["time_str"].iloc[-1] if "time_str" in sl.columns else str(i)
+            ev.append({
+                "t": ts,
+                "div": lab,
+                "px_slope": stt.get("px_slope"),
+                "px_p": stt.get("px_p"),
+                "cvd_slope": stt.get("cvd_slope"),
+                "cvd_p": stt.get("cvd_p"),
+                "spearman": stt.get("spearman"),
+                "spearman_p": stt.get("spearman_p"),
+                "note": stt.get("div_note") or "",
+            })
+        prev = lab if lab in keep else None
+    return ev
+
+
 def attach_bar_flow(df: pd.DataFrame) -> pd.DataFrame:
+
     """CVD/OBV on THESE bars. Call before any resample so coarser TF keeps last(CVD)."""
     if df is None or df.empty:
         return df
@@ -4360,12 +4395,16 @@ def live_dashboard_fragment():
 
                 # OBV
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] >= 0), mode="lines", showlegend=False,
-                    line=dict(color="#00E676", width=1.5), fill="tozeroy", fillcolor="rgba(0,230,118,0.16)",
+                    x=dfi["time_str"], y=dfi["obv"].clip(lower=0), mode="lines", showlegend=False,
+                    line=dict(color="#00E676", width=1.4), fill="tozeroy", fillcolor="rgba(0,230,118,0.18)",
                 ), row=2, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].where(dfi["obv"] < 0), mode="lines", showlegend=False,
-                    line=dict(color="#FF5252", width=1.5), fill="tozeroy", fillcolor="rgba(255,82,82,0.16)",
+                    x=dfi["time_str"], y=dfi["obv"].clip(upper=0), mode="lines", showlegend=False,
+                    line=dict(color="#FF5252", width=1.4), fill="tozeroy", fillcolor="rgba(255,82,82,0.18)",
+                ), row=2, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv"], mode="lines", showlegend=False,
+                    line=dict(color="#B0BEC5", width=1.1),
                 ), row=2, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", name="OBV MA20",
@@ -4381,19 +4420,65 @@ def live_dashboard_fragment():
                 # CVD — green above 0, red below 0 (not one colour from the last print)
                 cvd_last = float(dfi["cvd"].iloc[-1])
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] >= 0),
+                    x=dfi["time_str"], y=dfi["cvd"].clip(lower=0),
                     mode="lines", showlegend=False, name="CVD+",
-                    line=dict(color="#00E676", width=1.8),
+                    line=dict(color="#00E676", width=1.6),
                     fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
                 ), row=4, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] < 0),
+                    x=dfi["time_str"], y=dfi["cvd"].clip(upper=0),
                     mode="lines", showlegend=False, name="CVD-",
-                    line=dict(color="#FF5252", width=1.8),
+                    line=dict(color="#FF5252", width=1.6),
                     fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
+                ), row=4, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
+                    line=dict(color="#B0BEC5", width=1.2),
                 ), row=4, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
                 cvd_st = cvd_price_stats(dfi, window=20)
+                if cvd_st.get("ok"):
+                    colr = "#FF5252" if "BEARISH" in cvd_st["div"] else (
+                        "#00E676" if "BULLISH" in cvd_st["div"] else "#FFD54F"
+                    )
+                    fig_stack.add_annotation(
+                        text=cvd_st["div"],
+                        xref="paper", yref="paper", x=0.01, y=0.02,
+                        showarrow=False, font=dict(size=11, color=colr),
+                        bgcolor="rgba(16,20,28,0.85)",
+                        row=4, col=1,
+                    )
+
+                div_ev = scan_cvd_div_events(dfi, window=20)
+                if div_ev:
+                    ylo = float(dfi["close"].min())
+                    yhi = float(dfi["close"].max())
+                    clo = float(dfi["cvd"].min())
+                    chi = float(dfi["cvd"].max())
+                    for e in div_ev:
+                        tip = (
+                            f"{e['div']}<br>"
+                            f"Px slope {e['px_slope']:+.4f}/bar p={e['px_p']:.3f}<br>"
+                            f"CVD slope {e['cvd_slope']:+.2f}/bar p={e['cvd_p']:.3f}<br>"
+                            f"Spearman ρ={e.get('spearman') or 0:+.2f} p={e.get('spearman_p') or 1:.3f}<br>"
+                            f"{e['note']}"
+                        )
+                        fig_stack.add_trace(plt_go.Scatter(
+                            x=[e["t"], e["t"]], y=[ylo, yhi],
+                            mode="lines+text",
+                            line=dict(color="#29B6F6", width=1.4, dash="dash"),
+                            text=["", "D"], textposition="top center",
+                            textfont=dict(size=10, color="#29B6F6"),
+                            hovertemplate=tip + "<extra></extra>",
+                            showlegend=False, name="D",
+                        ), row=1, col=1)
+                        fig_stack.add_trace(plt_go.Scatter(
+                            x=[e["t"], e["t"]], y=[clo, chi],
+                            mode="lines",
+                            line=dict(color="#29B6F6", width=1.2, dash="dash"),
+                            hovertemplate=tip + "<extra></extra>",
+                            showlegend=False, name="D",
+                        ), row=4, col=1)
 
                 def _sess_chg(src):
                     if src is None or getattr(src, "empty", True):
