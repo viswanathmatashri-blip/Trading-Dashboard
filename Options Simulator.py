@@ -4272,13 +4272,19 @@ def live_dashboard_fragment():
                     x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
                 ), row=3, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
-                # CVD
+                # CVD — green above 0, red below 0 (not one colour from the last print)
                 cvd_last = float(dfi["cvd"].iloc[-1])
-                cvd_col = "#00E676" if cvd_last >= 0 else "#FF5252"
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
-                    line=dict(color=cvd_col, width=1.8), fill="tozeroy",
-                    fillcolor="rgba(0,230,118,0.08)" if cvd_last >= 0 else "rgba(255,82,82,0.08)",
+                    x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] >= 0),
+                    mode="lines", showlegend=False, name="CVD+",
+                    line=dict(color="#00E676", width=1.8),
+                    fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
+                ), row=4, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] < 0),
+                    mode="lines", showlegend=False, name="CVD-",
+                    line=dict(color="#FF5252", width=1.8),
+                    fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
                 ), row=4, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
 
