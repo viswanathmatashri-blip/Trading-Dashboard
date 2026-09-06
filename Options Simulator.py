@@ -4416,7 +4416,9 @@ def live_dashboard_fragment():
                     dfi["spot_px"] = dfi["close"].astype(float) - basis_q
                 else:
                     dfi["spot_px"] = pd.to_numeric(dfi["spot_px"], errors="coerce").ffill().bfill()
-                dfi["basis"] = dfi["close"].astype(float) - dfi["spot_px"].astype(float)
+                dfi["basis_raw"] = dfi["close"].astype(float) - dfi["spot_px"].astype(float)
+                # Smooth ONLY the F−S shift. Futures VWAP itself is untouched.
+                dfi["basis"] = dfi["basis_raw"].ewm(span=5, min_periods=1, adjust=False).mean()
                 dfi["vwap_idx"] = dfi["vwap"].astype(float) - dfi["basis"]
                 if "vwap_upper" in dfi.columns:
                     dfi["vwap_upper_idx"] = dfi["vwap_upper"].astype(float) - dfi["basis"]
@@ -4473,12 +4475,14 @@ def live_dashboard_fragment():
                     dfi["vwap_idx"].astype(float).values,
                     dfi["close"].astype(float).values,
                     dfi["basis"].astype(float).values,
+                    dfi.get("basis_raw", dfi["basis"]).astype(float).values,
+                    dfi["vwap"].astype(float).values,
                 ])
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
                     line=dict(color="#2196F3", width=2),
                     customdata=cd,
-                    hovertemplate="NIFTY %{y:.1f}<br>Fut %{customdata[1]:.1f}<br>VWAP %{customdata[0]:.1f}<br>Basis %{customdata[2]:+.1f}<extra></extra>",
+                    hovertemplate="NIFTY %{y:.1f}<br>Fut %{customdata[1]:.1f}<br>VWAP_idx %{customdata[0]:.1f}<br>VWAP_fut %{customdata[4]:.1f}<br>Basis EMA5 %{customdata[2]:+.1f} (raw %{customdata[3]:+.1f})<extra></extra>",
                 ), row=1, col=1)
                 last_fut = float(dfi["close"].iloc[-1])
                 last_sp = float(dfi["spot_px"].iloc[-1])
