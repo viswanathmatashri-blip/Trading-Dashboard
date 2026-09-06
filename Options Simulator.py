@@ -4635,52 +4635,35 @@ def live_dashboard_fragment():
                             orientation="h", showlegend=False,
                             marker=dict(color=colors if vp.get("ok") else "#64B5F6"),
                         ), row=1, col=2)
-                    if tape:
-                        txs = [t["ts"] for t in tape]
-                        dex_s = pd.Series([t["dex"] for t in tape], dtype=float)
-                        dex_ema = dex_s.ewm(span=8, adjust=False).mean()
-                        bar_c = np.where(dex_s >= 0, "#00E676", "#FF5252")
+                    if tape and fut_times:
+                        # Map snaps onto the same category axis as futures (HH:MM)
+                        dex_map = {str(t.get("ts"))[-5:]: t for t in tape}
+                        xs = list(fut_times)
+                        dex_y, pc_y, pp_y = [], [], []
+                        for ts in xs:
+                            key = str(ts)[-5:]
+                            rec = dex_map.get(key)
+                            dex_y.append(rec["dex"] if rec else None)
+                            pc_y.append((rec["prem_c"] / 1e7) if rec else None)
+                            pp_y.append((rec["prem_p"] / 1e7) if rec else None)
+                        s = pd.Series(dex_y, dtype=float)
+                        ema = s.ewm(span=8, min_periods=1, adjust=False).mean()
+                        bar_c = ["#00E676" if (v is not None and v >= 0) else "#FF5252" for v in dex_y]
                         fig_dex.add_trace(plt_go.Bar(
-                            x=txs, y=dex_s, name="DEX", marker_color=bar_c, opacity=0.75, showlegend=False,
+                            x=xs, y=dex_y, name="DEX", marker_color=bar_c, opacity=0.75, showlegend=False,
                         ), row=2, col=1)
                         fig_dex.add_trace(plt_go.Scatter(
-                            x=txs, y=dex_ema, name="DEX EMA8",
+                            x=xs, y=ema, name="DEX EMA8",
                             line=dict(color="#FFD54F", width=2),
                         ), row=2, col=1)
                         fig_dex.add_trace(plt_go.Scatter(
-                            x=txs, y=[t["prem_c"]/1e7 for t in tape], name="Call prem Cr",
-                            line=dict(color="#00E676", width=2),
+                            x=xs, y=pc_y, name="Call prem Cr",
+                            line=dict(color="#00E676", width=2), connectgaps=False,
                         ), row=3, col=1)
                         fig_dex.add_trace(plt_go.Scatter(
-                            x=txs, y=[t["prem_p"]/1e7 for t in tape], name="Put prem Cr",
-                            line=dict(color="#FF5252", width=2),
+                            x=xs, y=pp_y, name="Put prem Cr",
+                            line=dict(color="#FF5252", width=2), connectgaps=False,
                         ), row=3, col=1)
-                    elif not df_chain.empty:
-                        lotn = float(LOT_SIZES.get(Index_Name, 65))
-                        c_d = pd.to_numeric(df_chain.get("C_Δ", 0), errors="coerce").fillna(0)
-                        p_d = pd.to_numeric(df_chain.get("P_Δ", 0), errors="coerce").fillna(0)
-                        c_v = pd.to_numeric(df_chain.get("C_Vol", 0), errors="coerce").fillna(0)
-                        p_v = pd.to_numeric(df_chain.get("P_Vol", 0), errors="coerce").fillna(0)
-                        c_ltp = pd.to_numeric(df_chain.get("C_LTP", 0), errors="coerce").fillna(0)
-                        p_ltp = pd.to_numeric(df_chain.get("P_LTP", 0), errors="coerce").fillna(0)
-                        snap_dex = (c_d * c_v - p_d.abs() * p_v) * lotn
-                        cols = np.where(snap_dex >= 0, "#00E676", "#FF5252")
-                        fig_dex.add_trace(plt_go.Bar(
-                            x=df_chain["Strike"], y=snap_dex, name="Snap DEX",
-                            marker_color=cols, opacity=0.85, showlegend=False,
-                        ), row=2, col=1)
-                        fig_dex.add_trace(plt_go.Bar(
-                            x=df_chain["Strike"], y=c_ltp * c_v * lotn / 1e7, name="Call prem Cr",
-                            marker_color="#00E676", opacity=0.6, showlegend=False,
-                        ), row=3, col=1)
-                        fig_dex.add_trace(plt_go.Bar(
-                            x=df_chain["Strike"], y=-(p_ltp * p_v * lotn / 1e7), name="Put prem Cr",
-                            marker_color="#FF5252", opacity=0.6, showlegend=False,
-                        ), row=3, col=1)
-                        fig_dex.add_vline(x=data.get("spot_price"), line_dash="dash",
-                                          line_color="#FAFAFA", row=2, col=1)
-                        fig_dex.add_vline(x=data.get("spot_price"), line_dash="dash",
-                                          line_color="#FAFAFA", row=3, col=1)
                     fig_dex.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
                     fig_dex.update_layout(
                         template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
@@ -4688,17 +4671,22 @@ def live_dashboard_fragment():
                         legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
                         hovermode="x unified",
                     )
+                    fig_dex.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=list(dfi["time_str"]), range=xr,
+                                        showticklabels=False, row=1, col=1)
+                    fig_dex.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=list(dfi["time_str"]), range=xr,
+                                        showticklabels=False, row=2, col=1)
+                    fig_dex.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=list(dfi["time_str"]), range=xr,
+                                        nticks=8, row=3, col=1)
                     fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=2, col=1)
                     fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=3, col=1)
                     st.markdown("<div class='chart-card'><div class='card-title'>DEX flow &amp; net premium</div>", unsafe_allow_html=True)
                     if tape:
-                        st.caption(f"DEX time tape · {sess_day} · {len(tape)} snaps")
+                        st.caption(f"DEX / premium time · {sess_day} · {len(tape)} snaps · x = futures axis")
                     else:
-                        st.caption(
-                            "No intra-day DEX tape for this session. "
-                            "Lower panes = current chain snapshot DEX (Δ×Vol×lot) and premium by strike — "
-                            "not a reconstructed time series. Futures price cannot invent historical DEX."
-                        )
+                        st.caption("DEX / premium empty until Auto-Refresh stores snaps in market hours. No strike fallback.")
                     st.plotly_chart(fig_dex, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                 with tab_fp:
