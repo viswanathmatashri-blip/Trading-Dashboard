@@ -3704,6 +3704,9 @@ def live_dashboard_fragment():
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
 
+    if st.session_state.get("fut_tf_radio") in ("3 min", "5 min", "15 min"):
+        st.session_state["selected_timeframe"] = st.session_state["fut_tf_radio"]
+        st.session_state["tf_select_frag"] = st.session_state["fut_tf_radio"]
     want_tf = st.session_state.get("selected_timeframe", "5 min")
     stored = st.session_state.get("data_store") or {}
     need_tf = stored.get("bar_tf") != want_tf
@@ -3916,15 +3919,7 @@ def live_dashboard_fragment():
         if badge_html:
             st.markdown(f"<div style='padding-top:2px;'>{badge_html}</div>", unsafe_allow_html=True)
     with tf_col:
-        selected_tf = st.selectbox("TF", ["1 min", "3 min", "5 min", "15 min"],
-                                   index=["1 min", "3 min", "5 min", "15 min"].index(st.session_state["selected_timeframe"]),
-                                   key="tf_select_frag", label_visibility="collapsed")
-        if selected_tf != st.session_state["selected_timeframe"]:
-            st.session_state["selected_timeframe"] = selected_tf
-            updated_chart_data = fetch_live_data(selected_tf)
-            if updated_chart_data:
-                st.session_state["data_store"] = updated_chart_data
-                st.rerun()
+        st.caption(f"TF {st.session_state.get('selected_timeframe','5 min')}")
 
     if not df_full.empty and len(df_full) >= 20:
 
@@ -4003,11 +3998,12 @@ def live_dashboard_fragment():
             try:
                 t = series_to_ist(df_fut["time"])
                 dt = t.diff().dt.total_seconds().median()
-                if pd.notna(dt) and dt > 0 and abs(dt/60.0 - tf_min) > 1.5 and tf_min >= 5 and dt/60.0 < tf_min:
+                native = float(dt) / 60.0 if pd.notna(dt) and dt else tf_min
+                if native > 0 and tf_min > native + 0.6:
                     g = df_fut.copy()
                     g["time"] = t
                     g = g.set_index("time").sort_index()
-                    ohlc = g.resample(f"{tf_min}min").agg({
+                    ohlc = g.resample(f"{int(tf_min)}min", label="right", closed="right").agg({
                         "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
                     }).dropna(subset=["close"])
                     if len(ohlc) >= 5:
@@ -4046,20 +4042,17 @@ def live_dashboard_fragment():
             fut_header_col, tf_col, basis_col, band_col = st.columns([0.52, 0.20, 0.14, 0.14])
             with tf_col:
                 opts = ["3 min", "5 min", "15 min"]
-                cur = st.session_state.get("selected_timeframe", "5 min")
-                if cur not in opts:
-                    cur = "5 min"
-                new_tf = st.radio(
-                    "Bar", opts, index=opts.index(cur), horizontal=True,
-                    key="fut_tf_radio", label_visibility="collapsed",
-                )
+                if "fut_tf_radio" not in st.session_state:
+                    st.session_state["fut_tf_radio"] = (
+                        st.session_state.get("selected_timeframe", "5 min")
+                        if st.session_state.get("selected_timeframe") in opts else "5 min"
+                    )
+                new_tf = st.radio("Bar", opts, horizontal=True, key="fut_tf_radio",
+                                  label_visibility="collapsed")
                 if new_tf != st.session_state.get("selected_timeframe"):
                     st.session_state["selected_timeframe"] = new_tf
+                    st.session_state["tf_select_frag"] = new_tf
                     st.session_state["heatmap_timeframe"] = new_tf
-                    updated = fetch_live_data(new_tf)
-                    if updated:
-                        updated["selected_expiry"] = selected_expiry_str
-                        st.session_state["data_store"] = updated
                     st.rerun()
             with fut_header_col:
                 expiry_txt = basis.get("fut_expiry", "N/A")
