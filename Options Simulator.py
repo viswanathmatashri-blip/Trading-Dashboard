@@ -4190,13 +4190,7 @@ def live_dashboard_fragment():
                     dfi["spot_px"] = float(data["spot_price"])
                 close = dfi["close"].astype(float)
                 vol = dfi["volume"].astype(float)
-                if "cvd" not in dfi.columns or dfi["cvd"].isna().all():
-                    dfi = attach_bar_flow(dfi)
-                if "obv" not in dfi.columns or dfi["obv"].isna().all():
-                    direction = np.sign(close.diff().fillna(0.0))
-                    dfi["obv"] = (direction * vol).cumsum()
-                if "efi13" not in dfi.columns or dfi["efi13"].isna().all():
-                    dfi["efi13"] = (close.diff() * vol).ewm(span=13, adjust=False).mean()
+                dfi = attach_bar_flow(dfi)
                 dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
 
                 fig_stack = make_subplots(
