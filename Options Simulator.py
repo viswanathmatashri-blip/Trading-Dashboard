@@ -4316,10 +4316,11 @@ def live_dashboard_fragment():
                     f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
                     f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
                     f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
-                    f"📉 Near-Month Futures + VWAP + VP ({expiry_txt})</span>"
-                    f"<div class='micro-tip'><b>Futures</b> near-month LTP.<br>"
-                    f"<b>VWAP</b> = Σ(TP×V)/ΣV, TP=(H+L+C)/3.<br>"
-                    f"<b>VP</b> volume-by-price · POC / VA / HVN / LVN.</div></div>"
+                    f"📉 NIFTY spot + fut VWAP→index + VP ({expiry_txt})</span>"
+                    f"<div class='micro-tip'><b>Line</b> = index spot.<br>"
+                    f"<b>VWAP / σ</b> = futures VWAP minus bar basis (F−S).<br>"
+                    f"VWAP_idx = VWAP_fut − (Fut − Spot).<br>"
+                    f"<b>VP</b> futures volume profile shifted by last basis.</div></div>"
                     f"<div class='micro-hover' style='display:inline-block;padding:3px 8px;"
                     f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
                     f"<span style='font-weight:700;color:#00E676;font-size:11px;'>OBV</span>"
@@ -4406,6 +4407,29 @@ def live_dashboard_fragment():
                         pass
                 if dfi["spot_px"].isna().all() and data.get("spot_price"):
                     dfi["spot_px"] = float(data["spot_price"])
+                dfi["spot_px"] = pd.to_numeric(dfi["spot_px"], errors="coerce").ffill().bfill()
+                if dfi["spot_px"].isna().all():
+                    dfi["spot_px"] = dfi["close"].astype(float)
+                dfi["basis"] = dfi["close"].astype(float) - dfi["spot_px"].astype(float)
+                dfi["vwap_idx"] = dfi["vwap"].astype(float) - dfi["basis"]
+                if "vwap_upper" in dfi.columns:
+                    dfi["vwap_upper_idx"] = dfi["vwap_upper"].astype(float) - dfi["basis"]
+                    dfi["vwap_lower_idx"] = dfi["vwap_lower"].astype(float) - dfi["basis"]
+                smin = float(np.nanmin([dfi["spot_px"].min(), dfi.get("vwap_lower_idx", dfi["vwap_idx"]).min()]))
+                smax = float(np.nanmax([dfi["spot_px"].max(), dfi.get("vwap_upper_idx", dfi["vwap_idx"]).max()]))
+                spad = (smax - smin) * 0.06 if smax > smin else 20
+                y0, y1 = smin - spad, smax + spad
+                last_basis = float(dfi["basis"].iloc[-1])
+                if vp.get("ok"):
+                    vp = dict(vp)
+                    for k in ("mids", "poc", "val1", "vah1", "val15", "vah15"):
+                        if k == "mids" and vp.get("mids") is not None:
+                            vp["mids"] = [float(m) - last_basis for m in vp["mids"]]
+                        elif k in vp and vp[k] is not None and not isinstance(vp[k], (list, np.ndarray)):
+                            try:
+                                vp[k] = float(vp[k]) - last_basis
+                            except Exception:
+                                pass
                 close = dfi["close"].astype(float)
                 vol = dfi["volume"].astype(float)
                 dfi = attach_bar_flow(dfi)
@@ -4429,32 +4453,33 @@ def live_dashboard_fragment():
                 )
                 # price
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["vwap_upper"], mode="lines", showlegend=False, hoverinfo="skip",
+                    x=dfi["time_str"], y=dfi["vwap_upper_idx"], mode="lines", showlegend=False, hoverinfo="skip",
                     line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["vwap_lower"], mode="lines", showlegend=False, hoverinfo="skip",
+                    x=dfi["time_str"], y=dfi["vwap_lower_idx"], mode="lines", showlegend=False, hoverinfo="skip",
                     line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
                     fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
+                    x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP (idx)",
                     line=dict(color="#FF9800", width=2),
                     hoverinfo="skip"), row=1, col=1)
                 cd = np.column_stack([
-                    dfi["vwap"].astype(float).values,
-                    dfi["spot_px"].astype(float).values,
+                    dfi["vwap_idx"].astype(float).values,
+                    dfi["close"].astype(float).values,
+                    dfi["basis"].astype(float).values,
                 ])
                 fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
+                    x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
                     line=dict(color="#2196F3", width=2),
                     customdata=cd,
-                    hovertemplate="NIFTY %{customdata[1]:.1f}<br>Fut %{y:.1f}<br>VWAP %{customdata[0]:.1f}<extra></extra>",
+                    hovertemplate="NIFTY %{y:.1f}<br>Fut %{customdata[1]:.1f}<br>VWAP %{customdata[0]:.1f}<br>Basis %{customdata[2]:+.1f}<extra></extra>",
                 ), row=1, col=1)
                 last_fut = float(dfi["close"].iloc[-1])
-                last_sp = dfi["spot_px"].iloc[-1]
+                last_sp = float(dfi["spot_px"].iloc[-1])
                 last_sp = float(last_sp) if pd.notna(last_sp) else float(data.get("spot_price") or 0)
                 fig_stack.add_annotation(
                     x=dfi["time_str"].iloc[-1], y=last_fut,
-                    text=f"{last_fut:.0f} ({last_sp:.0f})",
+                    text=f"{last_sp:.0f} ({last_fut:.0f})",
                     showarrow=False, xanchor="left", font=dict(size=11, color="#00E676"),
                     row=1, col=1,
                 )
@@ -4615,19 +4640,19 @@ def live_dashboard_fragment():
                         horizontal_spacing=0.01,
                         specs=[[{}, {}], [{}, None], [{}, None]],
                     )
-                    if "vwap_upper" in dfi.columns:
+                    if "vwap_upper_idx" in dfi.columns:
                         fig_dex.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap_upper"], mode="lines", showlegend=False, hoverinfo="skip",
+                            x=dfi["time_str"], y=dfi["vwap_upper_idx"], mode="lines", showlegend=False, hoverinfo="skip",
                             line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
                         fig_dex.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap_lower"], mode="lines", showlegend=False, hoverinfo="skip",
+                            x=dfi["time_str"], y=dfi["vwap_lower_idx"], mode="lines", showlegend=False, hoverinfo="skip",
                             line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
                             fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
                     fig_dex.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
+                        x=dfi["time_str"], y=dfi.get("vwap_idx", dfi["vwap"]), mode="lines", name="VWAP (idx)",
                         line=dict(color="#FF9800", width=2), hoverinfo="skip"), row=1, col=1)
                     fig_dex.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
+                        x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
                         line=dict(color="#2196F3", width=2)), row=1, col=1)
                     if vp.get("ok"):
                         fig_dex.add_trace(plt_go.Bar(
@@ -4703,23 +4728,23 @@ def live_dashboard_fragment():
                     absorb = (lots >= 1.5 * med_l) & (rng <= 0.7 * med_r)
                     fig_fp = plt_go.Figure()
                     fig_fp.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["close"], mode="lines", name="Futures",
+                        x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
                         line=dict(color="#90A4AE", width=1.2), hoverinfo="skip"))
-                    if "vwap" in dfi.columns:
+                    if "vwap_idx" in dfi.columns:
                         fig_fp.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
+                            x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP (idx)",
                             line=dict(color="#FF9800", width=1.5), hoverinfo="skip"))
                     sizes = (14 + 48 * (lots / max(float(lots.max()), 1.0))).clip(10, 56)
                     cd = np.column_stack([lots, bar_cvd, rng.fillna(0)])
                     fig_fp.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["close"], mode="markers", name="Bar lots",
+                        x=dfi["time_str"], y=dfi["spot_px"], mode="markers", name="Bar lots",
                         marker=dict(size=sizes, color=colors, opacity=0.72),
                         customdata=cd,
                         hovertemplate="Lots %{customdata[0]:.0f}<br>ΔCVD %{customdata[1]:.0f}<br>Range %{customdata[2]:.1f}<br>Px %{y:.1f}<extra></extra>",
                     ))
                     if absorb.any():
                         fig_fp.add_trace(plt_go.Scatter(
-                            x=dfi.loc[absorb, "time_str"], y=dfi.loc[absorb, "close"],
+                            x=dfi.loc[absorb, "time_str"], y=dfi.loc[absorb, "spot_px"],
                             mode="markers", name="Absorption",
                             marker=dict(size=sizes[absorb.values] + 6, color="rgba(0,0,0,0)",
                                         line=dict(width=2, color="#FFD54F")),
