@@ -1428,7 +1428,42 @@ def save_session_cache(kind: str, index_name: str, interval: str, df: pd.DataFra
         pass
 
 
+def _redis_client():
+    url = os.getenv("REDIS_URL") or os.getenv("REDIS_TLS_URL") or ""
+    if not url:
+        return None
+    try:
+        import redis as _redis
+        return _redis.from_url(url, decode_responses=True, socket_timeout=2)
+    except Exception:
+        return None
+
+
+def _prune_redis_old_days(r, prefix: str, keep_day):
+    """Keep current session + previous calendar day keys only."""
+    try:
+        keys = r.keys(f"{prefix}*")
+        keep = {str(keep_day), str(keep_day - datetime.timedelta(days=1)),
+                str(keep_day - datetime.timedelta(days=2))}
+        for k in keys:
+            tail = k.split(":")[-1]
+            if tail not in keep:
+                r.delete(k)
+    except Exception:
+        pass
+
+
 def load_flow_tape(index_name: str, day):
+    r = _redis_client()
+    if r is not None:
+        try:
+            raw = r.get(f"flow:{index_name}:{day}")
+            if raw:
+                tape = json.loads(raw)
+                st.session_state[f"flow_tape_{index_name}_{day}"] = tape
+                return tape
+        except Exception:
+            pass
     path = SESSION_CACHE_DIR / f"flow_{index_name}_{day}.json"
     if path.exists():
         try:
@@ -1445,6 +1480,13 @@ def save_flow_tape(index_name: str, day, tape):
         (SESSION_CACHE_DIR / f"flow_{index_name}_{day}.json").write_text(json.dumps(tape))
     except Exception:
         pass
+    r = _redis_client()
+    if r is not None:
+        try:
+            r.setex(f"flow:{index_name}:{day}", 48 * 3600, json.dumps(tape))
+            _prune_redis_old_days(r, f"flow:{index_name}:", day if hasattr(day, "year") else _ist_now().date())
+        except Exception:
+            pass
 
 
 
@@ -3485,6 +3527,15 @@ def update_liq_delta_history(snap: dict, index_name: str) -> list:
     ist = pytz.timezone("Asia/Kolkata")
     now = datetime.datetime.now(ist)
     hist = list(st.session_state.get("liq_delta_history") or [])
+    if not hist:
+        r = _redis_client()
+        if r is not None:
+            try:
+                raw = r.get(f"liq:{index_name}:{_ist_now().date()}")
+                if raw:
+                    hist = json.loads(raw)
+            except Exception:
+                pass
     prev = hist[-1] if hist else None
     bid = float(snap.get("bid_qty_lots") or 0)
     ask = float(snap.get("ask_qty_lots") or 0)
@@ -3545,6 +3596,14 @@ def update_liq_delta_history(snap: dict, index_name: str) -> list:
         if ts >= cutoff and h.get("index", index_name) == index_name:
             cleaned.append(h)
     st.session_state["liq_delta_history"] = cleaned[-180:]
+    r = _redis_client()
+    if r is not None:
+        try:
+            day = _ist_now().date()
+            r.setex(f"liq:{index_name}:{day}", 48 * 3600, json.dumps(cleaned[-180:], default=str))
+            _prune_redis_old_days(r, f"liq:{index_name}:", day)
+        except Exception:
+            pass
     return st.session_state["liq_delta_history"]
 
 
@@ -4596,6 +4655,32 @@ def live_dashboard_fragment():
                             x=txs, y=[t["prem_p"]/1e7 for t in tape], name="Put prem Cr",
                             line=dict(color="#FF5252", width=2),
                         ), row=3, col=1)
+                    elif not df_chain.empty:
+                        lotn = float(LOT_SIZES.get(Index_Name, 65))
+                        c_d = pd.to_numeric(df_chain.get("C_Δ", 0), errors="coerce").fillna(0)
+                        p_d = pd.to_numeric(df_chain.get("P_Δ", 0), errors="coerce").fillna(0)
+                        c_v = pd.to_numeric(df_chain.get("C_Vol", 0), errors="coerce").fillna(0)
+                        p_v = pd.to_numeric(df_chain.get("P_Vol", 0), errors="coerce").fillna(0)
+                        c_ltp = pd.to_numeric(df_chain.get("C_LTP", 0), errors="coerce").fillna(0)
+                        p_ltp = pd.to_numeric(df_chain.get("P_LTP", 0), errors="coerce").fillna(0)
+                        snap_dex = (c_d * c_v - p_d.abs() * p_v) * lotn
+                        cols = np.where(snap_dex >= 0, "#00E676", "#FF5252")
+                        fig_dex.add_trace(plt_go.Bar(
+                            x=df_chain["Strike"], y=snap_dex, name="Snap DEX",
+                            marker_color=cols, opacity=0.85, showlegend=False,
+                        ), row=2, col=1)
+                        fig_dex.add_trace(plt_go.Bar(
+                            x=df_chain["Strike"], y=c_ltp * c_v * lotn / 1e7, name="Call prem Cr",
+                            marker_color="#00E676", opacity=0.6, showlegend=False,
+                        ), row=3, col=1)
+                        fig_dex.add_trace(plt_go.Bar(
+                            x=df_chain["Strike"], y=-(p_ltp * p_v * lotn / 1e7), name="Put prem Cr",
+                            marker_color="#FF5252", opacity=0.6, showlegend=False,
+                        ), row=3, col=1)
+                        fig_dex.add_vline(x=data.get("spot_price"), line_dash="dash",
+                                          line_color="#FAFAFA", row=2, col=1)
+                        fig_dex.add_vline(x=data.get("spot_price"), line_dash="dash",
+                                          line_color="#FAFAFA", row=3, col=1)
                     fig_dex.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
                     fig_dex.update_layout(
                         template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
@@ -4607,7 +4692,13 @@ def live_dashboard_fragment():
                     fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=3, col=1)
                     st.markdown("<div class='chart-card'><div class='card-title'>DEX flow &amp; net premium</div>", unsafe_allow_html=True)
                     if tape:
-                        st.caption(f"DEX / premium · {sess_day} · {len(tape)} snaps")
+                        st.caption(f"DEX time tape · {sess_day} · {len(tape)} snaps")
+                    else:
+                        st.caption(
+                            "No intra-day DEX tape for this session. "
+                            "Lower panes = current chain snapshot DEX (Δ×Vol×lot) and premium by strike — "
+                            "not a reconstructed time series. Futures price cannot invent historical DEX."
+                        )
                     st.plotly_chart(fig_dex, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                 with tab_fp:
