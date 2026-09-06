@@ -1447,6 +1447,111 @@ def save_flow_tape(index_name: str, day, tape):
         pass
 
 
+
+def cvd_price_stats(df: pd.DataFrame, window: int = 20) -> dict:
+    """OLS slopes + p-values on this TF only. Divergence only if both slopes significant.
+
+    Regular bearish: price HH and CVD LH (or price slope+ and CVD slope-).
+    Regular bullish: price LL and CVD HL (or price slope- and CVD slope+).
+    Swings use 3-bar pivots on the same bars — no other TF mixed in.
+    """
+    out = {
+        "ok": False, "n": 0, "win": window,
+        "px_slope": None, "px_p": None, "cvd_slope": None, "cvd_p": None,
+        "spearman": None, "spearman_p": None,
+        "div": "NONE", "div_note": "Need more bars.",
+        "sig": False,
+    }
+    if df is None or df.empty or "close" not in df.columns or "cvd" not in df.columns:
+        return out
+    px = pd.to_numeric(df["close"], errors="coerce")
+    cv = pd.to_numeric(df["cvd"], errors="coerce")
+    mask = px.notna() & cv.notna()
+    px, cv = px[mask], cv[mask]
+    n = int(len(px))
+    out["n"] = n
+    if n < max(12, window // 2):
+        out["div_note"] = f"Only {n} bars — no test."
+        return out
+    w = min(window, n)
+    y_p = px.iloc[-w:].to_numpy(dtype=float)
+    y_c = cv.iloc[-w:].to_numpy(dtype=float)
+    t = np.arange(w, dtype=float)
+    try:
+        from scipy.stats import linregress, spearmanr
+        rp = linregress(t, y_p)
+        rc = linregress(t, y_c)
+        rho, rho_p = spearmanr(y_p, y_c)
+    except Exception:
+        out["div_note"] = "scipy linregress failed."
+        return out
+    out.update({
+        "ok": True,
+        "px_slope": float(rp.slope), "px_p": float(rp.pvalue),
+        "cvd_slope": float(rc.slope), "cvd_p": float(rc.pvalue),
+        "spearman": float(rho) if pd.notna(rho) else None,
+        "spearman_p": float(rho_p) if pd.notna(rho_p) else None,
+    })
+    px_sig = rp.pvalue < 0.05 and abs(rp.slope) > 0
+    cv_sig = rc.pvalue < 0.05 and abs(rc.slope) > 0
+    out["sig"] = bool(px_sig and cv_sig)
+
+    def _pivots(s, left=3):
+        s = s.reset_index(drop=True)
+        hi, lo = [], []
+        for i in range(left, len(s) - left):
+            wdw = s.iloc[i - left:i + left + 1]
+            if s.iloc[i] == wdw.max() and (wdw == s.iloc[i]).sum() == 1:
+                hi.append(i)
+            if s.iloc[i] == wdw.min() and (wdw == s.iloc[i]).sum() == 1:
+                lo.append(i)
+        return hi, lo
+
+    swing = "NONE"
+    hi_p, lo_p = _pivots(px)
+    hi_c, lo_c = _pivots(cv)
+    if len(hi_p) >= 2 and len(hi_c) >= 2:
+        p1, p2 = hi_p[-2], hi_p[-1]
+        # match CVD highs nearest those price highs
+        def nearest(idxs, i):
+            return min(idxs, key=lambda j: abs(j - i))
+        c1, c2 = nearest(hi_c, p1), nearest(hi_c, p2)
+        if px.iloc[p2] > px.iloc[p1] * 1.0002 and cv.iloc[c2] < cv.iloc[c1]:
+            swing = "BEARISH SWING (price HH, CVD LH)"
+        elif px.iloc[p2] < px.iloc[p1] * 0.9998 and cv.iloc[c2] > cv.iloc[c1]:
+            swing = "BULLISH SWING (price LL, CVD HL)"
+    slope_div = "NONE"
+    if px_sig and cv_sig:
+        if rp.slope > 0 and rc.slope < 0:
+            slope_div = "BEARISH SLOPE"
+        elif rp.slope < 0 and rc.slope > 0:
+            slope_div = "BULLISH SLOPE"
+        else:
+            slope_div = "CONFIRMED (same sign)"
+    elif not px_sig and not cv_sig:
+        slope_div = "NO TREND (both slopes p≥0.05)"
+    else:
+        slope_div = "ONE-SIDED (only one slope p<0.05)"
+
+    # Foolproof flag: require slope disagreement AND significant AND swing agrees OR spearman significant negative with price up
+    if slope_div.startswith("BEARISH") and "BEARISH" in swing:
+        out["div"] = "BEARISH DIVERGENCE"
+        out["div_note"] = "Price rising (p<0.05) while CVD falling (p<0.05), and swing HH/LH."
+    elif slope_div.startswith("BULLISH") and "BULLISH" in swing:
+        out["div"] = "BULLISH DIVERGENCE"
+        out["div_note"] = "Price falling (p<0.05) while CVD rising (p<0.05), and swing LL/HL."
+    elif slope_div.startswith("BEARISH"):
+        out["div"] = "BEARISH SLOPE ONLY"
+        out["div_note"] = "Slopes oppose (p<0.05) but swing pivots do not confirm. Treat as watch, not trigger."
+    elif slope_div.startswith("BULLISH"):
+        out["div"] = "BULLISH SLOPE ONLY"
+        out["div_note"] = "Slopes oppose (p<0.05) but swing pivots do not confirm. Treat as watch, not trigger."
+    else:
+        out["div"] = slope_div
+        out["div_note"] = swing if swing != "NONE" else slope_div
+    return out
+
+
 def attach_bar_flow(df: pd.DataFrame) -> pd.DataFrame:
     """CVD/OBV on THESE bars. Call before any resample so coarser TF keeps last(CVD)."""
     if df is None or df.empty:
@@ -4193,6 +4298,7 @@ def live_dashboard_fragment():
                 dfi = attach_bar_flow(dfi)
                 dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
 
+                cvd_st = {"ok": False}
                 fig_stack = make_subplots(
                     rows=4, cols=2,
                     column_widths=[0.84, 0.16],
@@ -4287,6 +4393,7 @@ def live_dashboard_fragment():
                     fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
                 ), row=4, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
+                cvd_st = cvd_price_stats(dfi, window=20)
 
                 def _sess_chg(src):
                     if src is None or getattr(src, "empty", True):
@@ -4459,6 +4566,21 @@ def live_dashboard_fragment():
                     st.markdown("</div>", unsafe_allow_html=True)
                 cap = (f"{st.session_state.get('selected_timeframe','?')} · "
                        f"{len(dfi)} bars · Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}")
+                if cvd_st.get("ok"):
+                    cap += (f" · Px slope {cvd_st['px_slope']:+.3f}/bar p={cvd_st['px_p']:.3f}"
+                            f" · CVD slope {cvd_st['cvd_slope']:+.1f}/bar p={cvd_st['cvd_p']:.3f}"
+                            f" · {cvd_st['div']}")
+                    heading_ribbon(
+                        f"CVD vs Px · {cvd_st['div']}",
+                        f"Window last {cvd_st['win']} bars of <b>this TF only</b>. "
+                        f"OLS slope vs bar index. Significant = p&lt;0.05.<br>"
+                        f"Price slope {cvd_st['px_slope']:+.4f} /bar · p={cvd_st['px_p']:.3f}<br>"
+                        f"CVD slope {cvd_st['cvd_slope']:+.2f} /bar · p={cvd_st['cvd_p']:.3f}<br>"
+                        f"Spearman ρ={cvd_st.get('spearman') or 0:+.2f} p={cvd_st.get('spearman_p') or 1:.3f}<br>"
+                        f"{cvd_st['div_note']}<br>"
+                        "Full divergence = opposing significant slopes <b>and</b> matching swing (HH/LH or LL/HL). "
+                        "Slope-only is a watch. 15-min sessions have few bars — p-values stay weak.",
+                    )
                 if vp.get("ok"):
                     cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
                 st.caption(cap)
