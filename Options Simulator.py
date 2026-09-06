@@ -4387,29 +4387,35 @@ def live_dashboard_fragment():
                 vp = compute_session_volume_profile(df_fchart, bin_step=5.0, prominence_factor=0.35)
 
                 dfi = df_fchart.copy().reset_index(drop=True)
+                dfi["time"] = series_to_ist(dfi["time"])
                 dfi["spot_px"] = np.nan
                 df_sp = data.get("df_candles")
                 if df_sp is not None and not getattr(df_sp, "empty", True) and "close" in df_sp.columns:
                     try:
                         sp = df_sp.copy()
-                        sp["time"] = pd.to_datetime(sp["time"], utc=True, errors="coerce")
-                        if getattr(sp["time"].dt, "tz", None) is not None:
-                            sp["time"] = sp["time"].dt.tz_convert("Asia/Kolkata")
-                        sp["tmin"] = sp["time"].dt.floor("min")
-                        tmp = dfi.copy()
-                        tmp["tmin"] = pd.to_datetime(tmp["time"], utc=True, errors="coerce")
-                        if getattr(tmp["tmin"].dt, "tz", None) is not None:
-                            tmp["tmin"] = tmp["tmin"].dt.tz_convert("Asia/Kolkata")
-                        tmp["tmin"] = tmp["tmin"].dt.floor("min")
-                        merged = tmp.merge(sp[["tmin", "close"]].rename(columns={"close": "spot_px"}), on="tmin", how="left")
-                        dfi["spot_px"] = pd.to_numeric(merged["spot_px"], errors="coerce")
+                        sp["time"] = series_to_ist(sp["time"])
+                        sp = sp.dropna(subset=["time"]).sort_values("time")
+                        if latest_session is not None:
+                            sp = sp[sp["time"].dt.date == latest_session]
+                        left = dfi[["time"]].sort_values("time")
+                        mapped = pd.merge_asof(
+                            left,
+                            sp[["time", "close"]].rename(columns={"close": "spot_px"}).sort_values("time"),
+                            on="time", direction="nearest",
+                            tolerance=pd.Timedelta("6min"),
+                        )
+                        dfi["spot_px"] = pd.to_numeric(mapped["spot_px"], errors="coerce").values
                     except Exception:
-                        pass
-                if dfi["spot_px"].isna().all() and data.get("spot_price"):
-                    dfi["spot_px"] = float(data["spot_price"])
-                dfi["spot_px"] = pd.to_numeric(dfi["spot_px"], errors="coerce").ffill().bfill()
-                if dfi["spot_px"].isna().all():
-                    dfi["spot_px"] = dfi["close"].astype(float)
+                        dfi["spot_px"] = np.nan
+                n_ok = int(pd.to_numeric(dfi["spot_px"], errors="coerce").notna().sum())
+                if n_ok < max(5, len(dfi) // 4):
+                    # not enough aligned index bars — use futures minus last quoted basis
+                    last_s = float(data.get("spot_price") or 0)
+                    last_f = float(dfi["close"].iloc[-1])
+                    basis_q = last_f - last_s if last_s else float(data.get("basis_info", {}).get("basis", 0) or 0)
+                    dfi["spot_px"] = dfi["close"].astype(float) - basis_q
+                else:
+                    dfi["spot_px"] = pd.to_numeric(dfi["spot_px"], errors="coerce").ffill().bfill()
                 dfi["basis"] = dfi["close"].astype(float) - dfi["spot_px"].astype(float)
                 dfi["vwap_idx"] = dfi["vwap"].astype(float) - dfi["basis"]
                 if "vwap_upper" in dfi.columns:
