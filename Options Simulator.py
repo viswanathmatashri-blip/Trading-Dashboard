@@ -1492,9 +1492,13 @@ def cvd_price_stats(df: pd.DataFrame, window: int = 20) -> dict:
         "spearman": float(rho) if pd.notna(rho) else None,
         "spearman_p": float(rho_p) if pd.notna(rho_p) else None,
     })
-    px_sig = rp.pvalue < 0.05 and abs(rp.slope) > 0
-    cv_sig = rc.pvalue < 0.05 and abs(rc.slope) > 0
+    t_px = float(rp.slope / rp.stderr) if rp.stderr else 0.0
+    t_cv = float(rc.slope / rc.stderr) if rc.stderr else 0.0
+    px_sig = rp.pvalue < 0.05 and abs(t_px) >= 2.0
+    cv_sig = rc.pvalue < 0.05 and abs(t_cv) >= 2.0
     out["sig"] = bool(px_sig and cv_sig)
+    out["px_t"] = t_px
+    out["cvd_t"] = t_cv
 
     def _pivots(s, left=3):
         s = s.reset_index(drop=True)
@@ -1533,19 +1537,35 @@ def cvd_price_stats(df: pd.DataFrame, window: int = 20) -> dict:
     else:
         slope_div = "ONE-SIDED (only one slope p<0.05)"
 
-    # Foolproof flag: require slope disagreement AND significant AND swing agrees OR spearman significant negative with price up
-    if slope_div.startswith("BEARISH") and "BEARISH" in swing:
-        out["div"] = "BEARISH DIVERGENCE"
-        out["div_note"] = "Price rising (p<0.05) while CVD falling (p<0.05), and swing HH/LH."
+    last_px = float(px.iloc[-1])
+    last_cv = float(cv.iloc[-1])
+    px_pct = float((px.iloc[-w:] <= last_px).mean())
+    cv_pct = float((cv.iloc[-w:] <= last_cv).mean())
+    stretch = False
+    if "vwap" in df.columns:
+        vw = pd.to_numeric(df["vwap"], errors="coerce").iloc[-w:]
+        last_vw = float(vw.iloc[-1]) if vw.notna().any() else last_px
+        sig = float((px.iloc[-w:] - vw).std()) or 1.0
+        z_vw = (last_px - last_vw) / sig
+    else:
+        last_vw, z_vw = last_px, 0.0
+    rho_ok = (out["spearman_p"] is not None and out["spearman_p"] < 0.10
+              and out["spearman"] is not None)
+    # High-prob reversion: ALL of opposing |t|>=2, swing, location stretch, CVD extreme, spearman against
+    if slope_div.startswith("BEARISH") and "BEARISH" in swing and z_vw >= 0.6 and px_pct >= 0.70 and cv_pct <= 0.35 and rho_ok and out["spearman"] < 0:
+        out["div"] = "HIGH-PROB BEARISH DIV"
+        out["div_note"] = (f"Fade long: Px t={t_px:+.2f} p={rp.pvalue:.3f}, CVD t={t_cv:+.2f} p={rc.pvalue:.3f}. "
+                           f"zVWAP {z_vw:+.2f}, Px pct {px_pct:.0%}, CVD pct {cv_pct:.0%}, ρ={out['spearman']:+.2f}.")
+    elif slope_div.startswith("BULLISH") and "BULLISH" in swing and z_vw <= -0.6 and px_pct <= 0.30 and cv_pct >= 0.65 and rho_ok and out["spearman"] < 0:
+        out["div"] = "HIGH-PROB BULLISH DIV"
+        out["div_note"] = (f"Fade short: Px t={t_px:+.2f} p={rp.pvalue:.3f}, CVD t={t_cv:+.2f} p={rc.pvalue:.3f}. "
+                           f"zVWAP {z_vw:+.2f}, Px pct {px_pct:.0%}, CVD pct {cv_pct:.0%}, ρ={out['spearman']:+.2f}.")
+    elif slope_div.startswith("BEARISH") and "BEARISH" in swing:
+        out["div"] = "WATCH BEARISH"
+        out["div_note"] = "Slope+swing only — missing VWAP stretch / CVD extreme / Spearman. No D line."
     elif slope_div.startswith("BULLISH") and "BULLISH" in swing:
-        out["div"] = "BULLISH DIVERGENCE"
-        out["div_note"] = "Price falling (p<0.05) while CVD rising (p<0.05), and swing LL/HL."
-    elif slope_div.startswith("BEARISH"):
-        out["div"] = "BEARISH SLOPE ONLY"
-        out["div_note"] = "Slopes oppose (p<0.05) but swing pivots do not confirm. Treat as watch, not trigger."
-    elif slope_div.startswith("BULLISH"):
-        out["div"] = "BULLISH SLOPE ONLY"
-        out["div_note"] = "Slopes oppose (p<0.05) but swing pivots do not confirm. Treat as watch, not trigger."
+        out["div"] = "WATCH BULLISH"
+        out["div_note"] = "Slope+swing only — missing VWAP stretch / CVD extreme / Spearman. No D line."
     else:
         out["div"] = slope_div
         out["div_note"] = swing if swing != "NONE" else slope_div
@@ -1561,15 +1581,14 @@ def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
     if n < window + 2:
         return ev
     prev = None
-    keep = {
-        "BEARISH DIVERGENCE", "BULLISH DIVERGENCE",
-        "BEARISH SLOPE ONLY", "BULLISH SLOPE ONLY",
-    }
+    keep = {"HIGH-PROB BEARISH DIV", "HIGH-PROB BULLISH DIV"}
+    last_mark = -10**9
     for i in range(window - 1, n):
         sl = df.iloc[i - window + 1:i + 1]
         stt = cvd_price_stats(sl, window=window)
         lab = stt.get("div") or ""
-        if lab in keep and lab != prev:
+        if lab in keep and lab != prev and (i - last_mark) >= window:
+            last_mark = i
             ts = sl["time_str"].iloc[-1] if "time_str" in sl.columns else str(i)
             ev.append({
                 "t": ts,
@@ -4436,7 +4455,8 @@ def live_dashboard_fragment():
                     line=dict(color="#B0BEC5", width=1.2),
                 ), row=4, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
-                cvd_st = cvd_price_stats(dfi, window=20)
+                tf_min_w = {"3 min": 10, "5 min": 8, "15 min": 6}.get(st.session_state.get("selected_timeframe", "5 min"), 8)
+                cvd_st = cvd_price_stats(dfi, window=tf_min_w)
                 if cvd_st.get("ok"):
                     colr = "#FF5252" if "BEARISH" in cvd_st["div"] else (
                         "#00E676" if "BULLISH" in cvd_st["div"] else "#FFD54F"
@@ -4449,7 +4469,7 @@ def live_dashboard_fragment():
                         row=4, col=1,
                     )
 
-                div_ev = scan_cvd_div_events(dfi, window=20)
+                div_ev = scan_cvd_div_events(dfi, window=tf_min_w)
                 if div_ev:
                     ylo = float(dfi["close"].min())
                     yhi = float(dfi["close"].max())
