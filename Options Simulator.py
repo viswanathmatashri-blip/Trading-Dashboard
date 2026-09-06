@@ -1447,6 +1447,25 @@ def save_flow_tape(index_name: str, day, tape):
         pass
 
 
+def attach_bar_flow(df: pd.DataFrame) -> pd.DataFrame:
+    """CVD/OBV on THESE bars. Call before any resample so coarser TF keeps last(CVD)."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    cl = out["close"].astype(float)
+    vol = out["volume"].astype(float) if "volume" in out.columns else pd.Series(0.0, index=out.index)
+    hi = out["high"].astype(float) if "high" in out.columns else cl
+    lo = out["low"].astype(float) if "low" in out.columns else cl
+    hl = (hi - lo).replace(0, np.nan)
+    loc = ((cl - lo) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
+    out["signed_flow"] = vol * loc
+    out["cvd"] = out["signed_flow"].cumsum()
+    direction = np.sign(cl.diff().fillna(0.0))
+    out["obv"] = (direction * vol).cumsum()
+    out["efi13"] = (cl.diff() * vol).ewm(span=13, adjust=False).mean()
+    return out
+
+
 def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     parts = [x for x in (old, new) if x is not None and not getattr(x, "empty", True)]
     if not parts:
@@ -3994,6 +4013,8 @@ def live_dashboard_fragment():
         latest_session = None
         want_tf = st.session_state.get("selected_timeframe", "5 min")
         tf_min = {"3 min": 3, "5 min": 5, "15 min": 15, "1 min": 1, "10 min": 10}.get(want_tf, 5)
+        if not df_fut.empty and "time" in df_fut.columns:
+            df_fut = attach_bar_flow(df_fut)
         if not df_fut.empty and "time" in df_fut.columns and len(df_fut) >= 8:
             try:
                 t = series_to_ist(df_fut["time"])
@@ -4003,9 +4024,16 @@ def live_dashboard_fragment():
                     g = df_fut.copy()
                     g["time"] = t
                     g = g.set_index("time").sort_index()
-                    ohlc = g.resample(f"{int(tf_min)}min", label="right", closed="right").agg({
-                        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
-                    }).dropna(subset=["close"])
+                    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+                    if "cvd" in g.columns:
+                        agg["cvd"] = "last"
+                    if "obv" in g.columns:
+                        agg["obv"] = "last"
+                    if "efi13" in g.columns:
+                        agg["efi13"] = "last"
+                    if "signed_flow" in g.columns:
+                        agg["signed_flow"] = "sum"
+                    ohlc = g.resample(f"{int(tf_min)}min", label="right", closed="right").agg(agg).dropna(subset=["close"])
                     if len(ohlc) >= 5:
                         df_fut = ohlc.reset_index()
                         data["df_futures"] = df_fut
@@ -4162,13 +4190,14 @@ def live_dashboard_fragment():
                     dfi["spot_px"] = float(data["spot_price"])
                 close = dfi["close"].astype(float)
                 vol = dfi["volume"].astype(float)
-                direction = np.sign(close.diff().fillna(0.0))
-                dfi["obv"] = (direction * vol).cumsum()
+                if "cvd" not in dfi.columns or dfi["cvd"].isna().all():
+                    dfi = attach_bar_flow(dfi)
+                if "obv" not in dfi.columns or dfi["obv"].isna().all():
+                    direction = np.sign(close.diff().fillna(0.0))
+                    dfi["obv"] = (direction * vol).cumsum()
+                if "efi13" not in dfi.columns or dfi["efi13"].isna().all():
+                    dfi["efi13"] = (close.diff() * vol).ewm(span=13, adjust=False).mean()
                 dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
-                dfi["efi13"] = (close.diff() * vol).ewm(span=13, adjust=False).mean()
-                hl = (dfi["high"] - dfi["low"]).replace(0, np.nan)
-                loc = ((dfi["close"] - dfi["low"]) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
-                dfi["cvd"] = (dfi["volume"] * loc).cumsum()
 
                 fig_stack = make_subplots(
                     rows=4, cols=2,
