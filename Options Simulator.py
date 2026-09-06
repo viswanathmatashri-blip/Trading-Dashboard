@@ -4860,32 +4860,65 @@ def live_dashboard_fragment():
                     st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
                     st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 340), use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
-                heading_ribbon(
-                    f"🎯 Δ-GEX (OI) — {selected_expiry_str}",
-                    "<b>Delta-adjusted GEX (OI)</b><br>"
-                    "GEX_i × |Δ_i| so far OTM wings are down-weighted.<br>"
-                    "Expiry = selected chain only. Built from <b>OI</b>, not trade volume.<br>"
-                    "Flip line = zero-gamma strike.",
-                )
-                delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
-                fig_delta_gex = plt_go.Figure()
-                fig_delta_gex.add_trace(plt_go.Bar(
-                    x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], name="Δ-GEX",
-                    marker_color=delta_gex_colors, opacity=0.85, width=25,
-                ))
-                fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-                fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-                fig_delta_gex.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
-                st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                fig_delta_gex.update_layout(
-                    template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                    height=260, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
-                    showlegend=False,
-                )
-                fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
-                fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
-                st.plotly_chart(fig_delta_gex, use_container_width=True)
-                st.markdown("</div>", unsafe_allow_html=True)
+                tab_dgex, tab_dexoi = st.tabs(["Δ-GEX (OI)", "DEX OI"])
+                with tab_dgex:
+                    heading_ribbon(
+                        f"🎯 Δ-GEX (OI) — {selected_expiry_str}",
+                        "<b>Delta-adjusted GEX (OI)</b><br>"
+                        "GEX_i × |Δ_i| so far OTM wings are down-weighted.<br>"
+                        "Expiry = selected chain only. Built from <b>OI</b>, not trade volume.<br>"
+                        "Flip line = zero-gamma strike.",
+                    )
+                    delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
+                    fig_delta_gex = plt_go.Figure()
+                    fig_delta_gex.add_trace(plt_go.Bar(
+                        x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], name="Δ-GEX",
+                        marker_color=delta_gex_colors, opacity=0.85, width=25,
+                    ))
+                    fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
+                    fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
+                    fig_delta_gex.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    fig_delta_gex.update_layout(
+                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                        height=260, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
+                        showlegend=False,
+                    )
+                    fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
+                    fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
+                    st.plotly_chart(fig_delta_gex, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tab_dexoi:
+                    heading_ribbon(
+                        f"DEX OI — {selected_expiry_str}",
+                        "<b>Delta exposure vs OI</b> (not volume).<br>"
+                        "DEX_K = (Δ_CE × OI_CE − |Δ_PE| × OI_PE) × lot<br>"
+                        "Same snapshot as the selected expiry chain. Not a time tape.",
+                    )
+                    lotn = float(LOT_SIZES.get(Index_Name, 65))
+                    c_d = pd.to_numeric(df_chain.get("C_Δ", 0), errors="coerce").fillna(0.0)
+                    p_d = pd.to_numeric(df_chain.get("P_Δ", 0), errors="coerce").fillna(0.0)
+                    c_oi = pd.to_numeric(df_chain.get("C_OI", 0), errors="coerce").fillna(0.0)
+                    p_oi = pd.to_numeric(df_chain.get("P_OI", 0), errors="coerce").fillna(0.0)
+                    dex_oi = (c_d * c_oi - p_d.abs() * p_oi) * lotn
+                    dcols = np.where(dex_oi >= 0, "#26C6DA", "#FF8A65")
+                    fig_dexoi = plt_go.Figure()
+                    fig_dexoi.add_trace(plt_go.Bar(
+                        x=df_chain["Strike"], y=dex_oi, name="DEX OI",
+                        marker_color=dcols, opacity=0.85, width=25,
+                    ))
+                    fig_dexoi.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
+                    fig_dexoi.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    fig_dexoi.update_layout(
+                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                        height=260, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
+                        showlegend=False,
+                    )
+                    fig_dexoi.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
+                    fig_dexoi.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
+                    st.plotly_chart(fig_dexoi, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.info("GEX unavailable.")
 
