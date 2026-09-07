@@ -1040,7 +1040,7 @@ def gemini_generate(prompt: str, models: list) -> tuple:
                 url,
                 params={"key": key},
                 json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.3, "maxOutputTokens": 700}},
+                      "generationConfig": {"temperature": 0.25, "maxOutputTokens": 1100}},
                 timeout=25,
             )
             if r.status_code == 429:
@@ -1060,6 +1060,17 @@ def gemini_generate(prompt: str, models: list) -> tuple:
     return "", last_err or "ALL_FAILED"
 
 
+def _ser_stats(s, name):
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if s.empty:
+        return f"{name}: NA"
+    last = float(s.iloc[-1])
+    first = float(s.iloc[0])
+    return (f"{name}: last={last:.2f} sess_chg={last-first:.2f} "
+            f"min={float(s.min()):.2f} max={float(s.max()):.2f} "
+            f"sign={'+' if last>=0 else '-'}")
+
+
 def build_gemini_digest(data, dfi, scores, micro, flow, cvd_st) -> str:
     lv = data.get("levels") or {}
     px = data.get("spot_price")
@@ -1067,20 +1078,75 @@ def build_gemini_digest(data, dfi, scores, micro, flow, cvd_st) -> str:
         f"Index {data.get('index_name', '')} expiry {data.get('selected_expiry', '')}",
         f"Spot {px} Fut {data.get('F')} basis {data.get('basis_info', {}).get('basis')}",
         f"Flip {lv.get('Zero_Gamma_Flip')} GEX_sup {lv.get('GEX_Support')} GEX_res {lv.get('GEX_Resistance')}",
-        f"Net GEX OI {data.get('total_net_gex_oi')} PCR {data.get('pcr')}",
+        f"Net GEX OI {data.get('total_net_gex_oi')} Net GEX Vol {data.get('total_net_gex_vol')} PCR {data.get('pcr')}",
         f"Scores composite {scores.get('composite') if scores else ''} bias {scores.get('bias') if scores else ''}",
         f"PECO {(micro or {}).get('arrows')} {(micro or {}).get('action')} {(micro or {}).get('micro')}",
         f"PCD$ {(flow or {}).get('action')} {(flow or {}).get('micro')}",
         f"CVD div {(cvd_st or {}).get('div')} {(cvd_st or {}).get('div_note')}",
-        f"Trigger {(scores or {}).get('dir_trigger', {})}",
+        f"DirTrigger {(scores or {}).get('dir_trigger', {})}",
     ]
     if dfi is not None and not getattr(dfi, "empty", True):
         last = dfi.iloc[-1]
+        vw = last.get("vwap_idx", last.get("vwap"))
+        sp = last.get("spot_px", last.get("close"))
+        std = last.get("vwap_std")
+        z = ""
+        try:
+            if vw is not None and std and float(std) > 0 and sp is not None:
+                z = f" zVWAP={(float(sp)-float(vw))/float(std):+.2f}"
+        except Exception:
+            z = ""
         lines.append(
-            f"Last bar t={last.get('time_str')} spot={last.get('spot_px')} "
-            f"fut={last.get('close')} vwap_idx={last.get('vwap_idx')} "
-            f"efi={last.get('efi13')} cvd={last.get('cvd')} obv={last.get('obv')}"
+            f"Last bar t={last.get('time_str')} spot={sp} fut={last.get('close')} "
+            f"vwap_idx={last.get('vwap_idx')} vwap_fut={last.get('vwap')}{z}"
         )
+        for col, name in (("efi13", "EFI13"), ("cvd", "CVD"), ("obv", "OBV")):
+            if col in dfi.columns:
+                lines.append(_ser_stats(dfi[col], name))
+        if "obv_ma20" in dfi.columns:
+            lines.append(f"OBV vs MA20: last={float(dfi['obv'].iloc[-1]):.1f} ma={float(dfi['obv_ma20'].iloc[-1]):.1f}")
+        # Intra-day path (evenly sampled) so slope/divergence is visible
+        n = len(dfi)
+        step = max(1, n // 16)
+        path = []
+        for i in range(0, n, step):
+            r = dfi.iloc[i]
+            path.append(
+                f"{r.get('time_str','?')} S={float(r.get('spot_px', r.get('close',0)) or 0):.0f}"
+                f" V={float(r.get('vwap_idx', r.get('vwap',0)) or 0):.0f}"
+                f" EFI={float(r.get('efi13',0) or 0):.0f}"
+                f" CVD={float(r.get('cvd',0) or 0):.0f}"
+                f" OBV={float(r.get('obv',0) or 0):.0f}"
+            )
+        r = dfi.iloc[-1]
+        lastp = (
+            f"{r.get('time_str','?')} S={float(r.get('spot_px', r.get('close',0)) or 0):.0f}"
+            f" V={float(r.get('vwap_idx', r.get('vwap',0)) or 0):.0f}"
+            f" EFI={float(r.get('efi13',0) or 0):.0f}"
+            f" CVD={float(r.get('cvd',0) or 0):.0f}"
+            f" OBV={float(r.get('obv',0) or 0):.0f}"
+        )
+        if path[-1] != lastp:
+            path.append(lastp)
+        lines.append("PATH " + " | ".join(path))
+        if cvd_st:
+            lines.append(
+                f"CVD_STATS px_slope={cvd_st.get('px_slope')} p={cvd_st.get('px_p')} "
+                f"cvd_slope={cvd_st.get('cvd_slope')} p={cvd_st.get('cvd_p')} "
+                f"rho={cvd_st.get('spearman')} div={cvd_st.get('div')}"
+            )
+    tape = list(st.session_state.get("flow_tape") or [])
+    if tape:
+        t = tape[-1]
+        lines.append(
+            f"DEX last={t.get('dex')} CallPrem={t.get('prem_c')} PutPrem={t.get('prem_p')} "
+            f"snaps={len(tape)} last_ts={t.get('ts')}"
+        )
+        if len(tape) >= 3:
+            dex = pd.Series([x.get("dex", 0) for x in tape], dtype=float)
+            lines.append(_ser_stats(dex, "DEX_tape"))
+    else:
+        lines.append("DEX/premium tape: EMPTY (no intra-day snaps)")
     return "\n".join(str(x) for x in lines)
 
 
@@ -1091,10 +1157,20 @@ def maybe_gemini_regular(digest: str):
     if now - float(st.session_state.get("gemini_regular_ts") or 0) < 60:
         return
     prompt = (
-        "You are a Nifty options/futures desk assistant. "
-        "Give a compact 8-12 line regular tape read. No fabricated prints. "
-        "Cover: VWAP/sigma, EFI/CVD/OBV, PECO, PCD$, GEX walls/flip, risk. "
-        "End with one line BIAS + what would invalidate.\n\nDATA:\n" + digest
+        "You are a Nifty cash/futures/options desk analyst. "
+        "Use ONLY the snapshot below (spot, futures VWAP/sigma, EFI, OBV, CVD, "
+        "DEX/premium if present, GEX/Δ-GEX/DEX-OI, flip, PECO, PCD$). "
+        "Do not invent ticks, OI, or prints that are not in DATA.\n\n"
+        "Write these sections, short bullets:\n"
+        "1) MARKET STATE — spot vs VWAP/sigma, EFI/CVD/OBV agreement, GEX walls and flip.\n"
+        "2) PECO — VALIDATE or INVALIDATE the current PECO action. Why. What would flip it.\n"
+        "3) PCD$ — VALIDATE or INVALIDATE. Why. What would flip it.\n"
+        "4) PLAYERS — Retail (OTM premium/chase), Dealers (GEX/DEX/gamma flip), "
+        "Institutions (CVD/DEX/premium/book if present). Label confidence Low/Med.\n"
+        "5) HIGH-PROB ENTRIES — at most two: structure, side, invalidation, skip-if. "
+        "If no edge, say NO TRADE.\n"
+        "6) EXPECT / WATCH — next 30-90 min: pin vs expansion, levels that matter.\n"
+        "End with one line: BIAS | INVALIDATION.\n\nDATA:\n" + digest
     )
     txt, model = gemini_generate(prompt, GEMINI_REGULAR_MODELS)
     st.session_state["gemini_regular_ts"] = now
@@ -1108,9 +1184,15 @@ def gemini_trigger_feedback(event_text: str, digest: str) -> str:
     if not st.session_state.get("gemini_enabled"):
         return ""
     prompt = (
-        "Critical trigger on a live Nifty desk. 10-14 lines. "
-        "Say what the trigger is, what must be true for a fade vs continuation, "
-        "invalidation, and whether size should wait. Do not invent tape.\n\n"
+        "Critical TRIGGER on a Nifty desk. Use ONLY DATA. No invented tape.\n"
+        "Sections:\n"
+        "1) TRIGGER — name it and whether it is confirmed by VWAP/sigma, EFI, CVD, GEX/flip.\n"
+        "2) PECO — VALIDATE or INVALIDATE vs this trigger.\n"
+        "3) PCD$ — VALIDATE or INVALIDATE vs this trigger.\n"
+        "4) FADE vs FOLLOW — which is higher probability and the one invalidation print.\n"
+        "5) ENTRY — one plan or WAIT. Include stop idea in points not fantasy targets.\n"
+        "6) PLAYERS — retail / dealers / institutions in one line each.\n"
+        "End: BIAS | INVALIDATION.\n\n"
         f"TRIGGER:\n{event_text}\n\nDATA:\n{digest}"
     )
     txt, model = gemini_generate(prompt, GEMINI_TRIGGER_MODELS)
