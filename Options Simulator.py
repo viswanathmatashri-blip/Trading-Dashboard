@@ -5083,7 +5083,7 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
-                tab_flow, tab_dex, tab_fp = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Effort vs Result"])
+                tab_flow, tab_dex, tab_idx, tab_fp = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Index / Vol / CVD", "4 · Effort vs Result"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
@@ -5186,6 +5186,72 @@ def live_dashboard_fragment():
                     else:
                         st.caption("DEX / premium empty until Auto-Refresh stores snaps in market hours. No strike fallback.")
                     st.plotly_chart(fig_dex, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tab_idx:
+                    fig_ivc = make_subplots(
+                        rows=3, cols=1, shared_xaxes=True,
+                        row_heights=[0.50, 0.22, 0.28],
+                        vertical_spacing=0.04,
+                    )
+                    if "vwap_upper_idx" in dfi.columns:
+                        fig_ivc.add_trace(plt_go.Scatter(
+                            x=dfi["time_str"], y=dfi["vwap_upper_idx"], mode="lines",
+                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                            showlegend=False, hoverinfo="skip"), row=1, col=1)
+                        fig_ivc.add_trace(plt_go.Scatter(
+                            x=dfi["time_str"], y=dfi["vwap_lower_idx"], mode="lines",
+                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                            fill="tonexty", fillcolor="rgba(255,152,0,0.08)",
+                            showlegend=False, hoverinfo="skip"), row=1, col=1)
+                    fig_ivc.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi.get("vwap_idx", dfi.get("vwap")),
+                        mode="lines", name="VWAP",
+                        line=dict(color="#FF9800", width=2)), row=1, col=1)
+                    fig_ivc.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi["spot_px"] if "spot_px" in dfi.columns else dfi["close"],
+                        mode="lines", name="NIFTY",
+                        line=dict(color="#2196F3", width=2)), row=1, col=1)
+                    vol = dfi["volume"].astype(float) if "volume" in dfi.columns else pd.Series([0]*len(dfi))
+                    up = dfi["close"] >= dfi["open"] if "open" in dfi.columns else vol >= 0
+                    vcol = np.where(up, "#26A69A", "#EF5350")
+                    fig_ivc.add_trace(plt_go.Bar(
+                        x=dfi["time_str"], y=vol, name="Fut Vol",
+                        marker_color=vcol, opacity=0.85, showlegend=False,
+                    ), row=2, col=1)
+                    cvd_pos = dfi["cvd"].clip(lower=0)
+                    cvd_neg = dfi["cvd"].clip(upper=0)
+                    fig_ivc.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=cvd_pos, mode="lines", name="CVD+",
+                        line=dict(color="#00E676", width=1),
+                        fill="tozeroy", fillcolor="rgba(0,230,118,0.25)",
+                        showlegend=False), row=3, col=1)
+                    fig_ivc.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=cvd_neg, mode="lines", name="CVD-",
+                        line=dict(color="#FF5252", width=1),
+                        fill="tozeroy", fillcolor="rgba(255,82,82,0.25)",
+                        showlegend=False), row=3, col=1)
+                    fig_ivc.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi["cvd"], mode="lines", name="CVD",
+                        line=dict(color="#B0BEC5", width=1.4)), row=3, col=1)
+                    fig_ivc.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
+                    xr_i = [-0.5, max(len(dfi) - 0.5, 0.5)]
+                    fig_ivc.update_layout(
+                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                        height=620, margin=dict(l=44, r=10, t=8, b=28),
+                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                        hovermode="x unified", bargap=0.15,
+                    )
+                    for r in (1, 2, 3):
+                        fig_ivc.update_xaxes(
+                            type="category", categoryorder="array",
+                            categoryarray=list(dfi["time_str"]), range=xr_i,
+                            showticklabels=(r == 3), nticks=8, row=r, col=1,
+                        )
+                    fig_ivc.update_yaxes(tickfont=dict(size=8), row=1, col=1)
+                    fig_ivc.update_yaxes(tickfont=dict(size=8), row=2, col=1)
+                    fig_ivc.update_yaxes(tickfont=dict(size=8), row=3, col=1)
+                    st.markdown("<div class='chart-card'><div class='card-title'>Index + VWAP · Volume · CVD</div>", unsafe_allow_html=True)
+                    st.plotly_chart(fig_ivc, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                 with tab_fp:
                     lot = max(int(LOT_SIZES.get(Index_Name, 65)), 1)
