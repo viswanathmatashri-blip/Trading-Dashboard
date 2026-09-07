@@ -151,6 +151,7 @@ for k, v in {
     "flow_tape": [],
     "heatmap_timeframe": "5 min",
     "gex_heatmap_history": [],
+    "perp_window": "1 day",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -882,12 +883,16 @@ def build_chain(currency: str, expiry_ts: int, spot: float, r: float, strikes_be
         # Net GEX ≈ (Call_γ * Call_OI − Put_γ * Put_OI) * S^2 * 0.01 * contract
         gex_oi = (r0["C_γ"] * r0["C_OI"] - r0["P_γ"] * r0["P_OI"]) * lot * (spot ** 2) * 0.01
         gex_vol = (r0["C_γ"] * r0["C_Vol"] - r0["P_γ"] * r0["P_Vol"]) * lot * (spot ** 2) * 0.01
-        d_gex = gex_oi * (abs(r0["C_Δ"]) + abs(r0["P_Δ"])) / 2.0
+        d_gex = gex_oi * max(abs(r0["C_Δ"]) + abs(r0["P_Δ"]), 0.15)
+        dex_oi = (float(r0["C_Δ"]) * float(r0["C_OI"]) + float(r0["P_Δ"]) * float(r0["P_OI"])) * lot * spot
         vex = ((r0.get("C_vanna", 0) or 0) * r0["C_OI"] + (r0.get("P_vanna", 0) or 0) * r0["P_OI"]) * lot
         cex = ((r0.get("C_charm", 0) or 0) * r0["C_OI"] + (r0.get("P_charm", 0) or 0) * r0["P_OI"]) * lot
+        prem_c = float(r0["C_LTP"]) * float(r0["C_OI"]) * lot
+        prem_p = float(r0["P_LTP"]) * float(r0["P_OI"]) * lot
         r0.update({
             "Net_GEX_OI": gex_oi, "Net_GEX_Vol": gex_vol,
-            "Net_Delta_GEX_OI": d_gex, "VEX": vex, "CEX": cex,
+            "Net_Delta_GEX_OI": d_gex, "DEX_OI": dex_oi,
+            "VEX": vex, "CEX": cex, "Prem_C": prem_c, "Prem_P": prem_p,
         })
         chain.append(r0)
         total_call_oi += r0["C_OI"]
@@ -1509,18 +1514,35 @@ def live_dashboard():
                     unsafe_allow_html=True,
                 )
         with hdr3:
-            sigma_mult = st.selectbox(
-                "VWAP bands", [1.0, 1.5, 2.0], index=1,
-                format_func=lambda x: f"±{x}σ", key="vwap_sigma",
-                label_visibility="collapsed",
-            )
+            w1, w2 = st.columns(2)
+            with w1:
+                sigma_mult = st.selectbox(
+                    "VWAP bands", [1.0, 1.5, 2.0], index=1,
+                    format_func=lambda x: f"±{x}σ", key="vwap_sigma",
+                    label_visibility="collapsed",
+                )
+            with w2:
+                win_label = st.selectbox(
+                    "Window", ["6 hrs", "1 day", "2 days"],
+                    index=["6 hrs", "1 day", "2 days"].index(st.session_state.get("perp_window", "1 day"))
+                    if st.session_state.get("perp_window") in ["6 hrs", "1 day", "2 days"] else 1,
+                    key="perp_window_sel",
+                    label_visibility="collapsed",
+                )
+                st.session_state["perp_window"] = win_label
         if df_fut is not None and not df_fut.empty:
-            dfi = df_fut.tail(400).copy().reset_index(drop=True)
+            dfi = df_fut.copy().reset_index(drop=True)
             dfi["time"] = to_ist(dfi["time"])
             dfi["ist_date"] = dfi["time"].dt.date
-            # Keep last two IST days max, but VWAP resets each IST day
-            last_days = sorted(dfi["ist_date"].dropna().unique())[-2:]
-            dfi = dfi[dfi["ist_date"].isin(last_days)].reset_index(drop=True)
+            now_ist = datetime.datetime.now(IST)
+            hours = {"6 hrs": 6, "1 day": 24, "2 days": 48}.get(st.session_state.get("perp_window", "1 day"), 24)
+            cut = now_ist - datetime.timedelta(hours=hours)
+            dfi = dfi[dfi["time"] >= cut].reset_index(drop=True)
+            if dfi.empty:
+                dfi = df_fut.copy().reset_index(drop=True)
+                dfi["time"] = to_ist(dfi["time"])
+                dfi["ist_date"] = dfi["time"].dt.date
+                dfi = dfi.tail(max(12, hours * 2)).reset_index(drop=True)
             dfi["tp"] = (dfi["high"] + dfi["low"] + dfi["close"]) / 3.0
 
             vwaps, stds = [], []
@@ -1558,7 +1580,7 @@ def live_dashboard():
 
             fig_stack = make_subplots(
                 rows=4, cols=2, column_widths=[0.86, 0.14],
-                row_heights=[0.48, 0.16, 0.16, 0.20],
+                row_heights=[0.44, 0.16, 0.20, 0.20],
                 shared_xaxes=True, horizontal_spacing=0.008, vertical_spacing=0.012,
                 specs=[[{}, {}], [{}, None], [{}, None], [{}, None]],
             )
@@ -1593,7 +1615,11 @@ def live_dashboard():
                 line=dict(color="#FFF176", width=1.4),
             ), row=2, col=1)
             efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
-            fig_stack.add_trace(plt_go.Bar(x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False), row=3, col=1)
+            fig_stack.add_trace(plt_go.Bar(
+                x=dfi["time_str"], y=dfi["efi13"],
+                marker_color=efi_col, marker_line_width=0,
+                opacity=1.0, showlegend=False, name="EFI13",
+            ), row=3, col=1)
             cvd_last = float(dfi["cvd"].iloc[-1])
             fig_stack.add_trace(plt_go.Scatter(
                 x=dfi["time_str"], y=dfi["cvd"].where(dfi["cvd"] >= 0),
@@ -1611,8 +1637,9 @@ def live_dashboard():
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=rr, col=1)
             fig_stack.update_layout(
                 template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=480, margin=dict(l=36, r=4, t=4, b=12), hovermode="x unified",
+                height=500, margin=dict(l=36, r=4, t=4, b=12), hovermode="x unified",
                 legend=dict(orientation="h", y=1.02, x=0, font=dict(size=9)),
+                bargap=0.05,
             )
             fig_stack.update_yaxes(range=[y0, y1], title_text="PX", title_font=dict(size=9), tickfont=dict(size=8), row=1, col=1)
             fig_stack.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
@@ -1625,7 +1652,75 @@ def live_dashboard():
                 categoryarray=dfi["time_str"].tolist(),
                 nticks=8, tickfont=dict(size=8), row=4, col=1,
             )
-            st.plotly_chart(fig_stack, use_container_width=True, key="chart_perp_stack")
+            # Snapshot DEX / premium for the time-series tab
+            tot_dex = float(df_chain["DEX_OI"].sum()) if not df_chain.empty and "DEX_OI" in df_chain.columns else 0.0
+            tot_pc = float(df_chain["Prem_C"].sum()) if not df_chain.empty and "Prem_C" in df_chain.columns else 0.0
+            tot_pp = float(df_chain["Prem_P"].sum()) if not df_chain.empty and "Prem_P" in df_chain.columns else 0.0
+            tape = list(st.session_state.get("flow_tape") or [])
+            tape.append({
+                "ts": now_ist.strftime("%d-%b %H:%M"),
+                "dex": tot_dex,
+                "prem_c": tot_pc,
+                "prem_p": tot_pp,
+            })
+            st.session_state["flow_tape"] = tape[-180:]
+
+            tab_flow, tab_dex = st.tabs(["Perp · OBV · EFI · CVD", "Perp · DEX · Premium"])
+            with tab_flow:
+                st.plotly_chart(fig_stack, use_container_width=True, key="chart_perp_stack")
+            with tab_dex:
+                heading_ribbon(
+                    "DEX flow · net premium",
+                    "<b>DEX</b> = Σ (Δ_call×OI_call + Δ_put×OI_put) × S. Signed dollar delta from OI.<br>"
+                    "<b>Call / Put prem</b> = Σ LTP×OI. Needs Auto-Refresh to build a time path.",
+                )
+                fig_dex = make_subplots(
+                    rows=3, cols=2, column_widths=[0.86, 0.14],
+                    row_heights=[0.46, 0.27, 0.27],
+                    shared_xaxes=False, vertical_spacing=0.06, horizontal_spacing=0.01,
+                    specs=[[{}, {}], [{}, None], [{}, None]],
+                )
+                fig_dex.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["vwap"], mode="lines", name="VWAP",
+                                                line=dict(color="#FF9800", width=2)), row=1, col=1)
+                fig_dex.add_trace(plt_go.Scatter(x=dfi["time_str"], y=dfi["close"], mode="lines", name="Perp",
+                                                line=dict(color="#2196F3", width=2)), row=1, col=1)
+                if vp.get("ok"):
+                    fig_dex.add_trace(plt_go.Bar(
+                        x=vols if vp.get("ok") else [], y=mids if vp.get("ok") else [],
+                        orientation="h", showlegend=False,
+                        marker=dict(color=colors if vp.get("ok") else "#64B5F6"),
+                    ), row=1, col=2)
+                if tape:
+                    txs = [t["ts"] for t in tape]
+                    dex_s = pd.Series([t["dex"] for t in tape], dtype=float)
+                    bar_c = np.where(dex_s >= 0, "#00E676", "#FF5252")
+                    fig_dex.add_trace(plt_go.Bar(x=txs, y=dex_s, name="DEX $", marker_color=bar_c, opacity=0.85), row=2, col=1)
+                    fig_dex.add_trace(plt_go.Scatter(
+                        x=txs, y=dex_s.ewm(span=5, adjust=False).mean(), name="DEX EMA",
+                        line=dict(color="#FFD54F", width=2),
+                    ), row=2, col=1)
+                    fig_dex.add_trace(plt_go.Scatter(
+                        x=txs, y=[t["prem_c"] / 1e6 for t in tape], name="Call prem $M",
+                        line=dict(color="#00E676", width=2),
+                    ), row=3, col=1)
+                    fig_dex.add_trace(plt_go.Scatter(
+                        x=txs, y=[t["prem_p"] / 1e6 for t in tape], name="Put prem $M",
+                        line=dict(color="#FF5252", width=2),
+                    ), row=3, col=1)
+                    fig_dex.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=1)
+                fig_dex.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=500, margin=dict(l=36, r=4, t=8, b=12), hovermode="x unified",
+                    legend=dict(orientation="h", y=1.02, x=0, font=dict(size=9)),
+                )
+                fig_dex.update_yaxes(title_text="PX", tickfont=dict(size=8), row=1, col=1)
+                fig_dex.update_yaxes(title_text="DEX $", tickfont=dict(size=8), row=2, col=1)
+                fig_dex.update_yaxes(title_text="Prem $M", tickfont=dict(size=8), row=3, col=1)
+                st.plotly_chart(fig_dex, use_container_width=True, key="chart_perp_dex")
+                if len(tape) < 4:
+                    st.caption("DEX / premium path needs a few Auto-Refresh snaps. Keep refresh on.")
+                else:
+                    st.caption(f"DEX tape · {len(tape)} snaps · last DEX ${tot_dex:,.0f}")
             cap = (
                 f"IST · Perp {float(dfi['close'].iloc[-1]):,.1f} · VWAP {float(dfi['vwap'].iloc[-1]):,.1f} "
                 f"· CVD {cvd_last:,.0f}"
@@ -1708,20 +1803,40 @@ def live_dashboard():
                 st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 250), use_container_width=True, key="chart_gex_vol")
 
             heading_ribbon(
-                "Δ-GEX (OI)",
-                "<b>Delta-weighted GEX</b> = Net GEX × average |Δ| at the strike.<br>"
-                "Far OTM wings shrink. White dash = index. Orange dot = zero-gamma flip.",
+                "Δ-GEX (OI)  ·  DEX / OI",
+                "<b>Δ-GEX</b> = Net GEX × (|Δc|+|Δp|). ATM bars dominate.<br>"
+                "<b>DEX / OI</b> = (Δc×OIc + Δp×OIp) × S. Signed dollar delta inventory.",
             )
-            cols = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
-            fig_dg = plt_go.Figure()
-            fig_dg.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], marker_color=cols, width=25))
-            fig_dg.add_hline(y=0, line_color="#FFFFFF")
-            fig_dg.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
-            fig_dg.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800")
-            fig_dg.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                                 height=200, margin=dict(l=6, r=6, t=8, b=6), showlegend=False)
-            fig_dg.update_xaxes(range=[min_s, max_s])
-            st.plotly_chart(fig_dg, use_container_width=True, key="chart_delta_gex")
+            diffs = df_chain["Strike"].sort_values().diff().dropna()
+            bar_w = float(diffs.median()) * 0.72 if len(diffs) else 400.0
+
+            def _strike_bars(ycol, key_name, h=240):
+                y = df_chain[ycol].astype(float)
+                cols = np.where(y >= 0, "#00E676", "#FF5252")
+                fig = plt_go.Figure()
+                fig.add_trace(plt_go.Bar(
+                    x=df_chain["Strike"], y=y, marker_color=cols,
+                    marker_line_width=0, width=bar_w, opacity=1.0,
+                    hovertemplate="K %{x:.0f}<br>%{y:,.0f}<extra></extra>",
+                ))
+                fig.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
+                fig.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
+                fig.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800")
+                ymax = float(y.abs().max() or 1.0)
+                fig.update_layout(
+                    template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                    height=h, margin=dict(l=8, r=8, t=8, b=8), showlegend=False,
+                    bargap=0.15,
+                )
+                fig.update_xaxes(range=[min_s, max_s], tickformat="d")
+                fig.update_yaxes(range=[-ymax * 1.15, ymax * 1.15], zeroline=True, zerolinecolor="#FFFFFF")
+                st.plotly_chart(fig, use_container_width=True, key=key_name)
+
+            t_dg, t_dex = st.tabs(["Δ-GEX (OI)", "DEX / OI"])
+            with t_dg:
+                _strike_bars("Net_Delta_GEX_OI", "chart_delta_gex")
+            with t_dex:
+                _strike_bars("DEX_OI", "chart_dex_oi")
         else:
             st.info("GEX unavailable.")
 
