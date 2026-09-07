@@ -1154,8 +1154,14 @@ def maybe_gemini_regular(digest: str):
     if not st.session_state.get("gemini_enabled"):
         return
     now = time.time()
-    if now - float(st.session_state.get("gemini_regular_ts") or 0) < 60:
+    last = float(st.session_state.get("gemini_regular_ts") or 0)
+    if now - last < 60:
+        st.session_state["gemini_regular_wait"] = int(60 - (now - last))
         return
+    if st.session_state.get("gemini_in_flight"):
+        return
+    st.session_state["gemini_in_flight"] = True
+    st.session_state["gemini_regular_wait"] = 60
     prompt = (
         "You are a Nifty cash/futures/options desk analyst. "
         "Use ONLY the snapshot below (spot, futures VWAP/sigma, EFI, OBV, CVD, "
@@ -1172,12 +1178,15 @@ def maybe_gemini_regular(digest: str):
         "6) EXPECT / WATCH — next 30-90 min: pin vs expansion, levels that matter.\n"
         "End with one line: BIAS | INVALIDATION.\n\nDATA:\n" + digest
     )
-    txt, model = gemini_generate(prompt, GEMINI_REGULAR_MODELS)
-    st.session_state["gemini_regular_ts"] = now
-    if txt:
-        st.session_state["gemini_regular"] = f"[{model}]\n{txt}"
-    else:
-        st.session_state["gemini_regular"] = f"(no model answered: {model})"
+    try:
+        txt, model = gemini_generate(prompt, GEMINI_REGULAR_MODELS)
+        st.session_state["gemini_regular_ts"] = time.time()
+        if txt:
+            st.session_state["gemini_regular"] = f"[{model}]\n{txt}"
+        else:
+            st.session_state["gemini_regular"] = f"(no model answered: {model})"
+    finally:
+        st.session_state["gemini_in_flight"] = False
 
 
 def gemini_trigger_feedback(event_text: str, digest: str) -> str:
@@ -5410,7 +5419,7 @@ def live_dashboard_fragment():
                 g1, g2 = st.tabs(["Regular analysis", "Trigger feedback"])
                 with g1:
                     st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    st.caption("Gemini 3.5 Flash Lite → Flash → 3.1 Lite · ≥60s · checkbox is the only gate")
+                    st.caption(f"Regular Gemini on its own 60s clock (not the 5s UI refresh). Next in {st.session_state.get('gemini_regular_wait', 0)}s")
                     st.text(st.session_state.get("gemini_regular") or "Waiting — enable Gemini in live hours.")
                     st.markdown("</div>", unsafe_allow_html=True)
                 with g2:
