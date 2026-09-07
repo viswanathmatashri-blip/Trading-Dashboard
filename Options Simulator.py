@@ -1213,6 +1213,24 @@ def gemini_trigger_feedback(event_text: str, digest: str) -> str:
     return ""
 
 
+def fmt_compact_num(x) -> str:
+    try:
+        v = float(x or 0)
+    except Exception:
+        return "—"
+    sgn = "-" if v < 0 else ""
+    a = abs(v)
+    if a >= 1e12:
+        return f"{sgn}{a/1e12:.2f}T"
+    if a >= 1e9:
+        return f"{sgn}{a/1e9:.2f}B"
+    if a >= 1e6:
+        return f"{sgn}{a/1e6:.2f}M"
+    if a >= 1e3:
+        return f"{sgn}{a/1e3:.1f}K"
+    return f"{v:.0f}"
+
+
 def heading_ribbon(title: str, tip_html: str, size: int = 13):
     """Compact hoverable chart-title ribbon."""
     st.markdown(
@@ -4351,7 +4369,7 @@ def live_dashboard_fragment():
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Spot (Fut)", f"{data['spot_price']:.0f} ({data['F']:.0f})")
     c2.metric("Max Pain", f"{data['max_pain_strike']}")
-    c3.metric("Net GEX (OI)", f"₹{data['total_net_gex_oi']/1e7:.1f} Cr")
+    c3.metric("Net GEX (OI)", fmt_compact_num(data.get("total_net_gex_oi")))
     c4.metric("ATM IV Rank", f"{data['iv_percentile']:.0f}%")
     c5.metric("PCR", f"{data['pcr']:.2f}")
     c6.metric("C/P OI", f"{data['total_call_oi']//1000}k/{data['total_put_oi']//1000}k")
@@ -5299,6 +5317,15 @@ def live_dashboard_fragment():
                             "#90CAF9",
                         ))
                 st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+                b1, b2 = st.columns([0.50, 0.50])
+                with b1:
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with b2:
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    render_block_tape(data, Index_Name)
+                    st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.info("Futures / VWAP not available.")
 
@@ -5430,15 +5457,6 @@ def live_dashboard_fragment():
             else:
                 st.info("GEX unavailable.")
 
-        book_l, tape_r = st.columns([0.50, 0.50])
-        with book_l:
-            st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-            render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-        with tape_r:
-            st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-            render_block_tape(data, Index_Name)
-            st.markdown("</div>", unsafe_allow_html=True)
 
         # Delta-GEX (selected) | Heatmap
         # Multi-exp Delta-GEX   | VEX/CEX
