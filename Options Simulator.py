@@ -4848,31 +4848,20 @@ def live_dashboard_fragment():
                 tab_flow, tab_dex, tab_fp = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Effort vs Result"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
-                    try:
-                        ev = st.plotly_chart(fig_stack, use_container_width=True,
-                                             on_select="rerun", selection_mode="points",
-                                             key="flow_chart_select")
-                        if st.session_state.get("avwap_on") and ev is not None:
-                            sel = getattr(ev, "selection", None)
-                            pts = getattr(sel, "points", None) if sel is not None else None
-                            if pts:
-                                xval = pts[0].get("x") if isinstance(pts[0], dict) else None
-                                if xval:
-                                    st.session_state["avwap_time"] = str(xval)
-                                    st.rerun()
-                    except TypeError:
-                        st.plotly_chart(fig_stack, use_container_width=True)
-                        if st.session_state.get("avwap_on"):
-                            opts_t = dfi["time_str"].tolist() if "time_str" in dfi.columns else []
-                            if opts_t:
-                                cur = st.session_state.get("avwap_time") or opts_t[0]
-                                if cur not in opts_t:
-                                    cur = opts_t[0]
-                                pick = st.selectbox("AVWAP anchor (click not supported)", opts_t,
-                                                    index=opts_t.index(cur), key="avwap_pick")
-                                if pick != st.session_state.get("avwap_time"):
-                                    st.session_state["avwap_time"] = pick
-                                    st.rerun()
+                    st.plotly_chart(fig_stack, use_container_width=True)
+                    if st.session_state.get("avwap_on"):
+                        opts_t = list(dfi["time_str"]) if "time_str" in dfi.columns else []
+                        if opts_t:
+                            cur = st.session_state.get("avwap_time")
+                            if cur not in opts_t:
+                                cur = opts_t[0]
+                            pick = st.selectbox(
+                                "AVWAP anchor time (one at a time)",
+                                opts_t, index=opts_t.index(cur), key="avwap_pick",
+                            )
+                            if pick != st.session_state.get("avwap_time"):
+                                st.session_state["avwap_time"] = pick
+                                st.rerun()
                     st.markdown("</div>", unsafe_allow_html=True)
                 with tab_dex:
                     sess_day = latest_session or _ist_now().date()
