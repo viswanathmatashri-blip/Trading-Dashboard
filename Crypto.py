@@ -152,6 +152,10 @@ for k, v in {
     "heatmap_timeframe": "5 min",
     "gex_heatmap_history": [],
     "perp_window": "1 day",
+    "price_alerts": [],
+    "last_peco_sent": "",
+    "last_peco_ts": 0.0,
+    "tg_log": [],
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -202,6 +206,48 @@ def deribit_get(method: str, params: dict | None = None, timeout: int = 20):
         time.sleep(0.4 * (attempt + 1))
     LAST_API_ERROR = last or "Deribit unreachable"
     return None
+
+
+def telegram_creds():
+    token = (
+        os.environ.get("TELE_BOTTOKEN")
+        or os.environ.get("TELE_BOT_TOKEN")
+        or os.environ.get("TELEGRAM_BOT_TOKEN")
+        or ""
+    ).strip()
+    chat = (
+        os.environ.get("TELE_CHATID")
+        or os.environ.get("TELE_CHAT_ID")
+        or os.environ.get("TELEGRAM_CHAT_ID")
+        or ""
+    ).strip()
+    return token, chat
+
+
+def send_telegram(text: str) -> tuple[bool, str]:
+    token, chat = telegram_creds()
+    if not token or not chat:
+        return False, "TELE_BOTTOKEN / TELE_CHATID not set on Render"
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=12,
+        )
+        js = {}
+        try:
+            js = r.json()
+        except Exception:
+            js = {}
+        if r.status_code == 200 and js.get("ok"):
+            log = list(st.session_state.get("tg_log") or [])
+            log.append({"ts": datetime.datetime.now(IST).strftime("%H:%M:%S"), "ok": True, "msg": text[:80]})
+            st.session_state["tg_log"] = log[-20:]
+            return True, "sent"
+        desc = (js.get("description") or r.text or f"HTTP {r.status_code}")[:160]
+        return False, desc
+    except Exception as e:
+        return False, str(e)
 
 
 def heading_ribbon(title: str, tip_html: str, size: int = 12):
@@ -1530,6 +1576,55 @@ def live_dashboard():
                     label_visibility="collapsed",
                 )
                 st.session_state["perp_window"] = win_label
+
+        al1, al2, al3, al4 = st.columns([0.28, 0.18, 0.22, 0.32])
+        with al1:
+            alert_px = st.number_input(
+                "Alert", min_value=0.0, value=0.0, step=50.0,
+                key="tg_alert_px", label_visibility="visible",
+            )
+        with al2:
+            arm = st.button("Send alert", key="tg_arm_btn", use_container_width=True)
+        with al3:
+            peco_tg = st.checkbox("PECO → TG", value=True, key="tg_peco_on")
+        with al4:
+            token_ok, chat_ok = telegram_creds()
+            if token_ok and chat_ok:
+                st.caption("TG live")
+            else:
+                st.caption("Set TELE_BOTTOKEN + TELE_CHATID")
+        if arm:
+            if alert_px <= 0:
+                st.warning("Enter a futures price > 0")
+            else:
+                last_px = 0.0
+                if df_fut is not None and not df_fut.empty:
+                    last_px = float(df_fut["close"].iloc[-1])
+                side = "above" if alert_px >= last_px else "below"
+                alerts = list(st.session_state.get("price_alerts") or [])
+                alerts.append({
+                    "price": float(alert_px),
+                    "side": side,
+                    "armed_at": last_px,
+                    "ccy": currency,
+                    "done": False,
+                })
+                st.session_state["price_alerts"] = alerts
+                ok, msg = send_telegram(
+                    f"🔔 <b>{currency} alert armed</b>\n"
+                    f"Trigger {side} <b>{alert_px:,.1f}</b>\n"
+                    f"Spot now {last_px:,.1f}"
+                )
+                if ok:
+                    st.success(f"Armed {side} {alert_px:,.1f}")
+                else:
+                    st.error(f"Armed locally, Telegram failed: {msg}")
+
+        live_alerts = [a for a in (st.session_state.get("price_alerts") or []) if not a.get("done") and a.get("ccy") == currency]
+        if live_alerts:
+            bits = " · ".join(f"{a['side']} {a['price']:,.0f}" for a in live_alerts)
+            st.caption(f"Armed: {bits}")
+
         if df_fut is not None and not df_fut.empty:
             dfi = df_fut.copy().reset_index(drop=True)
             dfi["time"] = to_ist(dfi["time"])
@@ -1732,6 +1827,52 @@ def live_dashboard():
             # PECO trigger sits directly under VP / price stack
             micro = classify_microstructure(dfi)
             trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
+            last_close = float(dfi["close"].iloc[-1])
+
+            # Price alerts
+            new_alerts = []
+            for a in list(st.session_state.get("price_alerts") or []):
+                if a.get("done") or a.get("ccy") != currency:
+                    new_alerts.append(a)
+                    continue
+                hit = (a["side"] == "above" and last_close >= a["price"]) or (
+                    a["side"] == "below" and last_close <= a["price"]
+                )
+                if hit:
+                    ok, _ = send_telegram(
+                        f"🎯 <b>{currency} PRICE HIT</b>\n"
+                        f"Alert {a['side']} {a['price']:,.1f}\n"
+                        f"Perp now <b>{last_close:,.1f}</b>\n"
+                        f"VWAP {float(dfi['vwap'].iloc[-1]):,.1f}"
+                    )
+                    a = dict(a)
+                    a["done"] = True
+                    a["hit"] = last_close
+                new_alerts.append(a)
+            st.session_state["price_alerts"] = new_alerts
+
+            # PECO long/short → Telegram (cooldown 8 min per state)
+            act = str(micro.get("action") or "")
+            peco_side = "LONG" if "LONG" in act else ("SHORT" if "SHORT" in act else "")
+            if peco_tg and peco_side:
+                sig = f"{currency}:{peco_side}:{act}"
+                now_s = time.time()
+                last_sig = st.session_state.get("last_peco_sent") or ""
+                last_ts = float(st.session_state.get("last_peco_ts") or 0)
+                if sig != last_sig or (now_s - last_ts) > 480:
+                    ok, _ = send_telegram(
+                        f"{'🟢' if peco_side == 'LONG' else '🔴'} <b>PECO {peco_side}</b> {currency}\n"
+                        f"{act}\n"
+                        f"P{ARROW_GLYPH[micro.get('price','f')]} "
+                        f"E{ARROW_GLYPH[micro.get('efi','f')]} "
+                        f"C{ARROW_GLYPH[micro.get('cvd','f')]} "
+                        f"O{ARROW_GLYPH[micro.get('obv','f')]}\n"
+                        f"Perp {last_close:,.1f}  VWAP {float(dfi['vwap'].iloc[-1]):,.1f}\n"
+                        f"Prepare to {peco_side.lower()}"
+                    )
+                    if ok:
+                        st.session_state["last_peco_sent"] = sig
+                        st.session_state["last_peco_ts"] = now_s
             peco_arrows = (
                 f"P{ARROW_GLYPH[micro.get('price','f')]} "
                 f"E{ARROW_GLYPH[micro.get('efi','f')]} "
