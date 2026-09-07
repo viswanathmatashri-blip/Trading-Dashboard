@@ -130,6 +130,25 @@ def ist_label(series, with_date: bool = True) -> pd.Series:
     return t.dt.strftime("%d-%b %H:%M" if with_date else "%H:%M")
 CONTRACT_SIZE = {"BTC": 1.0, "ETH": 1.0}  # 1 option contract = 1 coin
 PERP = {"BTC": "BTC-PERPETUAL", "ETH": "ETH-PERPETUAL"}
+BINANCE_FUT = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
+BINANCE_INTERVAL = {
+    "1 min": "1m", "3 min": "3m", "5 min": "5m", "15 min": "15m", "1 hour": "1h",
+}
+BINANCE_KLINE_URLS = (
+    "https://fapi.binance.com/fapi/v1/klines",
+    "https://www.binance.com/fapi/v1/klines",
+    "https://data-api.binance.vision/api/v3/klines",
+)
+BINANCE_PRICE_URLS = (
+    "https://fapi.binance.com/fapi/v1/ticker/price",
+    "https://www.binance.com/fapi/v1/ticker/price",
+    "https://data-api.binance.vision/api/v3/ticker/price",
+)
+BINANCE_DEPTH_URLS = (
+    "https://fapi.binance.com/fapi/v1/depth",
+    "https://www.binance.com/fapi/v1/depth",
+    "https://data-api.binance.vision/api/v3/depth",
+)
 DVOL = {"BTC": "BTCDVOL", "ETH": "ETHDVOL"}
 BIN_STEP = {"BTC": 250.0, "ETH": 25.0}
 
@@ -214,14 +233,24 @@ def telegram_creds():
         or os.environ.get("TELE_BOT_TOKEN")
         or os.environ.get("TELEGRAM_BOT_TOKEN")
         or ""
-    ).strip()
+    ).strip().strip('"').strip("'")
     chat = (
         os.environ.get("TELE_CHATID")
         or os.environ.get("TELE_CHAT_ID")
         or os.environ.get("TELEGRAM_CHAT_ID")
         or ""
-    ).strip()
+    ).strip().strip('"').strip("'").replace(" ", "")
+    if chat.startswith("@"):
+        chat = chat[1:]
     return token, chat
+
+
+def _tg_chat_payload(chat: str):
+    if chat.startswith("-") and chat[1:].isdigit():
+        return int(chat)
+    if chat.isdigit():
+        return int(chat)
+    return chat
 
 
 def send_telegram(text: str) -> tuple[bool, str]:
@@ -231,7 +260,12 @@ def send_telegram(text: str) -> tuple[bool, str]:
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            json={
+                "chat_id": _tg_chat_payload(chat),
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
             timeout=12,
         )
         js = {}
@@ -755,6 +789,70 @@ def fetch_index_price(currency: str) -> float:
 def fetch_book_summaries(currency: str, kind: str = "option") -> list:
     res = deribit_get("public/get_book_summary_by_currency", {"currency": currency, "kind": kind})
     return res or []
+
+
+def _binance_get(urls, params, timeout=12):
+    last = None
+    for u in urls:
+        try:
+            r = _HTTP.get(u, params=params, timeout=timeout)
+            if r.status_code != 200:
+                last = f"{u} {r.status_code}"
+                continue
+            js = r.json()
+            if isinstance(js, dict) and js.get("code"):
+                last = str(js.get("msg") or js)
+                continue
+            return js
+        except Exception as e:
+            last = str(e)
+            continue
+    return None
+
+
+@st.cache_data(ttl=12, show_spinner=False)
+def fetch_binance_klines(symbol: str, tf_label: str, lookback_hours: int = 72) -> pd.DataFrame:
+    interval = BINANCE_INTERVAL.get(tf_label, "5m")
+    minutes = max(int(INTERVAL_MS.get(tf_label, 300_000) / 60_000), 1)
+    limit = int(min(1500, max(50, lookback_hours * 60 / minutes + 10)))
+    js = _binance_get(BINANCE_KLINE_URLS, {"symbol": symbol, "interval": interval, "limit": limit})
+    if not js or not isinstance(js, list):
+        return pd.DataFrame()
+    rows = []
+    for k in js:
+        try:
+            rows.append({
+                "time": pd.to_datetime(int(k[0]), unit="ms", utc=True),
+                "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                "close": float(k[4]), "volume": float(k[5]),
+            })
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return compute_technical_indicators(pd.DataFrame(rows))
+
+
+@st.cache_data(ttl=8, show_spinner=False)
+def fetch_binance_last(symbol: str) -> float:
+    js = _binance_get(BINANCE_PRICE_URLS, {"symbol": symbol})
+    if isinstance(js, dict) and js.get("price"):
+        try:
+            return float(js["price"])
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+@st.cache_data(ttl=8, show_spinner=False)
+def fetch_binance_book(symbol: str, limit: int = 20) -> dict:
+    js = _binance_get(BINANCE_DEPTH_URLS, {"symbol": symbol, "limit": limit})
+    if not isinstance(js, dict):
+        return {}
+    bids = [[float(p), float(q)] for p, q in (js.get("bids") or [])[:limit]]
+    asks = [[float(p), float(q)] for p, q in (js.get("asks") or [])[:limit]]
+    last = fetch_binance_last(symbol)
+    return {"bids": bids, "asks": asks, "last_price": last, "mark_price": last}
 
 
 @st.cache_data(ttl=20, show_spinner=False)
@@ -1283,8 +1381,13 @@ def fetch_live_bundle(tf_label: str):
     if spot <= 0:
         return None
     res_ms = INTERVAL_MS.get(tf_label, 300_000)
-    df_perp = fetch_candles(PERP[currency], res_ms, lookback_hours=96)
-    df_spot = df_perp.copy()  # index ≈ perp for crypto; both shown
+    bsym = BINANCE_FUT.get(currency, "BTCUSDT")
+    df_perp = fetch_binance_klines(bsym, tf_label, lookback_hours=96)
+    src = f"Binance {bsym}"
+    if df_perp is None or df_perp.empty:
+        df_perp = fetch_candles(PERP[currency], res_ms, lookback_hours=96)
+        src = f"Deribit {PERP[currency]} (Binance blocked)"
+    df_spot = df_perp.copy()
     hv = hv_from_candles(df_perp, hv_days)
 
     built = build_chain(currency, exp_choice, spot, r_rate, strikes_below, strikes_above)
@@ -1301,9 +1404,13 @@ def fetch_live_bundle(tf_label: str):
     atm_iv = (atm["C_IV"] + atm["P_IV"]) / 2.0
     iv_pct = float(si.percentileofscore(ivs, atm_iv)) if ivs else 50.0
 
-    perp_book = fetch_order_book(PERP[currency], 20)
-    perp_ticker = deribit_get("public/ticker", {"instrument_name": PERP[currency]}) or {}
-    fut_ltp = float(perp_ticker.get("last_price") or perp_ticker.get("mark_price") or spot)
+    perp_book = fetch_binance_book(bsym, 20)
+    if not perp_book.get("bids"):
+        perp_book = fetch_order_book(PERP[currency], 20)
+    fut_ltp = fetch_binance_last(bsym)
+    if fut_ltp <= 0:
+        perp_ticker = deribit_get("public/ticker", {"instrument_name": PERP[currency]}) or {}
+        fut_ltp = float(perp_ticker.get("last_price") or perp_ticker.get("mark_price") or spot)
     basis = fut_ltp - spot
 
     dvol = fetch_dvol_candles(currency)
@@ -1328,8 +1435,9 @@ def fetch_live_bundle(tf_label: str):
         "dvol": dvol,
         "perp_book": perp_book,
         "basis_info": {
-            "fut_token": PERP[currency],
-            "fut_expiry": "PERPETUAL",
+            "fut_token": bsym,
+            "fut_expiry": "BINANCE USDT-M",
+            "source": src,
             "spot_ltp": spot,
             "fut_ltp": fut_ltp,
             "basis": round(basis, 2),
@@ -1544,8 +1652,8 @@ def live_dashboard():
         hdr1, hdr2, hdr3 = st.columns([0.52, 0.20, 0.28])
         with hdr1:
             heading_ribbon(
-                f"PERP · VWAP · VP  ({currency})",
-                "<b>PERP</b> — Deribit perpetual last.<br>"
+                f"BINANCE {BINANCE_FUT.get(currency,'BTCUSDT')} · VWAP · VP",
+                "<b>Futures</b> — Binance USDT-M perpetual (BTCUSDT / ETHUSDT).<br>"
                 "<b>VWAP</b> — session Σ(TP×Vol)/ΣVol, TP=(H+L+C)/3. Orange line + ±σ bands.<br>"
                 "<b>VP</b> — volume-at-price histogram (right). Yellow bar = POC.<br>"
                 "<b>Basis</b> — Perp − Index. Contango +, backwardation −.",
@@ -1984,7 +2092,7 @@ def live_dashboard():
     # Book + tape
     book_l, tape_r = st.columns(2)
     with book_l:
-        heading_ribbon("📘 Perp Limit Book Δ", "Resting book size on BTC/ETH-PERPETUAL. Δ = this snap − last snap.")
+        heading_ribbon("📘 Futures Limit Book Δ", "Binance BTCUSDT / ETHUSDT book. Δ = this snap − last snap.")
         book = data.get("perp_book") or {}
         hist = update_liq_from_book(book, currency) if book else list(st.session_state.get("liq_delta_history") or [])
         if hist:
