@@ -5211,12 +5211,27 @@ def live_dashboard_fragment():
                         x=dfi["time_str"], y=dfi["spot_px"] if "spot_px" in dfi.columns else dfi["close"],
                         mode="lines", name="NIFTY",
                         line=dict(color="#2196F3", width=2)), row=1, col=1)
-                    vol = dfi["volume"].astype(float) if "volume" in dfi.columns else pd.Series([0]*len(dfi))
+                    vol = dfi["volume"].astype(float) if "volume" in dfi.columns else pd.Series([0.0]*len(dfi))
+                    sma20 = vol.rolling(20, min_periods=20).mean()
+                    spike = vol > (3.0 * sma20)
                     up = dfi["close"] >= dfi["open"] if "open" in dfi.columns else vol >= 0
-                    vcol = np.where(up, "#26A69A", "#EF5350")
+                    vcol = []
+                    for i in range(len(vol)):
+                        if bool(spike.iloc[i]) if i < len(spike) else False:
+                            vcol.append("#FFD54F")
+                        elif bool(up.iloc[i]) if hasattr(up, "iloc") else bool(up[i]):
+                            vcol.append("#26A69A")
+                        else:
+                            vcol.append("#EF5350")
                     fig_ivc.add_trace(plt_go.Bar(
                         x=dfi["time_str"], y=vol, name="Fut Vol",
                         marker_color=vcol, opacity=0.85, showlegend=False,
+                        customdata=np.column_stack([sma20.fillna(0), spike.fillna(False).astype(int)]),
+                        hovertemplate="Vol %{y:.0f}<br>SMA20 %{customdata[0]:.0f}<br>3xSMA %{customdata[1]}<extra></extra>",
+                    ), row=2, col=1)
+                    fig_ivc.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=sma20, mode="lines", name="Vol SMA20",
+                        line=dict(color="#90A4AE", width=1.2), showlegend=False,
                     ), row=2, col=1)
                     cvd_pos = dfi["cvd"].clip(lower=0)
                     cvd_neg = dfi["cvd"].clip(upper=0)
@@ -5237,7 +5252,7 @@ def live_dashboard_fragment():
                     xr_i = [-0.5, max(len(dfi) - 0.5, 0.5)]
                     fig_ivc.update_layout(
                         template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=620, margin=dict(l=44, r=10, t=8, b=28),
+                        height=620, margin=dict(l=44, r=228, t=8, b=28),
                         legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
                         hovermode="x unified", bargap=0.15,
                     )
