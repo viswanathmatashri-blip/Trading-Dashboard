@@ -130,6 +130,16 @@ if "basket_legs" not in st.session_state:
     st.session_state["basket_legs"] = []
 if "selected_timeframe" not in st.session_state:
     st.session_state["selected_timeframe"] = "5 min"
+if "chart_window" not in st.session_state:
+    st.session_state["chart_window"] = "Session (6h)"
+if "px_alert_on" not in st.session_state:
+    st.session_state["px_alert_on"] = False
+if "px_alert_lvl" not in st.session_state:
+    st.session_state["px_alert_lvl"] = 0.0
+if "avwap_on" not in st.session_state:
+    st.session_state["avwap_on"] = False
+if "avwap_time" not in st.session_state:
+    st.session_state["avwap_time"] = None
 if "enable_main_refresh" not in st.session_state:
     st.session_state["enable_main_refresh"] = False
 if "enable_zscore_refresh" not in st.session_state:
@@ -951,6 +961,16 @@ def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st):
             if band != "INSIDE" and not cooled("sigma"):
                 events.append(f"SIGMA  {prev['sigma_band']} → {band}  z={z:+.2f}")
         prev["sigma_band"] = band
+
+    tgt = st.session_state.get("px_alert_lvl")
+    if st.session_state.get("px_alert_on") and tgt:
+        tgt = float(tgt)
+        hit_side = "ABOVE" if px >= tgt else "BELOW"
+        prev_hit = st.session_state.get("px_alert_side")
+        if prev_hit and hit_side != prev_hit and not cooled("pxlvl", 60):
+            events.append(f"PRICE ALERT  hit {tgt:,.1f}  ({prev_hit} → {hit_side})")
+            st.session_state["px_alert_on"] = False
+        st.session_state["px_alert_side"] = hit_side
 
     if flip:
         flip_side = "ABOVE_FLIP" if px >= flip else "BELOW_FLIP"
@@ -4480,6 +4500,34 @@ def live_dashboard_fragment():
                     format_func=lambda x: f"±{x}σ", key="vwap_sigma_select",
                     label_visibility="collapsed"
                 )
+            tw, al, av = st.columns([0.28, 0.44, 0.28])
+            with tw:
+                st.session_state["chart_window"] = st.radio(
+                    "Window", ["Session (6h)", "3h", "1h"], horizontal=True,
+                    key="chart_window_radio",
+                )
+            with al:
+                a1, a2, a3 = st.columns([0.45, 0.35, 0.20])
+                with a1:
+                    lvl = st.number_input("Alert px", min_value=0.0, step=1.0,
+                                         value=float(st.session_state.get("px_alert_lvl") or 0) or None,
+                                         placeholder="NIFTY level", key="px_alert_input",
+                                         label_visibility="collapsed")
+                with a2:
+                    if st.button("Activate Alert", key="px_alert_btn"):
+                        if lvl and float(lvl) > 0:
+                            st.session_state["px_alert_lvl"] = float(lvl)
+                            st.session_state["px_alert_on"] = True
+                            st.session_state["px_alert_side"] = None
+                with a3:
+                    if st.session_state.get("px_alert_on"):
+                        st.caption(f"🔔 {st.session_state['px_alert_lvl']:.0f}")
+                    else:
+                        st.caption("off")
+            with av:
+                st.session_state["avwap_on"] = st.checkbox("Anchored VWAP", key="avwap_chk")
+                if st.session_state["avwap_on"] and st.session_state.get("avwap_time"):
+                    st.caption(f"anchor {st.session_state['avwap_time']}")
 
             if not df_fchart.empty:
                 df_fchart = df_fchart.copy()
@@ -4571,6 +4619,31 @@ def live_dashboard_fragment():
                 dfi = attach_bar_flow(dfi)
                 dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
 
+                win = st.session_state.get("chart_window") or "Session (6h)"
+                if "time" in dfi.columns and win in ("3h", "1h") and len(dfi):
+                    tlast = pd.to_datetime(dfi["time"].iloc[-1])
+                    hrs = 3 if win == "3h" else 1
+                    cut = tlast - pd.Timedelta(hours=hrs)
+                    dfi = dfi[pd.to_datetime(dfi["time"]) >= cut].copy().reset_index(drop=True)
+                    if "time_str" in dfi.columns:
+                        fut_times = dfi["time_str"].tolist()
+
+                dfi["avwap_idx"] = np.nan
+                if st.session_state.get("avwap_on") and st.session_state.get("avwap_time") and len(dfi):
+                    at = str(st.session_state["avwap_time"])
+                    if "time_str" in dfi.columns and at in set(dfi["time_str"].astype(str)):
+                        i0 = int(dfi.index[dfi["time_str"].astype(str) == at][0])
+                        sub = dfi.iloc[i0:].copy()
+                        tp = (sub["high"] + sub["low"] + sub["close"]) / 3.0
+                        vol = sub["volume"].astype(float)
+                        cv = vol.cumsum().replace(0, np.nan)
+                        av = (tp.astype(float) * vol).cumsum() / cv
+                        if "basis" in sub.columns:
+                            av_idx = av - sub["basis"].astype(float)
+                        else:
+                            av_idx = av
+                        dfi.loc[sub.index, "avwap_idx"] = av_idx.values
+
                 cvd_st = {"ok": False}
                 fig_stack = make_subplots(
                     rows=4, cols=2,
@@ -4599,6 +4672,11 @@ def live_dashboard_fragment():
                     x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP (idx)",
                     line=dict(color="#FF9800", width=2),
                     hoverinfo="skip"), row=1, col=1)
+                if st.session_state.get("avwap_on") and "avwap_idx" in dfi.columns and dfi["avwap_idx"].notna().any():
+                    fig_stack.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi["avwap_idx"], mode="lines", name="AVWAP",
+                        line=dict(color="#CE93D8", width=2, dash="dash"),
+                    ), row=1, col=1)
                 cd = np.column_stack([
                     dfi["vwap_idx"].astype(float).values,
                     dfi["close"].astype(float).values,
@@ -4770,7 +4848,31 @@ def live_dashboard_fragment():
                 tab_flow, tab_dex, tab_fp = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Effort vs Result"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
-                    st.plotly_chart(fig_stack, use_container_width=True)
+                    try:
+                        ev = st.plotly_chart(fig_stack, use_container_width=True,
+                                             on_select="rerun", selection_mode="points",
+                                             key="flow_chart_select")
+                        if st.session_state.get("avwap_on") and ev is not None:
+                            sel = getattr(ev, "selection", None)
+                            pts = getattr(sel, "points", None) if sel is not None else None
+                            if pts:
+                                xval = pts[0].get("x") if isinstance(pts[0], dict) else None
+                                if xval:
+                                    st.session_state["avwap_time"] = str(xval)
+                                    st.rerun()
+                    except TypeError:
+                        st.plotly_chart(fig_stack, use_container_width=True)
+                        if st.session_state.get("avwap_on"):
+                            opts_t = dfi["time_str"].tolist() if "time_str" in dfi.columns else []
+                            if opts_t:
+                                cur = st.session_state.get("avwap_time") or opts_t[0]
+                                if cur not in opts_t:
+                                    cur = opts_t[0]
+                                pick = st.selectbox("AVWAP anchor (click not supported)", opts_t,
+                                                    index=opts_t.index(cur), key="avwap_pick")
+                                if pick != st.session_state.get("avwap_time"):
+                                    st.session_state["avwap_time"] = pick
+                                    st.rerun()
                     st.markdown("</div>", unsafe_allow_html=True)
                 with tab_dex:
                     sess_day = latest_session or _ist_now().date()
