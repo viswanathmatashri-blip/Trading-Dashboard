@@ -1,4 +1,4 @@
-import os
+    import os
 from pathlib import Path
 import logging
 import warnings
@@ -140,6 +140,14 @@ if "avwap_on" not in st.session_state:
     st.session_state["avwap_on"] = False
 if "avwap_time" not in st.session_state:
     st.session_state["avwap_time"] = None
+if "gemini_enabled" not in st.session_state:
+    st.session_state["gemini_enabled"] = False
+if "gemini_regular" not in st.session_state:
+    st.session_state["gemini_regular"] = ""
+if "gemini_trigger" not in st.session_state:
+    st.session_state["gemini_trigger"] = ""
+if "gemini_regular_ts" not in st.session_state:
+    st.session_state["gemini_regular_ts"] = 0.0
 if "enable_main_refresh" not in st.session_state:
     st.session_state["enable_main_refresh"] = False
 if "enable_zscore_refresh" not in st.session_state:
@@ -989,8 +997,129 @@ def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st):
 
     st.session_state["tg_prev"] = prev
     st.session_state["tg_cool"] = cool
+    digest = build_gemini_digest(data, dfi, scores if isinstance(scores, dict) else {}, micro, flow, cvd_st)
     for ev in events:
-        send_telegram_alert(f"OS ALERT\n{ev}\n{header}{scores.get('timestamp_ist','') if isinstance(scores, dict) else ''}")
+        gfb = ""
+        try:
+            gfb = gemini_trigger_feedback(ev, digest)
+        except Exception:
+            gfb = ""
+        msg = f"OS ALERT\n{ev}\n{header}"
+        if gfb:
+            msg += "\n--- Trigger feedback ---\n" + gfb[:2500]
+        send_telegram_alert(msg)
+
+
+
+GEMINI_TRIGGER_MODELS = [
+    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-3.5-flash", "gemini-3.5-flash-lite",
+    "gemini-2.5-flash", "gemini-2.0-flash",
+    "gemini-3.1-flash-lite",
+]
+GEMINI_REGULAR_MODELS = [
+    "gemini-3.5-flash-lite", "gemini-3.5-flash",
+    "gemini-2.5-flash-lite", "gemini-2.0-flash-lite", "gemini-2.0-flash",
+    "gemini-3.1-flash-lite",
+]
+
+
+def _gemini_key():
+    return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+
+
+def gemini_generate(prompt: str, models: list) -> tuple:
+    key = _gemini_key()
+    if not key:
+        return "", "NO_KEY"
+    last_err = ""
+    for model in models:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            r = requests.post(
+                url,
+                params={"key": key},
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"temperature": 0.3, "maxOutputTokens": 700}},
+                timeout=25,
+            )
+            if r.status_code == 429:
+                last_err = f"{model} 429"
+                continue
+            if r.status_code >= 400:
+                last_err = f"{model} {r.status_code}"
+                continue
+            js = r.json()
+            parts = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+            txt = "".join(p.get("text", "") for p in parts).strip()
+            if txt:
+                return txt, model
+        except Exception as e:
+            last_err = f"{model} {e}"
+            continue
+    return "", last_err or "ALL_FAILED"
+
+
+def build_gemini_digest(data, dfi, scores, micro, flow, cvd_st) -> str:
+    lv = data.get("levels") or {}
+    px = data.get("spot_price")
+    lines = [
+        f"Index {data.get('index_name', '')} expiry {data.get('selected_expiry', '')}",
+        f"Spot {px} Fut {data.get('F')} basis {data.get('basis_info', {}).get('basis')}",
+        f"Flip {lv.get('Zero_Gamma_Flip')} GEX_sup {lv.get('GEX_Support')} GEX_res {lv.get('GEX_Resistance')}",
+        f"Net GEX OI {data.get('total_net_gex_oi')} PCR {data.get('pcr')}",
+        f"Scores composite {scores.get('composite') if scores else ''} bias {scores.get('bias') if scores else ''}",
+        f"PECO {(micro or {}).get('arrows')} {(micro or {}).get('action')} {(micro or {}).get('micro')}",
+        f"PCD$ {(flow or {}).get('action')} {(flow or {}).get('micro')}",
+        f"CVD div {(cvd_st or {}).get('div')} {(cvd_st or {}).get('div_note')}",
+        f"Trigger {(scores or {}).get('dir_trigger', {})}",
+    ]
+    if dfi is not None and not getattr(dfi, "empty", True):
+        last = dfi.iloc[-1]
+        lines.append(
+            f"Last bar t={last.get('time_str')} spot={last.get('spot_px')} "
+            f"fut={last.get('close')} vwap_idx={last.get('vwap_idx')} "
+            f"efi={last.get('efi13')} cvd={last.get('cvd')} obv={last.get('obv')}"
+        )
+    return "\n".join(str(x) for x in lines)
+
+
+def maybe_gemini_regular(digest: str):
+    if not st.session_state.get("gemini_enabled"):
+        return
+    now = time.time()
+    if now - float(st.session_state.get("gemini_regular_ts") or 0) < 60:
+        return
+    prompt = (
+        "You are a Nifty options/futures desk assistant. "
+        "Give a compact 8-12 line regular tape read. No fabricated prints. "
+        "Cover: VWAP/sigma, EFI/CVD/OBV, PECO, PCD$, GEX walls/flip, risk. "
+        "End with one line BIAS + what would invalidate.\n\nDATA:\n" + digest
+    )
+    txt, model = gemini_generate(prompt, GEMINI_REGULAR_MODELS)
+    st.session_state["gemini_regular_ts"] = now
+    if txt:
+        st.session_state["gemini_regular"] = f"[{model}]\n{txt}"
+    else:
+        st.session_state["gemini_regular"] = f"(no model answered: {model})"
+
+
+def gemini_trigger_feedback(event_text: str, digest: str) -> str:
+    if not st.session_state.get("gemini_enabled"):
+        return ""
+    prompt = (
+        "Critical trigger on a live Nifty desk. 10-14 lines. "
+        "Say what the trigger is, what must be true for a fade vs continuation, "
+        "invalidation, and whether size should wait. Do not invent tape.\n\n"
+        f"TRIGGER:\n{event_text}\n\nDATA:\n{digest}"
+    )
+    txt, model = gemini_generate(prompt, GEMINI_TRIGGER_MODELS)
+    if txt:
+        out = f"[{model}]\n{txt}"
+        st.session_state["gemini_trigger"] = out
+        return out
+    st.session_state["gemini_trigger"] = f"(trigger model failed: {model})"
+    return ""
 
 
 def heading_ribbon(title: str, tip_html: str, size: int = 13):
@@ -5111,7 +5240,9 @@ def live_dashboard_fragment():
                     fig.update_yaxes(range=r1, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
                     fig.update_yaxes(range=r2, secondary_y=True, showgrid=False)
                     return fig
-                g_oi, g_vol = st.tabs(["GEX / OI", "GEX / Volume"])
+                g_oi, g_vol, tab_dgex, tab_dexoi = st.tabs(
+                    ["GEX / OI", "GEX / Volume", "Δ-GEX (OI)", "DEX OI"]
+                )
                 with g_oi:
                     st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
                     st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 340), use_container_width=True)
@@ -5120,7 +5251,6 @@ def live_dashboard_fragment():
                     st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
                     st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 340), use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
-                tab_dgex, tab_dexoi = st.tabs(["Δ-GEX (OI)", "DEX OI"])
                 with tab_dgex:
                     heading_ribbon(
                         f"🎯 Δ-GEX (OI) — {selected_expiry_str}",
@@ -5178,6 +5308,33 @@ def live_dashboard_fragment():
                     fig_dexoi.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
                     fig_dexoi.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
                     st.plotly_chart(fig_dexoi, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                on = st.checkbox("Gemini on", key="gemini_enabled",
+                                 help="Off = zero API calls. On = calls even when the cash market is closed.")
+                if on:
+                    try:
+                        micro_g = classify_microstructure(dfi) if "dfi" in dir() else {}
+                        flow_g = classify_flow_playbook(dfi, data) if "dfi" in dir() else {}
+                        digest = build_gemini_digest(
+                            data,
+                            dfi if "dfi" in dir() else None,
+                            scores if isinstance(scores, dict) else {},
+                            micro_g, flow_g,
+                            cvd_st if "cvd_st" in dir() else {},
+                        )
+                        maybe_gemini_regular(digest)
+                    except Exception:
+                        pass
+                g1, g2 = st.tabs(["Regular analysis", "Trigger feedback"])
+                with g1:
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    st.caption("Gemini 3.5 Flash Lite → Flash → 3.1 Lite · ≥60s · checkbox is the only gate")
+                    st.text(st.session_state.get("gemini_regular") or "Waiting — enable Gemini in live hours.")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with g2:
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    st.caption("3.8 → 3.7 → 3.6 → 3.5 on VWAP/EFI/PECO/PCD$/σ/flip/CVD alerts")
+                    st.text(st.session_state.get("gemini_trigger") or "No trigger feedback yet.")
                     st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.info("GEX unavailable.")
