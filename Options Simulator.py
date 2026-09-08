@@ -1692,11 +1692,11 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
     return ""
 
 # --- HOLIDAY / WEEKEND FALLBACK ENGINE FOR CANDLE CHARTS ---
-def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15):
+def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX"):
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
     live, today, _, _ = market_session_state(now_dt)
-    cached = load_session_cache("spot", "IDX", api_interval, today)
+    cached = load_session_cache("spot", index_name, api_interval, today)
     offsets = [0] if live else list(range(0, 10))
     for offset in offsets:
         target_to = now_dt - datetime.timedelta(days=offset)
@@ -1719,7 +1719,7 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
                 df_candles["time"] = series_to_ist(df_candles["time"])
                 if live:
                     df_candles = merge_candle_frames(cached, df_candles)
-                    save_session_cache("spot", "IDX", api_interval, df_candles, today)
+                    save_session_cache("spot", index_name, api_interval, df_candles, today)
                 return compute_technical_indicators(df_candles), (offset > 0 and not live)
     if live and not cached.empty:
         return compute_technical_indicators(cached.copy()), False
@@ -2057,6 +2057,11 @@ def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     parts = [x for x in (old, new) if x is not None and not getattr(x, "empty", True)]
     if not parts:
         return pd.DataFrame()
+    if len(parts) == 2 and "close" in parts[0].columns and "close" in parts[1].columns:
+        a = pd.to_numeric(parts[0]["close"], errors="coerce").median()
+        b = pd.to_numeric(parts[1]["close"], errors="coerce").median()
+        if a and b and a > 0 and b > 0 and max(a, b) / min(a, b) > 1.25:
+            return parts[1].copy()
     out = pd.concat(parts, ignore_index=True)
     out["time"] = series_to_ist(out["time"])
     out = out.dropna(subset=["time"]).sort_values("time")
@@ -2377,6 +2382,10 @@ with st.sidebar.expander("1. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
         Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"])
+    if st.session_state.get("_last_index") and st.session_state["_last_index"] != Index_Name:
+        st.session_state["flow_tape"] = []
+        st.session_state.pop("liq_delta_history", None)
+    st.session_state["_last_index"] = Index_Name
     
     default_token, spot_exchange, Exchange = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
     
@@ -2545,7 +2554,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         api_interval, lookback_days = interval_mapping.get(selected_interval_label, ("FIVE_MINUTE", 15))
 
         df_candles, is_holiday_fallback = fetch_candles_with_holiday_fallback(
-            smart_api, spot_token, spot_exch, api_interval, lookback_days
+            smart_api, spot_token, spot_exch, api_interval, lookback_days, Index_Name
         )
 
         # ----- Near-month Futures candles + real VWAP -----
@@ -3325,7 +3334,7 @@ def render_delta_gex_heatmap(data: dict, index_name: str, expiry_str: str, heatm
         api_interval, lookback_days = interval_mapping.get(heatmap_tf_label, ("FIVE_MINUTE", 15))
         if smart_api:
             df_hm, _ = fetch_candles_with_holiday_fallback(
-                smart_api, spot_token, spot_exch, api_interval, lookback_days
+                smart_api, spot_token, spot_exch, api_interval, lookback_days, index_name
             )
             df_session = _prepare_session_candles(df_hm)
 
