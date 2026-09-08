@@ -212,7 +212,9 @@ LOT_SIZES = {
     "BANKNIFTY": 30,
     "FINNIFTY": 60,
     "MIDCPNIFTY": 120,
-    "SENSEX": 20
+    "SENSEX": 20,
+    "GOLDM": 1,
+    "SILVERM": 1,
 }
 
 INDEX_TOKEN_MAP = {
@@ -220,7 +222,9 @@ INDEX_TOKEN_MAP = {
     "BANKNIFTY": ("99926009", "NSE", "NFO"),
     "FINNIFTY": ("99926037", "NSE", "NFO"),
     "MIDCPNIFTY": ("99926074", "NSE", "NFO"),
-    "SENSEX": ("99919000", "BSE", "BFO")
+    "SENSEX": ("99919000", "BSE", "BFO"),
+    "GOLDM": ("", "MCX", "MCX"),
+    "SILVERM": ("", "MCX", "MCX"),
 }
 INDIA_VIX_TOKEN = "99926017"
 
@@ -1707,8 +1711,8 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
             "exchange": exchange,
             "symboltoken": spot_token,
             "interval": api_interval,
-            "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
-            "todate": target_to.strftime("%Y-%m-%d 15:30")
+            "fromdate": target_from.strftime(f"%Y-%m-%d {session_hours()[4]}"),
+            "todate": target_to.strftime(f"%Y-%m-%d {session_hours()[5]}")
         }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
         time.sleep(0.20)
@@ -1770,10 +1774,19 @@ def _ist_now():
     return datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
 
 
-def market_session_state(now=None):
+def session_hours(index_name=None):
+    """Cash/FO 09:15–15:30; MCX GOLDM/SILVERM 09:00–23:30 IST weekdays."""
+    name = index_name or st.session_state.get("_last_index") or st.session_state.get("Index_Name") or "NIFTY"
+    if str(name).upper() in ("GOLDM", "SILVERM"):
+        return 9, 0, 23, 30, "09:00", "23:30"
+    return 9, 15, 15, 30, "09:15", "15:30"
+
+
+def market_session_state(now=None, index_name=None):
     now = now or _ist_now()
-    open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    oh, om, ch, cm, _, _ = session_hours(index_name)
+    open_t = now.replace(hour=oh, minute=om, second=0, microsecond=0)
+    close_t = now.replace(hour=ch, minute=cm, second=0, microsecond=0)
     live = now.weekday() < 5 and open_t <= now <= close_t
     return live, now.date(), open_t, close_t
 
@@ -2080,8 +2093,9 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
     out = df.copy()
     out["time"] = series_to_ist(out["time"])
     out = out.dropna(subset=["time"]).sort_values("time")
+    oh, om, ch, cm, _, _ = session_hours()
     mins = out["time"].dt.hour * 60 + out["time"].dt.minute
-    out = out[(mins >= 9 * 60 + 15) & (mins <= 15 * 60 + 30)]
+    out = out[(mins >= oh * 60 + om) & (mins <= ch * 60 + cm)]
     if out.empty:
         return empty
     out["session_date"] = out["time"].dt.date
@@ -2173,10 +2187,9 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
 
-    market_open = now_dt.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now_dt.replace(hour=15, minute=30, second=0, microsecond=0)
+    live_sess, _, market_open, market_close = market_session_state(now_dt, index_name)
     is_weekday = now_dt.weekday() < 5
-    currently_closed = (not is_weekday) or (now_dt < market_open or now_dt > market_close)
+    currently_closed = not live_sess
 
     cached = load_session_cache("fut", index_name, api_interval, now_dt.date())
     best_df = pd.DataFrame()
@@ -2192,8 +2205,8 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
             "exchange": fut_exch,
             "symboltoken": str(fut_token),
             "interval": api_interval,
-            "fromdate": target_from.strftime("%Y-%m-%d 09:15"),
-            "todate": target_to.strftime("%Y-%m-%d 15:30")
+            "fromdate": target_from.strftime(f"%Y-%m-%d {session_hours(index_name)[4]}"),
+            "todate": target_to.strftime(f"%Y-%m-%d {session_hours(index_name)[5]}")
         }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
         time.sleep(0.20)
@@ -2381,13 +2394,16 @@ df_master = download_master_scrip()
 with st.sidebar.expander("1. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
-        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"])
+        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "SILVERM"])
     if st.session_state.get("_last_index") and st.session_state["_last_index"] != Index_Name:
         st.session_state["flow_tape"] = []
         st.session_state.pop("liq_delta_history", None)
     st.session_state["_last_index"] = Index_Name
     
     default_token, spot_exchange, Exchange = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
+    if not default_token:
+        tok, _ = get_near_month_futures_token(df_master, Index_Name, Exchange)
+        default_token = tok or ""
     
     with c2:
         st.text_input("Exchange", value=Exchange, disabled=True)
@@ -2397,7 +2413,7 @@ with st.sidebar.expander("1. Market Parameters", expanded=True):
     df_options = df_master[
         (df_master["exch_seg"] == Exchange)
         & (df_master["name"] == Index_Name)
-        & (df_master["instrumenttype"].isin(["OPTIDX", "OPTSTK"]))
+        & (df_master["instrumenttype"].isin(["OPTIDX", "OPTSTK", "OPTFUT"]))
     ].copy()
 
     df_options["expiry_dt"] = pd.to_datetime(df_options["expiry"], format="%d%b%Y", errors='coerce')
@@ -2982,8 +2998,9 @@ def _prepare_session_candles(df_candles: pd.DataFrame) -> pd.DataFrame:
     else:
         parsed = parsed.dt.tz_convert(ist_tz)
     df[time_col] = parsed
-    session_start = datetime.datetime.strptime("09:15", "%H:%M").time()
-    session_end = datetime.datetime.strptime("15:30", "%H:%M").time()
+    _, _, _, _, os_, cs_ = session_hours()
+    session_start = datetime.datetime.strptime(os_, "%H:%M").time()
+    session_end = datetime.datetime.strptime(cs_, "%H:%M").time()
     df = df[(df[time_col].dt.time >= session_start) & (df[time_col].dt.time <= session_end)]
     if df.empty:
         return pd.DataFrame()
