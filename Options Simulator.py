@@ -213,8 +213,7 @@ LOT_SIZES = {
     "FINNIFTY": 60,
     "MIDCPNIFTY": 120,
     "SENSEX": 20,
-    "GOLDM": 1,
-    "SILVERM": 1,
+    "GOLDM": 100,
 }
 
 INDEX_TOKEN_MAP = {
@@ -224,7 +223,6 @@ INDEX_TOKEN_MAP = {
     "MIDCPNIFTY": ("99926074", "NSE", "NFO"),
     "SENSEX": ("99919000", "BSE", "BFO"),
     "GOLDM": ("", "MCX", "MCX"),
-    "SILVERM": ("", "MCX", "MCX"),
 }
 INDIA_VIX_TOKEN = "99926017"
 
@@ -1730,19 +1728,39 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
     return pd.DataFrame(), False
 
 
+MCX_NAME_ALIASES = {
+    "GOLDM": ["GOLDM", "GOLD"],
+}
+
+
 def get_near_month_futures_token(df_scrip_master, index_name, fut_exch):
-    """Return token of the nearest active futures contract."""
+    """Nearest future. GOLDM: symbol GOLDM*FUT, name often GOLD, FUTCOM/MCX."""
     try:
         ist_now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-        fut_scrips = df_scrip_master[
-            (df_scrip_master["exch_seg"] == fut_exch) &
-            (df_scrip_master["name"] == index_name) &
-            (df_scrip_master["instrumenttype"].isin(["FUTIDX", "FUTSTK"]))
-        ].copy()
+        df = df_scrip_master.copy()
+        df["_name"] = df["name"].astype(str).str.upper()
+        df["_seg"] = df["exch_seg"].astype(str).str.upper()
+        df["_ityp"] = df["instrumenttype"].astype(str).str.upper()
+        df["_sym"] = df["symbol"].astype(str).str.upper() if "symbol" in df.columns else ""
+        if index_name == "GOLDM":
+            fut_scrips = df[
+                df["_seg"].isin(["MCX", "NCO"])
+                & df["_ityp"].eq("FUTCOM")
+                & df["_sym"].str.startswith("GOLDM")
+                & df["_sym"].str.contains("FUT")
+            ].copy()
+        else:
+            segs = [str(fut_exch).upper()] if fut_exch else ["NFO"]
+            fut_scrips = df[
+                df["_seg"].isin(segs)
+                & df["_ityp"].isin(["FUTIDX", "FUTSTK", "FUTCOM"])
+                & df["_name"].eq(str(index_name).upper())
+            ].copy()
         fut_scrips["expiry_dt"] = pd.to_datetime(fut_scrips["expiry"], format="%d%b%Y", errors="coerce")
         active = fut_scrips[fut_scrips["expiry_dt"].dt.date >= ist_now.date()].sort_values("expiry_dt")
         if not active.empty:
-            return str(active.iloc[0]["token"]), active.iloc[0]["expiry"]
+            row = active.iloc[0]
+            return str(row["token"]), row["expiry"]
     except Exception:
         pass
     return None, None
@@ -2394,7 +2412,7 @@ df_master = download_master_scrip()
 with st.sidebar.expander("1. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
-        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "SILVERM"])
+        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM"])
     if st.session_state.get("_last_index") and st.session_state["_last_index"] != Index_Name:
         st.session_state["flow_tape"] = []
         st.session_state.pop("liq_delta_history", None)
@@ -2410,11 +2428,21 @@ with st.sidebar.expander("1. Market Parameters", expanded=True):
 
     rate_param = st.number_input("Risk Free Rate (r)", min_value=0.0, max_value=0.15, value=0.07, step=0.01)
 
-    df_options = df_master[
-        (df_master["exch_seg"] == Exchange)
-        & (df_master["name"] == Index_Name)
-        & (df_master["instrumenttype"].isin(["OPTIDX", "OPTSTK", "OPTFUT"]))
-    ].copy()
+    if Index_Name == "GOLDM":
+        df_options = df_master[
+            (df_master["exch_seg"].isin(["MCX", "NCO"]))
+            & (df_master["instrumenttype"].isin(["OPTFUT", "OPTCOM"]))
+            & (df_master["name"].astype(str).str.upper().isin(["GOLD", "GOLDM"]))
+        ].copy()
+        if "symbol" in df_options.columns:
+            goldm_opt = df_options[df_options["symbol"].astype(str).str.upper().str.startswith("GOLDM")]
+            df_options = goldm_opt if not goldm_opt.empty else df_options
+    else:
+        df_options = df_master[
+            (df_master["exch_seg"] == Exchange)
+            & (df_master["name"] == Index_Name)
+            & (df_master["instrumenttype"].isin(["OPTIDX", "OPTSTK", "OPTFUT"]))
+        ].copy()
 
     df_options["expiry_dt"] = pd.to_datetime(df_options["expiry"], format="%d%b%Y", errors='coerce')
     ist_tz = pytz.timezone("Asia/Kolkata")
@@ -2559,10 +2587,29 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
     try:
         update_p(0.20, f"Fetching Live Spot & Volatility for {Index_Name}...")
         spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
-
-        spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=Index_Name, symboltoken=spot_token)
+        fut_tok, fut_exp = get_near_month_futures_token(df_master, Index_Name, opt_exch)
+        if (not spot_token) and fut_tok:
+            spot_token = fut_tok
+        ltp_sym = Index_Name
+        try:
+            if fut_tok is not None and df_master is not None:
+                hit = df_master[df_master["token"].astype(str) == str(fut_tok)]
+                if not hit.empty and "symbol" in hit.columns:
+                    ltp_sym = str(hit.iloc[0]["symbol"])
+        except Exception:
+            pass
+        spot_resp = None
+        if spot_token:
+            spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=ltp_sym, symboltoken=spot_token)
         time.sleep(0.40)
-        spot_price = float(spot_resp["data"]["ltp"]) if spot_resp and spot_resp.get("status") and spot_resp.get("data") else 80000.0 if Index_Name == "SENSEX" else 24500.0
+        if spot_resp and spot_resp.get("status") and spot_resp.get("data"):
+            spot_price = float(spot_resp["data"]["ltp"])
+        elif Index_Name == "SENSEX":
+            spot_price = 80000.0
+        elif Index_Name in MCX_NAME_ALIASES:
+            spot_price = 0.0
+        else:
+            spot_price = 24500.0
 
         index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, spot_exch, days=hv_days)
 
