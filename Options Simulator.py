@@ -5047,6 +5047,31 @@ def live_dashboard_fragment():
                     increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350",
                     showlegend=True,
                 ), row=1, col=1)
+                lv_w = data.get("levels") or {}
+                spot_w = float(data.get("spot_price") or (dfi["spot_px"].iloc[-1] if "spot_px" in dfi.columns else 0) or 0)
+                band = max(spot_w * 0.00035, 4.0)  # ~0.035% strip, not a wide zone
+                walls = [
+                    (lv_w.get("GEX_Resistance"), "#FF5252", "rgba(255,82,82,0.08)", "Call wall", "dot", 1.0),
+                    (lv_w.get("GEX_Support"), "#00E676", "rgba(0,230,118,0.08)", "Put wall", "dot", 1.0),
+                    (lv_w.get("Zero_Gamma_Flip"), "#FFB300", "rgba(255,179,0,0.10)", "Flip", "solid", 1.5),
+                ]
+                for px, lc, fc, name, dash, w in walls:
+                    try:
+                        px = float(px)
+                    except Exception:
+                        continue
+                    if not px:
+                        continue
+                    fig_stack.add_hline(y=px, line_color=lc, line_width=w, line_dash=dash,
+                                        row=1, col=1)
+                    fig_stack.add_hrect(y0=px-band, y1=px+band, fillcolor=fc, line_width=0,
+                                        row=1, col=1)
+                    fig_stack.add_annotation(
+                        x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
+                        y=px, text=name, showarrow=False, xanchor="right", yanchor="bottom",
+                        font=dict(size=9, color=lc), bgcolor="rgba(14,17,23,0.35)",
+                        row=1, col=1,
+                    )
                 last_fut = float(dfi["close"].iloc[-1])
                 last_sp = float(dfi["spot_px"].iloc[-1])
                 last_sp = float(last_sp) if pd.notna(last_sp) else float(data.get("spot_price") or 0)
