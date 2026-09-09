@@ -5049,29 +5049,61 @@ def live_dashboard_fragment():
                 ), row=1, col=1)
                 lv_w = data.get("levels") or {}
                 spot_w = float(data.get("spot_price") or (dfi["spot_px"].iloc[-1] if "spot_px" in dfi.columns else 0) or 0)
-                band = max(spot_w * 0.00035, 4.0)  # ~0.035% strip, not a wide zone
-                walls = [
-                    (lv_w.get("GEX_Resistance"), "#FF5252", "rgba(255,82,82,0.08)", "Call wall", "dot", 1.0),
-                    (lv_w.get("GEX_Support"), "#00E676", "rgba(0,230,118,0.08)", "Put wall", "dot", 1.0),
-                    (lv_w.get("Zero_Gamma_Flip"), "#FFB300", "rgba(255,179,0,0.10)", "Flip", "solid", 1.5),
-                ]
-                for px, lc, fc, name, dash, w in walls:
+                call_w = put_w = None
+                dch = data.get("df_chain")
+                if dch is None:
+                    dch = df_chain if "df_chain" in dir() else None
+                try:
+                    if dch is not None and not getattr(dch, "empty", True) and "Strike" in dch.columns:
+                        dc = dch.copy()
+                        dc["Strike"] = pd.to_numeric(dc["Strike"], errors="coerce")
+                        above = dc[dc["Strike"] > spot_w]
+                        below = dc[dc["Strike"] < spot_w]
+                        if not above.empty:
+                            key = "C_OI" if "C_OI" in above.columns else ("Net_GEX_OI" if "Net_GEX_OI" in above.columns else None)
+                            call_w = float(above.sort_values(key, ascending=False).iloc[0]["Strike"]) if key else float(above["Strike"].min())
+                        if not below.empty:
+                            key = "P_OI" if "P_OI" in below.columns else ("Net_GEX_OI" if "Net_GEX_OI" in below.columns else None)
+                            put_w = float(below.sort_values(key, ascending=False).iloc[0]["Strike"]) if key else float(below["Strike"].max())
+                except Exception:
+                    call_w = put_w = None
+                if not call_w:
                     try:
-                        px = float(px)
+                        r = float(lv_w.get("GEX_Resistance") or 0)
+                        call_w = r if r > spot_w else None
                     except Exception:
-                        continue
+                        pass
+                if not put_w:
+                    try:
+                        s = float(lv_w.get("GEX_Support") or 0)
+                        put_w = s if s < spot_w else None
+                    except Exception:
+                        pass
+                flip_w = lv_w.get("Zero_Gamma_Flip")
+                band = max(spot_w * 0.0004, 5.0)
+                try:
+                    flip_w = float(flip_w)
+                    if flip_w:
+                        fig_stack.add_hrect(y0=flip_w-band, y1=flip_w+band,
+                                            fillcolor="rgba(255,82,82,0.07)", line_width=0,
+                                            row=1, col=1)
+                        fig_stack.add_hline(y=flip_w, line_color="#FFB300", line_width=1.4,
+                                            line_dash="dot", row=1, col=1)
+                        fig_stack.add_annotation(
+                            x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
+                            y=flip_w, text="Flip", showarrow=False, xanchor="right",
+                            font=dict(size=9, color="#FFB300"), row=1, col=1)
+                except Exception:
+                    pass
+                for px, lc, name in ((call_w, "#FF5252", "Call wall"), (put_w, "#00E676", "Put wall")):
                     if not px:
                         continue
-                    fig_stack.add_hline(y=px, line_color=lc, line_width=w, line_dash=dash,
-                                        row=1, col=1)
-                    fig_stack.add_hrect(y0=px-band, y1=px+band, fillcolor=fc, line_width=0,
-                                        row=1, col=1)
+                    fig_stack.add_hline(y=float(px), line_color=lc, line_width=1.0,
+                                        line_dash="dot", row=1, col=1)
                     fig_stack.add_annotation(
                         x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
-                        y=px, text=name, showarrow=False, xanchor="right", yanchor="bottom",
-                        font=dict(size=9, color=lc), bgcolor="rgba(14,17,23,0.35)",
-                        row=1, col=1,
-                    )
+                        y=float(px), text=name, showarrow=False, xanchor="right",
+                        font=dict(size=9, color=lc), row=1, col=1)
                 last_fut = float(dfi["close"].iloc[-1])
                 last_sp = float(dfi["spot_px"].iloc[-1])
                 last_sp = float(last_sp) if pd.notna(last_sp) else float(data.get("spot_price") or 0)
