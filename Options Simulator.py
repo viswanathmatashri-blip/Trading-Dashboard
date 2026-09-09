@@ -776,60 +776,194 @@ def _robust_arrow(series: pd.Series, z_th: float = 0.90, ema_span: int = 8) -> s
     return "f"
 
 
+
+LEVEL_GLYPH = {"++": "⇈", "+": "↑", "-": "↓", "--": "⇊", "=": "→"}
+PDEC_ORDER = ("++", "+", "-", "--")
+
+
+def _level4(series, z_hi=1.10, z_mid=0.45) -> str:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 3:
+        return "-"
+    last = float(s.iloc[-1])
+    tail = s.tail(min(20, len(s)))
+    sd = float(tail.std(ddof=1) or 0.0) or 1e-9
+    z = (last - float(tail.mean())) / sd
+    if last >= 0:
+        return "++" if z >= z_hi else "+"
+    return "--" if z <= -z_hi else "-"
+
+
+def _price_level4(df) -> str:
+    px = pd.to_numeric(df["close"], errors="coerce")
+    last = float(px.iloc[-1])
+    base = _level4(px)
+    if "vwap" in df.columns:
+        vw = float(df["vwap"].iloc[-1])
+        if last >= vw and base in ("-", "--"):
+            base = "+"
+        if last < vw and base in ("+", "++"):
+            base = "-"
+        stretch = (last - vw) / max(abs(vw), 1.0)
+        if stretch > 0.003 and base == "+":
+            base = "++"
+        if stretch < -0.003 and base == "-":
+            base = "--"
+    return base
+
+
+def _build_pdec_playbook():
+    """256-state P,Δ,EFI,CVD book (4^4). Actions follow the uploaded table bands."""
+    bands = [
+        ("Pure Trend & Momentum Regime", [
+            "LONG BREAKOUT (Target: Upper 2.0σ)", "LONG", "CAUTIOUS LONG (Tight SL / Partial Exit)",
+            "PREPARE SHORT (Exhaustion Top)", "PREPARE LONG", "PREPARE TRAIL SL",
+            "EXIT LONG / WATCH REVERSAL", "SCALE OUT LONG", "NO NEW SHORT ENTRIES",
+            "PREPARE SHORT / MEAN-REVERSION", "SHORT ENTRY (Target: VWAP)", "TAKE PROFIT LONG",
+            "PREPARE SHORT", "SHORT / MEAN-REVERSION", "EXIT LONG", "CAUTIOUS LONG (Trailing SL tight)",
+        ]),
+        ("Pure Trend & Momentum Regime", [
+            "HOLD LONG", "TRAIL SL TIGHT", "EXIT LONG", "HOLD LONG", "HOLD LONG", "NO ENTRY",
+            "PREPARE SHORT", "HOLD LONG", "TAKE PROFIT LONG", "HOLD LONG / SHORT ENTRY",
+            "BLOCK NEW LONG POSITIONS", "EXIT LONG", "SHORT ENTRY", "SHORT BREAKDOWN PREPARATION",
+            "HOLD LONG WITH CAUTION", "CAUTIOUS LONG",
+        ]),
+        ("Bullish Absorption & Resistance Dynamics", [
+            "PREPARE EXIT LONG", "NO ENTRY (High Volatility Squeeze)", "HOLD LONG",
+            "NO ENTRY (Unstable move)", "HOLD LONG", "DYNAMIC ABSORPTION EXIT",
+            "EXIT LONG", "SHORT / MEAN-REVERSION", "PREPARE SHORT", "SHORT ENTRY",
+            "EXIT LONG", "SHORT / MEAN-REVERSION", "SHORT ENTRY (Target: VWAP)",
+            "BULLISH ABSORPTION WATCH", "HOLD LONG", "PREPARE EXIT LONG",
+        ]),
+        ("Upper VWAP Consolidation & Distribution", [
+            "SHORT ENTRY", "HOLD SHORT", "HOLD LONG", "WATCH FOR REVERSAL",
+            "SHORT BREAKOUT PREPARATION", "EXIT LONG", "SHORT ENTRY",
+            "NO ENTRY (High Friction Zone)", "SHORT ENTRY", "SHORT BREAKOUT (Target: VWAP / Lower Band)",
+            "LONG ENTRY / HOLD LONG", "HOLD LONG", "CAUTIOUS LONG", "WATCH FOR REVERSAL",
+            "HOLD LONG", "NO ENTRY",
+        ]),
+        ("Moderate VWAP Bullish Drift", [
+            "PREPARE SHORT", "HOLD LONG (Tight SL)", "EXIT LONG", "SHORT ENTRY",
+            "PREPARE SHORT", "SHORT ENTRY", "TRAIL SL TIGHT", "EXIT LONG", "NO ENTRY",
+            "NO ENTRY", "PREPARE EXIT LONG", "EXIT LONG", "SHORT / MEAN-REVERSION",
+            "EXIT LONG", "PREPARE SHORT", "CAUTIOUS LONG",
+        ]),
+        ("Neutral VWAP Friction & Churn", [
+            "HOLD LONG", "NO ENTRY", "PREPARE SHORT", "EXIT LONG", "PREPARE LONG",
+            "NO ENTRY", "SHORT / MEAN-REVERSION", "SHORT ENTRY", "EXIT LONG",
+            "BULLISH ABSORPTION WATCH", "HOLD LONG", "PREPARE SHORT", "HOLD LONG",
+            "PREPARE SHORT", "SHORT ENTRY", "NO ENTRY",
+        ]),
+        ("VWAP Crossover & Mid-Band Transition", [
+            "SHORT BREAKOUT PREPARATION", "NO ENTRY", "SHORT / MEAN-REVERSION",
+            "SHORT BREAKOUT (Target: Lower VWAP Band)", "LONG ENTRY (Target: Upper VWAP Band)",
+            "CAUTIOUS LONG", "PREPARE LONG", "NO ENTRY", "SHORT / MEAN-REVERSION", "NO ENTRY",
+            "PREPARE LONG", "HOLD SHORT", "NO ENTRY", "HOLD SHORT", "NO ENTRY", "SHORT ENTRY",
+        ]),
+        ("Lower VWAP Consolidation & Drift", [
+            "PREPARE LONG", "NO ENTRY", "SHORT / MEAN-REVERSION", "NO ENTRY",
+            "PREPARE SHORT", "LONG ENTRY / MEAN-REVERSION", "NO ENTRY", "PREPARE LONG",
+            "NO ENTRY", "PREPARE LONG", "HOLD SHORT", "NO ENTRY", "EXIT SHORT",
+            "PREPARE LONG", "NO ENTRY", "HOLD SHORT",
+        ]),
+        ("Sub-VWAP Bearish Acceleration", [
+            "CAUTIOUS LONG", "NO ENTRY", "ACCUMULATION WATCH", "NO ENTRY", "HOLD SHORT",
+            "LONG / MEAN-REVERSION WATCH", "HOLD SHORT", "HOLD SHORT", "HOLD SHORT",
+            "NO ENTRY", "SHORT ENTRY", "NO ENTRY", "BULLISH ABSORPTION WATCH",
+            "PREPARE LONG", "HOLD LONG / EXIT SHORT", "SHORT ENTRY",
+        ]),
+        ("Sub-VWAP Bearish Acceleration", [
+            "PREPARE SHORT", "NO ENTRY", "EXIT SHORT", "NO ENTRY", "SHORT ENTRY",
+            "PREPARE LONG (Divergence Setup)", "EXIT SHORT", "SHORT BREAKOUT",
+            "SHORT BREAKOUT (Target: Lower 2.0σ)", "LONG / MEAN-REVERSION",
+            "SHORT ENTRY / PREPARE LONG", "NO ENTRY", "LONG / MEAN-REVERSION",
+            "HOLD SHORT", "HOLD SHORT", "PREPARE SHORT",
+        ]),
+        ("Lower VWAP Band OverSold & Reversal", [
+            "HOLD SHORT", "PREPARE LONG", "EXIT SHORT", "PREPARE LONG", "PREPARE SHORT",
+            "EXIT SHORT", "NO ENTRY", "SHORT BREAKDOWN", "LONG / MEAN-REVERSION",
+            "CAUTIOUS LONG", "LONG / MEAN-REVERSION", "NO ENTRY", "PREPARE LONG",
+            "LONG ENTRY (Target: VWAP)", "HOLD SHORT", "PREPARE LONG",
+        ]),
+        ("Extreme Downtrend Breakdown & Flash Moves", [
+            "SHORT BREAKDOWN", "CAUTIOUS LONG", "HOLD SHORT", "NO ENTRY", "ACCUMULATION WATCH",
+            "NO ENTRY (Unstable move)", "HOLD SHORT", "LONG / MEAN-REVERSION", "EXIT SHORT",
+            "HOLD SHORT", "PREPARE LONG", "EXIT SHORT", "SHORT BREAKDOWN",
+            "WATCH", "DYNAMIC ABSORPTION EXIT / LONG", "HOLD SHORT",
+        ]),
+        ("Extreme Downtrend Breakdown & Flash Moves", [
+            "HOLD SHORT", "SHORT BREAKDOWN", "EXIT SHORT", "SHORT BREAKDOWN",
+            "SHORT BREAKDOWN", "EXIT SHORT", "SHORT BREAKDOWN", "PREPARE LONG / MEAN-REVERSION",
+            "EXIT SHORT", "SHORT BREAKDOWN (Target: Lower 2.0σ)", "SHORT BREAKDOWN", "WATCH",
+            "HOLD SHORT", "HOLD SHORT", "HOLD SHORT", "NO ENTRY",
+        ]),
+        ("Extreme Downtrend Breakdown & Flash Moves", [
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+        ]),
+        ("Extreme Downtrend Breakdown & Flash Moves", [
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+        ]),
+        ("Extreme Downtrend Breakdown & Flash Moves", [
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+            "NO ENTRY", "NO ENTRY", "NO ENTRY", "NO ENTRY",
+        ]),
+    ]
+    acts = []
+    names = []
+    for name, chunk in bands:
+        for a in chunk:
+            names.append(name)
+            acts.append(a)
+    while len(acts) < 256:
+        names.append("Unclassified")
+        acts.append("NO ENTRY")
+    book = {}
+    i = 0
+    for p in PDEC_ORDER:
+        for d in PDEC_ORDER:
+            for e in PDEC_ORDER:
+                for cv in PDEC_ORDER:
+                    book[(p, d, e, cv)] = (names[i], acts[i])
+                    i += 1
+    return book
+
+
+MICRO_PDEC_PLAYBOOK = _build_pdec_playbook()
+
+
 def classify_microstructure(dfi: pd.DataFrame) -> dict:
-    """Live Price / EFI / CVD / OBV arrows + playbook row. Price uses close vs VWAP + return z."""
+    """P / Delta / EFI / CVD 256-state book. PCD$ flow book unchanged."""
     empty = {"ok": False, "arrows": "→ → → →", "micro": "", "action": "NO ENTRY",
-             "key": ("f","f","f","f"), "hover": ""}
+             "key": ("-","-","-","-"), "hover": ""}
     if dfi is None or dfi.empty:
         return empty
     d = dfi.copy()
-    price_s = d["close"].astype(float)
-    efi_s = d["efi13"] if "efi13" in d.columns else pd.Series(dtype=float)
-    cvd_s = d["cvd"] if "cvd" in d.columns else pd.Series(dtype=float)
-    obv_s = d["obv"] if "obv" in d.columns else pd.Series(dtype=float)
-
-    p_arr = _robust_arrow(price_s, z_th=0.95)
-    if "vwap" in d.columns and len(price_s):
-        last_px = float(price_s.iloc[-1])
-        last_vw = float(d["vwap"].iloc[-1])
-        # VWAP must agree for a non-flat price call (filters noise ticks)
-        if p_arr == "u" and last_px <= last_vw:
-            p_arr = "f"
-        if p_arr == "d" and last_px >= last_vw:
-            p_arr = "f"
-    e_arr = _robust_arrow(efi_s, z_th=0.85) if len(efi_s) else "f"
-    c_arr = _robust_arrow(cvd_s, z_th=0.85) if len(cvd_s) else "f"
-    o_arr = _robust_arrow(obv_s, z_th=0.85) if len(obv_s) else "f"
-    key = (p_arr, e_arr, c_arr, o_arr)
-    efi_zero = False
-    efi_note = ""
-    if len(efi_s) >= 12:
-        ev = pd.to_numeric(efi_s, errors="coerce").dropna()
-        last_e = float(ev.iloc[-1])
-        sd_e = float(ev.tail(20).std(ddof=1) or 0.0)
-        # Substantial: |EFI| small vs own noise AND robust arrow already flat
-        if sd_e > 0 and abs(last_e) <= 0.40 * sd_e and e_arr == "f":
-            efi_zero = True
-            e_arr = "f"
-            key = (p_arr, "f", c_arr, o_arr)
-            zkey = (p_arr, c_arr, o_arr)
-            micro, action = EFI_ZERO_PLAYBOOK.get(zkey, MICRO_PLAYBOOK.get(key, ("Unclassified", "NO ENTRY")))
-            efi_note = f"|EFI| {last_e:.0f} ≤ 0.40σ ({0.40*sd_e:.0f}) → 27-state EFI≈0 book"
-        else:
-            micro, action = MICRO_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
-            efi_note = f"|EFI| {last_e:.0f} vs 0.40σ={0.40*sd_e:.0f} → 81-state book"
+    p_arr = _price_level4(d)
+    if "open" in d.columns:
+        delta_s = d["close"].astype(float) - d["open"].astype(float)
     else:
-        micro, action = MICRO_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
-    glyphs = " ".join(ARROW_GLYPH[k] for k in key)
+        delta_s = d["close"].astype(float).diff().fillna(0.0)
+    d_arr = _level4(delta_s)
+    e_arr = _level4(d["efi13"]) if "efi13" in d.columns else "-"
+    c_arr = _level4(d["cvd"]) if "cvd" in d.columns else "-"
+    key = (p_arr, d_arr, e_arr, c_arr)
+    micro, action = MICRO_PDEC_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
+    efi_note = f"PDEC {p_arr} {d_arr} {e_arr} {c_arr} · 256-state book"
+    glyphs = " ".join(LEVEL_GLYPH[k] for k in key)
     hover = (
-        f"Spot/Fut {ARROW_GLYPH[p_arr]}  EFI {ARROW_GLYPH[e_arr]}  "
-        f"CVD {ARROW_GLYPH[c_arr]}  OBV {ARROW_GLYPH[o_arr]}<br>"
+        f"P {LEVEL_GLYPH[p_arr]}  Δ {LEVEL_GLYPH[d_arr]}  "
+        f"EFI {LEVEL_GLYPH[e_arr]}  CVD {LEVEL_GLYPH[c_arr]}<br>"
         f"<b>{action}</b><br>{micro}<br>{efi_note}"
     )
     return {
         "ok": True, "key": key, "arrows": glyphs, "micro": micro, "action": action,
-        "price": p_arr, "efi": e_arr, "cvd": c_arr, "obv": o_arr, "hover": hover,
-        "efi_zero": efi_zero, "efi_note": efi_note,
+        "price": p_arr, "delta": d_arr, "efi": e_arr, "cvd": c_arr, "obv": d_arr,
+        "hover": hover, "efi_zero": False, "efi_note": efi_note,
     }
 
 
@@ -4548,23 +4682,19 @@ def live_dashboard_fragment():
                     for e in decision_log[-8:]:
                         st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
 
-        with st.expander("▼ Micro Playbook (81 + EFI≈0 27 + Flow 18)", expanded=False):
-            items = list(MICRO_PLAYBOOK.items())
+        with st.expander("▼ Micro Playbook (256 PΔEC + Flow 18)", expanded=False):
+            items = list(MICRO_PDEC_PLAYBOOK.items())
             cols = st.columns(3)
+            n = (len(items) + 2) // 3
             for ci, col in enumerate(cols):
-                chunk = items[ci * 27:(ci + 1) * 27]
-                rows = ["| # | P EFI CVD OBV | Micro · Action |", "|---|---|---|"]
-                for i, (k, v) in enumerate(chunk, start=ci * 27 + 1):
-                    g = "".join(ARROW_GLYPH[x] for x in k)
+                chunk = items[ci * n:(ci + 1) * n]
+                rows = ["| # | P Δ EFI CVD | Micro · Action |", "|---|---|---|"]
+                for i, (k, v) in enumerate(chunk, start=ci * n + 1):
+                    g = " ".join(LEVEL_GLYPH[x] for x in k)
                     rows.append(f"| {i} | {g} | {v[0]} — {v[1]} |")
                 with col:
                     st.markdown(chr(10).join(rows))
-            st.caption("81-state: P vs VWAP+z; EFI/CVD/OBV EMA+z.")
-            st.markdown("**EFI ≈ 0 book (27)** — used only if |EFI| ≤ 0.40 × 20-bar σ(EFI) and EFI arrow is flat.")
-            zrows = ["| P CVD OBV | Micro · Action |", "|---|---|"]
-            for k, v in EFI_ZERO_PLAYBOOK.items():
-                zrows.append(f"| {''.join(ARROW_GLYPH[x] for x in k)} | {v[0]} — {v[1]} |")
-            st.markdown(chr(10).join(zrows))
+            st.caption("256-state PDEC: Price vs VWAP, bar Δ, EFI13, CVD. Four levels ⇈ ↑ ↓ ⇊.")
             st.markdown("**Flow book (18)** — P, CVD, DEX tape, net call−put premium. DEX/prem stay → until ≥6 snaps.")
             frows = ["| P C DEX Prem | Micro · Action |", "|---|---|"]
             for k, v in FLOW_PLAYBOOK.items():
@@ -5429,8 +5559,10 @@ def live_dashboard_fragment():
                     act = micro["action"]
                     tag = " EFI≈0" if micro.get("efi_zero") else ""
                     chips.append(_chip(
-                        f"P{ARROW_GLYPH[micro['price']]} E{ARROW_GLYPH[micro['efi']]} "
-                        f"C{ARROW_GLYPH[micro['cvd']]} O{ARROW_GLYPH[micro['obv']]}{tag}<br>{act}",
+                        f"P{LEVEL_GLYPH.get(micro['price'], micro['price'])} "
+                        f"Δ{LEVEL_GLYPH.get(micro.get('delta', micro.get('obv','-')), '')} "
+                        f"E{LEVEL_GLYPH.get(micro['efi'], micro['efi'])} "
+                        f"C{LEVEL_GLYPH.get(micro['cvd'], micro['cvd'])}<br>{act}",
                         f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br>"
                         f"{micro.get('efi_note','')}<br><b>Algo action:</b> {act}",
                         "#00E676",
