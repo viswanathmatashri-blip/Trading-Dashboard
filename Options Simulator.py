@@ -5404,20 +5404,69 @@ def live_dashboard_fragment():
                     st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
                     heading_ribbon(
                         "Footprint proxy (not exchange VAP)",
-                        "SmartAPI has no bid/ask volume-at-price.<br>"
-                        "Each refresh stores futures LTP, best bid/ask, and Δsession volume.<br>"
-                        "<b>LTP ≥ Ask</b> → aggressive buy (ask vol).<br>"
-                        "<b>LTP ≤ Bid</b> → aggressive sell (bid vol).<br>"
-                        "Else tick rule vs prior LTP. Buckets map to the selected TF bars.<br>"
-                        "Empty until Auto-Refresh has run in live hours.",
+                        "Candles = <b>index spot OHLC</b>. Volume split uses futures.<br>"
+                        "If depth snaps have Δsession volume: LTP≥Ask = buy, LTP≤Bid = sell.<br>"
+                        "If snaps have no ΔV (common on SmartAPI FULL), bar futures volume is split "
+                        "by close vs open — labelled fallback, not bid/ask aggression.",
                     )
+                    tf_lab = st.session_state.get("selected_timeframe", "5 min")
+                    tf_min = 15 if "15" in tf_lab else (3 if "3" in tf_lab else 5)
+                    idx_o = idx_h = idx_l = idx_c = None
+                    dspot = data.get("df_candles")
+                    if dspot is not None and not getattr(dspot, "empty", True) and "time" in dspot.columns:
+                        ds = dspot.copy()
+                        ds["time"] = series_to_ist(ds["time"])
+                        dfi_t = pd.to_datetime(dfi["time"])
+                        if getattr(dfi_t.dt, "tz", None) is None:
+                            dfi_t = dfi_t.dt.tz_localize("Asia/Kolkata")
+                        left = pd.DataFrame({"time": dfi_t})
+                        ds = ds.sort_values("time")
+                        m = pd.merge_asof(left.sort_values("time"), ds[["time","open","high","low","close"]].sort_values("time"),
+                                          on="time", direction="nearest", tolerance=pd.Timedelta(minutes=tf_min))
+                        if m["close"].notna().any():
+                            idx_o, idx_h, idx_l, idx_c = m["open"], m["high"], m["low"], m["close"]
+                    if idx_c is None:
+                        idx_c = dfi["spot_px"] if "spot_px" in dfi.columns else dfi["close"]
+                        idx_o = idx_c.shift(1).fillna(idx_c)
+                        idx_h = pd.concat([idx_o, idx_c], axis=1).max(axis=1)
+                        idx_l = pd.concat([idx_o, idx_c], axis=1).min(axis=1)
                     hist = [h for h in (st.session_state.get("liq_delta_history") or [])
-                            if h.get("index") in (None, Index_Name)]
+                            if (h.get("index") in (None, Index_Name))]
+                    buy_v = np.zeros(len(dfi), dtype=float)
+                    sell_v = np.zeros(len(dfi), dtype=float)
+                    used_depth = 0
+                    if hist and "time" in dfi.columns:
+                        bars = pd.to_datetime(dfi["time"])
+                        if getattr(bars.dt, "tz", None) is None:
+                            bars = bars.dt.tz_localize("Asia/Kolkata")
+                        floor = bars.dt.floor(f"{tf_min}min")
+                        for h in hist:
+                            ts = pd.to_datetime(h.get("ts"), errors="coerce")
+                            if ts is pd.NaT or ts is None:
+                                continue
+                            if getattr(ts, "tzinfo", None) is None:
+                                ts = pytz.timezone("Asia/Kolkata").localize(ts)
+                            ts = ts.tz_convert("Asia/Kolkata")
+                            key = ts.floor(f"{tf_min}min")
+                            hit = np.where(floor == key)[0]
+                            if len(hit) == 0:
+                                hit = [int((bars - ts).abs().argmin())]
+                            j = int(hit[0])
+                            sv = float(h.get("signed_vol") or 0)
+                            if sv > 0:
+                                buy_v[j] += sv; used_depth += 1
+                            elif sv < 0:
+                                sell_v[j] += abs(sv); used_depth += 1
+                    fallback = (buy_v.sum() + sell_v.sum()) <= 0
+                    if fallback and "volume" in dfi.columns:
+                        vol = dfi["volume"].astype(float).values
+                        up = (dfi["close"].astype(float) >= dfi["open"].astype(float)).values if "open" in dfi.columns else np.ones(len(dfi), bool)
+                        buy_v = np.where(up, vol, 0.0)
+                        sell_v = np.where(~up, vol, 0.0)
                     fig_ft = plt_go.Figure()
-                    o = dfi["open"] if "open" in dfi.columns else dfi["close"]
                     fig_ft.add_trace(plt_go.Candlestick(
-                        x=dfi["time_str"], open=o, high=dfi["high"], low=dfi["low"], close=dfi["close"],
-                        name="Fut", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
+                        x=dfi["time_str"], open=idx_o, high=idx_h, low=idx_l, close=idx_c,
+                        name="NIFTY", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
                         showlegend=False,
                     ))
                     if "vwap_idx" in dfi.columns:
@@ -5425,30 +5474,12 @@ def live_dashboard_fragment():
                             x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP idx",
                             line=dict(color="#FF9800", width=1.4),
                         ))
-                    buy_v = [0.0] * len(dfi)
-                    sell_v = [0.0] * len(dfi)
-                    if hist and "time" in dfi.columns:
-                        bt = pd.to_datetime(dfi["time"])
-                        for h in hist:
-                            ts = pd.to_datetime(h.get("ts"), errors="coerce")
-                            if ts is pd.NaT or ts is None:
-                                continue
-                            if getattr(ts, "tzinfo", None) is None:
-                                ts = pytz.timezone("Asia/Kolkata").localize(ts)
-                            diffs = (bt - ts).abs()
-                            j = int(diffs.argmin())
-                            sv = float(h.get("signed_vol") or 0)
-                            if sv >= 0:
-                                buy_v[j] += sv
-                            else:
-                                sell_v[j] += abs(sv)
-                    mid = (dfi["high"].astype(float) + dfi["low"].astype(float)) / 2.0
                     fig_ft.add_trace(plt_go.Bar(
-                        x=dfi["time_str"], y=buy_v, name="Ask/Buy ΔV",
+                        x=dfi["time_str"], y=buy_v, name="Buy ΔV",
                         marker_color="rgba(0,230,118,0.45)", yaxis="y2",
                     ))
                     fig_ft.add_trace(plt_go.Bar(
-                        x=dfi["time_str"], y=[-v for v in sell_v], name="Bid/Sell ΔV",
+                        x=dfi["time_str"], y=-sell_v, name="Sell ΔV",
                         marker_color="rgba(255,82,82,0.45)", yaxis="y2",
                     ))
                     xr = [-0.5, max(len(dfi) - 0.5, 0.5)]
@@ -5457,14 +5488,17 @@ def live_dashboard_fragment():
                         height=560, margin=dict(l=44, r=228, t=8, b=28),
                         hovermode="x unified", barmode="relative",
                         legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
-                        yaxis=dict(title="Price", side="left"),
-                        yaxis2=dict(title="ΔVol", overlaying="y", side="right", showgrid=False),
+                        yaxis=dict(title="Index", side="left"),
+                        yaxis2=dict(title="Fut ΔVol", overlaying="y", side="right", showgrid=False),
                         xaxis=dict(type="category", categoryorder="array",
-                                   categoryarray=list(dfi["time_str"]), range=xr, nticks=8),
+                                   categoryarray=list(dfi["time_str"]), range=xr, nticks=8,
+                                   rangeslider=dict(visible=False)),
                     )
                     st.plotly_chart(fig_ft, use_container_width=True)
-                    nsnap = len(hist)
-                    st.caption(f"Depth snaps used: {nsnap}. Live hours + Auto-Refresh fill bid/ask prints.")
+                    if fallback:
+                        st.caption(f"ΔV from depth snaps = 0 (snaps={len(hist)}). Showing futures bar volume split close≥open / close<open.")
+                    else:
+                        st.caption(f"Depth-classified ΔV on {used_depth} snaps · {len(hist)} stored.")
                     st.markdown("</div>", unsafe_allow_html=True)
                 cap = (f"{st.session_state.get('selected_timeframe','?')} · "
                        f"{len(dfi)} bars · Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}")
