@@ -1800,6 +1800,20 @@ def session_hours(index_name=None):
     return 9, 15, 15, 30, "09:15", "15:30"
 
 
+def session_axis_labels(tf_label=None, index_name=None):
+    """Full-session HH:MM slots so bar width stays constant from the open."""
+    oh, om, ch, cm, _, _ = session_hours(index_name)
+    lab = str(tf_label or st.session_state.get("selected_timeframe") or "5 min")
+    step = 15 if "15" in lab else (3 if "3" in lab else 5)
+    out = []
+    t = oh * 60 + om
+    end = ch * 60 + cm
+    while t <= end:
+        out.append(f"{t // 60:02d}:{t % 60:02d}")
+        t += step
+    return out or ["09:15"]
+
+
 def market_session_state(now=None, index_name=None):
     now = now or _ist_now()
     oh, om, ch, cm, _, _ = session_hours(index_name)
@@ -4939,6 +4953,7 @@ def live_dashboard_fragment():
                     if "time_str" in dfi.columns:
                         fut_times = dfi["time_str"].tolist()
 
+                axis_times = session_axis_labels(st.session_state.get("selected_timeframe"), Index_Name)
                 dfi["avwap_idx"] = np.nan
                 if st.session_state.get("avwap_on") and st.session_state.get("avwap_time") and len(dfi):
                     at = str(st.session_state["avwap_time"])
@@ -5134,7 +5149,7 @@ def live_dashboard_fragment():
                 except Exception:
                     pass
 
-                xr = [-0.5, max(len(fut_times) - 0.5, 0.5)]
+                xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
                 fig_stack.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                     height=620, margin=dict(l=40, r=6, t=8, b=18),
@@ -5144,19 +5159,19 @@ def live_dashboard_fragment():
                 )
                 fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", row=1, col=1)
                 fig_stack.update_yaxes(range=[y0, y1], type="linear", showticklabels=False, row=1, col=2)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=1, col=1)
                 fig_stack.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=2)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=2, col=1)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=3, col=1)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=fut_times,
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, nticks=8, row=4, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
-                tab_flow, tab_dex, tab_idx, tab_fp, tab_foot = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Index / Vol / CVD", "4 · Effort vs Result", "5 · Footprint"])
+                tab_flow, tab_dex, tab_idx, tab_foot = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Index / Vol / CVD", "4 · Footprint"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
@@ -5243,13 +5258,13 @@ def live_dashboard_fragment():
                         hovermode="x unified",
                     )
                     fig_dex.update_xaxes(type="category", categoryorder="array",
-                                        categoryarray=list(dfi["time_str"]), range=xr,
+                                        categoryarray=axis_times, range=xr,
                                         showticklabels=False, row=1, col=1)
                     fig_dex.update_xaxes(type="category", categoryorder="array",
-                                        categoryarray=list(dfi["time_str"]), range=xr,
+                                        categoryarray=axis_times, range=xr,
                                         showticklabels=False, row=2, col=1)
                     fig_dex.update_xaxes(type="category", categoryorder="array",
-                                        categoryarray=list(dfi["time_str"]), range=xr,
+                                        categoryarray=axis_times, range=xr,
                                         nticks=8, row=3, col=1)
                     fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=2, col=1)
                     fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=3, col=1)
@@ -5322,7 +5337,7 @@ def live_dashboard_fragment():
                         x=dfi["time_str"], y=dfi["cvd"], mode="lines", name="CVD",
                         line=dict(color="#B0BEC5", width=1.4)), row=3, col=1)
                     fig_ivc.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
-                    xr_i = [-0.5, max(len(dfi) - 0.5, 0.5)]
+                    xr_i = [-0.5, max(len(axis_times) - 0.5, 0.5)]
                     fig_ivc.update_layout(
                         template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
                         height=620, margin=dict(l=44, r=228, t=8, b=28),
@@ -5332,7 +5347,7 @@ def live_dashboard_fragment():
                     for r in (1, 2, 3):
                         fig_ivc.update_xaxes(
                             type="category", categoryorder="array",
-                            categoryarray=list(dfi["time_str"]), range=xr_i,
+                            categoryarray=axis_times, range=xr_i,
                             showticklabels=(r == 3), nticks=8, row=r, col=1,
                         )
                     fig_ivc.update_yaxes(tickfont=dict(size=8), row=1, col=1)
@@ -5340,65 +5355,6 @@ def live_dashboard_fragment():
                     fig_ivc.update_yaxes(tickfont=dict(size=8), row=3, col=1)
                     st.markdown("<div class='chart-card'><div class='card-title'>Index + VWAP · Volume · CVD</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_ivc, use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with tab_fp:
-                    lot = max(int(LOT_SIZES.get(Index_Name, 65)), 1)
-                    rng = (dfi["high"] - dfi["low"]).replace(0, np.nan)
-                    bar_cvd = dfi["cvd"].diff().fillna(dfi["cvd"])
-                    lots = (dfi["volume"].astype(float) / lot).clip(lower=0)
-                    # result: signed close vs open; effort: lots
-                    up = dfi["close"] >= dfi["open"]
-                    colors = np.where(up, "#00E676", "#FF5252")
-                    # absorption: high lots, small range vs session median
-                    med_r = float(rng.median()) if rng.notna().any() else 1.0
-                    med_l = float(lots.median()) if len(lots) else 1.0
-                    absorb = (lots >= 1.5 * med_l) & (rng <= 0.7 * med_r)
-                    fig_fp = plt_go.Figure()
-                    fig_fp.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
-                        line=dict(color="#90A4AE", width=1.2), hoverinfo="skip"))
-                    if "vwap_idx" in dfi.columns:
-                        fig_fp.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP (idx)",
-                            line=dict(color="#FF9800", width=1.5), hoverinfo="skip"))
-                    sizes = (14 + 48 * (lots / max(float(lots.max()), 1.0))).clip(10, 56)
-                    cd = np.column_stack([lots, bar_cvd, rng.fillna(0)])
-                    fig_fp.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["spot_px"], mode="markers", name="Bar lots",
-                        marker=dict(size=sizes, color=colors, opacity=0.72),
-                        customdata=cd,
-                        hovertemplate="Lots %{customdata[0]:.0f}<br>ΔCVD %{customdata[1]:.0f}<br>Range %{customdata[2]:.1f}<br>Px %{y:.1f}<extra></extra>",
-                    ))
-                    if absorb.any():
-                        fig_fp.add_trace(plt_go.Scatter(
-                            x=dfi.loc[absorb, "time_str"], y=dfi.loc[absorb, "spot_px"],
-                            mode="markers", name="Absorption",
-                            marker=dict(size=sizes[absorb.values] + 6, color="rgba(0,0,0,0)",
-                                        line=dict(width=2, color="#FFD54F")),
-                            hoverinfo="skip",
-                        ))
-                    xr = [-0.5, max(len(dfi) - 0.5, 0.5)]
-                    fig_fp.update_layout(
-                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=520, margin=dict(l=52, r=228, t=10, b=36),
-                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
-                        hovermode="closest",
-                    )
-                    fig_fp.update_xaxes(type="category", categoryorder="array",
-                                        categoryarray=list(dfi["time_str"]), range=xr,
-                                        tickangle=0, nticks=10)
-                    fig_fp.update_yaxes(side="left", automargin=True)
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    heading_ribbon(
-                        "Effort vs result (not footprint)",
-                        "SmartAPI has no bid/ask volume-at-price.<br>"
-                        "Bubble <b>size</b> = futures bar volume / lot.<br>"
-                        "Green = close ≥ open · Red = close < open.<br>"
-                        "Gold ring = absorption: lots ≥ 1.5× median and range ≤ 0.7× median range "
-                        "(effort without result → fade risk).<br>"
-                        "Big bubble + large range in same direction → effort is moving price (breakout risk).",
-                    )
-                    st.plotly_chart(fig_fp, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
                 with tab_foot:
                     st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
@@ -5463,37 +5419,44 @@ def live_dashboard_fragment():
                         up = (dfi["close"].astype(float) >= dfi["open"].astype(float)).values if "open" in dfi.columns else np.ones(len(dfi), bool)
                         buy_v = np.where(up, vol, 0.0)
                         sell_v = np.where(~up, vol, 0.0)
-                    fig_ft = plt_go.Figure()
+                    fig_ft = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                           row_heights=[0.68, 0.32], vertical_spacing=0.04)
                     fig_ft.add_trace(plt_go.Candlestick(
                         x=dfi["time_str"], open=idx_o, high=idx_h, low=idx_l, close=idx_c,
                         name="NIFTY", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
                         showlegend=False,
-                    ))
+                    ), row=1, col=1)
                     if "vwap_idx" in dfi.columns:
                         fig_ft.add_trace(plt_go.Scatter(
                             x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP idx",
                             line=dict(color="#FF9800", width=1.4),
-                        ))
+                        ), row=1, col=1)
                     fig_ft.add_trace(plt_go.Bar(
                         x=dfi["time_str"], y=buy_v, name="Buy ΔV",
-                        marker_color="rgba(0,230,118,0.45)", yaxis="y2",
-                    ))
+                        marker_color="rgba(0,230,118,0.55)",
+                    ), row=2, col=1)
                     fig_ft.add_trace(plt_go.Bar(
                         x=dfi["time_str"], y=-sell_v, name="Sell ΔV",
-                        marker_color="rgba(255,82,82,0.45)", yaxis="y2",
-                    ))
-                    xr = [-0.5, max(len(dfi) - 0.5, 0.5)]
+                        marker_color="rgba(255,82,82,0.55)",
+                    ), row=2, col=1)
+                    fig_ft.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
+                    xr_ft = [-0.5, max(len(axis_times) - 0.5, 0.5)]
                     fig_ft.update_layout(
                         template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
                         height=560, margin=dict(l=44, r=228, t=8, b=28),
                         hovermode="x unified", barmode="relative",
                         legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
-                        yaxis=dict(title="Index", side="left"),
-                        yaxis2=dict(title="Fut ΔVol", overlaying="y", side="right", showgrid=False),
-                        xaxis=dict(type="category", categoryorder="array",
-                                   categoryarray=list(dfi["time_str"]), range=xr, nticks=8,
-                                   rangeslider=dict(visible=False)),
                     )
+                    fig_ft.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=axis_times, range=xr_ft,
+                                        rangeslider=dict(visible=False), showticklabels=False,
+                                        row=1, col=1)
+                    fig_ft.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=axis_times, range=xr_ft,
+                                        rangeslider=dict(visible=False), nticks=8,
+                                        row=2, col=1)
+                    fig_ft.update_yaxes(title_text="Index", row=1, col=1)
+                    fig_ft.update_yaxes(title_text="Fut ΔVol", row=2, col=1)
                     st.plotly_chart(fig_ft, use_container_width=True)
                     if fallback:
                         st.caption(f"ΔV from depth snaps = 0 (snaps={len(hist)}). Showing futures bar volume split close≥open / close<open.")
