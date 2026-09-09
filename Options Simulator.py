@@ -5156,7 +5156,7 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
-                tab_flow, tab_dex, tab_idx, tab_fp = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Index / Vol / CVD", "4 · Effort vs Result"])
+                tab_flow, tab_dex, tab_idx, tab_fp, tab_foot = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Index / Vol / CVD", "4 · Effort vs Result", "5 · Footprint"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
@@ -5399,6 +5399,72 @@ def live_dashboard_fragment():
                         "Big bubble + large range in same direction → effort is moving price (breakout risk).",
                     )
                     st.plotly_chart(fig_fp, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tab_foot:
+                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                    heading_ribbon(
+                        "Footprint proxy (not exchange VAP)",
+                        "SmartAPI has no bid/ask volume-at-price.<br>"
+                        "Each refresh stores futures LTP, best bid/ask, and Δsession volume.<br>"
+                        "<b>LTP ≥ Ask</b> → aggressive buy (ask vol).<br>"
+                        "<b>LTP ≤ Bid</b> → aggressive sell (bid vol).<br>"
+                        "Else tick rule vs prior LTP. Buckets map to the selected TF bars.<br>"
+                        "Empty until Auto-Refresh has run in live hours.",
+                    )
+                    hist = [h for h in (st.session_state.get("liq_delta_history") or [])
+                            if h.get("index") in (None, Index_Name)]
+                    fig_ft = plt_go.Figure()
+                    o = dfi["open"] if "open" in dfi.columns else dfi["close"]
+                    fig_ft.add_trace(plt_go.Candlestick(
+                        x=dfi["time_str"], open=o, high=dfi["high"], low=dfi["low"], close=dfi["close"],
+                        name="Fut", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
+                        showlegend=False,
+                    ))
+                    if "vwap_idx" in dfi.columns:
+                        fig_ft.add_trace(plt_go.Scatter(
+                            x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP idx",
+                            line=dict(color="#FF9800", width=1.4),
+                        ))
+                    buy_v = [0.0] * len(dfi)
+                    sell_v = [0.0] * len(dfi)
+                    if hist and "time" in dfi.columns:
+                        bt = pd.to_datetime(dfi["time"])
+                        for h in hist:
+                            ts = pd.to_datetime(h.get("ts"), errors="coerce")
+                            if ts is pd.NaT or ts is None:
+                                continue
+                            if getattr(ts, "tzinfo", None) is None:
+                                ts = pytz.timezone("Asia/Kolkata").localize(ts)
+                            diffs = (bt - ts).abs()
+                            j = int(diffs.argmin())
+                            sv = float(h.get("signed_vol") or 0)
+                            if sv >= 0:
+                                buy_v[j] += sv
+                            else:
+                                sell_v[j] += abs(sv)
+                    mid = (dfi["high"].astype(float) + dfi["low"].astype(float)) / 2.0
+                    fig_ft.add_trace(plt_go.Bar(
+                        x=dfi["time_str"], y=buy_v, name="Ask/Buy ΔV",
+                        marker_color="rgba(0,230,118,0.45)", yaxis="y2",
+                    ))
+                    fig_ft.add_trace(plt_go.Bar(
+                        x=dfi["time_str"], y=[-v for v in sell_v], name="Bid/Sell ΔV",
+                        marker_color="rgba(255,82,82,0.45)", yaxis="y2",
+                    ))
+                    xr = [-0.5, max(len(dfi) - 0.5, 0.5)]
+                    fig_ft.update_layout(
+                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                        height=560, margin=dict(l=44, r=228, t=8, b=28),
+                        hovermode="x unified", barmode="relative",
+                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                        yaxis=dict(title="Price", side="left"),
+                        yaxis2=dict(title="ΔVol", overlaying="y", side="right", showgrid=False),
+                        xaxis=dict(type="category", categoryorder="array",
+                                   categoryarray=list(dfi["time_str"]), range=xr, nticks=8),
+                    )
+                    st.plotly_chart(fig_ft, use_container_width=True)
+                    nsnap = len(hist)
+                    st.caption(f"Depth snaps used: {nsnap}. Live hours + Auto-Refresh fill bid/ask prints.")
                     st.markdown("</div>", unsafe_allow_html=True)
                 cap = (f"{st.session_state.get('selected_timeframe','?')} · "
                        f"{len(dfi)} bars · Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}")
