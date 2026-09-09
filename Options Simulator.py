@@ -4971,16 +4971,47 @@ def live_dashboard_fragment():
                         dfi.loc[sub.index, "avwap_idx"] = av_idx.values
 
                 cvd_st = {"ok": False}
+                tf_lab = st.session_state.get("selected_timeframe", "5 min")
+                tf_min = 15 if "15" in tf_lab else (3 if "3" in tf_lab else 5)
+                idx_o = dfi["open"] if "open" in dfi.columns else dfi["close"]
+                idx_h = dfi["high"] if "high" in dfi.columns else dfi["close"]
+                idx_l = dfi["low"] if "low" in dfi.columns else dfi["close"]
+                idx_c = dfi["spot_px"] if "spot_px" in dfi.columns else dfi["close"]
+                dspot = data.get("df_candles")
+                if dspot is not None and not getattr(dspot, "empty", True) and "time" in dspot.columns:
+                    try:
+                        ds = dspot.copy()
+                        ds["time"] = series_to_ist(ds["time"])
+                        dfi_t = pd.to_datetime(dfi["time"])
+                        if getattr(dfi_t.dt, "tz", None) is None:
+                            dfi_t = dfi_t.dt.tz_localize("Asia/Kolkata")
+                        left = pd.DataFrame({"time": dfi_t})
+                        m = pd.merge_asof(left.sort_values("time"),
+                                          ds[["time","open","high","low","close"]].sort_values("time"),
+                                          on="time", direction="nearest",
+                                          tolerance=pd.Timedelta(minutes=tf_min))
+                        if m["close"].notna().any():
+                            idx_o, idx_h, idx_l, idx_c = m["open"], m["high"], m["low"], m["close"]
+                    except Exception:
+                        pass
+                buy_v = np.zeros(len(dfi), dtype=float)
+                sell_v = np.zeros(len(dfi), dtype=float)
+                if "volume" in dfi.columns:
+                    vol = dfi["volume"].astype(float).values
+                    up = (dfi["close"].astype(float) >= dfi["open"].astype(float)).values if "open" in dfi.columns else np.ones(len(dfi), bool)
+                    buy_v = np.where(up, vol, 0.0)
+                    sell_v = np.where(~up, vol, 0.0)
                 fig_stack = make_subplots(
-                    rows=4, cols=2,
+                    rows=5, cols=2,
                     column_widths=[0.84, 0.16],
-                    row_heights=[0.46, 0.16, 0.16, 0.22],
+                    row_heights=[0.38, 0.14, 0.16, 0.16, 0.16],
                     shared_xaxes=True,
                     shared_yaxes=False,
                     horizontal_spacing=0.01,
-                    vertical_spacing=0.018,
+                    vertical_spacing=0.016,
                     specs=[
                         [{}, {}],
+                        [{}, None],
                         [{}, None],
                         [{}, None],
                         [{}, None],
@@ -5010,11 +5041,11 @@ def live_dashboard_fragment():
                     dfi.get("basis_raw", dfi["basis"]).astype(float).values,
                     dfi["vwap"].astype(float).values,
                 ])
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
-                    line=dict(color="#2196F3", width=2),
-                    customdata=cd,
-                    hovertemplate="NIFTY %{y:.1f}<br>Fut %{customdata[1]:.1f}<br>VWAP_idx %{customdata[0]:.1f}<br>VWAP_fut %{customdata[4]:.1f}<br>Basis EMA5 %{customdata[2]:+.1f} (raw %{customdata[3]:+.1f})<extra></extra>",
+                fig_stack.add_trace(plt_go.Candlestick(
+                    x=dfi["time_str"], open=idx_o, high=idx_h, low=idx_l, close=idx_c,
+                    name="NIFTY", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
+                    increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350",
+                    showlegend=True,
                 ), row=1, col=1)
                 last_fut = float(dfi["close"].iloc[-1])
                 last_sp = float(dfi["spot_px"].iloc[-1])
@@ -5038,49 +5069,55 @@ def live_dashboard_fragment():
                         hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
                     ), row=1, col=2)
 
-                # OBV
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].clip(lower=0), mode="lines", showlegend=False,
-                    line=dict(color="#00E676", width=1.4), fill="tozeroy", fillcolor="rgba(0,230,118,0.18)",
+                fig_stack.add_trace(plt_go.Bar(
+                    x=dfi["time_str"], y=buy_v, name="Buy ΔV",
+                    marker_color="rgba(0,230,118,0.7)", showlegend=False,
                 ), row=2, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].clip(upper=0), mode="lines", showlegend=False,
-                    line=dict(color="#FF5252", width=1.4), fill="tozeroy", fillcolor="rgba(255,82,82,0.18)",
-                ), row=2, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"], mode="lines", showlegend=False,
-                    line=dict(color="#B0BEC5", width=1.1),
-                ), row=2, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", name="OBV MA20",
-                    line=dict(color="#FFF176", width=1.6), showlegend=False,
+                fig_stack.add_trace(plt_go.Bar(
+                    x=dfi["time_str"], y=-sell_v, name="Sell ΔV",
+                    marker_color="rgba(255,82,82,0.7)", showlegend=False,
                 ), row=2, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
-                # EFI
                 efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
                 fig_stack.add_trace(plt_go.Bar(
                     x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
                 ), row=3, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
-                # CVD — green above 0, red below 0 (not one colour from the last print)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv"].clip(lower=0), mode="lines", showlegend=False,
+                    line=dict(color="#00E676", width=1.4), fill="tozeroy", fillcolor="rgba(0,230,118,0.18)",
+                ), row=4, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv"].clip(upper=0), mode="lines", showlegend=False,
+                    line=dict(color="#FF5252", width=1.4), fill="tozeroy", fillcolor="rgba(255,82,82,0.18)",
+                ), row=4, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv"], mode="lines", showlegend=False,
+                    line=dict(color="#B0BEC5", width=1.1),
+                ), row=4, col=1)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", name="OBV MA20",
+                    line=dict(color="#FFF176", width=1.6), showlegend=False,
+                ), row=4, col=1)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
                 cvd_last = float(dfi["cvd"].iloc[-1])
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"].clip(lower=0),
                     mode="lines", showlegend=False, name="CVD+",
                     line=dict(color="#00E676", width=1.6),
                     fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
-                ), row=4, col=1)
+                ), row=5, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"].clip(upper=0),
                     mode="lines", showlegend=False, name="CVD-",
                     line=dict(color="#FF5252", width=1.6),
                     fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
-                ), row=4, col=1)
+                ), row=5, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
                     line=dict(color="#B0BEC5", width=1.2),
-                ), row=4, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
+                ), row=5, col=1)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=5, col=1)
                 tf_min_w = {"3 min": 10, "5 min": 8, "15 min": 6}.get(st.session_state.get("selected_timeframe", "5 min"), 8)
                 cvd_st = cvd_price_stats(dfi, window=tf_min_w)
                 if cvd_st.get("ok"):
@@ -5092,7 +5129,7 @@ def live_dashboard_fragment():
                         xref="paper", yref="paper", x=0.01, y=0.02,
                         showarrow=False, font=dict(size=11, color=colr),
                         bgcolor="rgba(16,20,28,0.85)",
-                        row=4, col=1,
+                        row=5, col=1,
                     )
 
                 div_ev = scan_cvd_div_events(dfi, window=tf_min_w)
@@ -5152,10 +5189,11 @@ def live_dashboard_fragment():
                 xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
                 fig_stack.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=620, margin=dict(l=40, r=6, t=8, b=18),
+                    height=780, margin=dict(l=40, r=6, t=8, b=18),
                     legend=dict(orientation="h", yanchor="top", y=1.0, x=0.0, font=dict(size=10),
                                 bgcolor="rgba(14,17,23,0.4)"),
                     hovermode="x unified", bargap=0.15,
+                    xaxis_rangeslider_visible=False,
                 )
                 fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", row=1, col=1)
                 fig_stack.update_yaxes(range=[y0, y1], type="linear", showticklabels=False, row=1, col=2)
@@ -5167,11 +5205,14 @@ def live_dashboard_fragment():
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=3, col=1)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                                       range=xr, nticks=8, row=4, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=2, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=3, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="", row=4, col=1)
-                tab_flow, tab_dex, tab_idx, tab_foot = st.tabs(["1 · Flow (OBV/EFI/CVD)", "2 · DEX / Premium", "3 · Index / Vol / CVD", "4 · Footprint"])
+                                       range=xr, showticklabels=False, row=4, col=1)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                                       range=xr, nticks=8, row=5, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="ΔV", row=2, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="OBV", row=4, col=1)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=5, col=1)
+                tab_flow, tab_dex = st.tabs(["1 · Index / ΔV / EFI / OBV / CVD", "2 · DEX / Premium"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
@@ -5253,7 +5294,7 @@ def live_dashboard_fragment():
                     fig_dex.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
                     fig_dex.update_layout(
                         template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=620, margin=dict(l=40, r=6, t=8, b=18),
+                        height=780, margin=dict(l=40, r=6, t=8, b=18),
                         legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
                         hovermode="x unified",
                     )
@@ -5274,194 +5315,6 @@ def live_dashboard_fragment():
                     else:
                         st.caption("DEX / premium empty until Auto-Refresh stores snaps in market hours. No strike fallback.")
                     st.plotly_chart(fig_dex, use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with tab_idx:
-                    fig_ivc = make_subplots(
-                        rows=3, cols=1, shared_xaxes=True,
-                        row_heights=[0.50, 0.22, 0.28],
-                        vertical_spacing=0.04,
-                    )
-                    if "vwap_upper_idx" in dfi.columns:
-                        fig_ivc.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap_upper_idx"], mode="lines",
-                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                            showlegend=False, hoverinfo="skip"), row=1, col=1)
-                        fig_ivc.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap_lower_idx"], mode="lines",
-                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                            fill="tonexty", fillcolor="rgba(255,152,0,0.08)",
-                            showlegend=False, hoverinfo="skip"), row=1, col=1)
-                    fig_ivc.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi.get("vwap_idx", dfi.get("vwap")),
-                        mode="lines", name="VWAP",
-                        line=dict(color="#FF9800", width=2)), row=1, col=1)
-                    fig_ivc.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["spot_px"] if "spot_px" in dfi.columns else dfi["close"],
-                        mode="lines", name="NIFTY",
-                        line=dict(color="#2196F3", width=2)), row=1, col=1)
-                    vol = dfi["volume"].astype(float) if "volume" in dfi.columns else pd.Series([0.0]*len(dfi))
-                    sma20 = vol.rolling(20, min_periods=20).mean()
-                    spike = vol > (3.0 * sma20)
-                    up = dfi["close"] >= dfi["open"] if "open" in dfi.columns else vol >= 0
-                    vcol = []
-                    for i in range(len(vol)):
-                        if bool(spike.iloc[i]) if i < len(spike) else False:
-                            vcol.append("#FFD54F")
-                        elif bool(up.iloc[i]) if hasattr(up, "iloc") else bool(up[i]):
-                            vcol.append("#26A69A")
-                        else:
-                            vcol.append("#EF5350")
-                    fig_ivc.add_trace(plt_go.Bar(
-                        x=dfi["time_str"], y=vol, name="Fut Vol",
-                        marker_color=vcol, opacity=0.85, showlegend=False,
-                        customdata=np.column_stack([sma20.fillna(0), spike.fillna(False).astype(int)]),
-                        hovertemplate="Vol %{y:.0f}<br>SMA20 %{customdata[0]:.0f}<br>3xSMA %{customdata[1]}<extra></extra>",
-                    ), row=2, col=1)
-                    fig_ivc.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=sma20, mode="lines", name="Vol SMA20",
-                        line=dict(color="#90A4AE", width=1.2), showlegend=False,
-                    ), row=2, col=1)
-                    cvd_pos = dfi["cvd"].clip(lower=0)
-                    cvd_neg = dfi["cvd"].clip(upper=0)
-                    fig_ivc.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=cvd_pos, mode="lines", name="CVD+",
-                        line=dict(color="#00E676", width=1),
-                        fill="tozeroy", fillcolor="rgba(0,230,118,0.25)",
-                        showlegend=False), row=3, col=1)
-                    fig_ivc.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=cvd_neg, mode="lines", name="CVD-",
-                        line=dict(color="#FF5252", width=1),
-                        fill="tozeroy", fillcolor="rgba(255,82,82,0.25)",
-                        showlegend=False), row=3, col=1)
-                    fig_ivc.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["cvd"], mode="lines", name="CVD",
-                        line=dict(color="#B0BEC5", width=1.4)), row=3, col=1)
-                    fig_ivc.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
-                    xr_i = [-0.5, max(len(axis_times) - 0.5, 0.5)]
-                    fig_ivc.update_layout(
-                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=620, margin=dict(l=44, r=228, t=8, b=28),
-                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
-                        hovermode="x unified", bargap=0.15,
-                    )
-                    for r in (1, 2, 3):
-                        fig_ivc.update_xaxes(
-                            type="category", categoryorder="array",
-                            categoryarray=axis_times, range=xr_i,
-                            showticklabels=(r == 3), nticks=8, row=r, col=1,
-                        )
-                    fig_ivc.update_yaxes(tickfont=dict(size=8), row=1, col=1)
-                    fig_ivc.update_yaxes(tickfont=dict(size=8), row=2, col=1)
-                    fig_ivc.update_yaxes(tickfont=dict(size=8), row=3, col=1)
-                    st.markdown("<div class='chart-card'><div class='card-title'>Index + VWAP · Volume · CVD</div>", unsafe_allow_html=True)
-                    st.plotly_chart(fig_ivc, use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with tab_foot:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    heading_ribbon(
-                        "Footprint proxy (not exchange VAP)",
-                        "Candles = <b>index spot OHLC</b>. Volume split uses futures.<br>"
-                        "If depth snaps have Δsession volume: LTP≥Ask = buy, LTP≤Bid = sell.<br>"
-                        "If snaps have no ΔV (common on SmartAPI FULL), bar futures volume is split "
-                        "by close vs open — labelled fallback, not bid/ask aggression.",
-                    )
-                    tf_lab = st.session_state.get("selected_timeframe", "5 min")
-                    tf_min = 15 if "15" in tf_lab else (3 if "3" in tf_lab else 5)
-                    idx_o = idx_h = idx_l = idx_c = None
-                    dspot = data.get("df_candles")
-                    if dspot is not None and not getattr(dspot, "empty", True) and "time" in dspot.columns:
-                        ds = dspot.copy()
-                        ds["time"] = series_to_ist(ds["time"])
-                        dfi_t = pd.to_datetime(dfi["time"])
-                        if getattr(dfi_t.dt, "tz", None) is None:
-                            dfi_t = dfi_t.dt.tz_localize("Asia/Kolkata")
-                        left = pd.DataFrame({"time": dfi_t})
-                        ds = ds.sort_values("time")
-                        m = pd.merge_asof(left.sort_values("time"), ds[["time","open","high","low","close"]].sort_values("time"),
-                                          on="time", direction="nearest", tolerance=pd.Timedelta(minutes=tf_min))
-                        if m["close"].notna().any():
-                            idx_o, idx_h, idx_l, idx_c = m["open"], m["high"], m["low"], m["close"]
-                    if idx_c is None:
-                        idx_c = dfi["spot_px"] if "spot_px" in dfi.columns else dfi["close"]
-                        idx_o = idx_c.shift(1).fillna(idx_c)
-                        idx_h = pd.concat([idx_o, idx_c], axis=1).max(axis=1)
-                        idx_l = pd.concat([idx_o, idx_c], axis=1).min(axis=1)
-                    hist = [h for h in (st.session_state.get("liq_delta_history") or [])
-                            if (h.get("index") in (None, Index_Name))]
-                    buy_v = np.zeros(len(dfi), dtype=float)
-                    sell_v = np.zeros(len(dfi), dtype=float)
-                    used_depth = 0
-                    if hist and "time" in dfi.columns:
-                        bars = pd.to_datetime(dfi["time"])
-                        if getattr(bars.dt, "tz", None) is None:
-                            bars = bars.dt.tz_localize("Asia/Kolkata")
-                        floor = bars.dt.floor(f"{tf_min}min")
-                        for h in hist:
-                            ts = pd.to_datetime(h.get("ts"), errors="coerce")
-                            if ts is pd.NaT or ts is None:
-                                continue
-                            if getattr(ts, "tzinfo", None) is None:
-                                ts = pytz.timezone("Asia/Kolkata").localize(ts)
-                            ts = ts.tz_convert("Asia/Kolkata")
-                            key = ts.floor(f"{tf_min}min")
-                            hit = np.where(floor == key)[0]
-                            if len(hit) == 0:
-                                hit = [int((bars - ts).abs().argmin())]
-                            j = int(hit[0])
-                            sv = float(h.get("signed_vol") or 0)
-                            if sv > 0:
-                                buy_v[j] += sv; used_depth += 1
-                            elif sv < 0:
-                                sell_v[j] += abs(sv); used_depth += 1
-                    fallback = (buy_v.sum() + sell_v.sum()) <= 0
-                    if fallback and "volume" in dfi.columns:
-                        vol = dfi["volume"].astype(float).values
-                        up = (dfi["close"].astype(float) >= dfi["open"].astype(float)).values if "open" in dfi.columns else np.ones(len(dfi), bool)
-                        buy_v = np.where(up, vol, 0.0)
-                        sell_v = np.where(~up, vol, 0.0)
-                    fig_ft = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                           row_heights=[0.68, 0.32], vertical_spacing=0.04)
-                    fig_ft.add_trace(plt_go.Candlestick(
-                        x=dfi["time_str"], open=idx_o, high=idx_h, low=idx_l, close=idx_c,
-                        name="NIFTY", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
-                        showlegend=False,
-                    ), row=1, col=1)
-                    if "vwap_idx" in dfi.columns:
-                        fig_ft.add_trace(plt_go.Scatter(
-                            x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP idx",
-                            line=dict(color="#FF9800", width=1.4),
-                        ), row=1, col=1)
-                    fig_ft.add_trace(plt_go.Bar(
-                        x=dfi["time_str"], y=buy_v, name="Buy ΔV",
-                        marker_color="rgba(0,230,118,0.55)",
-                    ), row=2, col=1)
-                    fig_ft.add_trace(plt_go.Bar(
-                        x=dfi["time_str"], y=-sell_v, name="Sell ΔV",
-                        marker_color="rgba(255,82,82,0.55)",
-                    ), row=2, col=1)
-                    fig_ft.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
-                    xr_ft = [-0.5, max(len(axis_times) - 0.5, 0.5)]
-                    fig_ft.update_layout(
-                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=560, margin=dict(l=44, r=228, t=8, b=28),
-                        hovermode="x unified", barmode="relative",
-                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
-                    )
-                    fig_ft.update_xaxes(type="category", categoryorder="array",
-                                        categoryarray=axis_times, range=xr_ft,
-                                        rangeslider=dict(visible=False), showticklabels=False,
-                                        row=1, col=1)
-                    fig_ft.update_xaxes(type="category", categoryorder="array",
-                                        categoryarray=axis_times, range=xr_ft,
-                                        rangeslider=dict(visible=False), nticks=8,
-                                        row=2, col=1)
-                    fig_ft.update_yaxes(title_text="Index", row=1, col=1)
-                    fig_ft.update_yaxes(title_text="Fut ΔVol", row=2, col=1)
-                    st.plotly_chart(fig_ft, use_container_width=True)
-                    if fallback:
-                        st.caption(f"ΔV from depth snaps = 0 (snaps={len(hist)}). Showing futures bar volume split close≥open / close<open.")
-                    else:
-                        st.caption(f"Depth-classified ΔV on {used_depth} snaps · {len(hist)} stored.")
                     st.markdown("</div>", unsafe_allow_html=True)
                 cap = (f"{st.session_state.get('selected_timeframe','?')} · "
                        f"{len(dfi)} bars · Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}")
