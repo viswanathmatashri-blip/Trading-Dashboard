@@ -5351,28 +5351,27 @@ def live_dashboard_fragment():
                 ), row=1, col=1)
                 pdec_hist = pdec_session_history(dfi)
                 if st.session_state.get("pdec_labels_on") and pdec_hist:
-                    xs, ys, txt, hov = [], [], [], []
+                    pad = max((float(pd.Series(idx_h).max()) - float(pd.Series(idx_l).min())) * 0.004, 0.8)
                     prev = None
-                    pad = max((float(pd.Series(idx_h).max()) - float(pd.Series(idx_l).min())) * 0.012, 1.5)
                     for rec in pdec_hist:
                         act = rec["action"]
                         if not act or rec.get("y") is None:
                             continue
-                        # skip exact repeats to cut clutter; keep change + last bar
-                        if act == prev and rec is not pdec_hist[-1]:
+                        if act == prev:
                             continue
                         prev = act
-                        short = act if len(act) <= 22 else act[:20] + "…"
-                        xs.append(rec["t"]); ys.append(rec["y"] + pad); txt.append(short)
-                        hov.append(f"{rec['t']} {rec['glyphs']}<br>{rec['micro']}<br><b>{act}</b>")
-                    if xs:
-                        fig_stack.add_trace(plt_go.Scatter(
-                            x=xs, y=ys, mode="text", text=txt, name="PDEC",
-                            textfont=dict(size=8, color="#B0BEC5"),
-                            textposition="top center",
-                            hovertext=hov, hoverinfo="text",
-                            showlegend=False,
-                        ), row=1, col=1)
+                        short = act if len(act) <= 28 else act[:26] + "…"
+                        fig_stack.add_annotation(
+                            x=rec["t"], y=float(rec["y"]) + pad,
+                            text=short,
+                            showarrow=False,
+                            textangle=-90,
+                            xanchor="center",
+                            yanchor="bottom",
+                            font=dict(size=8, color="#CFD8DC"),
+                            bgcolor="rgba(14,17,23,0.25)",
+                            row=1, col=1,
+                        )
                 lv_w = data.get("levels") or {}
                 spot_w = float(data.get("spot_price") or (dfi["spot_px"].iloc[-1] if "spot_px" in dfi.columns else 0) or 0)
                 call_w = put_w = None
