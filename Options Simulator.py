@@ -1587,7 +1587,7 @@ def evaluate_directional_trigger(data: dict, df_candles: pd.DataFrame) -> dict:
             cvd = float(cvd_s.iloc[-1])
             efi = float((df["close"].astype(float).diff() * vol).ewm(span=13, adjust=False).mean().iloc[-1])
             try:
-                vp = compute_session_volume_profile(df, bin_step=5.0, prominence_factor=0.35)
+                vp = compute_session_volume_profile(df, bin_step=2.0, prominence_factor=0.35)
                 lvn = list(vp.get("lvn") or [])
             except Exception:
                 lvn = []
@@ -4518,6 +4518,19 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prom
     wmean = float(np.sum(mids * vol_at) / tot)
     wstd = float(np.sqrt(max(np.sum(vol_at * (mids - wmean) ** 2) / tot, 0.0)))
     hvn, lvn = _prominence_nodes(vol_at, mids, prominence_factor=prominence_factor)
+    # 70% value area expanding from POC
+    target = 0.70 * tot
+    lo_i = hi_i = poc_i
+    acc = float(vol_at[poc_i])
+    while acc < target and (lo_i > 0 or hi_i < n_bins - 1):
+        left = vol_at[lo_i - 1] if lo_i > 0 else -1
+        right = vol_at[hi_i + 1] if hi_i < n_bins - 1 else -1
+        if right >= left:
+            hi_i += 1
+            acc += float(vol_at[hi_i])
+        else:
+            lo_i -= 1
+            acc += float(vol_at[lo_i])
     return {
         "ok": True,
         "mids": mids,
@@ -4530,6 +4543,8 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prom
         "val1": wmean - wstd,
         "vah15": wmean + 1.5 * wstd,
         "val15": wmean - 1.5 * wstd,
+        "vah": float(mids[hi_i]),
+        "val": float(mids[lo_i]),
         "hvn": hvn,
         "lvn": lvn,
         "bin_step": bin_step,
@@ -5311,7 +5326,7 @@ def live_dashboard_fragment():
                 fmax = max(df_fchart["close"].max(), df_fchart["vwap_upper"].max())
                 fpad = (fmax - fmin) * 0.06
                 y0, y1 = fmin - fpad, fmax + fpad
-                vp = compute_session_volume_profile(df_fchart, bin_step=5.0, prominence_factor=0.35)
+                vp = compute_session_volume_profile(df_fchart, bin_step=2.0, prominence_factor=0.35)
 
                 dfi = df_fchart.copy().reset_index(drop=True)
                 dfi["time"] = series_to_ist(dfi["time"])
@@ -5357,7 +5372,7 @@ def live_dashboard_fragment():
                 last_basis = float(dfi["basis"].iloc[-1])
                 if vp.get("ok"):
                     vp = dict(vp)
-                    for k in ("mids", "poc", "val1", "vah1", "val15", "vah15"):
+                    for k in ("mids", "poc", "val1", "vah1", "val15", "vah15", "vah", "val"):
                         if k == "mids" and vp.get("mids") is not None:
                             vp["mids"] = [float(m) - last_basis for m in vp["mids"]]
                         elif k in vp and vp[k] is not None and not isinstance(vp[k], (list, np.ndarray)):
@@ -5575,9 +5590,6 @@ def live_dashboard_fragment():
                 try:
                     flip_w = float(flip_w)
                     if flip_w:
-                        fig_stack.add_hrect(y0=flip_w-band, y1=flip_w+band,
-                                            fillcolor="rgba(255,82,82,0.07)", line_width=0,
-                                            row=1, col=1)
                         fig_stack.add_hline(y=flip_w, line_color="#FFB300", line_width=1.4,
                                             line_dash="dot", row=1, col=1)
                         fig_stack.add_annotation(
@@ -5586,6 +5598,41 @@ def live_dashboard_fragment():
                             font=dict(size=9, color="#FFB300"), row=1, col=1)
                 except Exception:
                     pass
+                if vp.get("ok"):
+                    for px, name in ((vp.get("vah"), "VAH"), (vp.get("val"), "VAL")):
+                        if px is None:
+                            continue
+                        fig_stack.add_hline(y=float(px), line_color="#F48FB1", line_width=1.2,
+                                            line_dash="dot", row=1, col=1)
+                        fig_stack.add_annotation(
+                            x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
+                            y=float(px), text=name, showarrow=False, xanchor="right",
+                            font=dict(size=9, color="#F48FB1"), row=1, col=1)
+                pdh = pdl = None
+                dspot = data.get("df_candles")
+                try:
+                    if dspot is not None and not getattr(dspot, "empty", True):
+                        ds = dspot.copy()
+                        ds["time"] = pd.to_datetime(ds["time"])
+                        days = sorted(ds["time"].dt.date.unique())
+                        if latest_session and len(days) >= 1:
+                            prevs = [d for d in days if d < latest_session]
+                            if prevs:
+                                prev = ds[ds["time"].dt.date == prevs[-1]]
+                                if not prev.empty:
+                                    pdh = float(prev["high"].max())
+                                    pdl = float(prev["low"].min())
+                except Exception:
+                    pdh = pdl = None
+                for px, lc, name in ((pdh, "#FF5252", "PDH"), (pdl, "#00E676", "PDL")):
+                    if not px:
+                        continue
+                    fig_stack.add_hline(y=float(px), line_color=lc, line_width=1.1,
+                                        line_dash="dot", row=1, col=1)
+                    fig_stack.add_annotation(
+                        x=axis_times[0] if axis_times else dfi["time_str"].iloc[0],
+                        y=float(px), text=name, showarrow=False, xanchor="left",
+                        font=dict(size=9, color=lc), row=1, col=1)
                 for wall_px, lc, name in ((call_w, "#FF5252", "Call wall"), (put_w, "#00E676", "Put wall")):
                     if not wall_px:
                         continue
