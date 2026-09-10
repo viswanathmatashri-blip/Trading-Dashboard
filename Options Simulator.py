@@ -5083,7 +5083,13 @@ def live_dashboard_fragment():
                     if "Net_Delta_GEX_OI" in df_chain.columns:
                         st.plotly_chart(_gmini(df_chain["Net_Delta_GEX_OI"]), use_container_width=True)
                 with gx4:
-                    st.caption("Full DEX tab stays with chain tools below if needed.")
+                    lotn = float(LOT_SIZES.get(Index_Name, 65))
+                    c_d = pd.to_numeric(df_chain.get("C_Δ", 0), errors="coerce").fillna(0.0)
+                    p_d = pd.to_numeric(df_chain.get("P_Δ", 0), errors="coerce").fillna(0.0)
+                    c_oi = pd.to_numeric(df_chain.get("C_OI", 0), errors="coerce").fillna(0.0)
+                    p_oi = pd.to_numeric(df_chain.get("P_OI", 0), errors="coerce").fillna(0.0)
+                    dex_oi = (c_d * c_oi - p_d.abs() * p_oi) * lotn
+                    st.plotly_chart(_gmini(dex_oi), use_container_width=True)
             else:
                 st.caption("GEX unavailable.")
 
@@ -5162,7 +5168,8 @@ def live_dashboard_fragment():
 
         # ----- Compact: Futures+VP+OBV+EFI+CVD | GEX OI + GEX Vol -----
         fut_msg = data.get("fut_fallback_msg", "")
-        left_col, right_col = st.columns([0.88, 0.12])
+        left_col = st.container()
+        right_col = None
         vp = {"ok": False}
         y0 = y1 = None
         sigma_mult = 1.5
@@ -5260,18 +5267,18 @@ def live_dashboard_fragment():
                     else:
                         st.caption("off")
             with av:
-                st.session_state["avwap_on"] = st.checkbox("Anchored VWAP", key="avwap_chk")
-                st.session_state["pdec_labels_on"] = st.checkbox(
-                    "PDEC on candles", key="pdec_lbl_chk",
-                    help="Show each bar's 256-state action above the index candle. Off by default.",
-                )
-                st.session_state["big_trade_on"] = st.checkbox("Big trades", key="big_trd_chk")
-                st.session_state["big_trade_min"] = st.selectbox(
-                    "Min lots", [150, 200, 250, 300, 400, 500],
-                    index=0, key="big_trd_min", label_visibility="collapsed",
-                ) if st.session_state.get("big_trade_on") else 150
-                if st.session_state["avwap_on"] and st.session_state.get("avwap_time"):
-                    st.caption(f"anchor {st.session_state['avwap_time']}")
+                c1, c2, c3, c4 = st.columns([1.15, 1.15, 0.95, 0.85])
+                with c1:
+                    st.session_state["avwap_on"] = st.checkbox("AVWAP", key="avwap_chk")
+                with c2:
+                    st.session_state["pdec_labels_on"] = st.checkbox("PDEC", key="pdec_lbl_chk")
+                with c3:
+                    st.session_state["big_trade_on"] = st.checkbox("Big Δ", key="big_trd_chk")
+                with c4:
+                    st.session_state["big_trade_min"] = st.selectbox(
+                        "Min lots", [50, 75, 100, 150, 200, 250, 300, 400, 500],
+                        index=0, key="big_trd_min", label_visibility="collapsed",
+                    )
 
             if not df_fchart.empty:
                 df_fchart = df_fchart.copy()
@@ -5469,20 +5476,27 @@ def live_dashboard_fragment():
                     showlegend=True,
                 ), row=1, col=1)
                 if st.session_state.get("big_trade_on") and "volume" in dfi.columns:
-                    lotn = max(float(LOT_SIZES.get(Index_Name, 65) or 65), 1)
-                    lots = dfi["volume"].astype(float) / lotn
-                    thr = float(st.session_state.get("big_trade_min") or 150)
+                    vol_raw = dfi["volume"].astype(float)
+                    # Angel fut candles: volume is already lots (typically 10^2–10^4 / bar).
+                    # Only divide by lot size if the series looks like shares.
+                    med = float(vol_raw.replace(0, np.nan).median() or 0)
+                    lots = vol_raw / float(LOT_SIZES.get(Index_Name, 65) or 65) if med > 20000 else vol_raw
+                    thr = float(st.session_state.get("big_trade_min") or 50)
                     msk = lots >= thr
+                    y_px = pd.Series(idx_c, index=dfi.index) if not hasattr(idx_c, "loc") else idx_c
                     if msk.any():
+                        sizes = (10 + 20 * (lots[msk] / max(float(lots[msk].max()), 1))).clip(9, 32)
+                        colr = np.where(
+                            dfi.loc[msk, "close"].astype(float) >= dfi.loc[msk, "open"].astype(float),
+                            "#00E676", "#FF5252",
+                        ) if "open" in dfi.columns else "#FFD54F"
                         fig_stack.add_trace(plt_go.Scatter(
                             x=dfi.loc[msk, "time_str"],
-                            y=(idx_c if hasattr(idx_c, "loc") else dfi["close"]).loc[msk] if hasattr(idx_c, "loc") else dfi.loc[msk, "close"],
+                            y=y_px.loc[msk],
                             mode="markers", name=f"≥{int(thr)} lots",
-                            marker=dict(size=(12 + 18 * (lots[msk] / max(float(lots.max()), 1))).clip(10, 28),
-                                        color=np.where(dfi.loc[msk, "close"] >= dfi.loc[msk, "open"], "#00E676", "#FF5252")
-                                        if "open" in dfi.columns else "#FFD54F",
-                                        opacity=0.55, line=dict(width=1, color="#FFF59D")),
-                            hovertemplate="Lots %{customdata:.0f}<extra></extra>",
+                            marker=dict(size=sizes, color=colr, opacity=0.62,
+                                        line=dict(width=1, color="#FFF59D")),
+                            hovertemplate="%{x} · %{customdata:.0f} lots<extra>big Δ</extra>",
                             customdata=lots[msk],
                         ), row=1, col=1)
                 pdec_hist = pdec_session_history(dfi)
@@ -5922,136 +5936,6 @@ def live_dashboard_fragment():
                     st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.info("Futures / VWAP not available.")
-
-        with right_col:
-            try:
-                sess_d = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date()
-                last_ltp = float(data.get("spot_price") or 0)
-                hist = st.session_state.get("liq_delta_history") or []
-                dvol = 0.0
-                bid = ask = None
-                if hist:
-                    h = hist[-1]
-                    bid = h.get("bid"); ask = h.get("ask")
-                    dvol = float(h.get("signed_vol") or 0)
-                elif not df_fchart.empty and "volume" in df_fchart.columns:
-                    lotn = max(float(LOT_SIZES.get(Index_Name, 65) or 65), 1)
-                    dvol = float(df_fchart["volume"].iloc[-1]) / lotn
-                    if df_fchart["close"].iloc[-1] >= df_fchart["open"].iloc[-1]:
-                        ask = last_ltp
-                    else:
-                        bid = last_ltp
-                pmap = update_price_delta_map(Index_Name, last_ltp, bid, ask, dvol, sess_d)
-                rows = sorted(((int(k), float(v)) for k, v in pmap.items()), key=lambda x: -abs(x[1]))[:18]
-                st.caption("Price Δ lots (session)")
-                if rows:
-                    import pandas as _pd
-                    st.dataframe(_pd.DataFrame(rows, columns=["Px", "Net lots"]), hide_index=True, height=280)
-                else:
-                    st.caption("Fills accumulate in live hours.")
-            except Exception:
-                st.caption("Price delta map warming.")
-            heading_ribbon(
-                "📈 GEX vs OI / Volume",
-                "<b>GEX (OI)</b> = (Call_γ − Put_γ) × OI × lot × S² × 0.01<br>"
-                "Dealer gamma inventory from open interest. Positive GEX = long-gamma pin.<br>"
-                "<b>GEX (Volume)</b> same formula with session trade volume instead of OI — "
-                "today’s printed flow, not overnight positioning.<br>"
-                "Call OI/Vol up, Put OI/Vol down on the same strike axis. Zero lines aligned.",
-            )
-            if not df_chain.empty and lvls:
-                def _one_gex(c_col, p_col, net_col, h):
-                    fig = make_subplots(specs=[[{"secondary_y": True}]])
-                    cols = np.where(df_chain[net_col] >= 0, "#006400", "#8B0000")
-                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain[c_col], name="Call",
-                                            marker_color="#2E7D32", opacity=0.55, showlegend=False), secondary_y=False)
-                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=-df_chain[p_col], name="Put",
-                                            marker_color="#C62828", opacity=0.55, showlegend=False), secondary_y=False)
-                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain[net_col], name="Net GEX",
-                                            marker_color=cols, opacity=0.85, width=25, showlegend=False), secondary_y=True)
-                    fig.add_hline(y=0, line_width=1, line_color="#FFFFFF")
-                    fig.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA")
-                    prim = pd.concat([df_chain[c_col].astype(float), -df_chain[p_col].astype(float)])
-                    r1, r2 = calculate_synced_ranges(prim, df_chain[net_col].astype(float))
-                    fig.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                                      height=h, barmode="overlay", margin=dict(l=8, r=8, t=8, b=18), hovermode="x unified")
-                    fig.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
-                    fig.update_yaxes(range=r1, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
-                    fig.update_yaxes(range=r2, secondary_y=True, showgrid=False)
-                    return fig
-                g_oi, g_vol, tab_dgex, tab_dexoi = st.tabs(
-                    ["GEX / OI", "GEX / Volume", "Δ-GEX (OI)", "DEX OI"]
-                )
-                with g_oi:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    st.plotly_chart(_one_gex("C_OI", "P_OI", "Net_GEX_OI", 340), use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with g_vol:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    st.plotly_chart(_one_gex("C_Vol", "P_Vol", "Net_GEX_Vol", 340), use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with tab_dgex:
-                    heading_ribbon(
-                        f"🎯 Δ-GEX (OI) — {selected_expiry_str}",
-                        "<b>Delta-adjusted GEX (OI)</b><br>"
-                        "GEX_i × |Δ_i| so far OTM wings are down-weighted.<br>"
-                        "Expiry = selected chain only. Built from <b>OI</b>, not trade volume.<br>"
-                        "Flip line = zero-gamma strike.",
-                    )
-                    delta_gex_colors = np.where(df_chain["Net_Delta_GEX_OI"] >= 0, "#00E676", "#FF5252")
-                    fig_delta_gex = plt_go.Figure()
-                    fig_delta_gex.add_trace(plt_go.Bar(
-                        x=df_chain["Strike"], y=df_chain["Net_Delta_GEX_OI"], name="Δ-GEX",
-                        marker_color=delta_gex_colors, opacity=0.85, width=25,
-                    ))
-                    fig_delta_gex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-                    fig_delta_gex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-                    fig_delta_gex.add_vline(x=lvls.get("Zero_Gamma_Flip", data["spot_price"]), line_dash="dot", line_color="#FF9800", annotation_text="Flip", annotation_font_size=10)
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    fig_delta_gex.update_layout(
-                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=260, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
-                        showlegend=False,
-                    )
-                    fig_delta_gex.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
-                    fig_delta_gex.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
-                    st.plotly_chart(fig_delta_gex, use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with tab_dexoi:
-                    heading_ribbon(
-                        f"DEX OI — {selected_expiry_str}",
-                        "<b>Delta exposure vs OI</b> (not volume).<br>"
-                        "DEX_K = (Δ_CE × OI_CE − |Δ_PE| × OI_PE) × lot<br>"
-                        "Same snapshot as the selected expiry chain. Not a time tape.",
-                    )
-                    lotn = float(LOT_SIZES.get(Index_Name, 65))
-                    c_d = pd.to_numeric(df_chain.get("C_Δ", 0), errors="coerce").fillna(0.0)
-                    p_d = pd.to_numeric(df_chain.get("P_Δ", 0), errors="coerce").fillna(0.0)
-                    c_oi = pd.to_numeric(df_chain.get("C_OI", 0), errors="coerce").fillna(0.0)
-                    p_oi = pd.to_numeric(df_chain.get("P_OI", 0), errors="coerce").fillna(0.0)
-                    dex_oi = (c_d * c_oi - p_d.abs() * p_oi) * lotn
-                    dcols = np.where(dex_oi >= 0, "#26C6DA", "#FF8A65")
-                    fig_dexoi = plt_go.Figure()
-                    fig_dexoi.add_trace(plt_go.Bar(
-                        x=df_chain["Strike"], y=dex_oi, name="DEX OI",
-                        marker_color=dcols, opacity=0.85, width=25,
-                    ))
-                    fig_dexoi.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
-                    fig_dexoi.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    fig_dexoi.update_layout(
-                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=260, margin=dict(l=8, r=8, t=18, b=8), hovermode="x unified",
-                        showlegend=False,
-                    )
-                    fig_dexoi.update_xaxes(type="linear", tickformat="d", dtick=200, range=[min_strike_val, max_strike_val])
-                    fig_dexoi.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
-                    st.plotly_chart(fig_dexoi, use_container_width=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-            else:
-                st.info("GEX unavailable.")
-
 
         # Delta-GEX (selected) | Heatmap
         # Multi-exp Delta-GEX   | VEX/CEX
