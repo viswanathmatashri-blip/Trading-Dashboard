@@ -2090,6 +2090,67 @@ except Exception:
     SESSION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _price_delta_path(index_name, day):
+    return SESSION_CACHE_DIR / f"price_delta_{index_name}_{day}.json"
+
+
+def load_price_delta_map(index_name, day):
+    try:
+        import redis
+        r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"), socket_timeout=0.4)
+        raw = r.get(f"pdelta:{index_name}:{day}")
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+    fp = _price_delta_path(index_name, day)
+    if fp.exists():
+        try:
+            return json.loads(fp.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_price_delta_map(index_name, day, mp):
+    try:
+        fp = _price_delta_path(index_name, day)
+        fp.write_text(json.dumps(mp))
+    except Exception:
+        pass
+    try:
+        import redis
+        r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"), socket_timeout=0.4)
+        r.set(f"pdelta:{index_name}:{day}", json.dumps(mp))
+        # drop previous session keys
+        for k in r.scan_iter(f"pdelta:{index_name}:*"):
+            if k.decode().split(":")[-1] != str(day):
+                r.delete(k)
+    except Exception:
+        pass
+
+
+def update_price_delta_map(index_name, ltp, bid, ask, dvol_lots, day):
+    """Accumulate signed lots at last price. + hit ask / - hit bid. Not exchange VAP."""
+    if not ltp or dvol_lots is None:
+        return load_price_delta_map(index_name, day)
+    mp = load_price_delta_map(index_name, day)
+    px = str(int(round(float(ltp))))
+    signed = 0.0
+    try:
+        if ask and float(ltp) >= float(ask):
+            signed = abs(float(dvol_lots))
+        elif bid and float(ltp) <= float(bid):
+            signed = -abs(float(dvol_lots))
+        else:
+            signed = float(dvol_lots)
+    except Exception:
+        signed = float(dvol_lots or 0)
+    mp[px] = float(mp.get(px, 0)) + signed
+    save_price_delta_map(index_name, day, mp)
+    return mp
+
+
 def _ist_now():
     return datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
 
@@ -2380,12 +2441,15 @@ def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
     return ev
 
 
-def attach_bar_flow(df: pd.DataFrame) -> pd.DataFrame:
-
-    """CVD/OBV on THESE bars. Call before any resample so coarser TF keeps last(CVD)."""
+def attach_bar_flow(df: pd.DataFrame, rebuild: bool = False) -> pd.DataFrame:
+    """CVD/OBV on THESE bars. Call on native TF only. Resample must use last(CVD), not rebuild."""
     if df is None or df.empty:
         return df
     out = df.copy()
+    if not rebuild and "cvd" in out.columns and out["cvd"].notna().any():
+        if "obv_ma20" not in out.columns and "obv" in out.columns:
+            pass
+        return out
     cl = out["close"].astype(float)
     vol = out["volume"].astype(float) if "volume" in out.columns else pd.Series(0.0, index=out.index)
     hi = out["high"].astype(float) if "high" in out.columns else cl
@@ -4715,6 +4779,25 @@ def live_dashboard_fragment():
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
+    with st.sidebar:
+        with st.expander("Gemini analysis", expanded=False):
+            on = st.checkbox("Gemini on", key="gemini_enabled",
+                             help="Off = zero API calls.")
+            if on:
+                try:
+                    dfi_g = st.session_state.get("_last_dfi")
+                    scores_g = st.session_state.get("_last_scores") or {}
+                    data_g = st.session_state.get("data_store") or {}
+                    micro_g = classify_microstructure(dfi_g) if dfi_g is not None else {}
+                    flow_g = classify_flow_playbook(dfi_g, data_g) if dfi_g is not None else {}
+                    digest = build_gemini_digest(data_g, dfi_g, scores_g, micro_g, flow_g, {})
+                    maybe_gemini_regular(digest)
+                except Exception:
+                    pass
+            st.caption(f"Next regular {st.session_state.get('gemini_regular_wait', 0)}s")
+            st.text(st.session_state.get("gemini_regular") or "Waiting.")
+            st.caption("Trigger feedback")
+            st.text(st.session_state.get("gemini_trigger") or "No trigger yet.")
 
     if st.session_state.get("fut_tf_radio") in ("3 min", "5 min", "15 min"):
         st.session_state["selected_timeframe"] = st.session_state["fut_tf_radio"]
@@ -4941,39 +5024,68 @@ def live_dashboard_fragment():
         max_p = max(df_chart["close"].max(), df_chart["bb_upper"].max())
         padding = (max_p - min_p) * 0.05
 
-        tech_left, tech_right = st.columns([0.58, 0.42])
+        df_chain = pd.DataFrame(data.get("chain_results") or [])
+        lvls_tech = data.get("levels") or {}
+        tech_left, tech_gex = st.columns([0.50, 0.50])
 
         with tech_left:
-            fig_px = plt_go.Figure()
-            fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot", line=dict(color="#00E676", width=2)))
-            fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper", line=dict(color="rgba(33,150,243,0.5)", width=1)))
-            fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_lower"], mode="lines", name="BB Lower", line=dict(color="rgba(33,150,243,0.5)", width=1), fill="tonexty", fillcolor="rgba(33,150,243,0.05)"))
-            fig_px.update_layout(
-                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=320, margin=dict(l=10, r=10, t=20, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
-                hovermode="x unified", yaxis=dict(range=[min_p - padding, max_p + padding], tickformat="d"),
-                xaxis=dict(type="category", nticks=8),
-            )
-            st.plotly_chart(fig_px, use_container_width=True)
-
-        with tech_right:
-            fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.55, 0.45])
-            colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
-            fig_ind.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="Hist", marker_color=colors_macd, showlegend=False))
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD [{macd_val:.1f}]", line=dict(color="#2196F3", width=1.3)))
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Sig [{macd_sig:.1f}]", line=dict(color="#FF9800", width=1.3)))
-            fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name=f"RSI [{rsi_val:.0f}]", line=dict(color="#E040FB", width=1.3)), row=2, col=1)
-            fig_ind.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=2, col=1)
-            fig_ind.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=2, col=1)
-            fig_ind.update_layout(
-                template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                height=320, margin=dict(l=10, r=10, t=20, b=10),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
-                hovermode="x unified",
-            )
-            fig_ind.update_xaxes(type="category", nticks=6)
-            st.plotly_chart(fig_ind, use_container_width=True)
+            tab_bb, tab_osc = st.tabs(["NIFTY + BB", "MACD / RSI"])
+            with tab_bb:
+                fig_px = plt_go.Figure()
+                fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot", line=dict(color="#00E676", width=2)))
+                fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_upper"], mode="lines", name="BB Upper", line=dict(color="rgba(33,150,243,0.5)", width=1)))
+                fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["bb_lower"], mode="lines", name="BB Lower", line=dict(color="rgba(33,150,243,0.5)", width=1), fill="tonexty", fillcolor="rgba(33,150,243,0.05)"))
+                fig_px.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=320, margin=dict(l=10, r=10, t=20, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
+                    hovermode="x unified", yaxis=dict(range=[min_p - padding, max_p + padding], tickformat="d"),
+                    xaxis=dict(type="category", nticks=8),
+                )
+                st.plotly_chart(fig_px, use_container_width=True)
+            with tab_osc:
+                fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.55, 0.45])
+                colors_macd = np.where(df_chart["macd_hist"] >= 0, "#00E676", "#FF5252")
+                fig_ind.add_trace(plt_go.Bar(x=df_chart["time_str"], y=df_chart["macd_hist"], name="Hist", marker_color=colors_macd, showlegend=False))
+                fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd"], mode="lines", name=f"MACD [{macd_val:.1f}]", line=dict(color="#2196F3", width=1.3)))
+                fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["macd_signal"], mode="lines", name=f"Sig [{macd_sig:.1f}]", line=dict(color="#FF9800", width=1.3)))
+                fig_ind.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["rsi"], mode="lines", name=f"RSI [{rsi_val:.0f}]", line=dict(color="#E040FB", width=1.3)), row=2, col=1)
+                fig_ind.add_hline(y=70, line_dash="dash", line_color="#FF5252", line_width=1, row=2, col=1)
+                fig_ind.add_hline(y=30, line_dash="dash", line_color="#00E676", line_width=1, row=2, col=1)
+                fig_ind.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=320, margin=dict(l=10, r=10, t=20, b=10),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, font=dict(size=10)),
+                    hovermode="x unified",
+                )
+                fig_ind.update_xaxes(type="category", nticks=6)
+                st.plotly_chart(fig_ind, use_container_width=True)
+        with tech_gex:
+            if not df_chain.empty and "Strike" in df_chain.columns:
+                gx1, gx2, gx3, gx4 = st.tabs(["GEX/OI", "GEX/Vol", "Δ-GEX", "DEX OI"])
+                spot_g = float(data.get("spot_price") or 0)
+                def _gmini(y, h=300):
+                    fig = plt_go.Figure()
+                    cols = np.where(pd.to_numeric(y, errors="coerce").fillna(0) >= 0, "#00E676", "#FF5252")
+                    fig.add_trace(plt_go.Bar(x=df_chain["Strike"], y=y, marker_color=cols, showlegend=False))
+                    fig.add_vline(x=spot_g, line_dash="dash", line_color="#FAFAFA")
+                    fig.update_layout(template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                                      height=h, margin=dict(l=6, r=6, t=8, b=8), showlegend=False)
+                    fig.update_xaxes(tickformat="d")
+                    return fig
+                with gx1:
+                    if "Net_GEX_OI" in df_chain.columns:
+                        st.plotly_chart(_gmini(df_chain["Net_GEX_OI"]), use_container_width=True)
+                with gx2:
+                    if "Net_GEX_Vol" in df_chain.columns:
+                        st.plotly_chart(_gmini(df_chain["Net_GEX_Vol"]), use_container_width=True)
+                with gx3:
+                    if "Net_Delta_GEX_OI" in df_chain.columns:
+                        st.plotly_chart(_gmini(df_chain["Net_Delta_GEX_OI"]), use_container_width=True)
+                with gx4:
+                    st.caption("Full DEX tab stays with chain tools below if needed.")
+            else:
+                st.caption("GEX unavailable.")
 
         # ========== ROW1: Futures 50% | Liq Δ 20% | GEX OI 30% ==========
         # ========== ROW2: CVD 50%     | Liq Δ 20% | GEX Vol 30% ==========
@@ -5050,7 +5162,7 @@ def live_dashboard_fragment():
 
         # ----- Compact: Futures+VP+OBV+EFI+CVD | GEX OI + GEX Vol -----
         fut_msg = data.get("fut_fallback_msg", "")
-        left_col, right_col = st.columns([0.70, 0.30])
+        left_col, right_col = st.columns([0.88, 0.12])
         vp = {"ok": False}
         y0 = y1 = None
         sigma_mult = 1.5
@@ -5153,6 +5265,11 @@ def live_dashboard_fragment():
                     "PDEC on candles", key="pdec_lbl_chk",
                     help="Show each bar's 256-state action above the index candle. Off by default.",
                 )
+                st.session_state["big_trade_on"] = st.checkbox("Big trades", key="big_trd_chk")
+                st.session_state["big_trade_min"] = st.selectbox(
+                    "Min lots", [150, 200, 250, 300, 400, 500],
+                    index=0, key="big_trd_min", label_visibility="collapsed",
+                ) if st.session_state.get("big_trade_on") else 150
                 if st.session_state["avwap_on"] and st.session_state.get("avwap_time"):
                     st.caption(f"anchor {st.session_state['avwap_time']}")
 
@@ -5243,7 +5360,10 @@ def live_dashboard_fragment():
                                 pass
                 close = dfi["close"].astype(float)
                 vol = dfi["volume"].astype(float)
-                dfi = attach_bar_flow(dfi)
+                if "cvd" not in dfi.columns or dfi["cvd"].isna().all():
+                    dfi = attach_bar_flow(dfi, rebuild=True)
+                elif "obv" not in dfi.columns:
+                    dfi = attach_bar_flow(dfi, rebuild=True)
                 dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
 
                 win = st.session_state.get("chart_window") or "Session (6h)"
@@ -5304,16 +5424,15 @@ def live_dashboard_fragment():
                     buy_v = np.where(up, vol, 0.0)
                     sell_v = np.where(~up, vol, 0.0)
                 fig_stack = make_subplots(
-                    rows=5, cols=2,
+                    rows=4, cols=2,
                     column_widths=[0.84, 0.16],
-                    row_heights=[0.38, 0.14, 0.16, 0.16, 0.16],
+                    row_heights=[0.52, 0.14, 0.16, 0.18],
                     shared_xaxes=True,
                     shared_yaxes=False,
                     horizontal_spacing=0.01,
                     vertical_spacing=0.016,
                     specs=[
                         [{}, {}],
-                        [{}, None],
                         [{}, None],
                         [{}, None],
                         [{}, None],
@@ -5349,6 +5468,23 @@ def live_dashboard_fragment():
                     increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350",
                     showlegend=True,
                 ), row=1, col=1)
+                if st.session_state.get("big_trade_on") and "volume" in dfi.columns:
+                    lotn = max(float(LOT_SIZES.get(Index_Name, 65) or 65), 1)
+                    lots = dfi["volume"].astype(float) / lotn
+                    thr = float(st.session_state.get("big_trade_min") or 150)
+                    msk = lots >= thr
+                    if msk.any():
+                        fig_stack.add_trace(plt_go.Scatter(
+                            x=dfi.loc[msk, "time_str"],
+                            y=(idx_c if hasattr(idx_c, "loc") else dfi["close"]).loc[msk] if hasattr(idx_c, "loc") else dfi.loc[msk, "close"],
+                            mode="markers", name=f"≥{int(thr)} lots",
+                            marker=dict(size=(12 + 18 * (lots[msk] / max(float(lots.max()), 1))).clip(10, 28),
+                                        color=np.where(dfi.loc[msk, "close"] >= dfi.loc[msk, "open"], "#00E676", "#FF5252")
+                                        if "open" in dfi.columns else "#FFD54F",
+                                        opacity=0.55, line=dict(width=1, color="#FFF59D")),
+                            hovertemplate="Lots %{customdata:.0f}<extra></extra>",
+                            customdata=lots[msk],
+                        ), row=1, col=1)
                 pdec_hist = pdec_session_history(dfi)
                 if st.session_state.get("pdec_labels_on") and pdec_hist:
                     hi_s = pd.to_numeric(idx_h, errors="coerce")
@@ -5481,41 +5617,24 @@ def live_dashboard_fragment():
                     x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
                 ), row=3, col=1)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].clip(lower=0), mode="lines", showlegend=False,
-                    line=dict(color="#00E676", width=1.4), fill="tozeroy", fillcolor="rgba(0,230,118,0.18)",
-                ), row=4, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"].clip(upper=0), mode="lines", showlegend=False,
-                    line=dict(color="#FF5252", width=1.4), fill="tozeroy", fillcolor="rgba(255,82,82,0.18)",
-                ), row=4, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv"], mode="lines", showlegend=False,
-                    line=dict(color="#B0BEC5", width=1.1),
-                ), row=4, col=1)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["obv_ma20"], mode="lines", name="OBV MA20",
-                    line=dict(color="#FFF176", width=1.6), showlegend=False,
-                ), row=4, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
                 cvd_last = float(dfi["cvd"].iloc[-1])
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"].clip(lower=0),
                     mode="lines", showlegend=False, name="CVD+",
                     line=dict(color="#00E676", width=1.6),
                     fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
-                ), row=5, col=1)
+                ), row=4, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"].clip(upper=0),
                     mode="lines", showlegend=False, name="CVD-",
                     line=dict(color="#FF5252", width=1.6),
                     fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
-                ), row=5, col=1)
+                ), row=4, col=1)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
                     line=dict(color="#B0BEC5", width=1.2),
-                ), row=5, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=5, col=1)
+                ), row=4, col=1)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
                 tf_min_w = {"3 min": 10, "5 min": 8, "15 min": 6}.get(st.session_state.get("selected_timeframe", "5 min"), 8)
                 cvd_st = cvd_price_stats(dfi, window=tf_min_w)
                 if cvd_st.get("ok"):
@@ -5527,7 +5646,7 @@ def live_dashboard_fragment():
                         xref="paper", yref="paper", x=0.01, y=0.02,
                         showarrow=False, font=dict(size=11, color=colr),
                         bgcolor="rgba(16,20,28,0.85)",
-                        row=5, col=1,
+                        row=4, col=1,
                     )
 
                 div_ev = scan_cvd_div_events(dfi, window=tf_min_w)
@@ -5576,6 +5695,8 @@ def live_dashboard_fragment():
                 spot_chg = _sess_chg(data.get("df_candles"))
                 fut_chg = _sess_chg(df_fchart if not df_fchart.empty else data.get("df_futures"))
                 trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
+                st.session_state["_last_dfi"] = dfi
+                st.session_state["_last_scores"] = scores if isinstance(scores, dict) else {}
                 micro = classify_microstructure(dfi)
                 flow_pb = classify_flow_playbook(dfi, data)
                 try:
@@ -5587,7 +5708,7 @@ def live_dashboard_fragment():
                 xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
                 fig_stack.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                    height=780, margin=dict(l=40, r=6, t=8, b=18),
+                    height=820, margin=dict(l=40, r=6, t=8, b=18),
                     legend=dict(orientation="h", yanchor="top", y=1.0, x=0.0, font=dict(size=10),
                                 bgcolor="rgba(14,17,23,0.4)"),
                     hovermode="x unified", bargap=0.15,
@@ -5603,14 +5724,11 @@ def live_dashboard_fragment():
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=3, col=1)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                                       range=xr, showticklabels=False, row=4, col=1)
-                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                                       range=xr, nticks=8, row=5, col=1)
+                                       range=xr, nticks=8, row=4, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="ΔV", row=2, col=1)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="OBV", row=4, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=5, col=1)
-                tab_flow, tab_dex = st.tabs(["1 · Index / ΔV / EFI / OBV / CVD", "2 · DEX / Premium"])
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=1)
+                tab_flow, tab_dex = st.tabs(["1 · Index / ΔV / EFI / CVD", "2 · DEX / Premium"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
@@ -5698,7 +5816,7 @@ def live_dashboard_fragment():
                     fig_dex.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
                     fig_dex.update_layout(
                         template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                        height=780, margin=dict(l=40, r=6, t=8, b=18),
+                        height=820, margin=dict(l=40, r=6, t=8, b=18),
                         legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
                         hovermode="x unified",
                     )
@@ -5806,6 +5924,33 @@ def live_dashboard_fragment():
                 st.info("Futures / VWAP not available.")
 
         with right_col:
+            try:
+                sess_d = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date()
+                last_ltp = float(data.get("spot_price") or 0)
+                hist = st.session_state.get("liq_delta_history") or []
+                dvol = 0.0
+                bid = ask = None
+                if hist:
+                    h = hist[-1]
+                    bid = h.get("bid"); ask = h.get("ask")
+                    dvol = float(h.get("signed_vol") or 0)
+                elif not df_fchart.empty and "volume" in df_fchart.columns:
+                    lotn = max(float(LOT_SIZES.get(Index_Name, 65) or 65), 1)
+                    dvol = float(df_fchart["volume"].iloc[-1]) / lotn
+                    if df_fchart["close"].iloc[-1] >= df_fchart["open"].iloc[-1]:
+                        ask = last_ltp
+                    else:
+                        bid = last_ltp
+                pmap = update_price_delta_map(Index_Name, last_ltp, bid, ask, dvol, sess_d)
+                rows = sorted(((int(k), float(v)) for k, v in pmap.items()), key=lambda x: -abs(x[1]))[:18]
+                st.caption("Price Δ lots (session)")
+                if rows:
+                    import pandas as _pd
+                    st.dataframe(_pd.DataFrame(rows, columns=["Px", "Net lots"]), hide_index=True, height=280)
+                else:
+                    st.caption("Fills accumulate in live hours.")
+            except Exception:
+                st.caption("Price delta map warming.")
             heading_ribbon(
                 "📈 GEX vs OI / Volume",
                 "<b>GEX (OI)</b> = (Call_γ − Put_γ) × OI × lot × S² × 0.01<br>"
@@ -5903,33 +6048,7 @@ def live_dashboard_fragment():
                     fig_dexoi.update_yaxes(showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF", tickformat="~s")
                     st.plotly_chart(fig_dexoi, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
-                on = st.checkbox("Gemini on", key="gemini_enabled",
-                                 help="Off = zero API calls. On = calls even when the cash market is closed.")
-                if on:
-                    try:
-                        micro_g = classify_microstructure(dfi) if "dfi" in dir() else {}
-                        flow_g = classify_flow_playbook(dfi, data) if "dfi" in dir() else {}
-                        digest = build_gemini_digest(
-                            data,
-                            dfi if "dfi" in dir() else None,
-                            scores if isinstance(scores, dict) else {},
-                            micro_g, flow_g,
-                            cvd_st if "cvd_st" in dir() else {},
-                        )
-                        maybe_gemini_regular(digest)
-                    except Exception:
-                        pass
-                g1, g2 = st.tabs(["Regular analysis", "Trigger feedback"])
-                with g1:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    st.caption(f"Regular Gemini on its own 60s clock (not the 5s UI refresh). Next in {st.session_state.get('gemini_regular_wait', 0)}s")
-                    st.text(st.session_state.get("gemini_regular") or "Waiting — enable Gemini in live hours.")
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with g2:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    st.caption("3.8 → 3.7 → 3.6 → 3.5 on VWAP/EFI/PECO/PCD$/σ/flip/CVD alerts")
-                    st.text(st.session_state.get("gemini_trigger") or "No trigger feedback yet.")
-                    st.markdown("</div>", unsafe_allow_html=True)
+
             else:
                 st.info("GEX unavailable.")
 
