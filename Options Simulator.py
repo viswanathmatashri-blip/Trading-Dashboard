@@ -5436,14 +5436,14 @@ def live_dashboard_fragment():
                             font=dict(size=9, color="#FFB300"), row=1, col=1)
                 except Exception:
                     pass
-                for px, lc, name in ((call_w, "#FF5252", "Call wall"), (put_w, "#00E676", "Put wall")):
-                    if not px:
+                for wall_px, lc, name in ((call_w, "#FF5252", "Call wall"), (put_w, "#00E676", "Put wall")):
+                    if not wall_px:
                         continue
-                    fig_stack.add_hline(y=float(px), line_color=lc, line_width=1.0,
+                    fig_stack.add_hline(y=float(wall_px), line_color=lc, line_width=1.0,
                                         line_dash="dot", row=1, col=1)
                     fig_stack.add_annotation(
                         x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
-                        y=float(px), text=name, showarrow=False, xanchor="right",
+                        y=float(wall_px), text=name, showarrow=False, xanchor="right",
                         font=dict(size=9, color=lc), row=1, col=1)
                 last_fut = float(dfi["close"].iloc[-1])
                 last_sp = float(dfi["spot_px"].iloc[-1])
