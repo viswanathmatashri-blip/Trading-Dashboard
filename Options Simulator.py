@@ -5438,6 +5438,35 @@ def live_dashboard_fragment():
                             idx_o, idx_h, idx_l, idx_c = m["open"], m["high"], m["low"], m["close"]
                     except Exception:
                         pass
+                # Futures volume, mapped to index with *per-bar* basis (not last print).
+                try:
+                    b = dfi["basis"].astype(float) if "basis" in dfi.columns else 0.0
+                    # 3-min (or current TF) basis; also keep a 30-min step for stability
+                    if "time" in dfi.columns:
+                        t0 = pd.to_datetime(dfi["time"])
+                        step = t0.dt.floor("30min")
+                        b30 = pd.Series(b).groupby(step).transform("mean")
+                        b_use = 0.65 * pd.Series(b).astype(float) + 0.35 * b30.astype(float)
+                    else:
+                        b_use = pd.Series(b).astype(float)
+                    vp_src = pd.DataFrame({
+                        "high": dfi["high"].astype(float) - b_use.values,
+                        "low": dfi["low"].astype(float) - b_use.values,
+                        "close": dfi["close"].astype(float) - b_use.values,
+                        "volume": dfi["volume"].astype(float) if "volume" in dfi.columns else 0.0,
+                    })
+                    rng = (vp_src["high"] - vp_src["low"]).replace(0, np.nan)
+                    med_r = float(rng.median() or 0) or 1.0
+                    hi_q = float(vp_src["high"].quantile(0.97))
+                    lo_q = float(vp_src["low"].quantile(0.03))
+                    keep = (rng <= 4.0 * med_r) & (vp_src["high"] <= hi_q + med_r) & (vp_src["low"] >= lo_q - med_r)
+                    if keep.sum() >= 8:
+                        vp_src = vp_src[keep]
+                    vp2 = compute_session_volume_profile(vp_src, bin_step=2.0, prominence_factor=0.35)
+                    if vp2.get("ok"):
+                        vp = vp2
+                except Exception:
+                    pass
                 buy_v = np.zeros(len(dfi), dtype=float)
                 sell_v = np.zeros(len(dfi), dtype=float)
                 if "volume" in dfi.columns:
