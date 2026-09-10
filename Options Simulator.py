@@ -5351,25 +5351,41 @@ def live_dashboard_fragment():
                 ), row=1, col=1)
                 pdec_hist = pdec_session_history(dfi)
                 if st.session_state.get("pdec_labels_on") and pdec_hist:
-                    pad = max((float(pd.Series(idx_h).max()) - float(pd.Series(idx_l).min())) * 0.004, 0.8)
+                    hi_s = pd.to_numeric(idx_h, errors="coerce")
+                    t_s = pd.to_datetime(dfi["time"]) if "time" in dfi.columns else None
+                    cap = hi_s.copy()
+                    if t_s is not None:
+                        hhmm = t_s.dt.hour * 60 + t_s.dt.minute
+                        mask = (hhmm >= 9 * 60 + 30) & (hhmm <= 15 * 60 + 15)
+                        if mask.any():
+                            cap = hi_s[mask.values] if len(hi_s) == len(mask) else hi_s
+                    peak = float(cap.max()) if cap.notna().any() else float(hi_s.max())
+                    rng = float(hi_s.max() - hi_s.min()) if hi_s.notna().any() else 20.0
+                    y_lab = peak + max(rng * 0.018, 3.0)
+                    # keep candle pane tall enough for vertical words
+                    try:
+                        if y1 is not None:
+                            y1 = max(y1, y_lab + rng * 0.12)
+                    except Exception:
+                        pass
                     prev = None
                     for rec in pdec_hist:
                         act = rec["action"]
-                        if not act or rec.get("y") is None:
+                        if not act:
                             continue
                         if act == prev:
                             continue
                         prev = act
                         short = act if len(act) <= 28 else act[:26] + "…"
                         fig_stack.add_annotation(
-                            x=rec["t"], y=float(rec["y"]) + pad,
+                            x=rec["t"], y=y_lab,
                             text=short,
                             showarrow=False,
                             textangle=-90,
                             xanchor="center",
                             yanchor="bottom",
                             font=dict(size=8, color="#CFD8DC"),
-                            bgcolor="rgba(14,17,23,0.25)",
+                            bgcolor="rgba(14,17,23,0.20)",
                             row=1, col=1,
                         )
                 lv_w = data.get("levels") or {}
