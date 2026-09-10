@@ -1108,6 +1108,33 @@ def classify_microstructure(dfi: pd.DataFrame) -> dict:
     }
 
 
+def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 12) -> list:
+    """Causal PDEC action at each bar using only data up to that bar."""
+    out = []
+    if dfi is None or dfi.empty:
+        return out
+    n = len(dfi)
+    for i in range(n):
+        if i + 1 < min_bars:
+            continue
+        sl = dfi.iloc[: i + 1]
+        try:
+            rec = classify_microstructure(sl)
+        except Exception:
+            continue
+        if not rec.get("ok"):
+            continue
+        hi = sl["high"].iloc[-1] if "high" in sl.columns else sl["close"].iloc[-1]
+        t = sl["time_str"].iloc[-1] if "time_str" in sl.columns else str(i)
+        out.append({
+            "i": i, "t": t, "action": rec.get("action") or "",
+            "key": rec.get("key"), "micro": rec.get("micro") or "",
+            "glyphs": rec.get("arrows") or "",
+            "y": float(hi) if pd.notna(hi) else None,
+        })
+    return out
+
+
 def classify_flow_playbook(dfi: pd.DataFrame, data: dict) -> dict:
     empty = {"ok": False, "action": "", "micro": "", "hover": ""}
     if dfi is None or dfi.empty:
@@ -5122,6 +5149,10 @@ def live_dashboard_fragment():
                         st.caption("off")
             with av:
                 st.session_state["avwap_on"] = st.checkbox("Anchored VWAP", key="avwap_chk")
+                st.session_state["pdec_labels_on"] = st.checkbox(
+                    "PDEC on candles", key="pdec_lbl_chk",
+                    help="Show each bar's 256-state action above the index candle. Off by default.",
+                )
                 if st.session_state["avwap_on"] and st.session_state.get("avwap_time"):
                     st.caption(f"anchor {st.session_state['avwap_time']}")
 
@@ -5318,6 +5349,30 @@ def live_dashboard_fragment():
                     increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350",
                     showlegend=True,
                 ), row=1, col=1)
+                pdec_hist = pdec_session_history(dfi)
+                if st.session_state.get("pdec_labels_on") and pdec_hist:
+                    xs, ys, txt, hov = [], [], [], []
+                    prev = None
+                    pad = max((float(pd.Series(idx_h).max()) - float(pd.Series(idx_l).min())) * 0.012, 1.5)
+                    for rec in pdec_hist:
+                        act = rec["action"]
+                        if not act or rec.get("y") is None:
+                            continue
+                        # skip exact repeats to cut clutter; keep change + last bar
+                        if act == prev and rec is not pdec_hist[-1]:
+                            continue
+                        prev = act
+                        short = act if len(act) <= 22 else act[:20] + "…"
+                        xs.append(rec["t"]); ys.append(rec["y"] + pad); txt.append(short)
+                        hov.append(f"{rec['t']} {rec['glyphs']}<br>{rec['micro']}<br><b>{act}</b>")
+                    if xs:
+                        fig_stack.add_trace(plt_go.Scatter(
+                            x=xs, y=ys, mode="text", text=txt, name="PDEC",
+                            textfont=dict(size=8, color="#B0BEC5"),
+                            textposition="top center",
+                            hovertext=hov, hoverinfo="text",
+                            showlegend=False,
+                        ), row=1, col=1)
                 lv_w = data.get("levels") or {}
                 spot_w = float(data.get("spot_price") or (dfi["spot_px"].iloc[-1] if "spot_px" in dfi.columns else 0) or 0)
                 call_w = put_w = None
@@ -5544,6 +5599,12 @@ def live_dashboard_fragment():
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
+                    if pdec_hist:
+                        with st.expander(f"PDEC session log ({len(pdec_hist)} bars)", expanded=False):
+                            lines = ["| Time | P Δ E C | Action |", "|---|---|---|"]
+                            for rec in pdec_hist:
+                                lines.append(f"| {rec['t']} | {rec['glyphs']} | {rec['action']} |")
+                            st.markdown("\n".join(lines))
                     if st.session_state.get("avwap_on"):
                         opts_t = list(dfi["time_str"]) if "time_str" in dfi.columns else []
                         if opts_t:
