@@ -214,6 +214,7 @@ LOT_SIZES = {
     "MIDCPNIFTY": 120,
     "SENSEX": 20,
     "GOLDM": 100,
+    "CRUDEOIL": 100,
 }
 
 INDEX_TOKEN_MAP = {
@@ -223,6 +224,7 @@ INDEX_TOKEN_MAP = {
     "MIDCPNIFTY": ("99926074", "NSE", "NFO"),
     "SENSEX": ("99919000", "BSE", "BFO"),
     "GOLDM": ("", "MCX", "MCX"),
+    "CRUDEOIL": ("", "MCX", "MCX"),
 }
 INDIA_VIX_TOKEN = "99926017"
 
@@ -2032,6 +2034,7 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
 
 MCX_NAME_ALIASES = {
     "GOLDM": ["GOLDM", "GOLD"],
+    "CRUDEOIL": ["CRUDEOIL", "CRUDE"],
 }
 
 
@@ -2044,13 +2047,18 @@ def get_near_month_futures_token(df_scrip_master, index_name, fut_exch):
         df["_seg"] = df["exch_seg"].astype(str).str.upper()
         df["_ityp"] = df["instrumenttype"].astype(str).str.upper()
         df["_sym"] = df["symbol"].astype(str).str.upper() if "symbol" in df.columns else ""
-        if index_name == "GOLDM":
+        if index_name in MCX_NAME_ALIASES:
+            prefixes = tuple(MCX_NAME_ALIASES[index_name])
             fut_scrips = df[
                 df["_seg"].isin(["MCX", "NCO"])
                 & df["_ityp"].eq("FUTCOM")
-                & df["_sym"].str.startswith("GOLDM")
+                & df["_sym"].str.startswith(prefixes)
                 & df["_sym"].str.contains("FUT")
             ].copy()
+            # prefer exact product (CRUDEOIL not CRUDEOILM if both exist)
+            exact = fut_scrips[fut_scrips["_sym"].str.startswith(index_name)]
+            if not exact.empty:
+                fut_scrips = exact
         else:
             segs = [str(fut_exch).upper()] if fut_exch else ["NFO"]
             fut_scrips = df[
@@ -2158,7 +2166,7 @@ def _ist_now():
 def session_hours(index_name=None):
     """Cash/FO 09:15–15:30; MCX GOLDM/SILVERM 09:00–23:30 IST weekdays."""
     name = index_name or st.session_state.get("_last_index") or st.session_state.get("Index_Name") or "NIFTY"
-    if str(name).upper() in ("GOLDM", "SILVERM"):
+    if str(name).upper() in ("GOLDM", "SILVERM", "CRUDEOIL", "CRUDEOILM"):
         return 9, 0, 23, 30, "09:00", "23:30"
     return 9, 15, 15, 30, "09:15", "15:30"
 
@@ -2792,7 +2800,7 @@ df_master = download_master_scrip()
 with st.sidebar.expander("1. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
-        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM"])
+        Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"])
     if st.session_state.get("_last_index") and st.session_state["_last_index"] != Index_Name:
         st.session_state["flow_tape"] = []
         st.session_state.pop("liq_delta_history", None)
@@ -2808,15 +2816,16 @@ with st.sidebar.expander("1. Market Parameters", expanded=True):
 
     rate_param = st.number_input("Risk Free Rate (r)", min_value=0.0, max_value=0.15, value=0.07, step=0.01)
 
-    if Index_Name == "GOLDM":
+    if Index_Name in MCX_NAME_ALIASES:
+        aliases = [a.upper() for a in MCX_NAME_ALIASES[Index_Name]]
         df_options = df_master[
             (df_master["exch_seg"].isin(["MCX", "NCO"]))
             & (df_master["instrumenttype"].isin(["OPTFUT", "OPTCOM"]))
-            & (df_master["name"].astype(str).str.upper().isin(["GOLD", "GOLDM"]))
+            & (df_master["name"].astype(str).str.upper().isin(aliases + [Index_Name]))
         ].copy()
         if "symbol" in df_options.columns:
-            goldm_opt = df_options[df_options["symbol"].astype(str).str.upper().str.startswith("GOLDM")]
-            df_options = goldm_opt if not goldm_opt.empty else df_options
+            pref = df_options[df_options["symbol"].astype(str).str.upper().str.startswith(Index_Name)]
+            df_options = pref if not pref.empty else df_options
     else:
         df_options = df_master[
             (df_master["exch_seg"] == Exchange)
@@ -4480,6 +4489,42 @@ def _prominence_nodes(vol_at: np.ndarray, mids: np.ndarray, prominence_factor: f
     return hvn, lvn
 
 
+
+def compute_delta_profile(df: pd.DataFrame, bin_step: float = 2.0) -> dict:
+    """Signed futures volume at index-mapped price. + close>=open, - otherwise."""
+    empty = {"ok": False}
+    if df is None or df.empty or "volume" not in df.columns:
+        return empty
+    lo = float(min(df["low"].min(), df["close"].min()))
+    hi = float(max(df["high"].max(), df["close"].max()))
+    if hi <= lo:
+        hi = lo + bin_step
+    bin_step = float(bin_step) if bin_step and bin_step > 0 else 2.0
+    lo = np.floor(lo / bin_step) * bin_step
+    hi = np.ceil(hi / bin_step) * bin_step
+    edges = np.arange(lo, hi + bin_step * 0.5, bin_step)
+    if len(edges) < 3:
+        return empty
+    n_bins = len(edges) - 1
+    dlt = np.zeros(n_bins, dtype=float)
+    has_open = "open" in df.columns
+    for _, r in df.iterrows():
+        v = float(r.get("volume") or 0)
+        if v <= 0:
+            continue
+        signed = v if (not has_open or float(r["close"]) >= float(r["open"])) else -v
+        l = float(r["low"]); h = float(r["high"])
+        if h <= l:
+            h = l + 1e-6
+        span = h - l
+        for i in range(n_bins):
+            a, b = edges[i], edges[i + 1]
+            overlap = max(0.0, min(h, b) - max(l, a))
+            if overlap > 0:
+                dlt[i] += signed * (overlap / span)
+    mids = (edges[:-1] + edges[1:]) / 2.0
+    return {"ok": True, "mids": mids, "delta": dlt}
+
 def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prominence_factor: float = 0.35) -> dict:
     """Volume-at-price with tick-size bins, POC, ±1σ/±1.5σ VA, prominence HVN/LVN."""
     empty = {"ok": False}
@@ -5450,6 +5495,7 @@ def live_dashboard_fragment():
                     else:
                         b_use = pd.Series(b).astype(float)
                     vp_src = pd.DataFrame({
+                        "open": dfi["open"].astype(float) - b_use.values,
                         "high": dfi["high"].astype(float) - b_use.values,
                         "low": dfi["low"].astype(float) - b_use.values,
                         "close": dfi["close"].astype(float) - b_use.values,
@@ -5475,37 +5521,65 @@ def live_dashboard_fragment():
                     buy_v = np.where(up, vol, 0.0)
                     sell_v = np.where(~up, vol, 0.0)
                 fig_stack = make_subplots(
-                    rows=4, cols=2,
-                    column_widths=[0.84, 0.16],
+                    rows=4, cols=3,
+                    column_widths=[0.13, 0.71, 0.16],
                     row_heights=[0.52, 0.14, 0.16, 0.18],
-                    shared_xaxes=True,
+                    shared_xaxes=False,
                     shared_yaxes=False,
                     horizontal_spacing=0.01,
                     vertical_spacing=0.016,
                     specs=[
-                        [{}, {}],
-                        [{}, None],
-                        [{}, None],
-                        [{}, None],
+                        [{}, {}, {}],
+                        [None, {}, None],
+                        [None, {}, None],
+                        [None, {}, None],
                     ],
                 )
+                try:
+                    dp = compute_delta_profile(vp_src if "vp_src" in dir() else None, bin_step=2.0)
+                except Exception:
+                    dp = {"ok": False}
+                if not isinstance(dp, dict) or not dp.get("ok"):
+                    try:
+                        b_use = dfi["basis"].astype(float) if "basis" in dfi.columns else 0.0
+                        vp_src = pd.DataFrame({
+                            "open": dfi["open"].astype(float) - b_use,
+                            "high": dfi["high"].astype(float) - b_use,
+                            "low": dfi["low"].astype(float) - b_use,
+                            "close": dfi["close"].astype(float) - b_use,
+                            "volume": dfi["volume"].astype(float),
+                        })
+                        dp = compute_delta_profile(vp_src, bin_step=2.0)
+                    except Exception:
+                        dp = {"ok": False}
+                if dp.get("ok"):
+                    dm, dd = [], []
+                    for m, dlt in zip(dp["mids"], dp["delta"]):
+                        if y0 is not None and not (y0 <= float(m) <= y1):
+                            continue
+                        dm.append(float(m)); dd.append(float(dlt))
+                    fig_stack.add_trace(plt_go.Bar(
+                        x=dd, y=dm, orientation="h", showlegend=False, name="ΔP",
+                        marker=dict(color=["#00E676" if v >= 0 else "#FF5252" for v in dd]),
+                        hovertemplate="Px %{y:.0f}<br>Δ %{x:.0f}<extra></extra>",
+                    ), row=1, col=1)
                 # price
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["vwap_upper_idx"], mode="lines", showlegend=False, hoverinfo="skip",
-                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
+                    line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=2)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["vwap_lower_idx"], mode="lines", showlegend=False, hoverinfo="skip",
                     line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-                    fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
+                    fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=2)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP (idx)",
                     line=dict(color="#FF9800", width=2),
-                    hoverinfo="skip"), row=1, col=1)
+                    hoverinfo="skip"), row=1, col=2)
                 if st.session_state.get("avwap_on") and "avwap_idx" in dfi.columns and dfi["avwap_idx"].notna().any():
                     fig_stack.add_trace(plt_go.Scatter(
                         x=dfi["time_str"], y=dfi["avwap_idx"], mode="lines", name="AVWAP",
                         line=dict(color="#CE93D8", width=2, dash="dash"),
-                    ), row=1, col=1)
+                    ), row=1, col=2)
                 cd = np.column_stack([
                     dfi["vwap_idx"].astype(float).values,
                     dfi["close"].astype(float).values,
@@ -5518,7 +5592,7 @@ def live_dashboard_fragment():
                     name="NIFTY", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
                     increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350",
                     showlegend=True,
-                ), row=1, col=1)
+                ), row=1, col=2)
                 if st.session_state.get("big_trade_on") and "volume" in dfi.columns:
                     vol_raw = dfi["volume"].astype(float)
                     # Angel fut candles: volume is already lots (typically 10^2–10^4 / bar).
@@ -5542,7 +5616,7 @@ def live_dashboard_fragment():
                                         line=dict(width=1, color="#FFF59D")),
                             hovertemplate="%{x} · %{customdata:.0f} lots<extra>big Δ</extra>",
                             customdata=lots[msk],
-                        ), row=1, col=1)
+                        ), row=1, col=2)
                 pdec_hist = pdec_session_history(dfi)
                 if st.session_state.get("pdec_labels_on") and pdec_hist:
                     hi_s = pd.to_numeric(idx_h, errors="coerce")
@@ -5580,7 +5654,7 @@ def live_dashboard_fragment():
                             yanchor="bottom",
                             font=dict(size=8, color="#CFD8DC"),
                             bgcolor="rgba(14,17,23,0.20)",
-                            row=1, col=1,
+                            row=1, col=2,
                         )
                 lv_w = data.get("levels") or {}
                 spot_w = float(data.get("spot_price") or (dfi["spot_px"].iloc[-1] if "spot_px" in dfi.columns else 0) or 0)
@@ -5620,11 +5694,11 @@ def live_dashboard_fragment():
                     flip_w = float(flip_w)
                     if flip_w:
                         fig_stack.add_hline(y=flip_w, line_color="#FFB300", line_width=1.4,
-                                            line_dash="dot", row=1, col=1)
+                                            line_dash="dot", row=1, col=2)
                         fig_stack.add_annotation(
                             x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
                             y=flip_w, text="Flip", showarrow=False, xanchor="right",
-                            font=dict(size=9, color="#FFB300"), row=1, col=1)
+                            font=dict(size=9, color="#FFB300"), row=1, col=2)
                 except Exception:
                     pass
                 if vp.get("ok"):
@@ -5632,11 +5706,11 @@ def live_dashboard_fragment():
                         if lvl_px is None:
                             continue
                         fig_stack.add_hline(y=float(lvl_px), line_color="#F48FB1", line_width=1.2,
-                                            line_dash="dot", row=1, col=1)
+                                            line_dash="dot", row=1, col=2)
                         fig_stack.add_annotation(
                             x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
                             y=float(lvl_px), text=name, showarrow=False, xanchor="right",
-                            font=dict(size=9, color="#F48FB1"), row=1, col=1)
+                            font=dict(size=9, color="#F48FB1"), row=1, col=2)
                 pdh = pdl = None
                 dspot = data.get("df_candles")
                 try:
@@ -5657,20 +5731,20 @@ def live_dashboard_fragment():
                     if not lvl_px:
                         continue
                     fig_stack.add_hline(y=float(lvl_px), line_color=lc, line_width=1.1,
-                                        line_dash="dot", row=1, col=1)
+                                        line_dash="dot", row=1, col=2)
                     fig_stack.add_annotation(
                         x=axis_times[0] if axis_times else dfi["time_str"].iloc[0],
                         y=float(lvl_px), text=name, showarrow=False, xanchor="left",
-                        font=dict(size=9, color=lc), row=1, col=1)
+                        font=dict(size=9, color=lc), row=1, col=2)
                 for wall_px, lc, name in ((call_w, "#FF5252", "Call wall"), (put_w, "#00E676", "Put wall")):
                     if not wall_px:
                         continue
                     fig_stack.add_hline(y=float(wall_px), line_color=lc, line_width=1.0,
-                                        line_dash="dot", row=1, col=1)
+                                        line_dash="dot", row=1, col=2)
                     fig_stack.add_annotation(
                         x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
                         y=float(wall_px), text=name, showarrow=False, xanchor="right",
-                        font=dict(size=9, color=lc), row=1, col=1)
+                        font=dict(size=9, color=lc), row=1, col=2)
                 last_fut = float(dfi["close"].iloc[-1])
                 last_sp = float(dfi["spot_px"].iloc[-1])
                 last_sp = float(last_sp) if pd.notna(last_sp) else float(data.get("spot_price") or 0)
@@ -5678,7 +5752,7 @@ def live_dashboard_fragment():
                     x=dfi["time_str"].iloc[-1], y=last_fut,
                     text=f"{last_sp:.0f} ({last_fut:.0f})",
                     showarrow=False, xanchor="left", font=dict(size=11, color="#00E676"),
-                    row=1, col=1,
+                    row=1, col=2,
                 )
                 if vp.get("ok"):
                     mids, vols, colors = [], [], []
@@ -5691,40 +5765,40 @@ def live_dashboard_fragment():
                         x=vols, y=mids, orientation="h", showlegend=False, name="VP",
                         marker=dict(color=colors),
                         hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra></extra>",
-                    ), row=1, col=2)
+                    ), row=1, col=3)
 
                 fig_stack.add_trace(plt_go.Bar(
                     x=dfi["time_str"], y=buy_v, name="Buy ΔV",
                     marker_color="rgba(0,230,118,0.7)", showlegend=False,
-                ), row=2, col=1)
+                ), row=2, col=2)
                 fig_stack.add_trace(plt_go.Bar(
                     x=dfi["time_str"], y=-sell_v, name="Sell ΔV",
                     marker_color="rgba(255,82,82,0.7)", showlegend=False,
-                ), row=2, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
+                ), row=2, col=2)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=2)
                 efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
                 fig_stack.add_trace(plt_go.Bar(
                     x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
-                ), row=3, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=1)
+                ), row=3, col=2)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=2)
                 cvd_last = float(dfi["cvd"].iloc[-1])
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"].clip(lower=0),
                     mode="lines", showlegend=False, name="CVD+",
                     line=dict(color="#00E676", width=1.6),
                     fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
-                ), row=4, col=1)
+                ), row=4, col=2)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"].clip(upper=0),
                     mode="lines", showlegend=False, name="CVD-",
                     line=dict(color="#FF5252", width=1.6),
                     fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
-                ), row=4, col=1)
+                ), row=4, col=2)
                 fig_stack.add_trace(plt_go.Scatter(
                     x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
                     line=dict(color="#B0BEC5", width=1.2),
-                ), row=4, col=1)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=1)
+                ), row=4, col=2)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=2)
                 tf_min_w = {"3 min": 10, "5 min": 8, "15 min": 6}.get(st.session_state.get("selected_timeframe", "5 min"), 8)
                 cvd_st = cvd_price_stats(dfi, window=tf_min_w)
                 if cvd_st.get("ok"):
@@ -5736,7 +5810,7 @@ def live_dashboard_fragment():
                         xref="paper", yref="paper", x=0.01, y=0.02,
                         showarrow=False, font=dict(size=11, color=colr),
                         bgcolor="rgba(16,20,28,0.85)",
-                        row=4, col=1,
+                        row=4, col=2,
                     )
 
                 div_ev = scan_cvd_div_events(dfi, window=tf_min_w)
@@ -5761,14 +5835,14 @@ def live_dashboard_fragment():
                             textfont=dict(size=10, color="#29B6F6"),
                             hovertemplate=tip + "<extra></extra>",
                             showlegend=False, name="D",
-                        ), row=1, col=1)
+                        ), row=1, col=2)
                         fig_stack.add_trace(plt_go.Scatter(
                             x=[e["t"], e["t"]], y=[clo, chi],
                             mode="lines",
                             line=dict(color="#29B6F6", width=1.2, dash="dash"),
                             hovertemplate=tip + "<extra></extra>",
                             showlegend=False, name="D",
-                        ), row=4, col=1)
+                        ), row=4, col=2)
 
                 def _sess_chg(src):
                     if src is None or getattr(src, "empty", True):
@@ -5804,20 +5878,22 @@ def live_dashboard_fragment():
                     hovermode="x unified", bargap=0.15,
                     xaxis_rangeslider_visible=False,
                 )
-                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", row=1, col=1)
-                fig_stack.update_yaxes(range=[y0, y1], type="linear", showticklabels=False, row=1, col=2)
+                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", showticklabels=True, row=1, col=1)
+                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", row=1, col=2)
+                fig_stack.update_yaxes(range=[y0, y1], type="linear", showticklabels=False, row=1, col=3)
+                fig_stack.update_xaxes(type="linear", showticklabels=True, showgrid=False, row=1, col=1)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                                       range=xr, showticklabels=False, row=1, col=1)
-                fig_stack.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=2)
+                                       range=xr, showticklabels=False, row=1, col=2)
+                fig_stack.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=3)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                                       range=xr, showticklabels=False, row=2, col=1)
+                                       range=xr, showticklabels=False, row=2, col=2)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                                       range=xr, showticklabels=False, row=3, col=1)
+                                       range=xr, showticklabels=False, row=3, col=2)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                                       range=xr, nticks=8, row=4, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="ΔV", row=2, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=1)
-                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=1)
+                                       range=xr, nticks=8, row=4, col=2)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="ΔV", row=2, col=2)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=2)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=2)
                 tab_flow, tab_dex = st.tabs(["1 · Index / ΔV / EFI / CVD", "2 · DEX / Premium"])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
