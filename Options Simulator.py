@@ -2453,7 +2453,24 @@ def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
 def _option_session_figure(df_opt, label):
     if df_opt is None or df_opt.empty or len(df_opt) < 3:
         return None, "NO DATA"
-    d = attach_bar_flow(df_opt.copy(), rebuild=True)
+    raw = df_opt.copy()
+    raw["time"] = pd.to_datetime(raw["time"])
+    try:
+        sess, day, _ = pick_last_nse_session(raw, min_bars=8, prefer_today=True)
+        d = sess if sess is not None and not sess.empty else raw
+    except Exception:
+        d = raw
+        d["session_date"] = pd.to_datetime(d["time"]).dt.date
+        last = sorted(d["session_date"].unique())[-1]
+        d = d[d["session_date"] == last].copy()
+    # drop print spikes that are not the option LTP (e.g. merged index)
+    px = pd.to_numeric(d["close"], errors="coerce")
+    med = float(px.median() or 0) or 1.0
+    if med > 0:
+        d = d[(px > med * 0.15) & (px < med * 6.0)].copy()
+    if d.empty or len(d) < 3:
+        return None, "NO DATA"
+    d = attach_bar_flow(d.reset_index(drop=True), rebuild=True)
     d["time"] = pd.to_datetime(d["time"])
     d["time_str"] = d["time"].dt.strftime("%H:%M")
     d["tp"] = (d["high"] + d["low"] + d["close"]) / 3.0
