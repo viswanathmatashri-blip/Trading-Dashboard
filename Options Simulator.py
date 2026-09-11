@@ -2449,6 +2449,56 @@ def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
     return ev
 
 
+
+def _option_session_figure(df_opt, label):
+    if df_opt is None or df_opt.empty or len(df_opt) < 3:
+        return None, "NO DATA"
+    d = attach_bar_flow(df_opt.copy(), rebuild=True)
+    d["time"] = pd.to_datetime(d["time"])
+    d["time_str"] = d["time"].dt.strftime("%H:%M")
+    d["tp"] = (d["high"] + d["low"] + d["close"]) / 3.0
+    cv = d["volume"].astype(float).cumsum().replace(0, np.nan)
+    d["vwap"] = (d["tp"] * d["volume"].astype(float)).cumsum() / cv
+    d["vwap"] = d["vwap"].ffill()
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.02,
+                        row_heights=[0.46, 0.16, 0.18, 0.20])
+    fig.add_trace(plt_go.Candlestick(
+        x=d["time_str"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
+        name=label, increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
+        increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350", showlegend=True,
+    ), row=1, col=1)
+    fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["vwap"], name="VWAP",
+                                line=dict(color="#FF9800", width=1.6)), row=1, col=1)
+    vol = d["volume"].astype(float)
+    up = d["close"] >= d["open"]
+    fig.add_trace(plt_go.Bar(x=d["time_str"], y=np.where(up, vol, 0), showlegend=False,
+                             marker_color="rgba(0,230,118,0.7)"), row=2, col=1)
+    fig.add_trace(plt_go.Bar(x=d["time_str"], y=np.where(~up, -vol, 0), showlegend=False,
+                             marker_color="rgba(255,82,82,0.7)"), row=2, col=1)
+    efi_c = np.where(d["efi13"] >= 0, "#00E676", "#FF5252")
+    fig.add_trace(plt_go.Bar(x=d["time_str"], y=d["efi13"], marker_color=efi_c, showlegend=False), row=3, col=1)
+    fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["cvd"], line=dict(color="#B0BEC5", width=1.2),
+                                showlegend=False), row=4, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=3, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=4, col=1)
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                      height=520, margin=dict(l=36, r=8, t=10, b=16),
+                      xaxis_rangeslider_visible=False, hovermode="x unified")
+    fig.update_yaxes(title_text="LTP", row=1, col=1)
+    fig.update_yaxes(title_text="Vol", row=2, col=1)
+    fig.update_yaxes(title_text="EFI", row=3, col=1)
+    fig.update_yaxes(title_text="CVD", row=4, col=1)
+    act = "NO DATA"
+    try:
+        recs = pdec_session_history(d)
+        if recs:
+            act = recs[-1].get("action") or "—"
+    except Exception:
+        pass
+    return fig, act
+
+
 def attach_bar_flow(df: pd.DataFrame, rebuild: bool = False) -> pd.DataFrame:
     """CVD/OBV on THESE bars. Call on native TF only. Resample must use last(CVD), not rebuild."""
     if df is None or df.empty:
@@ -3225,6 +3275,10 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST"),
             "bar_tf": selected_interval_label,
             "fut_bars": 0 if df_futures is None else int(len(df_futures)),
+            "atm_strike": atm_strike,
+            "atm_ce_token": atm_c_tok,
+            "atm_pe_token": atm_p_tok,
+            "opt_exchange": opt_exch,
         }
 
     except Exception:
@@ -5776,6 +5830,11 @@ def live_dashboard_fragment():
                     marker_color="rgba(255,82,82,0.7)", showlegend=False,
                 ), row=2, col=2)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=2)
+                try:
+                    dv_m = float(max(np.nanmax(np.abs(buy_v)), np.nanmax(np.abs(sell_v)), 1.0))
+                    fig_stack.update_yaxes(range=[-dv_m * 1.25, dv_m * 1.25], row=2, col=2)
+                except Exception:
+                    pass
                 efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
                 fig_stack.add_trace(plt_go.Bar(
                     x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
@@ -5898,6 +5957,32 @@ def live_dashboard_fragment():
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
+                    # ATM CE / PE session stack (same engine: VWAP, vol, EFI, CVD, PDEC)
+                    try:
+                        api = get_smart_api_client()
+                        atm_k = data.get("atm_strike")
+                        tf_lab = st.session_state.get("selected_timeframe", "5 min")
+                        api_int, _lb = interval_mapping.get(tf_lab, ("FIVE_MINUTE", 15))
+                        exch_opt = data.get("opt_exchange") or Exchange
+                        t_ce = st.tabs([f"ATM CE {atm_k:.0f}" if atm_k else "ATM CE",
+                                        f"ATM PE {atm_k:.0f}" if atm_k else "ATM PE"])
+                        for tab, tok, lab in (
+                            (t_ce[0], data.get("atm_ce_token"), "CE"),
+                            (t_ce[1], data.get("atm_pe_token"), "PE"),
+                        ):
+                            with tab:
+                                if not api or not tok:
+                                    st.caption("ATM token unavailable this cycle.")
+                                    continue
+                                dfo, _fb = fetch_candles_with_holiday_fallback(
+                                    api, str(tok), exch_opt, api_int, 5, f"{Index_Name}_{lab}"
+                                )
+                                fig_o, act_o = _option_session_figure(dfo, f"ATM {lab}")
+                                st.caption(f"PDEC · {act_o}")
+                                if fig_o is not None:
+                                    st.plotly_chart(fig_o, use_container_width=True)
+                    except Exception:
+                        pass
                     if pdec_hist:
                         with st.expander(f"PDEC session log ({len(pdec_hist)} bars)", expanded=False):
                             lines = ["| Time | P Δ E C | Action |", "|---|---|---|"]
