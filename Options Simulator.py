@@ -2450,7 +2450,7 @@ def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
 
 
 
-def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min"):
+def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", axis_times=None):
     if df_opt is None or df_opt.empty or len(df_opt) < 3:
         return None, "NO DATA"
     raw = df_opt.copy()
@@ -2476,7 +2476,7 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min"):
     cv = d["volume"].astype(float).cumsum().replace(0, np.nan)
     d["vwap"] = (d["tp"] * d["volume"].astype(float)).cumsum() / cv
     d["vwap"] = d["vwap"].ffill()
-    axis_times = session_axis_labels(tf_label, index_name)
+    axis_times = list(axis_times) if axis_times else session_axis_labels(tf_label, index_name)
     xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
     y0 = float(min(d["low"].min(), d["vwap"].min()))
     y1 = float(max(d["high"].max(), d["vwap"].max()))
@@ -2527,8 +2527,9 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min"):
     fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=3, col=2)
     fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=4, col=2)
     fig.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                      height=560, margin=dict(l=28, r=6, t=8, b=16),
-                      xaxis_rangeslider_visible=False, hovermode="x unified")
+                      height=560, margin=dict(l=40, r=6, t=8, b=18),
+                      hovermode="x unified")
+    fig.update_xaxes(rangeslider_visible=False)
     fig.update_yaxes(range=[y0, y1], tickformat=".1f", row=1, col=1)
     fig.update_yaxes(range=[y0, y1], title_text="LTP", row=1, col=2)
     fig.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=3)
@@ -2539,9 +2540,18 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min"):
                          range=xr, showticklabels=False, row=r, col=2)
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                      range=xr, nticks=8, row=4, col=2)
-    fig.update_yaxes(title_text="Vol", row=2, col=2)
-    fig.update_yaxes(title_text="EFI", row=3, col=2)
-    fig.update_yaxes(title_text="CVD", row=4, col=2)
+    try:
+        vm = float(max(abs(float(vol.max())), abs(float(vol.min())), 1.0))
+        fig.update_yaxes(range=[-vm * 1.2, vm * 1.2], title_text="Vol", row=2, col=2)
+        em = float(max(abs(float(d["efi13"].max())), abs(float(d["efi13"].min())), 1.0))
+        fig.update_yaxes(range=[-em * 1.2, em * 1.2], title_text="EFI", row=3, col=2)
+        cm = float(max(abs(float(d["cvd"].max())), abs(float(d["cvd"].min())), 1.0))
+        fig.update_yaxes(range=[min(0.0, float(d["cvd"].min()) * 1.1), max(0.0, float(d["cvd"].max()) * 1.1)],
+                         title_text="CVD", row=4, col=2)
+    except Exception:
+        fig.update_yaxes(title_text="Vol", row=2, col=2)
+        fig.update_yaxes(title_text="EFI", row=3, col=2)
+        fig.update_yaxes(title_text="CVD", row=4, col=2)
     act = "NO DATA"
     try:
         recs = pdec_session_history(d)
@@ -5551,6 +5561,7 @@ def live_dashboard_fragment():
                         fut_times = dfi["time_str"].tolist()
 
                 axis_times = session_axis_labels(st.session_state.get("selected_timeframe"), Index_Name)
+                st.session_state["_axis_times"] = axis_times
                 dfi["avwap_idx"] = np.nan
                 if st.session_state.get("avwap_on") and st.session_state.get("avwap_time") and len(dfi):
                     at = str(st.session_state["avwap_time"])
@@ -5983,6 +5994,7 @@ def live_dashboard_fragment():
                     pass
 
                 xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
+                fig_stack.update_xaxes(rangeslider_visible=False)
                 fig_stack.update_layout(
                     template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                     height=820, margin=dict(l=40, r=6, t=8, b=18),
@@ -6031,7 +6043,7 @@ def live_dashboard_fragment():
                                 dfo, _fb = fetch_candles_with_holiday_fallback(
                                     api, str(tok), exch_opt, api_int, 5, f"{Index_Name}_{lab}"
                                 )
-                                fig_o, act_o = _option_session_figure(dfo, f"ATM {lab}", Index_Name, tf_lab)
+                                fig_o, act_o = _option_session_figure(dfo, f"ATM {lab}", Index_Name, tf_lab, st.session_state.get("_axis_times"))
                                 st.caption(f"PDEC · {act_o}")
                                 if fig_o is not None:
                                     st.plotly_chart(fig_o, use_container_width=True)
