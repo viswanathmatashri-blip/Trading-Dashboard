@@ -2450,7 +2450,7 @@ def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
 
 
 
-def _option_session_figure(df_opt, label):
+def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min"):
     if df_opt is None or df_opt.empty or len(df_opt) < 3:
         return None, "NO DATA"
     raw = df_opt.copy()
@@ -2463,7 +2463,6 @@ def _option_session_figure(df_opt, label):
         d["session_date"] = pd.to_datetime(d["time"]).dt.date
         last = sorted(d["session_date"].unique())[-1]
         d = d[d["session_date"] == last].copy()
-    # drop print spikes that are not the option LTP (e.g. merged index)
     px = pd.to_numeric(d["close"], errors="coerce")
     med = float(px.median() or 0) or 1.0
     if med > 0:
@@ -2477,35 +2476,72 @@ def _option_session_figure(df_opt, label):
     cv = d["volume"].astype(float).cumsum().replace(0, np.nan)
     d["vwap"] = (d["tp"] * d["volume"].astype(float)).cumsum() / cv
     d["vwap"] = d["vwap"].ffill()
-    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.02,
-                        row_heights=[0.46, 0.16, 0.18, 0.20])
+    axis_times = session_axis_labels(tf_label, index_name)
+    xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
+    y0 = float(min(d["low"].min(), d["vwap"].min()))
+    y1 = float(max(d["high"].max(), d["vwap"].max()))
+    pad = (y1 - y0) * 0.06 if y1 > y0 else 2.0
+    y0, y1 = y0 - pad, y1 + pad
+    vp = compute_session_volume_profile(d, bin_step=max(0.5, (y1 - y0) / 40.0), prominence_factor=0.35)
+    dp = compute_delta_profile(d, bin_step=max(0.5, (y1 - y0) / 40.0))
+    fig = make_subplots(
+        rows=4, cols=3,
+        column_widths=[0.13, 0.71, 0.16],
+        row_heights=[0.46, 0.16, 0.18, 0.20],
+        shared_xaxes=False,
+        horizontal_spacing=0.01,
+        vertical_spacing=0.02,
+        specs=[[{}, {}, {}], [None, {}, None], [None, {}, None], [None, {}, None]],
+    )
+    if dp.get("ok"):
+        fig.add_trace(plt_go.Bar(
+            x=list(dp["delta"]), y=list(dp["mids"]), orientation="h", showlegend=False, name="ΔP",
+            marker=dict(color=["#00E676" if v >= 0 else "#FF5252" for v in dp["delta"]]),
+            hovertemplate="Px %{y:.1f}<br>Δ %{x:.0f}<extra></extra>",
+        ), row=1, col=1)
     fig.add_trace(plt_go.Candlestick(
         x=d["time_str"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
         name=label, increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
         increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350", showlegend=True,
-    ), row=1, col=1)
+    ), row=1, col=2)
     fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["vwap"], name="VWAP",
-                                line=dict(color="#FF9800", width=1.6)), row=1, col=1)
+                                line=dict(color="#FF9800", width=1.6)), row=1, col=2)
+    if vp.get("ok"):
+        cols = ["#FFD54F" if abs(m - vp["poc"]) < 1e-9 else "rgba(100,181,246,0.75)" for m in vp["mids"]]
+        fig.add_trace(plt_go.Bar(
+            x=list(vp["vol"]), y=list(vp["mids"]), orientation="h", showlegend=False, name="VP",
+            marker=dict(color=cols),
+            hovertemplate="Px %{y:.1f}<br>Vol %{x:.0f}<extra></extra>",
+        ), row=1, col=3)
     vol = d["volume"].astype(float)
     up = d["close"] >= d["open"]
     fig.add_trace(plt_go.Bar(x=d["time_str"], y=np.where(up, vol, 0), showlegend=False,
-                             marker_color="rgba(0,230,118,0.7)"), row=2, col=1)
+                             marker_color="rgba(0,230,118,0.7)"), row=2, col=2)
     fig.add_trace(plt_go.Bar(x=d["time_str"], y=np.where(~up, -vol, 0), showlegend=False,
-                             marker_color="rgba(255,82,82,0.7)"), row=2, col=1)
+                             marker_color="rgba(255,82,82,0.7)"), row=2, col=2)
     efi_c = np.where(d["efi13"] >= 0, "#00E676", "#FF5252")
-    fig.add_trace(plt_go.Bar(x=d["time_str"], y=d["efi13"], marker_color=efi_c, showlegend=False), row=3, col=1)
+    fig.add_trace(plt_go.Bar(x=d["time_str"], y=d["efi13"], marker_color=efi_c, showlegend=False), row=3, col=2)
     fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["cvd"], line=dict(color="#B0BEC5", width=1.2),
-                                showlegend=False), row=4, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=3, col=1)
-    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=4, col=1)
+                                showlegend=False), row=4, col=2)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=2)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=3, col=2)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=4, col=2)
     fig.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-                      height=520, margin=dict(l=36, r=8, t=10, b=16),
+                      height=560, margin=dict(l=28, r=6, t=8, b=16),
                       xaxis_rangeslider_visible=False, hovermode="x unified")
-    fig.update_yaxes(title_text="LTP", row=1, col=1)
-    fig.update_yaxes(title_text="Vol", row=2, col=1)
-    fig.update_yaxes(title_text="EFI", row=3, col=1)
-    fig.update_yaxes(title_text="CVD", row=4, col=1)
+    fig.update_yaxes(range=[y0, y1], tickformat=".1f", row=1, col=1)
+    fig.update_yaxes(range=[y0, y1], title_text="LTP", row=1, col=2)
+    fig.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=3)
+    fig.update_xaxes(type="linear", showgrid=False, row=1, col=1)
+    fig.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=3)
+    for r in (1, 2, 3):
+        fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                         range=xr, showticklabels=False, row=r, col=2)
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                     range=xr, nticks=8, row=4, col=2)
+    fig.update_yaxes(title_text="Vol", row=2, col=2)
+    fig.update_yaxes(title_text="EFI", row=3, col=2)
+    fig.update_yaxes(title_text="CVD", row=4, col=2)
     act = "NO DATA"
     try:
         recs = pdec_session_history(d)
@@ -2514,6 +2550,7 @@ def _option_session_figure(df_opt, label):
     except Exception:
         pass
     return fig, act
+
 
 
 def attach_bar_flow(df: pd.DataFrame, rebuild: bool = False) -> pd.DataFrame:
@@ -5994,7 +6031,7 @@ def live_dashboard_fragment():
                                 dfo, _fb = fetch_candles_with_holiday_fallback(
                                     api, str(tok), exch_opt, api_int, 5, f"{Index_Name}_{lab}"
                                 )
-                                fig_o, act_o = _option_session_figure(dfo, f"ATM {lab}")
+                                fig_o, act_o = _option_session_figure(dfo, f"ATM {lab}", Index_Name, tf_lab)
                                 st.caption(f"PDEC · {act_o}")
                                 if fig_o is not None:
                                     st.plotly_chart(fig_o, use_container_width=True)
