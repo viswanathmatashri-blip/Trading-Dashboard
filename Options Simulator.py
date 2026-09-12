@@ -2581,7 +2581,11 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
     d["vwap"] = (d["tp"] * d["volume"].astype(float)).cumsum() / cv
     d["vwap"] = d["vwap"].ffill()
     k_sig = float(st.session_state.get("vwap_sigma_select") or 1.5)
-    d["vwap_std"] = (d["close"].astype(float) - d["vwap"]).expanding(min_periods=4).std()
+    dev = d["close"].astype(float) - d["vwap"]
+    # rolling, not expanding — expanding 1-min on a short option print fans the cloud
+    d["vwap_std"] = dev.rolling(20, min_periods=12).std()
+    cap = float(d["close"].astype(float).std() or 1.0) * 3.0
+    d["vwap_std"] = d["vwap_std"].clip(upper=max(cap, 1.0))
     d["vwap_u"] = d["vwap"] + k_sig * d["vwap_std"]
     d["vwap_l"] = d["vwap"] - k_sig * d["vwap_std"]
     axis_times = list(axis_times) if axis_times else session_axis_labels(tf_label, index_name)
@@ -6374,8 +6378,15 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                         dfo, _fb = fetch_candles_with_holiday_fallback(
                             api, str(tok), exch_opt, api_int, lb, f"{Index_Name}_{lab}"
                         )
+                        used_tf = tf_lab
+                        if dfo is None or dfo.empty or len(dfo) < 25:
+                            dfo, _fb = fetch_candles_with_holiday_fallback(
+                                api, str(tok), exch_opt, "THREE_MINUTE", 1, f"{Index_Name}_{lab}_3m"
+                            )
+                            used_tf = "3 min"
+                            st.caption("ATM 1/2-min tape thin on SmartAPI — showing 3-min option candles.")
                         fig_o, act_o = _option_session_figure(
-                            dfo, f"ATM {lab}", Index_Name, tf_lab,
+                            dfo, f"ATM {lab}", Index_Name, used_tf,
                             st.session_state.get("_axis_times"),
                         )
                         st.caption(f"PDEC · {act_o}")
