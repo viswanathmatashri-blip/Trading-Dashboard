@@ -2580,11 +2580,15 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
     cv = d["volume"].astype(float).cumsum().replace(0, np.nan)
     d["vwap"] = (d["tp"] * d["volume"].astype(float)).cumsum() / cv
     d["vwap"] = d["vwap"].ffill()
+    k_sig = float(st.session_state.get("vwap_sigma_select") or 1.5)
+    d["vwap_std"] = (d["close"].astype(float) - d["vwap"]).expanding(min_periods=4).std()
+    d["vwap_u"] = d["vwap"] + k_sig * d["vwap_std"]
+    d["vwap_l"] = d["vwap"] - k_sig * d["vwap_std"]
     axis_times = list(axis_times) if axis_times else session_axis_labels(tf_label, index_name)
     xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
     y0 = float(min(d["low"].min(), d["vwap"].min()))
     y1 = float(max(d["high"].max(), d["vwap"].max()))
-    pad = (y1 - y0) * 0.06 if y1 > y0 else 2.0
+    pad = (y1 - y0) * (0.14 if st.session_state.get("pdec_labels_on") else 0.06) if y1 > y0 else 2.0
     y0, y1 = y0 - pad, y1 + pad
     vp = compute_session_volume_profile(d, bin_step=max(0.5, (y1 - y0) / 40.0), prominence_factor=0.35)
     dp = compute_delta_profile(d, bin_step=max(0.5, (y1 - y0) / 40.0))
@@ -2608,8 +2612,52 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
         name=label, increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
         increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350", showlegend=True,
     ), row=1, col=2)
+    if d["vwap_u"].notna().any():
+        fig.add_trace(plt_go.Scatter(
+            x=d["time_str"], y=d["vwap_u"], mode="lines", showlegend=False, hoverinfo="skip",
+            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+        ), row=1, col=2)
+        fig.add_trace(plt_go.Scatter(
+            x=d["time_str"], y=d["vwap_l"], mode="lines", showlegend=False, hoverinfo="skip",
+            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+            fill="tonexty", fillcolor="rgba(255,152,0,0.08)",
+        ), row=1, col=2)
     fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["vwap"], name="VWAP",
                                 line=dict(color="#FF9800", width=1.6)), row=1, col=2)
+    day_hi, day_lo = float(d["high"].max()), float(d["low"].min())
+    for pxv, name, colr in (
+        (day_hi, "Day H", "#FF8A80"),
+        (day_lo, "Day L", "#69F0AE"),
+        (vp.get("vah") if vp.get("ok") else None, "VAH", "#F48FB1"),
+        (vp.get("val") if vp.get("ok") else None, "VAL", "#F48FB1"),
+    ):
+        if pxv is None:
+            continue
+        fig.add_hline(y=float(pxv), line_dash="dot", line_color=colr, line_width=1.1, row=1, col=2)
+        fig.add_annotation(
+            x=d["time_str"].iloc[-1], y=float(pxv), text=name, showarrow=False,
+            xanchor="right", font=dict(size=9, color=colr), row=1, col=2,
+        )
+    if st.session_state.get("pdec_labels_on"):
+        try:
+            recs = pdec_session_history(d)
+            prev = None
+            peak = float(d["high"].max())
+            for rec in recs:
+                act = rec.get("action") or ""
+                if not act or act == prev:
+                    continue
+                prev = act
+                short = act if len(act) <= 22 else act[:20] + "…"
+                fig.add_annotation(
+                    x=rec.get("t") or "", y=peak,
+                    text=short, showarrow=False, textangle=-90,
+                    xanchor="center", yanchor="bottom",
+                    font=dict(size=8, color="#CFD8DC"),
+                    row=1, col=2,
+                )
+        except Exception:
+            pass
     if vp.get("ok"):
         cols = ["#FFD54F" if abs(m - vp["poc"]) < 1e-9 else "rgba(100,181,246,0.75)" for m in vp["mids"]]
         fig.add_trace(plt_go.Bar(
@@ -5284,7 +5332,7 @@ def live_dashboard_fragment():
                     for e in decision_log[-8:]:
                         st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
 
-        with st.expander("▼ Micro Playbook (256 PΔEC + Flow 18)", expanded=False):
+        with st.expander("▼ Micro Playbook (256 PΔEC + Flow 18 + Candles)", expanded=False):
             items = list(MICRO_PDEC_PLAYBOOK.items())
             cols = st.columns(3)
             n = (len(items) + 2) // 3
@@ -5302,6 +5350,54 @@ def live_dashboard_fragment():
             for k, v in FLOW_PLAYBOOK.items():
                 frows.append(f"| {''.join(ARROW_GLYPH[x] for x in k)} | {v[0]} — {v[1]} |")
             st.markdown(chr(10).join(frows))
+            st.markdown("**Candle gate (separate from 256 PDEC — no weight inside the book)**")
+            st.code(
+"""detect_candle_pattern(last 8 bars)
+trend: up = mean(close[-5:]) > mean(close[-10:-5:]); down = opposite
+body = |C-O|   range = H-L   upper = H-max(C,O)   lower = min(C,O)-L
+
+1-bar (current bar i):
+  Doji              body <= 0.08*range                         bias 0  conf Moderate
+  Marubozu          body >= 0.85*range and wicks <= 0.08*range bias +1/-1 conf High
+  Hammer            lower >= 2*body and upper <= 0.35*body
+                    and body <= 0.25*range and DOWNTREND       bias +1  conf Mod-High
+  Hanging Man       same shape and UPTREND                     bias -1  conf Low-Mod
+  Shooting Star     upper >= 2*body and lower <= 0.35*body
+                    and small body and UPTREND                 bias -1  conf High
+  Inverted Hammer   same shape and DOWNTREND                   bias +1  conf Moderate
+
+2-bar (j = i-1) overwrites 1-bar if it matches:
+  Bull Engulf       prior red, this green, this body covers prior body     +1 High
+  Bear Engulf       prior green, this red, this body covers prior body     -1 High
+  Piercing          prior red, this green, open < prior low,
+                    close >= prior open - 50% prior body, close < prior open  +1 Mod-High
+  Dark Cloud        mirror of piercing                                     -1 Mod-High
+  Bull Harami       prior red, this green smaller and inside prior body    +1 Moderate
+  Tweezer Bottom    |this.low - prior.low| <= 0.15*max(ranges) and DOWNTREND +1 Mod-High
+
+confirm_pdec_with_candle(raw_PDEC_action, pattern):
+  PDEC book is NOT changed.
+  LONG-ish  + High + bias<0  -> NO ENTRY
+  SHORT-ish + High + bias>0  -> NO ENTRY
+  LONG-ish  + bias<0         -> CAUTIOUS LONG
+  SHORT-ish + bias>0         -> CAUTIOUS SHORT
+  *ENTRY*   + Doji           -> NO ENTRY (wait next close)
+  else                       -> keep raw PDEC
+""",
+                language="text",
+            )
+            cur = ""
+            if isinstance(st.session_state.get("_last_scores"), dict):
+                pass
+            try:
+                dfi_now = st.session_state.get("_last_dfi")
+                if dfi_now is not None:
+                    cp = detect_candle_pattern(dfi_now)
+                    st.caption(
+                        f"Now: {cp.get('name')} · bias {cp.get('bias'):+} · {cp.get('conf')} · {cp.get('note')}"
+                    )
+            except Exception:
+                pass
 
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
