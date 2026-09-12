@@ -129,7 +129,7 @@ TOTP_SECRET = os.getenv("TOTP_SECRET", "")
 if "basket_legs" not in st.session_state:
     st.session_state["basket_legs"] = []
 if "selected_timeframe" not in st.session_state:
-    st.session_state["selected_timeframe"] = "5 min"
+    st.session_state["selected_timeframe"] = "3 min"
 if "chart_window" not in st.session_state:
     st.session_state["chart_window"] = "Session (6h)"
 if "px_alert_on" not in st.session_state:
@@ -2174,8 +2174,19 @@ def session_hours(index_name=None):
 def session_axis_labels(tf_label=None, index_name=None):
     """Full-session HH:MM slots so bar width stays constant from the open."""
     oh, om, ch, cm, _, _ = session_hours(index_name)
-    lab = str(tf_label or st.session_state.get("selected_timeframe") or "5 min")
-    step = 15 if "15" in lab else (3 if "3" in lab else 5)
+    lab = str(tf_label or st.session_state.get("selected_timeframe") or "3 min")
+    if "15" in lab:
+        step = 15
+    elif "10" in lab:
+        step = 10
+    elif lab.startswith("2"):
+        step = 2
+    elif lab.startswith("1"):
+        step = 1
+    elif "3" in lab:
+        step = 3
+    else:
+        step = 5
     out = []
     t = oh * 60 + om
     end = ch * 60 + cm
@@ -3034,11 +3045,12 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
 
 interval_mapping = {
-    "1 min": ("ONE_MINUTE", 7),
+    "1 min": ("ONE_MINUTE", 5),
+    "2 min": ("ONE_MINUTE", 5),
     "3 min": ("THREE_MINUTE", 10),
     "5 min": ("FIVE_MINUTE", 15),
     "10 min": ("TEN_MINUTE", 20),
-    "15 min": ("FIFTEEN_MINUTE", 30)
+    "15 min": ("FIFTEEN_MINUTE", 30),
 }
 
 # --- SECURE SESSION HANDLER (CACHE PERSISTENT TO PREVENT RATE LIMITS) ---
@@ -4977,7 +4989,7 @@ def live_dashboard_fragment():
             st.caption("Trigger feedback")
             st.text(st.session_state.get("gemini_trigger") or "No trigger yet.")
 
-    if st.session_state.get("fut_tf_radio") in ("3 min", "5 min", "15 min"):
+    if st.session_state.get("fut_tf_radio") in ("1 min", "2 min", "3 min", "5 min", "15 min"):
         st.session_state["selected_timeframe"] = st.session_state["fut_tf_radio"]
         st.session_state["tf_select_frag"] = st.session_state["fut_tf_radio"]
     want_tf = st.session_state.get("selected_timeframe", "5 min")
@@ -5297,7 +5309,7 @@ def live_dashboard_fragment():
         fut_times = []
         latest_session = None
         want_tf = st.session_state.get("selected_timeframe", "5 min")
-        tf_min = {"3 min": 3, "5 min": 5, "15 min": 15, "1 min": 1, "10 min": 10}.get(want_tf, 5)
+        tf_min = {"1 min": 1, "2 min": 2, "3 min": 3, "5 min": 5, "15 min": 15, "10 min": 10}.get(want_tf, 3)
         if not df_fut.empty and "time" in df_fut.columns:
             df_fut = attach_bar_flow(df_fut)
         if not df_fut.empty and "time" in df_fut.columns and len(df_fut) >= 8:
@@ -5355,11 +5367,11 @@ def live_dashboard_fragment():
         with left_col:
             fut_header_col, tf_col, basis_col, band_col = st.columns([0.52, 0.20, 0.14, 0.14])
             with tf_col:
-                opts = ["3 min", "5 min", "15 min"]
+                opts = ["1 min", "2 min", "3 min", "5 min", "15 min"]
                 if "fut_tf_radio" not in st.session_state:
                     st.session_state["fut_tf_radio"] = (
-                        st.session_state.get("selected_timeframe", "5 min")
-                        if st.session_state.get("selected_timeframe") in opts else "5 min"
+                        st.session_state.get("selected_timeframe", "3 min")
+                        if st.session_state.get("selected_timeframe") in opts else "3 min"
                     )
                 new_tf = st.radio("Bar", opts, horizontal=True, key="fut_tf_radio",
                                   label_visibility="collapsed")
@@ -5431,7 +5443,7 @@ def live_dashboard_fragment():
                 with a1:
                     lvl = st.number_input("Alert px", min_value=0.0, step=1.0,
                                          value=float(st.session_state.get("px_alert_lvl") or 0) or None,
-                                         placeholder="NIFTY level", key="px_alert_input",
+                                         placeholder=f"{Index_Name} level", key="px_alert_input",
                                          label_visibility="collapsed")
                 with a2:
                     if st.button("Activate Alert", key="px_alert_btn"):
@@ -5453,9 +5465,14 @@ def live_dashboard_fragment():
                 with c3:
                     st.session_state["big_trade_on"] = st.checkbox("Big Δ", key="big_trd_chk")
                 with c4:
+                    _lot_opts = [50, 75, 100, 150, 200, 250, 300, 400, 500, 600, 750, 1000]
+                    _def_lot = 300 if str(Index_Name).upper() in ("NIFTY", "BANKNIFTY") else 100
+                    if "big_trd_min" not in st.session_state:
+                        st.session_state["big_trd_min"] = _def_lot
                     st.session_state["big_trade_min"] = st.selectbox(
-                        "Min lots", [50, 75, 100, 150, 200, 250, 300, 400, 500],
-                        index=0, key="big_trd_min", label_visibility="collapsed",
+                        "Min lots", _lot_opts,
+                        index=_lot_opts.index(st.session_state["big_trd_min"]) if st.session_state.get("big_trd_min") in _lot_opts else _lot_opts.index(_def_lot),
+                        key="big_trd_min", label_visibility="collapsed",
                     )
 
             if not df_fchart.empty:
@@ -6019,36 +6036,16 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="ΔV", row=2, col=2)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=2)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=2)
-                tab_flow, tab_dex = st.tabs(["1 · Index / ΔV / EFI / CVD", "2 · DEX / Premium"])
+                atm_k = data.get("atm_strike")
+                tab_flow, tab_dex, tab_atm_ce, tab_atm_pe = st.tabs([
+                    "1 · Index / ΔV / EFI / CVD",
+                    "2 · DEX / Premium",
+                    f"3 · ATM CE {atm_k:.0f}" if atm_k else "3 · ATM CE",
+                    f"4 · ATM PE {atm_k:.0f}" if atm_k else "4 · ATM PE",
+                ])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     st.plotly_chart(fig_stack, use_container_width=True)
-                    # ATM CE / PE session stack (same engine: VWAP, vol, EFI, CVD, PDEC)
-                    try:
-                        api = get_smart_api_client()
-                        atm_k = data.get("atm_strike")
-                        tf_lab = st.session_state.get("selected_timeframe", "5 min")
-                        api_int, _lb = interval_mapping.get(tf_lab, ("FIVE_MINUTE", 15))
-                        exch_opt = data.get("opt_exchange") or Exchange
-                        t_ce = st.tabs([f"ATM CE {atm_k:.0f}" if atm_k else "ATM CE",
-                                        f"ATM PE {atm_k:.0f}" if atm_k else "ATM PE"])
-                        for tab, tok, lab in (
-                            (t_ce[0], data.get("atm_ce_token"), "CE"),
-                            (t_ce[1], data.get("atm_pe_token"), "PE"),
-                        ):
-                            with tab:
-                                if not api or not tok:
-                                    st.caption("ATM token unavailable this cycle.")
-                                    continue
-                                dfo, _fb = fetch_candles_with_holiday_fallback(
-                                    api, str(tok), exch_opt, api_int, 5, f"{Index_Name}_{lab}"
-                                )
-                                fig_o, act_o = _option_session_figure(dfo, f"ATM {lab}", Index_Name, tf_lab, st.session_state.get("_axis_times"))
-                                st.caption(f"PDEC · {act_o}")
-                                if fig_o is not None:
-                                    st.plotly_chart(fig_o, use_container_width=True)
-                    except Exception:
-                        pass
                     if pdec_hist:
                         with st.expander(f"PDEC session log ({len(pdec_hist)} bars)", expanded=False):
                             lines = ["| Time | P Δ E C | Action |", "|---|---|---|"]
@@ -6069,7 +6066,37 @@ def live_dashboard_fragment():
                                 st.session_state["avwap_time"] = pick
                                 st.rerun()
                     st.markdown("</div>", unsafe_allow_html=True)
+                def _render_atm_tab(tok, lab):
+                    try:
+                        api = get_smart_api_client()
+                        tf_lab = st.session_state.get("selected_timeframe", "5 min")
+                        api_int, _lb = interval_mapping.get(tf_lab, ("FIVE_MINUTE", 15))
+                        exch_opt = data.get("opt_exchange") or Exchange
+                        if not api or not tok:
+                            st.caption("ATM token unavailable this cycle.")
+                            return
+                        dfo, _fb = fetch_candles_with_holiday_fallback(
+                            api, str(tok), exch_opt, api_int, 5, f"{Index_Name}_{lab}"
+                        )
+                        fig_o, act_o = _option_session_figure(
+                            dfo, f"ATM {lab}", Index_Name, tf_lab,
+                            st.session_state.get("_axis_times"),
+                        )
+                        st.caption(f"PDEC · {act_o}")
+                        if fig_o is not None:
+                            st.plotly_chart(fig_o, use_container_width=True)
+                    except Exception as e:
+                        st.caption(f"ATM {lab} unavailable.")
+                with tab_atm_ce:
+                    st.markdown("<div class='chart-card'><div class='card-title'>ATM CE</div>", unsafe_allow_html=True)
+                    _render_atm_tab(data.get("atm_ce_token"), "CE")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tab_atm_pe:
+                    st.markdown("<div class='chart-card'><div class='card-title'>ATM PE</div>", unsafe_allow_html=True)
+                    _render_atm_tab(data.get("atm_pe_token"), "PE")
+                    st.markdown("</div>", unsafe_allow_html=True)
                 with tab_dex:
+
                     sess_day = latest_session or _ist_now().date()
                     tape = load_flow_tape(Index_Name, sess_day) or list(st.session_state.get("flow_tape") or [])
                     fig_dex = make_subplots(
