@@ -4773,6 +4773,12 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prom
 
     vah = float(va70["vah"]) if va70 else float(mids[min(n_bins - 1, poc_i)])
     val = float(va70["val"]) if va70 else float(mids[max(0, poc_i)])
+    nodes = _cluster_value_areas(vol_at, mids, bin_step=bin_step, max_nodes=5)
+    # Prefer cluster body that contains session POC as the drawn primary VA
+    for nd in nodes:
+        if nd.get("primary"):
+            # keep classic 70% as model VAH/VAL; drawing uses node body
+            break
     return {
         "ok": True,
         "mids": mids,
@@ -4790,43 +4796,104 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prom
         "vah80": float(va80["vah"]) if va80 else vah,
         "val80": float(va80["val"]) if va80 else val,
         "vas": vas,
+        "nodes": nodes,
         "hvn": hvn,
         "lvn": lvn,
         "bin_step": bin_step,
     }
 
 
+def _cluster_value_areas(vol_at, mids, bin_step=2.0, max_nodes=5):
+    """Practical VA nodes: body of each significant volume peak, not σ-bands."""
+    vol_at = np.asarray(vol_at, dtype=float)
+    mids = np.asarray(mids, dtype=float)
+    n = len(vol_at)
+    if n < 5:
+        return []
+    # 3-bin smooth for peak finding only
+    sm = vol_at.copy()
+    if n >= 3:
+        sm[1:-1] = 0.25 * vol_at[:-2] + 0.50 * vol_at[1:-1] + 0.25 * vol_at[2:]
+    poc_i = int(np.argmax(vol_at))
+    poc_vol = float(vol_at[poc_i]) or 1.0
+    min_sep = max(4, int(round(12.0 / max(float(bin_step), 1.0))))
+    peaks = []
+    for i in range(1, n - 1):
+        if sm[i] >= sm[i - 1] and sm[i] >= sm[i + 1] and vol_at[i] >= 0.22 * poc_vol:
+            peaks.append(i)
+    # keep highest in each min_sep window
+    peaks = sorted(peaks, key=lambda i: -vol_at[i])
+    kept = []
+    for i in peaks:
+        if all(abs(i - j) >= min_sep for j in kept):
+            kept.append(i)
+        if len(kept) >= max_nodes:
+            break
+    if poc_i not in kept:
+        kept = [poc_i] + [i for i in kept if abs(i - poc_i) >= min_sep]
+        kept = kept[:max_nodes]
+    nodes = []
+    for i in kept:
+        peak_v = float(vol_at[i])
+        floor = max(0.42 * peak_v, 0.10 * poc_vol)
+        lo = hi = i
+        while lo > 0 and vol_at[lo - 1] >= floor:
+            lo -= 1
+        while hi < n - 1 and vol_at[hi + 1] >= floor:
+            hi += 1
+        # snap to first clear trough beyond the body
+        while lo > 0 and vol_at[lo] > vol_at[lo - 1] and vol_at[lo - 1] >= 0.55 * floor:
+            lo -= 1
+        while hi < n - 1 and vol_at[hi] > vol_at[hi + 1] and vol_at[hi + 1] >= 0.55 * floor:
+            hi += 1
+        nodes.append({
+            "i": i, "poc": float(mids[i]), "vah": float(mids[hi]), "val": float(mids[lo]),
+            "vol": peak_v, "primary": i == poc_i,
+        })
+    # merge heavy overlap
+    nodes = sorted(nodes, key=lambda r: -r["vol"])
+    merged = []
+    for nd in nodes:
+        hit = None
+        for m in merged:
+            ov = min(nd["vah"], m["vah"]) - max(nd["val"], m["val"])
+            span = max(nd["vah"] - nd["val"], m["vah"] - m["val"], 1.0)
+            if ov > 0.55 * span:
+                hit = m
+                break
+        if hit:
+            if nd["vol"] > hit["vol"]:
+                hit.update({k: nd[k] for k in ("poc", "vah", "val", "vol", "i")})
+            hit["primary"] = hit["primary"] or nd["primary"]
+        else:
+            merged.append(dict(nd))
+    merged = sorted(merged, key=lambda r: -r["poc"])
+    return merged[:max_nodes]
+
+
 def vp_chart_levels(vp: dict) -> list:
-    """Every value-area / node boundary to draw. Dedupes levels within ~1 bin."""
+    """Only practical node VAH/VAL + session POC. No σ / 80% / HVN scatter."""
     out = []
     if not isinstance(vp, dict) or not vp.get("ok"):
         return out
     step = float(vp.get("bin_step") or 2.0)
-    specs = [
-        (vp.get("poc"), "POC", "#FFD54F", 1.6, "solid"),
-        (vp.get("vah"), "VAH", "#F48FB1", 1.5, "dash"),
-        (vp.get("val"), "VAL", "#F48FB1", 1.5, "dash"),
-        (vp.get("vah80"), "VAH80", "#CE93D8", 1.05, "dot"),
-        (vp.get("val80"), "VAL80", "#CE93D8", 1.05, "dot"),
-        (vp.get("vah1"), "VA+1σ", "#80CBC4", 1.0, "dot"),
-        (vp.get("val1"), "VA−1σ", "#80CBC4", 1.0, "dot"),
-        (vp.get("vah15"), "VA+1.5σ", "#4DB6AC", 0.9, "dot"),
-        (vp.get("val15"), "VA−1.5σ", "#4DB6AC", 0.9, "dot"),
-    ]
-    for i, va in enumerate(vp.get("vas") or []):
-        tag = va.get("tag") or f"VA{i+1}"
-        if tag in ("VA70",):
-            continue
-        if tag == "VA80":
-            continue
-        specs.append((va.get("vah"), f"{tag}-H", "#F8BBD0", 1.15, "dash"))
-        specs.append((va.get("val"), f"{tag}-L", "#F8BBD0", 1.15, "dash"))
-        specs.append((va.get("poc"), f"{tag}-POC", "#FFE082", 1.05, "dot"))
-    for px in vp.get("hvn") or []:
-        specs.append((px, "HVN", "#90CAF9", 0.8, "dot"))
-    for px in vp.get("lvn") or []:
-        specs.append((px, "LVN", "#B0BEC5", 0.8, "dot"))
-
+    nodes = list(vp.get("nodes") or [])
+    if not nodes:
+        nodes = [{
+            "vah": vp.get("vah"), "val": vp.get("val"), "poc": vp.get("poc"),
+            "primary": True, "vol": vp.get("poc_vol") or 0,
+        }]
+    specs = [(vp.get("poc"), "POC", "#FFD54F", 1.7, "solid")]
+    prim = next((n for n in nodes if n.get("primary")), nodes[0] if nodes else None)
+    others = [n for n in nodes if n is not prim]
+    # rank other nodes high-to-low price
+    others = sorted(others, key=lambda n: -float(n.get("poc") or 0))
+    if prim:
+        specs.append((prim.get("vah"), "VAH", "#F48FB1", 1.55, "dash"))
+        specs.append((prim.get("val"), "VAL", "#F48FB1", 1.55, "dash"))
+    for k, n in enumerate(others, start=2):
+        specs.append((n.get("vah"), f"VAH{k}", "#F8BBD0", 1.2, "dash"))
+        specs.append((n.get("val"), f"VAL{k}", "#F8BBD0", 1.2, "dash"))
     used = []
     for px, name, col, w, dash in specs:
         if px is None:
@@ -4835,13 +4902,8 @@ def vp_chart_levels(vp: dict) -> list:
             px = float(px)
         except Exception:
             continue
-        if any(abs(px - u) < max(step * 0.75, 1.0) and n == name.split("-")[0]
-               for u, n in used):
-            # keep named VAH/VAL even if close to HVN
-            if name not in ("VAH", "VAL", "POC"):
-                close_same = any(abs(px - u) < max(step * 0.75, 1.0) for u, _ in used)
-                if close_same and name in ("HVN", "LVN", "VA+1σ", "VA−1σ"):
-                    continue
+        if any(abs(px - u) < max(step * 1.5, 3.0) for u, _ in used):
+            continue
         used.append((px, name))
         out.append({"price": px, "name": name, "color": col, "width": w, "dash": dash})
     out.sort(key=lambda r: -r["price"])
@@ -5777,6 +5839,15 @@ def live_dashboard_fragment():
                                     nv[kk] = float(nv[kk]) - last_basis
                             shifted.append(nv)
                         vp["vas"] = shifted
+                    if vp.get("nodes"):
+                        nsh = []
+                        for nd in vp["nodes"]:
+                            nv = dict(nd)
+                            for kk in ("vah", "val", "poc"):
+                                if nv.get(kk) is not None:
+                                    nv[kk] = float(nv[kk]) - last_basis
+                            nsh.append(nv)
+                        vp["nodes"] = nsh
                 close = dfi["close"].astype(float)
                 vol = dfi["volume"].astype(float)
                 if "cvd" not in dfi.columns or dfi["cvd"].isna().all():
@@ -6488,16 +6559,10 @@ def live_dashboard_fragment():
                         "Slope-only is a watch. 15-min sessions have few bars — p-values stay weak.",
                     )
                 if vp.get("ok"):
-                    bits = [f"POC {vp['poc']:.0f}", f"VA70 {vp.get('val'):.0f}-{vp.get('vah'):.0f}"]
-                    if vp.get("val80") is not None:
-                        bits.append(f"VA80 {vp['val80']:.0f}-{vp['vah80']:.0f}")
-                    if vp.get("dval") is not None:
-                        bits.append(f"dVA {vp['dval']:.0f}-{vp['dvah']:.0f}")
-                    extra = [f"{va.get('tag')} {va.get('val'):.0f}-{va.get('vah'):.0f}"
-                             for va in (vp.get("vas") or []) if va.get("tag") not in ("VA70", "VA80", "dVA")]
-                    bits.extend(extra)
-                    if vp.get("val1") is not None:
-                        bits.append(f"VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}")
+                    bits = [f"POC {vp['poc']:.0f}"]
+                    for lv in vp_chart_levels(vp):
+                        if lv["name"] != "POC":
+                            bits.append(f"{lv['name']} {lv['price']:.0f}")
                     cap += " · " + " · ".join(bits)
                 st.caption(cap)
                 def _chip(body, tip, color="#00E676"):
