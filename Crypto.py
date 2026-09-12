@@ -5798,31 +5798,6 @@ def live_dashboard_fragment():
                     help="Pin this pane to one past trading session. VWAP, EFI, CVD, VP and VA labels recompute on that day only.",
                 )
                 st.session_state["replay_session_on"] = replay_on
-                today_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date()
-                known = []
-                try:
-                    src = data.get("df_futures")
-                    if src is not None and not getattr(src, "empty", True) and "time" in src.columns:
-                        known = sorted(pd.to_datetime(series_to_ist(src["time"])).dt.date.unique())
-                except Exception:
-                    known = []
-                default_day = st.session_state.get("replay_session_date") or (known[-1] if known else today_ist)
-                if replay_on:
-                    picked = st.date_input(
-                        "Session",
-                        value=default_day,
-                        min_value=today_ist - datetime.timedelta(days=40),
-                        max_value=today_ist,
-                        key="replay_session_date_input",
-                        help="05-09-2026 style calendar date. Weekend/holiday → no bars.",
-                    )
-                    if picked != st.session_state.get("replay_session_date"):
-                        st.session_state["replay_session_date"] = picked
-                        st.rerun()
-                    st.caption(picked.strftime("%d-%b-%Y"))
-                else:
-                    if st.session_state.get("replay_session_date") and not replay_on:
-                        pass
             with tw:
                 st.session_state["chart_window"] = st.radio(
                     "Window", ["Session (6h)", "3h", "1h"], horizontal=True,
@@ -5864,6 +5839,77 @@ def live_dashboard_fragment():
                         index=_lot_opts.index(st.session_state["big_trd_min"]) if st.session_state.get("big_trd_min") in _lot_opts else _lot_opts.index(_def_lot),
                         key="big_trd_min", label_visibility="collapsed",
                     )
+
+            if st.session_state.get("replay_session_on"):
+                today_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date()
+                known = []
+                try:
+                    src = data.get("df_futures")
+                    if src is not None and not getattr(src, "empty", True) and "time" in src.columns:
+                        known = sorted({d for d in pd.to_datetime(series_to_ist(src["time"])).dt.date.unique()})
+                except Exception:
+                    known = []
+                default_day = st.session_state.get("replay_session_date") or (known[-1] if known else today_ist)
+                st.markdown(
+                    "<div style='color:#00E676;font-size:12px;font-weight:700;margin:4px 0 2px 0;'>"
+                    "Replay session date</div>",
+                    unsafe_allow_html=True,
+                )
+                d1, d2, d3, d4 = st.columns([0.28, 0.28, 0.22, 0.22])
+                with d1:
+                    try:
+                        picked = st.date_input(
+                            "Calendar",
+                            value=default_day,
+                            min_value=today_ist - datetime.timedelta(days=60),
+                            max_value=today_ist,
+                            key="replay_session_date_input",
+                            format="DD-MM-YYYY",
+                        )
+                    except TypeError:
+                        picked = st.date_input(
+                            "Calendar",
+                            value=default_day,
+                            min_value=today_ist - datetime.timedelta(days=60),
+                            max_value=today_ist,
+                            key="replay_session_date_input",
+                        )
+                with d2:
+                    typed = st.text_input(
+                        "Or type DD-MM-YYYY",
+                        value=default_day.strftime("%d-%m-%Y") if default_day else "",
+                        key="replay_session_date_text",
+                        placeholder="05-09-2026",
+                    )
+                    if typed:
+                        try:
+                            parsed = datetime.datetime.strptime(typed.strip(), "%d-%m-%Y").date()
+                            picked = parsed
+                        except Exception:
+                            try:
+                                parsed = datetime.datetime.strptime(typed.strip(), "%Y-%m-%d").date()
+                                picked = parsed
+                            except Exception:
+                                st.caption("Use DD-MM-YYYY")
+                with d3:
+                    if known:
+                        labels = [d.strftime("%d-%b-%Y") for d in known]
+                        cur = default_day.strftime("%d-%b-%Y") if default_day else labels[-1]
+                        idx = labels.index(cur) if cur in labels else len(labels) - 1
+                        sel = st.selectbox("Loaded days", labels, index=idx, key="replay_known_days")
+                        try:
+                            picked = datetime.datetime.strptime(sel, "%d-%b-%Y").date()
+                        except Exception:
+                            pass
+                    else:
+                        st.caption("No days in memory — date above will fetch.")
+                with d4:
+                    if st.button("Load session", key="replay_load_btn"):
+                        st.session_state["replay_session_date"] = picked
+                        st.rerun()
+                    st.caption(f"Active: {picked.strftime('%d-%b-%Y')}")
+                if picked != st.session_state.get("replay_session_date"):
+                    st.session_state["replay_session_date"] = picked
 
             if not df_fchart.empty:
                 df_fchart = df_fchart.copy()
