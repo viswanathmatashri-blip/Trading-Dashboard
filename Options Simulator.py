@@ -1170,6 +1170,99 @@ def classify_flow_playbook(dfi: pd.DataFrame, data: dict) -> dict:
 
 
 
+
+def detect_candle_pattern(df: pd.DataFrame) -> dict:
+    """Last 1–2 bars vs short trend. Playbook patterns only. No lookahead."""
+    empty = {"ok": False, "name": "—", "bias": 0, "conf": "Low", "note": ""}
+    if df is None or len(df) < 3:
+        return empty
+    d = df.tail(8).copy()
+    for col in ("open", "high", "low", "close"):
+        if col not in d.columns:
+            return empty
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    o, h, l, cl = d["open"], d["high"], d["low"], d["close"]
+    body = (cl - o).abs()
+    rng = (h - l).replace(0, np.nan)
+    upper = h - np.maximum(cl, o)
+    lower = np.minimum(cl, o) - l
+    i, j = len(d) - 1, len(d) - 2
+    # short trend: last 5 closes vs prior 5
+    c5 = float(cl.iloc[-5:].mean()) if len(d) >= 5 else float(cl.iloc[-1])
+    p5 = float(cl.iloc[-10:-5].mean()) if len(d) >= 10 else float(cl.iloc[0])
+    uptrend = c5 > p5
+    downtrend = c5 < p5
+    b, r, u, lo = float(body.iloc[i]), float(rng.iloc[i] or 1e-9), float(upper.iloc[i]), float(lower.iloc[i])
+    bull = float(cl.iloc[i]) >= float(o.iloc[i])
+    small = b <= 0.25 * r
+    doji = b <= 0.08 * r
+    name, bias, conf, note = "None", 0, "Low", "No textbook print"
+    if doji:
+        name, bias, conf, note = "Doji", 0, "Moderate", "Indecision — wait next bar"
+    elif b >= 0.85 * r and u <= 0.08 * r and lo <= 0.08 * r:
+        name = "Bull Marubozu" if bull else "Bear Marubozu"
+        bias = 1 if bull else -1
+        conf, note = "High", "One-sided bar — continuation unless at exhaustion wick cluster"
+    elif lo >= 2.0 * max(b, 1e-9) and u <= 0.35 * b and small:
+        if downtrend:
+            name, bias, conf, note = "Hammer", 1, "Moderate-High", "Sell wick taken back at lows"
+        elif uptrend:
+            name, bias, conf, note = "Hanging Man", -1, "Low-Moderate", "Needs next red bar"
+        else:
+            name, bias, conf, note = "Hammer-like", 1, "Low", "Wick without clear downtrend"
+    elif u >= 2.0 * max(b, 1e-9) and lo <= 0.35 * max(b, 1e-9) and small:
+        if uptrend:
+            name, bias, conf, note = "Shooting Star", -1, "High", "Rally rejected at highs"
+        elif downtrend:
+            name, bias, conf, note = "Inverted Hammer", 1, "Moderate", "Needs next green bar"
+        else:
+            name, bias, conf, note = "Upper-wick reject", -1, "Moderate", "Offer defense"
+    # two-bar
+    if j >= 0:
+        o0, c0 = float(o.iloc[j]), float(cl.iloc[j])
+        o1, c1 = float(o.iloc[i]), float(cl.iloc[i])
+        h0, l0 = float(h.iloc[j]), float(l.iloc[j])
+        h1, l1 = float(h.iloc[i]), float(l.iloc[i])
+        b0, b1 = abs(c0 - o0), abs(c1 - o1)
+        bull0, bull1 = c0 >= o0, c1 >= o1
+        if (not bull0) and bull1 and c1 >= max(o0, c0) and o1 <= min(o0, c0):
+            name, bias, conf, note = "Bullish Engulfing", 1, "High", "Buyers wipe prior red body"
+        elif bull0 and (not bull1) and c1 <= min(o0, c0) and o1 >= max(o0, c0):
+            name, bias, conf, note = "Bearish Engulfing", -1, "High", "Sellers wipe prior green body"
+        elif (not bull0) and bull1 and o1 < l0 and c1 >= o0 - 0.5 * b0 and c1 < o0:
+            name, bias, conf, note = "Piercing Line", 1, "Moderate-High", "Close back through 50% of prior red"
+        elif bull0 and (not bull1) and o1 > h0 and c1 <= o0 + 0.5 * b0 and c1 > o0:
+            name, bias, conf, note = "Dark Cloud Cover", -1, "Moderate-High", "Close back through 50% of prior green"
+        elif (not bull0) and bull1 and b1 < b0 and min(o1, c1) >= min(o0, c0) and max(o1, c1) <= max(o0, c0):
+            name, bias, conf, note = "Bullish Harami", 1, "Moderate", "Down-move stall inside prior body"
+        elif abs(l1 - l0) <= 0.15 * max(h1 - l1, h0 - l0, 1e-9) and downtrend:
+            name, bias, conf, note = "Tweezer Bottom", 1, "Moderate-High", "Same low tested twice"
+    return {"ok": True, "name": name, "bias": bias, "conf": conf, "note": note, "uptrend": uptrend, "downtrend": downtrend}
+
+
+def confirm_pdec_with_candle(action: str, pat: dict) -> tuple:
+    """Do not rewrite the 256 book. Only veto/downgrade directional fires that fight the last print."""
+    act = action or "NO ENTRY"
+    if not pat or not pat.get("ok"):
+        return act, "no pattern"
+    name, bias, conf = pat.get("name") or "—", int(pat.get("bias") or 0), pat.get("conf") or ""
+    au = act.upper()
+    longish = any(s in au for s in ("LONG", "HOLD LONG", "PREPARE LONG", "CAUTIOUS LONG"))
+    shortish = any(s in au for s in ("SHORT", "HOLD SHORT", "PREPARE SHORT", "CAUTIOUS SHORT"))
+    high = "High" in conf
+    if longish and bias < 0 and high:
+        return "NO ENTRY", f"PDEC long vetoed by {name}"
+    if shortish and bias > 0 and high:
+        return "NO ENTRY", f"PDEC short vetoed by {name}"
+    if longish and bias < 0:
+        return "CAUTIOUS LONG", f"{name} against long book"
+    if shortish and bias > 0:
+        return "CAUTIOUS SHORT", f"{name} against short book"
+    if "ENTRY" in au and bias == 0 and name == "Doji":
+        return "NO ENTRY", "Doji — wait next close"
+    return act, f"{name} ({conf})"
+
+
 def _telegram_creds():
     tok = (os.getenv("TELE_BOTTOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     chat = (os.getenv("TELE_CHATID") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
@@ -6071,6 +6164,14 @@ def live_dashboard_fragment():
                 st.session_state["_last_dfi"] = dfi
                 st.session_state["_last_scores"] = scores if isinstance(scores, dict) else {}
                 micro = classify_microstructure(dfi)
+                candle_pat = detect_candle_pattern(dfi)
+                raw_act = micro.get("action") if isinstance(micro, dict) else ""
+                filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
+                if isinstance(micro, dict):
+                    micro["action_raw"] = raw_act
+                    micro["action"] = filt_act
+                    micro["candle"] = candle_pat.get("name")
+                    micro["candle_why"] = filt_why
                 flow_pb = classify_flow_playbook(dfi, data)
                 try:
                     process_telegram_alerts(data, dfi, scores if isinstance(scores, dict) else {},
@@ -6104,6 +6205,16 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="ΔV", row=2, col=2)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=2)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=2)
+                if "micro" not in dir() or not isinstance(micro, dict):
+                    micro = classify_microstructure(dfi)
+                    candle_pat = detect_candle_pattern(dfi)
+                    raw_act = micro.get("action") if isinstance(micro, dict) else ""
+                    filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
+                    if isinstance(micro, dict):
+                        micro["action_raw"] = raw_act
+                        micro["action"] = filt_act
+                        micro["candle"] = candle_pat.get("name")
+                        micro["candle_why"] = filt_why
                 atm_k = data.get("atm_strike")
                 tab_flow, tab_dex, tab_atm_ce, tab_atm_pe = st.tabs([
                     "1 · Index / ΔV / EFI / CVD",
@@ -6113,6 +6224,11 @@ def live_dashboard_fragment():
                 ])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
+                    if isinstance(micro, dict) and micro.get("candle"):
+                        st.caption(
+                            f"Candle · {micro.get('candle')} · PDEC raw {micro.get('action_raw') or '—'} → "
+                            f"{micro.get('action')} · {micro.get('candle_why') or ''}"
+                        )
                     st.plotly_chart(fig_stack, use_container_width=True)
                     if pdec_hist:
                         with st.expander(f"PDEC session log ({len(pdec_hist)} bars)", expanded=False):
