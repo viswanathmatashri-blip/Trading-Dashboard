@@ -3126,7 +3126,15 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         else:
             spot_price = 24500.0
 
-        index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, spot_exch, days=hv_days)
+        hv_key = f"hv_{Index_Name}_{hv_days}"
+        hv_ts = st.session_state.get("_hv_ts") or 0
+        now_s = datetime.datetime.now().timestamp()
+        if st.session_state.get(hv_key) and (now_s - hv_ts) < 900:
+            index_hv = float(st.session_state[hv_key])
+        else:
+            index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, spot_exch, days=hv_days)
+            st.session_state[hv_key] = float(index_hv or 0)
+            st.session_state["_hv_ts"] = now_s
 
         update_p(0.35, "Fetching Historical Underlying Candles (with Holiday Fallback)...")
         api_interval, lookback_days = interval_mapping.get(selected_interval_label, ("FIVE_MINUTE", 15))
@@ -4964,6 +4972,54 @@ def render_live_alert_ribbon(data: dict = None):
 
 
 # --- LIVE DASHBOARD FRAGMENT ---
+
+def refresh_index_tapes(data, want_tf):
+    """5s path: only spot LTP + index/futures candles. Keep last chain/GEX."""
+    if not data:
+        return data
+    try:
+        smart_api = get_smart_api_client()
+        if not smart_api:
+            return data
+        api_interval, lookback_days = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
+        lookback_days = min(int(lookback_days or 5), 4)
+        spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
+        fut_tok, _ = get_near_month_futures_token(df_master, Index_Name, opt_exch)
+        if not spot_token and fut_tok:
+            spot_token = fut_tok
+        ltp_sym = Index_Name
+        try:
+            if fut_tok is not None:
+                hit = df_master[df_master["token"].astype(str) == str(fut_tok)]
+                if not hit.empty and "symbol" in hit.columns:
+                    ltp_sym = str(hit.iloc[0]["symbol"])
+        except Exception:
+            pass
+        if spot_token:
+            spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=ltp_sym, symboltoken=spot_token)
+            if spot_resp and spot_resp.get("status") and spot_resp.get("data"):
+                data["spot_price"] = float(spot_resp["data"]["ltp"])
+        df_candles, is_fb = fetch_candles_with_holiday_fallback(
+            smart_api, spot_token, spot_exch, api_interval, lookback_days, Index_Name
+        )
+        if df_candles is not None and not df_candles.empty:
+            data["df_candles"] = df_candles
+            data["is_holiday_fallback"] = is_fb
+        df_futures, fut_fb, basis_info, fut_msg = fetch_futures_candles_with_vwap(
+            smart_api, Index_Name, df_master, api_interval, lookback_days
+        )
+        if df_futures is not None and not df_futures.empty:
+            data["df_futures"] = df_futures
+            data["fut_is_fallback"] = fut_fb
+            data["basis_info"] = basis_info
+            data["fut_fallback_msg"] = fut_msg
+        data["bar_tf"] = want_tf
+        data["timestamp"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d-%b-%Y %H:%M:%S IST")
+    except Exception:
+        pass
+    return data
+
+
 @st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
 def live_dashboard_fragment():
     if "data_store" not in st.session_state:
@@ -4996,11 +5052,19 @@ def live_dashboard_fragment():
     stored = st.session_state.get("data_store") or {}
     need_tf = stored.get("bar_tf") != want_tf
     if st.session_state.get("enable_main_refresh", False) or need_tf:
-        refreshed_data = fetch_live_data(want_tf)
-        if refreshed_data:
-            refreshed_data["selected_expiry"] = selected_expiry_str
-            refreshed_data["bar_tf"] = want_tf
-            st.session_state["data_store"] = refreshed_data
+        now_s = datetime.datetime.now().timestamp()
+        last_full = float(st.session_state.get("_full_fetch_ts") or 0)
+        have = st.session_state.get("data_store")
+        # Full chain+IV+GEX at most every 20s; 5s ticks only refresh index/futures candles.
+        if need_tf or have is None or (now_s - last_full) >= 20:
+            refreshed_data = fetch_live_data(want_tf)
+            if refreshed_data:
+                refreshed_data["selected_expiry"] = selected_expiry_str
+                refreshed_data["bar_tf"] = want_tf
+                st.session_state["data_store"] = refreshed_data
+                st.session_state["_full_fetch_ts"] = now_s
+        else:
+            st.session_state["data_store"] = refresh_index_tapes(have, want_tf)
 
     data = st.session_state["data_store"]
     lvls = data.get("levels", {})
@@ -5023,6 +5087,10 @@ def live_dashboard_fragment():
             st.caption("⚠️ Non-trading day – showing last session")
     with head_r:
         cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
+        st.session_state["atm_live_ok"] = st.checkbox(
+            "ATM live", value=st.session_state.get("atm_live_ok", False),
+            key="cb_atm_live", help="Off = 5s loop skips ATM CE/PE candle API.",
+        )
         if cb_main != st.session_state["enable_main_refresh"]:
             st.session_state["enable_main_refresh"] = cb_main
             st.rerun()
@@ -6067,6 +6135,12 @@ def live_dashboard_fragment():
                                 st.rerun()
                     st.markdown("</div>", unsafe_allow_html=True)
                 def _render_atm_tab(tok, lab):
+                    if st.session_state.get("enable_main_refresh") and not st.session_state.get("atm_live_ok"):
+                        st.caption("ATM tape paused during 5s index refresh. Enable “ATM live” to fetch.")
+                        cached = st.session_state.get(f"_atm_fig_{lab}")
+                        if cached:
+                            st.plotly_chart(cached, use_container_width=True)
+                        return
                     try:
                         api = get_smart_api_client()
                         tf_lab = st.session_state.get("selected_timeframe", "5 min")
