@@ -132,6 +132,10 @@ if "selected_timeframe" not in st.session_state:
     st.session_state["selected_timeframe"] = "3 min"
 if "chart_window" not in st.session_state:
     st.session_state["chart_window"] = "Session (6h)"
+if "replay_session_on" not in st.session_state:
+    st.session_state["replay_session_on"] = False
+if "replay_session_date" not in st.session_state:
+    st.session_state["replay_session_date"] = None
 if "px_alert_on" not in st.session_state:
     st.session_state["px_alert_on"] = False
 if "px_alert_lvl" not in st.session_state:
@@ -2601,10 +2605,12 @@ def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bool = True) -> tuple:
+def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bool = True,
+                          force_date=None) -> tuple:
     """Return (session_df, session_date, used_prior_session).
     During live hours prefer TODAY even with 1–2 bars (Mon 09:16 problem).
     min_bars only applies when falling back to a completed prior session.
+    force_date: pin to that calendar date when present in the frame.
     """
     empty = (pd.DataFrame(), None, True)
     if df is None or df.empty or "time" not in df.columns:
@@ -2624,6 +2630,17 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
     chosen = None
     used_prior = True
     live_now, _, _, _ = market_session_state()
+    if force_date is not None:
+        try:
+            fd = force_date if hasattr(force_date, "year") else pd.to_datetime(force_date).date()
+        except Exception:
+            fd = None
+        if fd is not None and fd in counts.index:
+            sess = out[out["session_date"] == fd].copy().reset_index(drop=True)
+            sess["time_str"] = sess["time"].dt.strftime("%H:%M")
+            return sess, fd, fd != today
+        if fd is not None:
+            return pd.DataFrame(), fd, True
     if prefer_today and today in counts.index and today.weekday() < 5 and int(counts.loc[today]) >= 1:
         chosen = today
         used_prior = False
@@ -2652,6 +2669,38 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
     sess = out[out["session_date"] == chosen].copy().reset_index(drop=True)
     sess["time_str"] = sess["time"].dt.strftime("%H:%M")
     return sess, chosen, used_prior
+
+
+def fetch_one_session_ohlcv(smart_api, token, exchange, api_interval, day, index_name="IDX"):
+    """Single NSE/FO session of candles for replay. Returns raw OHLCV or empty."""
+    empty = pd.DataFrame()
+    if not smart_api or not token or day is None:
+        return empty
+    try:
+        day = day if hasattr(day, "year") else pd.to_datetime(day).date()
+    except Exception:
+        return empty
+    _, _, _, _, from_hm, to_hm = session_hours(index_name)
+    param = {
+        "exchange": exchange,
+        "symboltoken": str(token),
+        "interval": api_interval,
+        "fromdate": f"{day.strftime('%Y-%m-%d')} {from_hm}",
+        "todate": f"{day.strftime('%Y-%m-%d')} {to_hm}",
+    }
+    res = safe_api_call(smart_api.getCandleData, param)
+    time.sleep(0.20)
+    if not (res and res.get("status") and res.get("data")):
+        return empty
+    df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+    df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+    df["time"] = series_to_ist(df["time"])
+    df["session_date"] = df["time"].dt.date
+    df = df[df["session_date"] == day].copy()
+    if df.empty:
+        return empty
+    df["time_str"] = df["time"].dt.strftime("%H:%M")
+    return df.reset_index(drop=True)
 
 
 def fetch_india_vix_sessions(smart_api, lookback_days=10):
@@ -5603,8 +5652,49 @@ def live_dashboard_fragment():
                         data["df_futures"] = df_fut
             except Exception:
                 pass
+        replay_on = bool(st.session_state.get("replay_session_on"))
+        replay_day = st.session_state.get("replay_session_date")
+        force_day = replay_day if replay_on and replay_day else None
         if not df_fut.empty and len(df_fut) >= 1:
-            df_fchart, latest_session, _ = pick_last_nse_session(df_fut, min_bars=20, prefer_today=True)
+            df_fchart, latest_session, _ = pick_last_nse_session(
+                df_fut, min_bars=20, prefer_today=not bool(force_day), force_date=force_day,
+            )
+            if df_fchart.empty and force_day:
+                try:
+                    api = get_smart_api_client()
+                    tf_lab = st.session_state.get("selected_timeframe", "5 min")
+                    api_int, _lb = interval_mapping.get(tf_lab, ("FIVE_MINUTE", 15))
+                    fut_tok = (data.get("basis_info") or {}).get("fut_token")
+                    fut_ex = (data.get("basis_info") or {}).get("fut_exchange") or "NFO"
+                    fetched = fetch_one_session_ohlcv(
+                        api, fut_tok, fut_ex, api_int, force_day, Index_Name,
+                    )
+                    if fetched is not None and not fetched.empty:
+                        fetched = attach_bar_flow(fetched, rebuild=True)
+                        df_fchart = fetched
+                        latest_session = force_day
+                        # merge into store so next rerun is cheap
+                        try:
+                            base = data.get("df_futures")
+                            if base is None or getattr(base, "empty", True):
+                                data["df_futures"] = fetched.copy()
+                            else:
+                                data["df_futures"] = pd.concat([base, fetched], ignore_index=True)
+                                data["df_futures"] = data["df_futures"].drop_duplicates(subset=["time"])
+                        except Exception:
+                            pass
+                        # spot tape for that day
+                        try:
+                            spot_tok, spot_ex = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))[:2]
+                            sp = fetch_one_session_ohlcv(api, spot_tok, spot_ex, api_int, force_day, Index_Name)
+                            if sp is not None and not sp.empty:
+                                data["df_candles"] = pd.concat(
+                                    [data.get("df_candles", pd.DataFrame()), sp], ignore_index=True
+                                ) if data.get("df_candles") is not None else sp
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             if df_fchart.empty:
                 df_fut = df_fut.copy()
                 df_fut["time"] = series_to_ist(df_fut["time"])
@@ -5612,7 +5702,7 @@ def live_dashboard_fragment():
                 latest_session = sorted(df_fut["session_date"].unique())[-1]
                 df_fchart = df_fut[df_fut["session_date"] == latest_session].copy().reset_index(drop=True)
                 df_fchart["time_str"] = df_fchart["time"].dt.strftime("%H:%M")
-            fut_times = df_fchart["time_str"].tolist()
+            fut_times = df_fchart["time_str"].tolist() if not df_fchart.empty else []
 
         if not df_chain.empty:
             min_strike_val = float(df_chain["Strike"].min()) - 50
@@ -5699,7 +5789,40 @@ def live_dashboard_fragment():
                     format_func=lambda x: f"±{x}σ", key="vwap_sigma_select",
                     label_visibility="collapsed"
                 )
-            tw, al, av = st.columns([0.28, 0.44, 0.28])
+            tw, al, av, rp = st.columns([0.22, 0.34, 0.22, 0.22])
+            with rp:
+                replay_on = st.checkbox(
+                    "Replay day",
+                    value=bool(st.session_state.get("replay_session_on")),
+                    key="replay_session_chk",
+                    help="Pin this pane to one past trading session. VWAP, EFI, CVD, VP and VA labels recompute on that day only.",
+                )
+                st.session_state["replay_session_on"] = replay_on
+                today_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date()
+                known = []
+                try:
+                    src = data.get("df_futures")
+                    if src is not None and not getattr(src, "empty", True) and "time" in src.columns:
+                        known = sorted(pd.to_datetime(series_to_ist(src["time"])).dt.date.unique())
+                except Exception:
+                    known = []
+                default_day = st.session_state.get("replay_session_date") or (known[-1] if known else today_ist)
+                if replay_on:
+                    picked = st.date_input(
+                        "Session",
+                        value=default_day,
+                        min_value=today_ist - datetime.timedelta(days=40),
+                        max_value=today_ist,
+                        key="replay_session_date_input",
+                        help="05-09-2026 style calendar date. Weekend/holiday → no bars.",
+                    )
+                    if picked != st.session_state.get("replay_session_date"):
+                        st.session_state["replay_session_date"] = picked
+                        st.rerun()
+                    st.caption(picked.strftime("%d-%b-%Y"))
+                else:
+                    if st.session_state.get("replay_session_date") and not replay_on:
+                        pass
             with tw:
                 st.session_state["chart_window"] = st.radio(
                     "Window", ["Session (6h)", "3h", "1h"], horizontal=True,
@@ -5857,6 +5980,8 @@ def live_dashboard_fragment():
                 dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
 
                 win = st.session_state.get("chart_window") or "Session (6h)"
+                if st.session_state.get("replay_session_on"):
+                    win = "Session (6h)"
                 if "time" in dfi.columns and win in ("3h", "1h") and len(dfi):
                     tlast = pd.to_datetime(dfi["time"].iloc[-1])
                     hrs = 3 if win == "3h" else 1
