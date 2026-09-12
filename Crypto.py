@@ -5864,31 +5864,27 @@ def live_dashboard_fragment():
                     vp2 = compute_session_volume_profile(vp_src, bin_step=2.0, prominence_factor=0.35)
                     if vp2.get("ok"):
                         vp = vp2
-                    # Developing VA: last third of session (or last 90 min)
-                    try:
-                        if "time" in dfi.columns and len(vp_src) >= 18:
-                            tlast = pd.to_datetime(dfi["time"].iloc[-1])
-                            cut = tlast - pd.Timedelta(minutes=90)
-                            # align vp_src rows with dfi if same length
-                            if len(vp_src) == len(dfi):
-                                dev_src = vp_src.loc[pd.to_datetime(dfi["time"]) >= cut]
-                            else:
-                                dev_src = vp_src.tail(max(18, len(vp_src) // 3))
-                            if len(dev_src) >= 12:
-                                vpd = compute_session_volume_profile(dev_src, bin_step=2.0, prominence_factor=0.35)
-                                if vpd.get("ok") and isinstance(vp, dict):
-                                    vp = dict(vp)
-                                    vas = list(vp.get("vas") or [])
-                                    vas.append({
-                                        "vah": vpd.get("vah"), "val": vpd.get("val"),
-                                        "poc": vpd.get("poc"), "frac": 0.70, "tag": "dVA", "primary": False,
-                                    })
-                                    vp["vas"] = vas
-                                    vp["dvah"] = vpd.get("vah")
-                                    vp["dval"] = vpd.get("val")
-                                    vp["dpoc"] = vpd.get("poc")
-                    except Exception:
-                        pass
+                    # Developing VA: last 90 min (or last third of bars)
+                    if "time" in dfi.columns and len(vp_src) >= 18:
+                        tlast = pd.to_datetime(dfi["time"].iloc[-1])
+                        cut = tlast - pd.Timedelta(minutes=90)
+                        if len(vp_src) == len(dfi):
+                            dev_src = vp_src.loc[pd.to_datetime(dfi["time"]) >= cut]
+                        else:
+                            dev_src = vp_src.tail(max(18, len(vp_src) // 3))
+                        if len(dev_src) >= 12:
+                            vpd = compute_session_volume_profile(dev_src, bin_step=2.0, prominence_factor=0.35)
+                            if vpd.get("ok") and isinstance(vp, dict):
+                                vp = dict(vp)
+                                vas = list(vp.get("vas") or [])
+                                vas.append({
+                                    "vah": vpd.get("vah"), "val": vpd.get("val"),
+                                    "poc": vpd.get("poc"), "frac": 0.70, "tag": "dVA", "primary": False,
+                                })
+                                vp["vas"] = vas
+                                vp["dvah"] = vpd.get("vah")
+                                vp["dval"] = vpd.get("val")
+                                vp["dpoc"] = vpd.get("poc")
                 except Exception:
                     pass
                 buy_v = np.zeros(len(dfi), dtype=float)
@@ -6171,3 +6167,529 @@ def live_dashboard_fragment():
                     dv_m = float(max(np.nanmax(np.abs(buy_v)), np.nanmax(np.abs(sell_v)), 1.0))
                     fig_stack.update_yaxes(range=[-dv_m * 1.25, dv_m * 1.25], row=2, col=2)
                 except Exception:
+                    pass
+                efi_col = np.where(dfi["efi13"] >= 0, "#00E676", "#FF5252")
+                fig_stack.add_trace(plt_go.Bar(
+                    x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
+                ), row=3, col=2)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=2)
+                cvd_last = float(dfi["cvd"].iloc[-1])
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["cvd"].clip(lower=0),
+                    mode="lines", showlegend=False, name="CVD+",
+                    line=dict(color="#00E676", width=1.6),
+                    fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
+                ), row=4, col=2)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["cvd"].clip(upper=0),
+                    mode="lines", showlegend=False, name="CVD-",
+                    line=dict(color="#FF5252", width=1.6),
+                    fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
+                ), row=4, col=2)
+                fig_stack.add_trace(plt_go.Scatter(
+                    x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
+                    line=dict(color="#B0BEC5", width=1.2),
+                ), row=4, col=2)
+                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=2)
+                tf_min_w = {"3 min": 10, "5 min": 8, "15 min": 6}.get(st.session_state.get("selected_timeframe", "5 min"), 8)
+                cvd_st = cvd_price_stats(dfi, window=tf_min_w)
+                if cvd_st.get("ok"):
+                    colr = "#FF5252" if "BEARISH" in cvd_st["div"] else (
+                        "#00E676" if "BULLISH" in cvd_st["div"] else "#FFD54F"
+                    )
+                    fig_stack.add_annotation(
+                        text=cvd_st["div"],
+                        xref="paper", yref="paper", x=0.01, y=0.02,
+                        showarrow=False, font=dict(size=11, color=colr),
+                        bgcolor="rgba(16,20,28,0.85)",
+                        row=4, col=2,
+                    )
+
+                div_ev = scan_cvd_div_events(dfi, window=tf_min_w)
+                if div_ev:
+                    ylo = float(dfi["close"].min())
+                    yhi = float(dfi["close"].max())
+                    clo = float(dfi["cvd"].min())
+                    chi = float(dfi["cvd"].max())
+                    for e in div_ev:
+                        tip = (
+                            f"{e['div']}<br>"
+                            f"Px slope {e['px_slope']:+.4f}/bar p={e['px_p']:.3f}<br>"
+                            f"CVD slope {e['cvd_slope']:+.2f}/bar p={e['cvd_p']:.3f}<br>"
+                            f"Spearman ρ={e.get('spearman') or 0:+.2f} p={e.get('spearman_p') or 1:.3f}<br>"
+                            f"{e['note']}"
+                        )
+                        fig_stack.add_trace(plt_go.Scatter(
+                            x=[e["t"], e["t"]], y=[ylo, yhi],
+                            mode="lines+text",
+                            line=dict(color="#29B6F6", width=1.4, dash="dash"),
+                            text=["", "D"], textposition="top center",
+                            textfont=dict(size=10, color="#29B6F6"),
+                            hovertemplate=tip + "<extra></extra>",
+                            showlegend=False, name="D",
+                        ), row=1, col=2)
+                        fig_stack.add_trace(plt_go.Scatter(
+                            x=[e["t"], e["t"]], y=[clo, chi],
+                            mode="lines",
+                            line=dict(color="#29B6F6", width=1.2, dash="dash"),
+                            hovertemplate=tip + "<extra></extra>",
+                            showlegend=False, name="D",
+                        ), row=4, col=2)
+
+                def _sess_chg(src):
+                    if src is None or getattr(src, "empty", True):
+                        return None
+                    try:
+                        sess, _, _ = pick_last_nse_session(src, min_bars=5)
+                    except Exception:
+                        sess = src
+                    if sess is None or sess.empty:
+                        return None
+                    o = float(sess["open"].iloc[0]); cl = float(sess["close"].iloc[-1])
+                    return cl, cl - o, (cl - o) / o * 100.0 if o else 0.0
+
+                spot_chg = _sess_chg(data.get("df_candles"))
+                fut_chg = _sess_chg(df_fchart if not df_fchart.empty else data.get("df_futures"))
+                trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
+                st.session_state["_last_dfi"] = dfi
+                st.session_state["_last_scores"] = scores if isinstance(scores, dict) else {}
+                micro = classify_microstructure(dfi)
+                candle_pat = detect_candle_pattern(dfi)
+                raw_act = micro.get("action") if isinstance(micro, dict) else ""
+                filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
+                if isinstance(micro, dict):
+                    micro["action_raw"] = raw_act
+                    micro["action"] = filt_act
+                    micro["candle"] = candle_pat.get("name")
+                    micro["candle_why"] = filt_why
+                flow_pb = classify_flow_playbook(dfi, data)
+                try:
+                    process_telegram_alerts(data, dfi, scores if isinstance(scores, dict) else {},
+                                            micro, flow_pb, cvd_st if "cvd_st" in dir() else {})
+                except Exception:
+                    pass
+
+                xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
+                fig_stack.update_xaxes(rangeslider_visible=False)
+                fig_stack.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=820, margin=dict(l=40, r=6, t=8, b=18),
+                    legend=dict(orientation="h", yanchor="top", y=1.0, x=0.0, font=dict(size=10),
+                                bgcolor="rgba(14,17,23,0.4)"),
+                    hovermode="x unified", bargap=0.15,
+                    xaxis_rangeslider_visible=False,
+                )
+                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", showticklabels=True, row=1, col=1)
+                fig_stack.update_yaxes(range=[y0, y1], tickformat="d", type="linear", row=1, col=2)
+                fig_stack.update_yaxes(range=[y0, y1], type="linear", showticklabels=False, row=1, col=3)
+                fig_stack.update_xaxes(type="linear", showticklabels=True, showgrid=False, row=1, col=1)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                                       range=xr, showticklabels=False, row=1, col=2)
+                fig_stack.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=3)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                                       range=xr, showticklabels=False, row=2, col=2)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                                       range=xr, showticklabels=False, row=3, col=2)
+                fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                                       range=xr, nticks=8, row=4, col=2)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="ΔV", row=2, col=2)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=2)
+                fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=2)
+                if "micro" not in dir() or not isinstance(micro, dict):
+                    micro = classify_microstructure(dfi)
+                    candle_pat = detect_candle_pattern(dfi)
+                    raw_act = micro.get("action") if isinstance(micro, dict) else ""
+                    filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
+                    if isinstance(micro, dict):
+                        micro["action_raw"] = raw_act
+                        micro["action"] = filt_act
+                        micro["candle"] = candle_pat.get("name")
+                        micro["candle_why"] = filt_why
+                atm_k = data.get("atm_strike")
+                tab_flow, tab_dex, tab_atm_ce, tab_atm_pe = st.tabs([
+                    "1 · Index / ΔV / EFI / CVD",
+                    "2 · DEX / Premium",
+                    f"3 · ATM CE {atm_k:.0f}" if atm_k else "3 · ATM CE",
+                    f"4 · ATM PE {atm_k:.0f}" if atm_k else "4 · ATM PE",
+                ])
+                with tab_flow:
+                    st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
+                    if isinstance(micro, dict) and micro.get("candle"):
+                        st.caption(
+                            f"VA · {micro.get('regime','')} · {micro.get('model','')} · raw {micro.get('action_raw') or '—'} → "
+                            f"{micro.get('action')} · {micro.get('candle_why') or ''}"
+                        )
+                    st.plotly_chart(fig_stack, use_container_width=True)
+                    if pdec_hist:
+                        with st.expander(f"VA session log ({len(pdec_hist)} bars)", expanded=False):
+                            lines = ["| Time | P Δ E C | Action |", "|---|---|---|"]
+                            for rec in pdec_hist:
+                                lines.append(f"| {rec['t']} | {rec['glyphs']} | {rec['action']} |")
+                            st.markdown("\n".join(lines))
+                    if st.session_state.get("avwap_on"):
+                        opts_t = list(dfi["time_str"]) if "time_str" in dfi.columns else []
+                        if opts_t:
+                            cur = st.session_state.get("avwap_time")
+                            if cur not in opts_t:
+                                cur = opts_t[0]
+                            pick = st.selectbox(
+                                "AVWAP anchor time (one at a time)",
+                                opts_t, index=opts_t.index(cur), key="avwap_pick",
+                            )
+                            if pick != st.session_state.get("avwap_time"):
+                                st.session_state["avwap_time"] = pick
+                                st.rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
+                def _render_atm_tab(tok, lab):
+                    if st.session_state.get("enable_main_refresh") and not st.session_state.get("atm_live_ok") and not st.session_state.get("intel_refresh"):
+                        st.caption("ATM tape paused during 5s index refresh. Enable “ATM live” to fetch.")
+                        cached = st.session_state.get(f"_atm_fig_{lab}")
+                        if cached:
+                            st.plotly_chart(cached, use_container_width=True)
+                        return
+                    try:
+                        api = get_smart_api_client()
+                        tf_lab = st.session_state.get("selected_timeframe", "5 min")
+                        api_int, _lb = interval_mapping.get(tf_lab, ("FIVE_MINUTE", 15))
+                        exch_opt = data.get("opt_exchange") or Exchange
+                        if not api or not tok:
+                            st.caption("ATM token unavailable this cycle.")
+                            return
+                        lb = 0 if str(tf_lab).startswith(("1 ", "2 ")) else 1
+                        dfo, _fb = fetch_candles_with_holiday_fallback(
+                            api, str(tok), exch_opt, api_int, lb, f"{Index_Name}_{lab}"
+                        )
+                        used_tf = tf_lab
+                        if dfo is None or dfo.empty or len(dfo) < 25:
+                            dfo, _fb = fetch_candles_with_holiday_fallback(
+                                api, str(tok), exch_opt, "THREE_MINUTE", 1, f"{Index_Name}_{lab}_3m"
+                            )
+                            used_tf = "3 min"
+                            st.caption("ATM 1/2-min tape thin on SmartAPI — showing 3-min option candles.")
+                        fig_o, act_o = _option_session_figure(
+                            dfo, f"ATM {lab}", Index_Name, used_tf,
+                            st.session_state.get("_axis_times"),
+                        )
+                        st.caption(f"VA · {act_o}")
+                        if fig_o is not None:
+                            st.plotly_chart(fig_o, use_container_width=True)
+                    except Exception as e:
+                        st.caption(f"ATM {lab} unavailable.")
+                with tab_atm_ce:
+                    st.markdown("<div class='chart-card'><div class='card-title'>ATM CE</div>", unsafe_allow_html=True)
+                    _render_atm_tab(data.get("atm_ce_token"), "CE")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tab_atm_pe:
+                    st.markdown("<div class='chart-card'><div class='card-title'>ATM PE</div>", unsafe_allow_html=True)
+                    _render_atm_tab(data.get("atm_pe_token"), "PE")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with tab_dex:
+
+                    sess_day = latest_session or _ist_now().date()
+                    tape = load_flow_tape(Index_Name, sess_day) or list(st.session_state.get("flow_tape") or [])
+                    fig_dex = make_subplots(
+                        rows=3, cols=2,
+                        column_widths=[0.84, 0.16],
+                        row_heights=[0.46, 0.27, 0.27],
+                        shared_xaxes=False,
+                        vertical_spacing=0.06,
+                        horizontal_spacing=0.01,
+                        specs=[[{}, {}], [{}, None], [{}, None]],
+                    )
+                    if "vwap_upper_idx" in dfi.columns:
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=dfi["time_str"], y=dfi["vwap_upper_idx"], mode="lines", showlegend=False, hoverinfo="skip",
+                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=dfi["time_str"], y=dfi["vwap_lower_idx"], mode="lines", showlegend=False, hoverinfo="skip",
+                            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+                            fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
+                    fig_dex.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi.get("vwap_idx", dfi["vwap"]), mode="lines", name="VWAP (idx)",
+                        line=dict(color="#FF9800", width=2), hoverinfo="skip"), row=1, col=1)
+                    fig_dex.add_trace(plt_go.Scatter(
+                        x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
+                        line=dict(color="#2196F3", width=2)), row=1, col=1)
+                    if vp.get("ok"):
+                        fig_dex.add_trace(plt_go.Bar(
+                            x=vols if vp.get("ok") else [], y=mids if vp.get("ok") else [],
+                            orientation="h", showlegend=False,
+                            marker=dict(color=colors if vp.get("ok") else "#64B5F6"),
+                        ), row=1, col=2)
+                    if tape and fut_times:
+                        # Map snaps onto the same category axis as futures (HH:MM)
+                        dex_map = {str(t.get("ts"))[-5:]: t for t in tape}
+                        xs = list(fut_times)
+                        dex_y, pc_y, pp_y = [], [], []
+                        for ts in xs:
+                            key = str(ts)[-5:]
+                            rec = dex_map.get(key)
+                            dex_y.append(rec["dex"] if rec else None)
+                            pc_y.append((rec["prem_c"] / 1e7) if rec else None)
+                            pp_y.append((rec["prem_p"] / 1e7) if rec else None)
+                        s = pd.Series(dex_y, dtype=float)
+                        ema = s.ewm(span=8, min_periods=1, adjust=False).mean()
+                        bar_c = ["#00E676" if (v is not None and v >= 0) else "#FF5252" for v in dex_y]
+                        fig_dex.add_trace(plt_go.Bar(
+                            x=xs, y=dex_y, name="DEX", marker_color=bar_c, opacity=0.75, showlegend=False,
+                        ), row=2, col=1)
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=xs, y=ema, name="DEX EMA8",
+                            line=dict(color="#FFD54F", width=2),
+                        ), row=2, col=1)
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=xs, y=pc_y, name="Call prem Cr",
+                            line=dict(color="#00E676", width=2), connectgaps=False,
+                        ), row=3, col=1)
+                        fig_dex.add_trace(plt_go.Scatter(
+                            x=xs, y=pp_y, name="Put prem Cr",
+                            line=dict(color="#FF5252", width=2), connectgaps=False,
+                        ), row=3, col=1)
+                    fig_dex.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=2, col=1)
+                    fig_dex.update_layout(
+                        template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                        height=820, margin=dict(l=40, r=6, t=8, b=18),
+                        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+                        hovermode="x unified",
+                    )
+                    fig_dex.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=axis_times, range=xr,
+                                        showticklabels=False, row=1, col=1)
+                    fig_dex.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=axis_times, range=xr,
+                                        showticklabels=False, row=2, col=1)
+                    fig_dex.update_xaxes(type="category", categoryorder="array",
+                                        categoryarray=axis_times, range=xr,
+                                        nticks=8, row=3, col=1)
+                    fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=2, col=1)
+                    fig_dex.update_yaxes(title_text="", tickfont=dict(size=8), row=3, col=1)
+                    st.markdown("<div class='chart-card'><div class='card-title'>DEX flow &amp; net premium</div>", unsafe_allow_html=True)
+                    if tape:
+                        st.caption(f"DEX / premium time · {sess_day} · {len(tape)} snaps · x = futures axis")
+                    else:
+                        st.caption("DEX / premium empty until Auto-Refresh stores snaps in market hours. No strike fallback.")
+                    st.plotly_chart(fig_dex, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                cap = (f"{st.session_state.get('selected_timeframe','?')} · "
+                       f"{len(dfi)} bars · Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}")
+                if cvd_st.get("ok"):
+                    cap += (f" · Px slope {cvd_st['px_slope']:+.3f}/bar p={cvd_st['px_p']:.3f}"
+                            f" · CVD slope {cvd_st['cvd_slope']:+.1f}/bar p={cvd_st['cvd_p']:.3f}"
+                            f" · {cvd_st['div']}")
+                    heading_ribbon(
+                        f"CVD vs Px · {cvd_st['div']}",
+                        f"Window last {cvd_st['win']} bars of <b>this TF only</b>. "
+                        f"OLS slope vs bar index. Significant = p&lt;0.05.<br>"
+                        f"Price slope {cvd_st['px_slope']:+.4f} /bar · p={cvd_st['px_p']:.3f}<br>"
+                        f"CVD slope {cvd_st['cvd_slope']:+.2f} /bar · p={cvd_st['cvd_p']:.3f}<br>"
+                        f"Spearman ρ={cvd_st.get('spearman') or 0:+.2f} p={cvd_st.get('spearman_p') or 1:.3f}<br>"
+                        f"{cvd_st['div_note']}<br>"
+                        "Full divergence = opposing significant slopes <b>and</b> matching swing (HH/LH or LL/HL). "
+                        "Slope-only is a watch. 15-min sessions have few bars — p-values stay weak.",
+                    )
+                if vp.get("ok"):
+                    bits = [f"POC {vp['poc']:.0f}", f"VA70 {vp.get('val'):.0f}-{vp.get('vah'):.0f}"]
+                    if vp.get("val80") is not None:
+                        bits.append(f"VA80 {vp['val80']:.0f}-{vp['vah80']:.0f}")
+                    if vp.get("dval") is not None:
+                        bits.append(f"dVA {vp['dval']:.0f}-{vp['dvah']:.0f}")
+                    extra = [f"{va.get('tag')} {va.get('val'):.0f}-{va.get('vah'):.0f}"
+                             for va in (vp.get("vas") or []) if va.get("tag") not in ("VA70", "VA80", "dVA")]
+                    bits.extend(extra)
+                    if vp.get("val1") is not None:
+                        bits.append(f"VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}")
+                    cap += " · " + " · ".join(bits)
+                st.caption(cap)
+                def _chip(body, tip, color="#00E676"):
+                    return (
+                        f"<div class='micro-hover micro-chip'>"
+                        f"<div style='color:{color};font-weight:800;font-size:12px;line-height:1.3;text-align:center;'>{body}</div>"
+                        f"<div class='micro-tip'>{tip}</div></div>"
+                    )
+                chips = []
+                sc = f"NIFTY {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else "NIFTY —"
+                fc = f"FUT {fut_chg[0]:,.0f} {fut_chg[1]:+.0f} {fut_chg[2]:+.2f}%" if fut_chg else "FUT —"
+                chips.append(_chip(
+                    f"{sc}<br>{fc}",
+                    "Index spot and near-month futures session open→close. GEX walls use spot; VWAP uses futures.",
+                    "#00E676" if (spot_chg and spot_chg[2] >= 0) else "#FF5252",
+                ))
+                if isinstance(scores, dict) and "error" not in scores:
+                    chips.append(_chip(
+                        f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})",
+                        f"<b>Superhuman</b><br>{scores.get('clarity','')}<br>{scores.get('action','')}<br>"
+                        f"Quiet + long γ → PIN<br>Big range + long γ → REVERSION<br>"
+                        f"Short γ / wall break → TREND<br>|C|≤15 → NO EDGE<br>else → MILD DIR",
+                        scores.get("colour", "#00E676"),
+                    ))
+                tname = (trig or {}).get("trigger", "NO TRIGGER")
+                tbits = []
+                for ch in (trig or {}).get("checks") or []:
+                    side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
+                    tbits.append(f"{ch.get('name','')} <b>{side}</b> · {ch.get('note','')}")
+                chips.append(_chip(
+                    tname,
+                    f"<b>{tname}</b><br>{(trig or {}).get('summary','')}<br><br>" + "<br>".join(tbits),
+                    (trig or {}).get("colour", "#FF9800"),
+                ))
+                if micro.get("ok"):
+                    act = micro["action"]
+                    tag = " EFI≈0" if micro.get("efi_zero") else ""
+                    chips.append(_chip(
+                        f"P{LEVEL_GLYPH.get(micro['price'], micro['price'])} "
+                        f"Δ{LEVEL_GLYPH.get(micro.get('delta', micro.get('obv','-')), '')} "
+                        f"E{LEVEL_GLYPH.get(micro['efi'], micro['efi'])} "
+                        f"C{LEVEL_GLYPH.get(micro['cvd'], micro['cvd'])}<br>{act}",
+                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br>"
+                        f"{micro.get('efi_note','')}<br><b>Algo action:</b> {act}",
+                        "#00E676",
+                    ))
+                    flow = classify_flow_playbook(dfi, data)
+                    if flow.get("ok"):
+                        chips.append(_chip(
+                            f"P{ARROW_GLYPH[flow['price']]} C{ARROW_GLYPH[flow['cvd']]} "
+                            f"D{ARROW_GLYPH[flow['dex']]} $ {ARROW_GLYPH[flow['prem']]}<br>{flow['action']}",
+                            f"<b>Flow playbook (18)</b><br>{flow['hover']}",
+                            "#90CAF9",
+                        ))
+                st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+                if not st.session_state.get("intel_refresh"):
+                    b1, b2 = st.columns([0.50, 0.50])
+                    with b1:
+                        st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                        render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    with b2:
+                        st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                        render_block_tape(data, Index_Name)
+                        st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.info("Futures / VWAP not available.")
+
+        # Delta-GEX (selected) | Heatmap
+        # Multi-exp Delta-GEX   | VEX/CEX
+        # IV Skew 50%           | Z-Scores 50%
+        # Basket Greeks then Strategy Basket Legs
+        if not df_chain.empty and lvls:
+            st.markdown("---")
+            d_left, d_right = st.columns([0.40, 0.60])
+            with d_left:
+                heading_ribbon(
+                    "⚡ VEX / CEX Profile",
+                    "<b>VEX (vanna)</b> ≈ −pdf(d1)×d2/σ × OI × lot — dealer vanna vs spot/IV.<br>"
+                    "<b>CEX (charm)</b> ≈ ∂Δ/∂t × OI × lot — delta decay into expiry.<br>"
+                    "Positive vanna/charm often supports a pin; large negative supports acceleration.",
+                )
+                fig_vex_cex = make_subplots(specs=[[{"secondary_y": True}]])
+                fig_vex_cex.add_trace(plt_go.Bar(x=df_chain["Strike"], y=df_chain["VEX"], name="VEX", marker_color="#00E676", opacity=0.75, width=20), secondary_y=False)
+                fig_vex_cex.add_trace(plt_go.Scatter(x=df_chain["Strike"], y=df_chain["CEX"], name="CEX", line=dict(color="#2196F3", width=2), mode="lines+markers", marker=dict(size=4)), secondary_y=True)
+                fig_vex_cex.add_hline(y=0, line_width=1.2, line_color="#FFFFFF")
+                fig_vex_cex.add_vline(x=data["spot_price"], line_dash="dash", line_color="#FAFAFA", annotation_text="Spot", annotation_font_size=10)
+                vex_range, cex_range = calculate_synced_ranges(df_chain["VEX"].astype(float), df_chain["CEX"].astype(float))
+                fig_vex_cex.update_layout(
+                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                    height=520, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+                )
+                fig_vex_cex.update_xaxes(type="linear", tickformat="d", dtick=100, range=[min_strike_val, max_strike_val])
+                fig_vex_cex.update_yaxes(range=vex_range, secondary_y=False, showgrid=True, gridcolor="#262930", zeroline=True, zerolinecolor="#FFFFFF")
+                fig_vex_cex.update_yaxes(range=cex_range, secondary_y=True, showgrid=False)
+                st.plotly_chart(fig_vex_cex, use_container_width=True)
+
+            with d_right:
+                if st.session_state.get("intel_refresh"):
+                    st.caption("Intelligent refresh — GEX heatmap skipped.")
+                else:
+                    render_delta_gex_heatmap(
+                        data, Index_Name, selected_expiry_str,
+                        st.session_state.get("heatmap_timeframe", "5 min"),
+                    )
+
+            # IV Skew 50% | Z-Scores 50%
+            if st.session_state.get("intel_refresh"):
+                st.caption("Intelligent refresh — IV / Vanna / GEX / book skipped.")
+                skew_col, z_col = None, None
+            else:
+                st.markdown("---")
+                skew_col, z_col = st.columns([0.50, 0.50])
+            if skew_col is not None:
+              with skew_col:
+                heading_ribbon(f"📉 IV Skew ({selected_expiry_str})",
+            "IV from LTP via Black-Scholes (Brent). OTM tab = puts below spot + calls at/above. "
+            "Raw tab = full CE and PE IV curves. VIX tab = India VIX 5-min, last 3 sessions.")
+                smart_api = get_smart_api_client()
+                if smart_api and not df_master.empty:
+                    latest_spot = data["spot_price"]
+                    df_chain_iv = fetch_and_compute_full_chain_iv(
+                        smart_api, df_master, Index_Name, Exchange, selected_expiry_str,
+                        latest_spot, rate_param, strikes_below=strikes_below, strikes_above=strikes_above,
+                    )
+                    if not df_chain_iv.empty:
+                        tab1, tab2, tab3 = st.tabs(["OTM Skew (Puts & Calls)", "Both Raw Curves (CE vs PE)", "INDIA VIX"])
+                        with tab1:
+                            df_skew = get_clean_otm_skew(df_chain_iv, latest_spot)
+                            fig_skew = px.line(df_skew, x="Strike", y="IV_%", markers=True, color_discrete_sequence=["#00bfff"], hover_data=["Option_Type", "LTP"])
+                            fig_skew.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
+                            fig_skew.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), showlegend=False)
+                            st.plotly_chart(fig_skew, use_container_width=True)
+                        with tab2:
+                            fig_raw = px.line(df_chain_iv, x="Strike", y="IV_%", color="Option_Type", markers=True, color_discrete_map={"CE": "#00cc96", "PE": "#ff4136"}, hover_data=["LTP"])
+                            fig_raw.add_vline(x=latest_spot, line_dash="dash", line_color="white", annotation_text="Spot", annotation_font_size=10)
+                            fig_raw.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", height=360, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)))
+                            st.plotly_chart(fig_raw, use_container_width=True)
+                        with tab3:
+                            df_vix, vix_pct, vix_day = fetch_india_vix_sessions(smart_api)
+                            if df_vix.empty:
+                                st.info("India VIX candles unavailable.")
+                            else:
+                                colr = "#00E676" if (vix_pct or 0) >= 0 else "#FF5252"
+                                st.markdown(
+                                    f"<div style='font-size:18px;font-weight:800;color:{colr};'>"
+                                    f"INDIA VIX {float(df_vix['close'].iloc[-1]):.2f}  "
+                                    f"{vix_pct:+.2f}% <span style='font-size:12px;font-weight:500;color:#AAA;'>"
+                                    f"({vix_day} session)</span></div>",
+                                    unsafe_allow_html=True
+                                )
+                                fig_vix = plt_go.Figure()
+                                fig_vix.add_trace(plt_go.Scatter(
+                                    x=df_vix["time_str"], y=df_vix["close"], mode="lines",
+                                    line=dict(color="#FFD54F", width=2), name="VIX",
+                                ))
+                                fig_vix.update_layout(
+                                    template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                    height=320, margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
+                                )
+                                fig_vix.update_xaxes(type="category", nticks=8)
+                                fig_vix.update_yaxes(title="VIX")
+                                st.plotly_chart(fig_vix, use_container_width=True)
+                                st.caption("% is last session open→close. Chart = last 3 trading sessions.")
+                    else:
+                        st.info("Skew data unavailable.")
+                else:
+                    st.info("API session needed for skew.")
+            if z_col is not None:
+              with z_col:
+                zscore_analysis_fragment(mode="highlights")
+
+        elif not df_chain.empty:
+            st.info("Key levels not available – GEX charts skipped.")
+
+        # Basket Greeks ABOVE Strategy Basket Legs
+        st.markdown("---")
+        render_basket_metrics_block(data)
+        render_basket_table_fullwidth(data)
+
+
+live_dashboard_fragment()
+
+# --- Full-width: Institutional Order Flow, then Raw Z-Score details ---
+st.markdown("---")
+institutional_order_flow_scanner_fragment()
+st.markdown("---")
+zscore_analysis_fragment(mode="raw")
+
+# Clear loading status once full UI has rendered
+try:
+    clear_load_status()
+except Exception:
+    pass
