@@ -1016,12 +1016,42 @@ def classify_va_setup(dfi: pd.DataFrame, data: dict = None) -> dict:
         else:
             code = "CHOP"
 
+    # Range-only VWAP side gate: no shorts below VWAP, no longs above VWAP.
+    if reg.get("regime") == "RANGE":
+        vw_gate = None
+        if "vwap_idx" in d.columns:
+            try:
+                vw_gate = float(_series_num(d["vwap_idx"]).iloc[-1])
+            except Exception:
+                vw_gate = None
+        if vw_gate is None and "vwap" in d.columns:
+            try:
+                vw_gate = float(_series_num(d["vwap"]).iloc[-1])
+            except Exception:
+                vw_gate = None
+        if vw_gate is not None and last == last:
+            short_codes = {"M1S_ENTRY", "M1S_WATCH", "M1S_ADD"}
+            long_codes = {"M1L_ENTRY", "M1L_WATCH", "M1L_ADD"}
+            if last < vw_gate and code in short_codes:
+                code = "INSIDE"
+            elif last > vw_gate and code in long_codes:
+                code = "INSIDE"
+
     micro, action = VA_PLAYBOOK.get(code, VA_PLAYBOOK["CHOP"])
     glyphs = " ".join(LEVEL_GLYPH.get(k, "→") for k in (p_arr, d_arr, e_arr, c_arr))
     note = (
         f"{reg['note']} · {loc} z={loc_z:+.2f} · ΔΣ5={dv_sum:.0f} · "
         f"EFIsl={efi_sl:+.2f} p={efi_p:.2f} · Pxsl={px_sl:+.4f}"
     )
+    if reg.get("regime") == "RANGE":
+        try:
+            vw_show = float(_series_num(d["vwap_idx" if "vwap_idx" in d.columns else "vwap"]).iloc[-1])
+            if last < vw_show:
+                note += " · RANGE gate: px<VWAP → shorts blocked"
+            elif last > vw_show:
+                note += " · RANGE gate: px>VWAP → longs blocked"
+        except Exception:
+            pass
     hover = (
         f"{glyphs}<br><b>{action}</b><br>{micro}<br>{note}<br>"
         f"VAH {vah} VAL {val} POC {poc}"
@@ -5263,7 +5293,7 @@ def live_dashboard_fragment():
                     dfi_g = st.session_state.get("_last_dfi")
                     scores_g = st.session_state.get("_last_scores") or {}
                     data_g = st.session_state.get("data_store") or {}
-                    micro_g = classify_microstructure(dfi_g) if dfi_g is not None else {}
+                    micro_g = classify_microstructure(dfi_g, data) if dfi_g is not None else {}
                     flow_g = classify_flow_playbook(dfi_g, data_g) if dfi_g is not None else {}
                     digest = build_gemini_digest(data_g, dfi_g, scores_g, micro_g, flow_g, {})
                     maybe_gemini_regular(digest)
@@ -6448,7 +6478,7 @@ def live_dashboard_fragment():
                 trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
                 st.session_state["_last_dfi"] = dfi
                 st.session_state["_last_scores"] = scores if isinstance(scores, dict) else {}
-                micro = classify_microstructure(dfi)
+                micro = classify_microstructure(dfi, data)
                 candle_pat = detect_candle_pattern(dfi)
                 raw_act = micro.get("action") if isinstance(micro, dict) else ""
                 filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
@@ -6491,7 +6521,7 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=2)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=2)
                 if "micro" not in dir() or not isinstance(micro, dict):
-                    micro = classify_microstructure(dfi)
+                    micro = classify_microstructure(dfi, data)
                     candle_pat = detect_candle_pattern(dfi)
                     raw_act = micro.get("action") if isinstance(micro, dict) else ""
                     filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
@@ -6514,6 +6544,24 @@ def live_dashboard_fragment():
                             f"VA · {micro.get('regime','')} · {micro.get('model','')} · raw {micro.get('action_raw') or '—'} → "
                             f"{micro.get('action')} · {micro.get('candle_why') or ''}"
                         )
+                    try:
+                        regime = str((micro or {}).get("regime") or "CHOP").upper()
+                        label = {"RANGE": "RANGEBOUND", "TREND": "TRENDING", "CHOP": "CHOP / MIXED"}.get(regime, regime)
+                        colr = {"RANGE": "#FFD54F", "TREND": "#00E676", "CHOP": "#90A4AE"}.get(regime, "#90A4AE")
+                        x0 = axis_times[0] if axis_times else (dfi["time_str"].iloc[0] if "time_str" in dfi.columns else None)
+                        y_lab = y1 if y1 is not None else None
+                        if x0 is not None and y_lab is not None:
+                            fig_stack.add_annotation(
+                                x=x0, y=y_lab,
+                                text=f"<b>{label}</b>",
+                                showarrow=False, xanchor="left", yanchor="top",
+                                font=dict(size=13, color=colr),
+                                bgcolor="rgba(14,17,23,0.65)",
+                                bordercolor=colr, borderwidth=1,
+                                row=1, col=2,
+                            )
+                    except Exception:
+                        pass
                     st.plotly_chart(fig_stack, use_container_width=True)
                     if pdec_hist:
                         with st.expander(f"VA session log ({len(pdec_hist)} bars)", expanded=False):
