@@ -2101,7 +2101,7 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
         target_to = now_dt - datetime.timedelta(days=offset)
         if live and target_to.date() != today:
             continue
-        target_from = target_to - datetime.timedelta(days=lookback_days)
+        target_from = target_to if int(lookback_days or 0) <= 0 else target_to - datetime.timedelta(days=lookback_days)
         candle_param = {
             "exchange": exchange,
             "symboltoken": spot_token,
@@ -2872,7 +2872,7 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
         target_to = now_dt - datetime.timedelta(days=offset)
         if target_to.weekday() >= 5:
             continue
-        target_from = target_to - datetime.timedelta(days=lookback_days)
+        target_from = target_to if int(lookback_days or 0) <= 0 else target_to - datetime.timedelta(days=lookback_days)
         candle_param = {
             "exchange": fut_exch,
             "symboltoken": str(fut_token),
@@ -3186,8 +3186,8 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
 
 interval_mapping = {
-    "1 min": ("ONE_MINUTE", 5),
-    "2 min": ("ONE_MINUTE", 5),
+    "1 min": ("ONE_MINUTE", 0),
+    "2 min": ("ONE_MINUTE", 0),
     "3 min": ("THREE_MINUTE", 10),
     "5 min": ("FIVE_MINUTE", 15),
     "10 min": ("TEN_MINUTE", 20),
@@ -5123,7 +5123,10 @@ def refresh_index_tapes(data, want_tf):
         if not smart_api:
             return data
         api_interval, lookback_days = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
-        lookback_days = min(int(lookback_days or 5), 4)
+        if "1 min" in str(want_tf) or "2 min" in str(want_tf):
+            lookback_days = 0
+        else:
+            lookback_days = min(int(lookback_days or 5), 2)
         spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
         fut_tok, _ = get_near_month_futures_token(df_master, Index_Name, opt_exch)
         if not spot_token and fut_tok:
@@ -5230,7 +5233,13 @@ def live_dashboard_fragment():
         cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
         st.session_state["atm_live_ok"] = st.checkbox(
             "ATM live", value=st.session_state.get("atm_live_ok", False),
-            key="cb_atm_live", help="Off = 5s loop skips ATM CE/PE candle API.",
+            key="cb_atm_live", help="Fetch ATM CE/PE candles on refresh.",
+        )
+        st.session_state["intel_refresh"] = st.checkbox(
+            "Intelligent refresh",
+            value=st.session_state.get("intel_refresh", False),
+            key="cb_intel_refresh",
+            help="Only index candles + ATM. Skip GEX/DEX/IV/Vanna/heatmap/book.",
         )
         if cb_main != st.session_state["enable_main_refresh"]:
             st.session_state["enable_main_refresh"] = cb_main
@@ -6347,7 +6356,7 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                                 st.rerun()
                     st.markdown("</div>", unsafe_allow_html=True)
                 def _render_atm_tab(tok, lab):
-                    if st.session_state.get("enable_main_refresh") and not st.session_state.get("atm_live_ok"):
+                    if st.session_state.get("enable_main_refresh") and not st.session_state.get("atm_live_ok") and not st.session_state.get("intel_refresh"):
                         st.caption("ATM tape paused during 5s index refresh. Enable “ATM live” to fetch.")
                         cached = st.session_state.get(f"_atm_fig_{lab}")
                         if cached:
@@ -6361,8 +6370,9 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                         if not api or not tok:
                             st.caption("ATM token unavailable this cycle.")
                             return
+                        lb = 0 if str(tf_lab).startswith(("1 ", "2 ")) else 1
                         dfo, _fb = fetch_candles_with_holiday_fallback(
-                            api, str(tok), exch_opt, api_int, 5, f"{Index_Name}_{lab}"
+                            api, str(tok), exch_opt, api_int, lb, f"{Index_Name}_{lab}"
                         )
                         fig_o, act_o = _option_session_figure(
                             dfo, f"ATM {lab}", Index_Name, tf_lab,
@@ -6541,15 +6551,16 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                             "#90CAF9",
                         ))
                 st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
-                b1, b2 = st.columns([0.50, 0.50])
-                with b1:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
-                    st.markdown("</div>", unsafe_allow_html=True)
-                with b2:
-                    st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
-                    render_block_tape(data, Index_Name)
-                    st.markdown("</div>", unsafe_allow_html=True)
+                if not st.session_state.get("intel_refresh"):
+                    b1, b2 = st.columns([0.50, 0.50])
+                    with b1:
+                        st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                        render_liquidity_delta_panel(data, df_fchart, Index_Name, compact=True)
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    with b2:
+                        st.markdown("<div class='chart-card'>", unsafe_allow_html=True)
+                        render_block_tape(data, Index_Name)
+                        st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.info("Futures / VWAP not available.")
 
@@ -6584,15 +6595,23 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 st.plotly_chart(fig_vex_cex, use_container_width=True)
 
             with d_right:
-                render_delta_gex_heatmap(
-                    data, Index_Name, selected_expiry_str,
-                    st.session_state.get("heatmap_timeframe", "5 min"),
-                )
+                if st.session_state.get("intel_refresh"):
+                    st.caption("Intelligent refresh — GEX heatmap skipped.")
+                else:
+                    render_delta_gex_heatmap(
+                        data, Index_Name, selected_expiry_str,
+                        st.session_state.get("heatmap_timeframe", "5 min"),
+                    )
 
             # IV Skew 50% | Z-Scores 50%
-            st.markdown("---")
-            skew_col, z_col = st.columns([0.50, 0.50])
-            with skew_col:
+            if st.session_state.get("intel_refresh"):
+                st.caption("Intelligent refresh — IV / Vanna / GEX / book skipped.")
+                skew_col, z_col = None, None
+            else:
+                st.markdown("---")
+                skew_col, z_col = st.columns([0.50, 0.50])
+            if skew_col is not None:
+              with skew_col:
                 heading_ribbon(f"📉 IV Skew ({selected_expiry_str})",
             "IV from LTP via Black-Scholes (Brent). OTM tab = puts below spot + calls at/above. "
             "Raw tab = full CE and PE IV curves. VIX tab = India VIX 5-min, last 3 sessions.")
@@ -6646,7 +6665,8 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                         st.info("Skew data unavailable.")
                 else:
                     st.info("API session needed for skew.")
-            with z_col:
+            if z_col is not None:
+              with z_col:
                 zscore_analysis_fragment(mode="highlights")
 
         elif not df_chain.empty:
