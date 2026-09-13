@@ -18,7 +18,9 @@ import math
 import os
 import threading
 import time
+import urllib.request
 from collections import deque
+from datetime import date
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -33,9 +35,42 @@ HOST = os.getenv("TAPE_HOST", "0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
 PORT = int(os.getenv("PORT") or os.getenv("TAPE_PORT", "8765"))
 BAR_SECONDS = int(os.getenv("TAPE_BAR_SECONDS", "180"))  # 3-min bars by default
 NIFTY_TOKEN = os.getenv("NIFTY_TOKEN", "99926000")
-# Near-month Nifty futures token — set this or the server will LTP-only on index.
+# Optional override. If empty, nearest Nifty futures token is downloaded from Angel.
 FUT_TOKEN = os.getenv("FUT_TOKEN", "")
 FUT_EXCHANGE_TYPE = int(os.getenv("FUT_EXCHANGE_TYPE", "2"))  # NFO = 2
+SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+
+
+def resolve_nifty_fut_token() -> str:
+    """Nearest unexpired NIFTY index future on NFO. Same idea as the Streamlit app."""
+    if FUT_TOKEN:
+        return str(FUT_TOKEN)
+    try:
+        with urllib.request.urlopen(SCRIP_MASTER_URL, timeout=30) as resp:
+            rows = json.loads(resp.read().decode())
+        today = date.today()
+        best = None
+        for r in rows:
+            if str(r.get("name", "")).upper() != "NIFTY":
+                continue
+            if str(r.get("exch_seg", "")).upper() != "NFO":
+                continue
+            if str(r.get("instrumenttype", "")).upper() != "FUTIDX":
+                continue
+            exp = pd.to_datetime(r.get("expiry"), format="%d%b%Y", errors="coerce")
+            if pd.isna(exp) or exp.date() < today:
+                continue
+            tok = str(r.get("token") or "")
+            if not tok:
+                continue
+            if best is None or exp.date() < best[0]:
+                best = (exp.date(), tok, r.get("symbol"))
+        if best:
+            print(f"auto futures token {best[2]} expiry {best[0]} token {best[1]}")
+            return best[1]
+    except Exception as e:
+        print("fut token lookup failed", e)
+    return ""
 
 HERE = Path(__file__).resolve().parent
 HTML_PATH = HERE / "live_tape.html"
@@ -302,6 +337,7 @@ def angel_thread():
     feed = api.getfeedToken()
     sws = SmartWebSocketV2(jwt, api_key, client, feed)
 
+    fut_token = resolve_nifty_fut_token()
     last_spot = {"px": None}
     last_fut = {"px": None, "vol": 0.0}
 
@@ -319,11 +355,10 @@ def angel_thread():
             ts = float(msg.get("exchange_timestamp") or time.time() * 1000) / 1000.0
             if token == str(NIFTY_TOKEN):
                 last_spot["px"] = px
-                if not FUT_TOKEN:
+                if not fut_token:
                     BARS.on_tick(ts, px, 0.0, spot=px)
-            elif FUT_TOKEN and token == str(FUT_TOKEN):
+            elif fut_token and token == str(fut_token):
                 last_fut["px"] = px
-                # use increment if we only get cumulative volume
                 day_v = float(msg.get("volume_trade_for_the_day") or 0)
                 inc = 0.0
                 if day_v and last_fut["vol"] and day_v >= last_fut["vol"]:
@@ -336,8 +371,8 @@ def angel_thread():
 
     def on_open(_ws):
         tokens = [{"exchangeType": 1, "tokens": [str(NIFTY_TOKEN)]}]
-        if FUT_TOKEN:
-            tokens.append({"exchangeType": FUT_EXCHANGE_TYPE, "tokens": [str(FUT_TOKEN)]})
+        if fut_token:
+            tokens.append({"exchangeType": FUT_EXCHANGE_TYPE, "tokens": [str(fut_token)]})
         sws.subscribe("tape01", 3, tokens)
         print("subscribed", tokens)
 
