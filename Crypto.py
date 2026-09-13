@@ -1929,20 +1929,25 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
 def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX"):
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
-    live, today, _, _ = market_session_state(now_dt)
+    live, today, _, _ = market_session_state(now_dt, index_name)
     cached = load_session_cache("spot", index_name, api_interval, today)
-    offsets = [0] if live else list(range(0, 10))
+    offsets = [0] if live else list(range(0, 16))
     for offset in offsets:
         target_to = now_dt - datetime.timedelta(days=offset)
+        if target_to.weekday() >= 5:
+            continue
         if live and target_to.date() != today:
             continue
-        target_from = target_to if int(lookback_days or 0) <= 0 else target_to - datetime.timedelta(days=lookback_days)
+        sh = session_hours(index_name)
+        # off-hours: still pull that session's full window, never lookback=0 on a blank day
+        days_back = 0 if live else max(int(lookback_days or 0), 0)
+        target_from = target_to if days_back <= 0 else target_to - datetime.timedelta(days=days_back)
         candle_param = {
             "exchange": exchange,
             "symboltoken": spot_token,
             "interval": api_interval,
-            "fromdate": target_from.strftime(f"%Y-%m-%d {session_hours()[4]}"),
-            "todate": target_to.strftime(f"%Y-%m-%d {session_hours()[5]}")
+            "fromdate": target_from.strftime(f"%Y-%m-%d {sh[4]}"),
+            "todate": target_to.strftime(f"%Y-%m-%d {sh[5]}")
         }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
         time.sleep(0.20)
@@ -3264,10 +3269,8 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             spot_price = float(spot_resp["data"]["ltp"])
         elif Index_Name == "SENSEX":
             spot_price = 80000.0
-        elif Index_Name in MCX_NAME_ALIASES:
-            spot_price = 0.0
         else:
-            spot_price = 24500.0
+            spot_price = 0.0
 
         hv_key = f"hv_{Index_Name}_{hv_days}"
         hv_ts = st.session_state.get("_hv_ts") or 0
@@ -3291,6 +3294,11 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         df_futures, fut_is_fallback, basis_info, fut_fallback_msg = fetch_futures_candles_with_vwap(
             smart_api, Index_Name, df_master, api_interval, lookback_days
         )
+        if (not spot_price) or float(spot_price) <= 0:
+            for src in (df_futures, df_candles):
+                if src is not None and not getattr(src, "empty", True) and "close" in src.columns:
+                    spot_price = float(src["close"].iloc[-1])
+                    break
 
         now_dt = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
         expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
@@ -5375,6 +5383,12 @@ def refresh_index_tapes(data, want_tf):
             data["fut_is_fallback"] = fut_fb
             data["basis_info"] = basis_info
             data["fut_fallback_msg"] = fut_msg
+        if not data.get("spot_price"):
+            src = data.get("df_futures")
+            if src is None or getattr(src, "empty", True):
+                src = data.get("df_candles")
+            if src is not None and not getattr(src, "empty", True):
+                data["spot_price"] = float(src["close"].iloc[-1])
         data["bar_tf"] = want_tf
         data["timestamp"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d-%b-%Y %H:%M:%S IST")
         try:
