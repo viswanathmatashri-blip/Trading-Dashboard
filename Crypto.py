@@ -136,8 +136,6 @@ if "replay_session_on" not in st.session_state:
     st.session_state["replay_session_on"] = False
 if "replay_session_date" not in st.session_state:
     st.session_state["replay_session_date"] = None
-if "regime_mode" not in st.session_state:
-    st.session_state["regime_mode"] = "AUTO"
 if "px_alert_on" not in st.session_state:
     st.session_state["px_alert_on"] = False
 if "px_alert_lvl" not in st.session_state:
@@ -895,12 +893,6 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
         regime = "TREND"
     else:
         regime = "CHOP"
-    auto_regime = regime
-    ovr = str(st.session_state.get("regime_mode") or "AUTO").upper()
-    if ovr in ("RANGEBOUND", "RANGE"):
-        regime = "RANGE"
-    elif ovr in ("TRENDING", "TREND"):
-        regime = "TREND"
     out.update({
         "regime": regime, "score_range": round(s_range, 2), "score_trend": round(s_trend, 2),
         "eff": round(eff, 3), "atr_pct": round(atrp * 100.0, 3), "density": round(dens, 3),
@@ -908,13 +900,7 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
         "vah": float(vah) if vah else None, "val": float(val) if val else None,
         "poc": float(vp.get("poc")) if isinstance(vp, dict) and vp.get("poc") else None,
         "vp": vp if isinstance(vp, dict) else {},
-        "auto_regime": auto_regime,
-        "regime_src": "AUTO" if ovr == "AUTO" else ovr,
-        "note": (
-            f"{regime} dens={dens:.2f} eff={eff:.2f} zVWAP={vz:+.2f} "
-            f"GEX={'+' if gex_sign>0 else ('-' if gex_sign<0 else '0')}"
-            + ("" if ovr == "AUTO" else f" · override {ovr} (auto was {auto_regime})")
-        ),
+        "note": f"{regime} dens={dens:.2f} eff={eff:.2f} zVWAP={vz:+.2f} GEX={'+' if gex_sign>0 else ('-' if gex_sign<0 else '0')}",
     })
     return out
 
@@ -1030,42 +1016,12 @@ def classify_va_setup(dfi: pd.DataFrame, data: dict = None) -> dict:
         else:
             code = "CHOP"
 
-    # Range-only VWAP side gate: no shorts below VWAP, no longs above VWAP.
-    if reg.get("regime") == "RANGE":
-        vw_gate = None
-        if "vwap_idx" in d.columns:
-            try:
-                vw_gate = float(_series_num(d["vwap_idx"]).iloc[-1])
-            except Exception:
-                vw_gate = None
-        if vw_gate is None and "vwap" in d.columns:
-            try:
-                vw_gate = float(_series_num(d["vwap"]).iloc[-1])
-            except Exception:
-                vw_gate = None
-        if vw_gate is not None and last == last:
-            short_codes = {"M1S_ENTRY", "M1S_WATCH", "M1S_ADD"}
-            long_codes = {"M1L_ENTRY", "M1L_WATCH", "M1L_ADD"}
-            if last < vw_gate and code in short_codes:
-                code = "INSIDE"
-            elif last > vw_gate and code in long_codes:
-                code = "INSIDE"
-
     micro, action = VA_PLAYBOOK.get(code, VA_PLAYBOOK["CHOP"])
     glyphs = " ".join(LEVEL_GLYPH.get(k, "→") for k in (p_arr, d_arr, e_arr, c_arr))
     note = (
         f"{reg['note']} · {loc} z={loc_z:+.2f} · ΔΣ5={dv_sum:.0f} · "
         f"EFIsl={efi_sl:+.2f} p={efi_p:.2f} · Pxsl={px_sl:+.4f}"
     )
-    if reg.get("regime") == "RANGE":
-        try:
-            vw_show = float(_series_num(d["vwap_idx" if "vwap_idx" in d.columns else "vwap"]).iloc[-1])
-            if last < vw_show:
-                note += " · RANGE gate: px<VWAP → shorts blocked"
-            elif last > vw_show:
-                note += " · RANGE gate: px>VWAP → longs blocked"
-        except Exception:
-            pass
     hover = (
         f"{glyphs}<br><b>{action}</b><br>{micro}<br>{note}<br>"
         f"VAH {vah} VAL {val} POC {poc}"
@@ -1075,9 +1031,7 @@ def classify_va_setup(dfi: pd.DataFrame, data: dict = None) -> dict:
         "micro": micro + " · " + note, "action": action,
         "price": p_arr, "delta": d_arr, "efi": e_arr, "cvd": c_arr, "obv": d_arr,
         "hover": hover, "efi_zero": False, "efi_note": note,
-        "regime": reg["regime"], "regime_src": reg.get("regime_src", "AUTO"),
-        "auto_regime": reg.get("auto_regime"),
-        "model": code, "loc": loc, "loc_z": loc_z,
+        "regime": reg["regime"], "model": code, "loc": loc, "loc_z": loc_z,
         "vah": vah, "val": val, "poc": poc,
     }
 
@@ -3234,19 +3188,7 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 
         now_dt = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
         expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
-        live_now, _, _, _ = market_session_state(now_dt)
-        # Off-hours: freeze T at last cash close (15:30 IST). Continuous wall-clock
-        # T made |GEX| climb overnight (gamma ∝ 1/√T) even though OI was unchanged.
-        t_anchor = now_dt
-        if not live_now:
-            close_today = now_dt.replace(hour=15, minute=30, second=0, microsecond=0)
-            if now_dt >= close_today:
-                t_anchor = close_today
-            else:
-                t_anchor = close_today - datetime.timedelta(days=1)
-            while t_anchor.weekday() >= 5:
-                t_anchor -= datetime.timedelta(days=1)
-        time_diff_seconds = (expiry_datetime - t_anchor).total_seconds()
+        time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
         T = max(time_diff_seconds / (365.0 * 24 * 3600), 1e-5)
 
         atm_strike = min(all_expiry_strikes, key=lambda x: abs(x - spot_price)) if all_expiry_strikes else spot_price
@@ -3299,20 +3241,9 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                         or 0
                     )
 
-                    oi_raw = (
-                        item.get("opnInterest")
-                        or item.get("openInterest")
-                        or item.get("oi")
-                        or item.get("OPNINTEREST")
-                        or 0
-                    )
-                    try:
-                        oi_val = int(float(oi_raw))
-                    except Exception:
-                        oi_val = 0
                     market_data[str(item["symbolToken"])] = {
                         "ltp": float(item.get("ltp", 0.0)),
-                        "oi": oi_val,
+                        "oi": int(item.get("opnInterest", 0)),
                         "volume": int(vol_val),
                         "best_bid": float(item.get("bestBidPrice", item.get("ltp", 0.0))),
                         "best_ask": float(item.get("bestAskPrice", item.get("ltp", 0.0)))
@@ -3450,16 +3381,6 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         update_p(1.0, "Done!")
         if p_bar: p_bar.empty()
         if p_status: p_status.empty()
-
-        # Keep last good GEX if this fetch lost most OI (rate-limit / closed-book zeros).
-        prev = st.session_state.get("data_store") or {}
-        prev_coi = float(prev.get("total_call_oi") or 0) + float(prev.get("total_put_oi") or 0)
-        now_coi = float(total_call_oi or 0) + float(total_put_oi or 0)
-        if prev_coi > 0 and now_coi < 0.45 * prev_coi and prev.get("total_net_gex_oi") is not None:
-            total_net_gex_oi = float(prev.get("total_net_gex_oi") or total_net_gex_oi)
-            total_net_gex_vol = float(prev.get("total_net_gex_vol") or total_net_gex_vol)
-            if prev.get("chain_results"):
-                chain_results = prev["chain_results"]
 
         return {
             "spot_price": spot_price, "F": F, "T": T, "index_hv": index_hv, "iv_percentile": iv_percentile,
@@ -5342,7 +5263,7 @@ def live_dashboard_fragment():
                     dfi_g = st.session_state.get("_last_dfi")
                     scores_g = st.session_state.get("_last_scores") or {}
                     data_g = st.session_state.get("data_store") or {}
-                    micro_g = classify_microstructure(dfi_g, data) if dfi_g is not None else {}
+                    micro_g = classify_microstructure(dfi_g) if dfi_g is not None else {}
                     flow_g = classify_flow_playbook(dfi_g, data_g) if dfi_g is not None else {}
                     digest = build_gemini_digest(data_g, dfi_g, scores_g, micro_g, flow_g, {})
                     maybe_gemini_regular(digest)
@@ -5868,39 +5789,15 @@ def live_dashboard_fragment():
                     format_func=lambda x: f"±{x}σ", key="vwap_sigma_select",
                     label_visibility="collapsed"
                 )
-            tw, al, av, rp_chk, rp_date = st.columns([0.18, 0.26, 0.20, 0.12, 0.24])
-            with rp_chk:
+            tw, al, av, rp = st.columns([0.22, 0.34, 0.22, 0.22])
+            with rp:
                 replay_on = st.checkbox(
                     "Replay day",
                     value=bool(st.session_state.get("replay_session_on")),
                     key="replay_session_chk",
-                    help="Pin this pane to one past trading session.",
+                    help="Pin this pane to one past trading session. VWAP, EFI, CVD, VP and VA labels recompute on that day only.",
                 )
                 st.session_state["replay_session_on"] = replay_on
-            with rp_date:
-                today_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date()
-                default_day = st.session_state.get("replay_session_date") or today_ist
-                try:
-                    picked = st.date_input(
-                        "Replay date",
-                        value=default_day,
-                        min_value=today_ist - datetime.timedelta(days=60),
-                        max_value=today_ist,
-                        key="replay_session_date_input",
-                        format="DD-MM-YYYY",
-                    )
-                except TypeError:
-                    picked = st.date_input(
-                        "Replay date",
-                        value=default_day,
-                        min_value=today_ist - datetime.timedelta(days=60),
-                        max_value=today_ist,
-                        key="replay_session_date_input",
-                    )
-                if picked and picked != st.session_state.get("replay_session_date"):
-                    st.session_state["replay_session_date"] = picked
-                    if picked != today_ist:
-                        st.session_state["replay_session_on"] = True
             with tw:
                 st.session_state["chart_window"] = st.radio(
                     "Window", ["Session (6h)", "3h", "1h"], horizontal=True,
@@ -5943,16 +5840,76 @@ def live_dashboard_fragment():
                         key="big_trd_min", label_visibility="collapsed",
                     )
 
-            st.session_state["regime_mode"] = st.radio(
-                "Regime",
-                options=["AUTO", "RANGEBOUND", "TRENDING"],
-                index=["AUTO", "RANGEBOUND", "TRENDING"].index(
-                    st.session_state.get("regime_mode") or "AUTO"
-                ) if (st.session_state.get("regime_mode") or "AUTO") in ("AUTO", "RANGEBOUND", "TRENDING") else 0,
-                horizontal=True,
-                key="regime_mode_radio",
-                help="AUTO = density/efficiency/GEX score. RANGEBOUND forces Model 1. TRENDING forces Model 2.",
-            )
+            if st.session_state.get("replay_session_on"):
+                today_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date()
+                known = []
+                try:
+                    src = data.get("df_futures")
+                    if src is not None and not getattr(src, "empty", True) and "time" in src.columns:
+                        known = sorted({d for d in pd.to_datetime(series_to_ist(src["time"])).dt.date.unique()})
+                except Exception:
+                    known = []
+                default_day = st.session_state.get("replay_session_date") or (known[-1] if known else today_ist)
+                st.markdown(
+                    "<div style='color:#00E676;font-size:12px;font-weight:700;margin:4px 0 2px 0;'>"
+                    "Replay session date</div>",
+                    unsafe_allow_html=True,
+                )
+                d1, d2, d3, d4 = st.columns([0.28, 0.28, 0.22, 0.22])
+                with d1:
+                    try:
+                        picked = st.date_input(
+                            "Calendar",
+                            value=default_day,
+                            min_value=today_ist - datetime.timedelta(days=60),
+                            max_value=today_ist,
+                            key="replay_session_date_input",
+                            format="DD-MM-YYYY",
+                        )
+                    except TypeError:
+                        picked = st.date_input(
+                            "Calendar",
+                            value=default_day,
+                            min_value=today_ist - datetime.timedelta(days=60),
+                            max_value=today_ist,
+                            key="replay_session_date_input",
+                        )
+                with d2:
+                    typed = st.text_input(
+                        "Or type DD-MM-YYYY",
+                        value=default_day.strftime("%d-%m-%Y") if default_day else "",
+                        key="replay_session_date_text",
+                        placeholder="05-09-2026",
+                    )
+                    if typed:
+                        try:
+                            parsed = datetime.datetime.strptime(typed.strip(), "%d-%m-%Y").date()
+                            picked = parsed
+                        except Exception:
+                            try:
+                                parsed = datetime.datetime.strptime(typed.strip(), "%Y-%m-%d").date()
+                                picked = parsed
+                            except Exception:
+                                st.caption("Use DD-MM-YYYY")
+                with d3:
+                    if known:
+                        labels = [d.strftime("%d-%b-%Y") for d in known]
+                        cur = default_day.strftime("%d-%b-%Y") if default_day else labels[-1]
+                        idx = labels.index(cur) if cur in labels else len(labels) - 1
+                        sel = st.selectbox("Loaded days", labels, index=idx, key="replay_known_days")
+                        try:
+                            picked = datetime.datetime.strptime(sel, "%d-%b-%Y").date()
+                        except Exception:
+                            pass
+                    else:
+                        st.caption("No days in memory — date above will fetch.")
+                with d4:
+                    if st.button("Load session", key="replay_load_btn"):
+                        st.session_state["replay_session_date"] = picked
+                        st.rerun()
+                    st.caption(f"Active: {picked.strftime('%d-%b-%Y')}")
+                if picked != st.session_state.get("replay_session_date"):
+                    st.session_state["replay_session_date"] = picked
 
             if not df_fchart.empty:
                 df_fchart = df_fchart.copy()
@@ -6538,7 +6495,7 @@ def live_dashboard_fragment():
                 trig = scores.get("dir_trigger") if isinstance(scores, dict) else {}
                 st.session_state["_last_dfi"] = dfi
                 st.session_state["_last_scores"] = scores if isinstance(scores, dict) else {}
-                micro = classify_microstructure(dfi, data)
+                micro = classify_microstructure(dfi)
                 candle_pat = detect_candle_pattern(dfi)
                 raw_act = micro.get("action") if isinstance(micro, dict) else ""
                 filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
@@ -6581,7 +6538,7 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="EFI", row=3, col=2)
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=2)
                 if "micro" not in dir() or not isinstance(micro, dict):
-                    micro = classify_microstructure(dfi, data)
+                    micro = classify_microstructure(dfi)
                     candle_pat = detect_candle_pattern(dfi)
                     raw_act = micro.get("action") if isinstance(micro, dict) else ""
                     filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
@@ -6604,27 +6561,6 @@ def live_dashboard_fragment():
                             f"VA · {micro.get('regime','')} · {micro.get('model','')} · raw {micro.get('action_raw') or '—'} → "
                             f"{micro.get('action')} · {micro.get('candle_why') or ''}"
                         )
-                    try:
-                        regime = str((micro or {}).get("regime") or "CHOP").upper()
-                        label = {"RANGE": "RANGEBOUND", "TREND": "TRENDING", "CHOP": "CHOP / MIXED"}.get(regime, regime)
-                        src = str((micro or {}).get("regime_src") or "AUTO")
-                        if src != "AUTO":
-                            label = f"{label} (forced)"
-                        colr = {"RANGE": "#FFD54F", "TREND": "#00E676", "CHOP": "#90A4AE"}.get(regime, "#90A4AE")
-                        x0 = axis_times[0] if axis_times else (dfi["time_str"].iloc[0] if "time_str" in dfi.columns else None)
-                        y_lab = y1 if y1 is not None else None
-                        if x0 is not None and y_lab is not None:
-                            fig_stack.add_annotation(
-                                x=x0, y=y_lab,
-                                text=f"<b>{label}</b>",
-                                showarrow=False, xanchor="left", yanchor="top",
-                                font=dict(size=13, color=colr),
-                                bgcolor="rgba(14,17,23,0.65)",
-                                bordercolor=colr, borderwidth=1,
-                                row=1, col=2,
-                            )
-                    except Exception:
-                        pass
                     st.plotly_chart(fig_stack, use_container_width=True)
                     if pdec_hist:
                         with st.expander(f"VA session log ({len(pdec_hist)} bars)", expanded=False):
