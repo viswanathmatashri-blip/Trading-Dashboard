@@ -3218,7 +3218,19 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 
         now_dt = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
         expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
-        time_diff_seconds = (expiry_datetime - now_dt).total_seconds()
+        live_now, _, _, _ = market_session_state(now_dt)
+        # Off-hours: freeze T at last cash close (15:30 IST). Continuous wall-clock
+        # T made |GEX| climb overnight (gamma ∝ 1/√T) even though OI was unchanged.
+        t_anchor = now_dt
+        if not live_now:
+            close_today = now_dt.replace(hour=15, minute=30, second=0, microsecond=0)
+            if now_dt >= close_today:
+                t_anchor = close_today
+            else:
+                t_anchor = close_today - datetime.timedelta(days=1)
+            while t_anchor.weekday() >= 5:
+                t_anchor -= datetime.timedelta(days=1)
+        time_diff_seconds = (expiry_datetime - t_anchor).total_seconds()
         T = max(time_diff_seconds / (365.0 * 24 * 3600), 1e-5)
 
         atm_strike = min(all_expiry_strikes, key=lambda x: abs(x - spot_price)) if all_expiry_strikes else spot_price
@@ -3271,9 +3283,20 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
                         or 0
                     )
 
+                    oi_raw = (
+                        item.get("opnInterest")
+                        or item.get("openInterest")
+                        or item.get("oi")
+                        or item.get("OPNINTEREST")
+                        or 0
+                    )
+                    try:
+                        oi_val = int(float(oi_raw))
+                    except Exception:
+                        oi_val = 0
                     market_data[str(item["symbolToken"])] = {
                         "ltp": float(item.get("ltp", 0.0)),
-                        "oi": int(item.get("opnInterest", 0)),
+                        "oi": oi_val,
                         "volume": int(vol_val),
                         "best_bid": float(item.get("bestBidPrice", item.get("ltp", 0.0))),
                         "best_ask": float(item.get("bestAskPrice", item.get("ltp", 0.0)))
@@ -3411,6 +3434,16 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         update_p(1.0, "Done!")
         if p_bar: p_bar.empty()
         if p_status: p_status.empty()
+
+        # Keep last good GEX if this fetch lost most OI (rate-limit / closed-book zeros).
+        prev = st.session_state.get("data_store") or {}
+        prev_coi = float(prev.get("total_call_oi") or 0) + float(prev.get("total_put_oi") or 0)
+        now_coi = float(total_call_oi or 0) + float(total_put_oi or 0)
+        if prev_coi > 0 and now_coi < 0.45 * prev_coi and prev.get("total_net_gex_oi") is not None:
+            total_net_gex_oi = float(prev.get("total_net_gex_oi") or total_net_gex_oi)
+            total_net_gex_vol = float(prev.get("total_net_gex_vol") or total_net_gex_vol)
+            if prev.get("chain_results"):
+                chain_results = prev["chain_results"]
 
         return {
             "spot_price": spot_price, "F": F, "T": T, "index_hv": index_hv, "iv_percentile": iv_percentile,
