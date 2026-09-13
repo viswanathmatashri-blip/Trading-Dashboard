@@ -765,10 +765,9 @@ def compute_hourly_greeks(api, spot: float) -> dict:
             vega = spot * _norm_pdf(d1) * math.sqrt(max(T, 1e-9)) * 0.01
             ce_oi = float((sides.get("CE") or {}).get("oi") or 0)
             pe_oi = float((sides.get("PE") or {}).get("oi") or 0)
-            # Streamlit: call_gex - put_gex; no fake gamma on deep ITM
-            call_g = gam if k >= spot - 150 else 0.0
-            put_g = gam if k <= spot + 150 else 0.0
-            gex_k = call_g * ce_oi * gex_scale - put_g * pe_oi * gex_scale
+            if abs(k - spot) > 250:
+                continue
+            gex_k = gam * ce_oi * gex_scale - gam * pe_oi * gex_scale
             vex_k = (vega * ce_oi - vega * pe_oi) * LOT * 0.01
             net_gex += gex_k
             net_vex += vex_k
