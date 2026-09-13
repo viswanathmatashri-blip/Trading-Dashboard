@@ -150,6 +150,24 @@ class SessionBars:
         self.cvd += signed
         self.prev_close = price
 
+    def seed_bar(self, t0: float, o: float, h: float, l: float, c: float, volume: float, spot: float | None = None):
+        signed = 0.0
+        if self.prev_close is not None:
+            signed = volume * (1.0 if c >= self.prev_close else -1.0)
+        self.rows.append({
+            "t0": int(t0),
+            "open": o, "high": h, "low": l, "close": c,
+            "spot": spot if spot else c,
+            "volume": max(volume, 0.0),
+            "delta": signed,
+        })
+        self.pv += ((h + l + c) / 3.0) * max(volume, 0.0)
+        self.vol += max(volume, 0.0)
+        self.cvd += signed
+        self.prev_close = c
+        if len(self.rows) > 240:
+            self.rows = self.rows[-240:]
+
     def vwap(self) -> float | None:
         if self.vol <= 0:
             return self.cur["close"] if self.cur else None
@@ -340,6 +358,42 @@ def angel_thread():
     fut_token = resolve_nifty_fut_token()
     last_spot = {"px": None}
     last_fut = {"px": None, "vol": 0.0}
+
+    def seed_history():
+        """Load last session 3-min futures candles so charts/VA are not empty."""
+        if not fut_token:
+            print("no fut token — skip candle seed")
+            return
+        from datetime import datetime, timedelta
+        to_dt = datetime.now()
+        from_dt = to_dt - timedelta(days=5)
+        interval = "THREE_MINUTE" if BAR_SECONDS <= 180 else "FIVE_MINUTE"
+        param = {
+            "exchange": "NFO",
+            "symboltoken": str(fut_token),
+            "interval": interval,
+            "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+            "todate": to_dt.strftime("%Y-%m-%d 15:30"),
+        }
+        try:
+            res = api.getCandleData(param)
+        except Exception as e:
+            print("seed candles failed", e)
+            return
+        rows = (res or {}).get("data") or []
+        print(f"seeded {len(rows)} {interval} candles")
+        for row in rows:
+            # [timestamp, open, high, low, close, volume]
+            ts = pd.to_datetime(row[0])
+            t0 = ts.timestamp()
+            o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
+            vol = float(row[5] or 0)
+            BARS.seed_bar(t0, o, h, l, c, vol, spot=c)
+        if BARS.rows:
+            last_fut["px"] = float(BARS.rows[-1]["close"])
+            apply_bar_state(last_spot["px"], last_fut["px"])
+
+    seed_history()
 
     def on_data(_ws, msg):
         try:
