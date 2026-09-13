@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nifty live tape</title>
+  <style>
+    :root {
+      --bg: #0a0a0b;
+      --panel: #11151c;
+      --line: #2a3340;
+      --text: #e8eaed;
+      --muted: #8fa4b8;
+      --up: #00e676;
+      --dn: #ff5252;
+      --vwap: #ff9800;
+      --silver: #c8ccd4;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    header {
+      display: flex; align-items: baseline; justify-content: space-between;
+      padding: 10px 14px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 5;
+    }
+    h1 { margin: 0; font-size: 14px; letter-spacing: .08em; text-transform: uppercase; color: var(--silver); font-weight: 700; }
+    #status { color: var(--muted); font-size: 11px; }
+    #status.live { color: var(--up); }
+    #status.dead { color: var(--dn); }
+    .metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; padding: 10px 14px; }
+    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+    .metric .k { color: var(--muted); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+    .metric .v { font-size: 18px; font-weight: 700; margin-top: 2px; }
+    .va {
+      margin: 0 14px 10px; padding: 10px 12px; border-radius: 8px;
+      background: var(--panel); border: 1px solid var(--line);
+    }
+    .va .act { font-size: 16px; font-weight: 800; }
+    .va .micro { color: var(--muted); margin-top: 4px; font-size: 12px; }
+    canvas { width: 100%; height: 280px; display: block; }
+    .charts { padding: 0 14px 16px; display: grid; gap: 8px; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px 2px; }
+    .card h2 { margin: 0 0 4px 4px; font-size: 10px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Nifty tape · VWAP · EFI · CVD · VA</h1>
+    <div id="status">connecting…</div>
+  </header>
+  <div class="metrics">
+    <div class="metric"><div class="k">Nifty</div><div class="v" id="m-spot">—</div></div>
+    <div class="metric"><div class="k">Fut</div><div class="v" id="m-fut">—</div></div>
+    <div class="metric"><div class="k">VWAP</div><div class="v" id="m-vwap">—</div></div>
+    <div class="metric"><div class="k">EFI 13</div><div class="v" id="m-efi">—</div></div>
+    <div class="metric"><div class="k">CVD</div><div class="v" id="m-cvd">—</div></div>
+    <div class="metric"><div class="k">Bar</div><div class="v" id="m-bar">—</div></div>
+  </div>
+  <div class="va">
+    <div class="act" id="va-act">NO ENTRY</div>
+    <div class="micro" id="va-micro">Waiting for bars…</div>
+  </div>
+  <div class="charts">
+    <div class="card"><h2>Nifty + VWAP</h2><canvas id="c-px" height="280"></canvas></div>
+    <div class="card"><h2>EFI 13</h2><canvas id="c-efi" height="140"></canvas></div>
+    <div class="card"><h2>CVD</h2><canvas id="c-cvd" height="140"></canvas></div>
+  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $("status");
+    const canvases = {
+      px: $("c-px"),
+      efi: $("c-efi"),
+      cvd: $("c-cvd"),
+    };
+
+    let state = { bars: [], spot: null, fut: null, vwap: null, efi: null, cvd: null, va: {} };
+
+    function fmt(n, d = 1) {
+      if (n == null || Number.isNaN(n)) return "—";
+      return Number(n).toLocaleString("en-IN", { maximumFractionDigits: d, minimumFractionDigits: d });
+    }
+    function paint(up) {
+      return up ? getComputedStyle(document.documentElement).getPropertyValue("--up") : getComputedStyle(document.documentElement).getPropertyValue("--dn");
+    }
+
+    function drawLine(canvas, series, color, zero = false) {
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width = canvas.clientWidth * devicePixelRatio;
+      const h = canvas.height = canvas.clientHeight * devicePixelRatio;
+      ctx.clearRect(0, 0, w, h);
+      const vals = series.filter((v) => v != null && !Number.isNaN(v));
+      if (vals.length < 2) return;
+      let lo = Math.min(...vals), hi = Math.max(...vals);
+      if (zero) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+      if (hi === lo) { hi += 1; lo -= 1; }
+      const pad = (hi - lo) * 0.08;
+      hi += pad; lo -= pad;
+      const x = (i) => (i / (series.length - 1)) * w;
+      const y = (v) => h - ((v - lo) / (hi - lo)) * h;
+      if (zero) {
+        ctx.strokeStyle = "rgba(255,255,255,.25)";
+        ctx.beginPath(); ctx.moveTo(0, y(0)); ctx.lineTo(w, y(0)); ctx.stroke();
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.6 * devicePixelRatio;
+      ctx.beginPath();
+      let started = false;
+      series.forEach((v, i) => {
+        if (v == null) return;
+        if (!started) { ctx.moveTo(x(i), y(v)); started = true; }
+        else ctx.lineTo(x(i), y(v));
+      });
+      ctx.stroke();
+    }
+
+    function render() {
+      const bars = state.bars || [];
+      $("m-spot").textContent = fmt(state.spot, 1);
+      $("m-fut").textContent = fmt(state.fut, 1);
+      $("m-vwap").textContent = fmt(state.vwap, 1);
+      $("m-efi").textContent = fmt(state.efi, 0);
+      $("m-cvd").textContent = fmt(state.cvd, 0);
+      $("m-bar").textContent = state.bar_tf || "—";
+      const act = (state.va && state.va.action) || "NO ENTRY";
+      $("va-act").textContent = act;
+      $("va-act").style.color = /SHORT/.test(act) ? paint(false) : /LONG/.test(act) ? paint(true) : "#ff9800";
+      $("va-micro").textContent = (state.va && state.va.micro) || "";
+      drawLine(canvases.px, bars.map((b) => b.close), "#2196F3");
+      // overlay VWAP
+      const ctx = canvases.px.getContext("2d");
+      const vw = bars.map((b) => b.vwap);
+      if (vw.filter((v) => v != null).length > 1) {
+        const w = canvases.px.width, h = canvases.px.height;
+        const closes = bars.map((b) => b.close).filter((v) => v != null);
+        let lo = Math.min(...closes, ...vw.filter((v) => v != null));
+        let hi = Math.max(...closes, ...vw.filter((v) => v != null));
+        const pad = (hi - lo) * 0.08 || 1;
+        hi += pad; lo -= pad;
+        const x = (i) => (i / (bars.length - 1)) * w;
+        const y = (v) => h - ((v - lo) / (hi - lo)) * h;
+        ctx.strokeStyle = "#ff9800";
+        ctx.lineWidth = 1.4 * devicePixelRatio;
+        ctx.beginPath();
+        vw.forEach((v, i) => { if (v == null) return; i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)); });
+        ctx.stroke();
+      }
+      drawLine(canvases.efi, bars.map((b) => b.efi13), state.efi >= 0 ? "#00e676" : "#ff5252", true);
+      drawLine(canvases.cvd, bars.map((b) => b.cvd), "#b0bec5", true);
+    }
+
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.onopen = () => { statusEl.textContent = "live"; statusEl.className = "live"; };
+      ws.onclose = () => {
+        statusEl.textContent = "disconnected — retrying";
+        statusEl.className = "dead";
+        setTimeout(connect, 1500);
+      };
+      ws.onerror = () => ws.close();
+      ws.onmessage = (ev) => {
+        try { state = JSON.parse(ev.data); render(); } catch (e) {}
+      };
+    }
+    connect();
+    window.addEventListener("resize", render);
+  </script>
+</body>
+</html>
