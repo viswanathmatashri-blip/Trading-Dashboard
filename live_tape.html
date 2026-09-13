@@ -119,8 +119,14 @@
       let lo = Math.min(...lows), hi = Math.max(...highs);
       const va = state.va || {};
       const lv0 = state.levels || {};
-      [va.vah, va.val, va.poc, va.pdh, va.pdl, state.vwap, lv0.put_wall, lv0.call_wall, lv0.flip].forEach((v) => {
+      [va.vah, va.val, va.poc, va.pdh, va.pdl, state.vwap, lv0.put_wall, lv0.call_wall, lv0.flip,
+       va.vah80, va.val80, va.vah1, va.val1, va.vah15, va.val15].forEach((v) => {
         if (v) { lo = Math.min(lo, +v); hi = Math.max(hi, +v); }
+      });
+      (va.zones || []).forEach((z) => {
+        [z.vah, z.val, z.poc].forEach((v) => {
+          if (v) { lo = Math.min(lo, +v); hi = Math.max(hi, +v); }
+        });
       });
       const padPx = (hi - lo) * 0.06 || 8;
       lo -= padPx; hi += padPx;
@@ -167,7 +173,18 @@
         [(state.levels || {}).put_wall, "#00e676", "Put wall"],
         [(state.levels || {}).call_wall, "#ff5252", "Call wall"],
         [(state.levels || {}).flip, "#ffb300", "Flip"],
+        [va.vah80, "#64b5f6", "VAH80"],
+        [va.val80, "#81c784", "VAL80"],
+        [va.vah1, "#90caf9", "VAH1σ"],
+        [va.val1, "#a5d6a7", "VAL1σ"],
+        [va.vah15, "#4fc3f7", "VAH1.5σ"],
+        [va.val15, "#66bb6a", "VAL1.5σ"],
       ];
+      (va.zones || []).forEach((z, zi) => {
+        levels.push([z.vah, "#4dd0e1", (z.tag || "VA") + "H"]);
+        levels.push([z.val, "#80cbc4", (z.tag || "VA") + "L"]);
+        levels.push([z.poc, "#ffe082", (z.tag || "VA") + "P"]);
+      });
       levels.forEach(([v, col, name]) => {
         if (!v) return;
         const y = yPx(v);
