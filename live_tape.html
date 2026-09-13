@@ -6,45 +6,33 @@
   <title>Nifty live tape</title>
   <style>
     :root {
-      --bg: #0a0a0b;
-      --panel: #11151c;
-      --line: #2a3340;
-      --text: #e8eaed;
-      --muted: #8fa4b8;
-      --up: #00e676;
-      --dn: #ff5252;
-      --vwap: #ff9800;
-      --silver: #c8ccd4;
+      --bg: #0a0a0b; --panel: #11151c; --line: #2a3340; --text: #e8eaed;
+      --muted: #8fa4b8; --up: #26a69a; --dn: #ef5350; --vwap: #ff9800; --silver: #c8ccd4;
     }
     * { box-sizing: border-box; }
-    html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 ui-sans-serif, system-ui, sans-serif; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.35 ui-sans-serif, system-ui, sans-serif; }
     header {
       display: flex; align-items: baseline; justify-content: space-between;
-      padding: 10px 14px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 5;
+      padding: 8px 12px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 5;
     }
-    h1 { margin: 0; font-size: 14px; letter-spacing: .08em; text-transform: uppercase; color: var(--silver); font-weight: 700; }
-    #status { color: var(--muted); font-size: 11px; }
-    #status.live { color: var(--up); }
-    #status.dead { color: var(--dn); }
-    .metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; padding: 10px 14px; }
-    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+    h1 { margin: 0; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--silver); }
+    #status { font-size: 11px; color: var(--muted); }
+    #status.live { color: #00e676; }
+    #status.dead { color: #ff5252; }
+    .metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; padding: 8px 12px; }
+    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
     .metric .k { color: var(--muted); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
-    .metric .v { font-size: 18px; font-weight: 700; margin-top: 2px; }
-    .va {
-      margin: 0 14px 10px; padding: 10px 12px; border-radius: 8px;
-      background: var(--panel); border: 1px solid var(--line);
-    }
-    .va .act { font-size: 16px; font-weight: 800; }
-    .va .micro { color: var(--muted); margin-top: 4px; font-size: 12px; }
-    canvas { width: 100%; height: 280px; display: block; }
-    .charts { padding: 0 14px 16px; display: grid; gap: 8px; }
-    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px 2px; }
-    .card h2 { margin: 0 0 4px 4px; font-size: 10px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+    .metric .v { font-size: 16px; font-weight: 700; margin-top: 1px; }
+    .va { margin: 0 12px 8px; padding: 8px 10px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
+    .va .act { font-size: 15px; font-weight: 800; }
+    .va .micro { color: var(--muted); margin-top: 3px; font-size: 11px; }
+    .stack { margin: 0 12px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 4px; }
+    canvas { width: 100%; display: block; }
   </style>
 </head>
 <body>
   <header>
-    <h1>Nifty tape · VWAP · EFI · CVD · VA</h1>
+    <h1>Futures &amp; session flow</h1>
     <div id="status">connecting…</div>
   </header>
   <div class="metrics">
@@ -57,64 +45,188 @@
   </div>
   <div class="va">
     <div class="act" id="va-act">NO ENTRY</div>
-    <div class="micro" id="va-micro">Waiting for bars…</div>
+    <div class="micro" id="va-micro">Waiting…</div>
   </div>
-  <div class="charts">
-    <div class="card"><h2>Nifty + VWAP</h2><canvas id="c-px" height="280"></canvas></div>
-    <div class="card"><h2>EFI 13</h2><canvas id="c-efi" height="140"></canvas></div>
-    <div class="card"><h2>CVD</h2><canvas id="c-cvd" height="140"></canvas></div>
+  <div class="stack">
+    <canvas id="c-all"></canvas>
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
     const statusEl = $("status");
-    const canvases = {
-      px: $("c-px"),
-      efi: $("c-efi"),
-      cvd: $("c-cvd"),
-    };
-
-    let state = { bars: [], spot: null, fut: null, vwap: null, efi: null, cvd: null, va: {} };
+    const canvas = $("c-all");
+    let state = { bars: [], va: {} };
 
     function fmt(n, d = 1) {
-      if (n == null || Number.isNaN(n)) return "—";
+      if (n == null || Number.isNaN(+n)) return "—";
       return Number(n).toLocaleString("en-IN", { maximumFractionDigits: d, minimumFractionDigits: d });
     }
-    function paint(up) {
-      return up ? getComputedStyle(document.documentElement).getPropertyValue("--up") : getComputedStyle(document.documentElement).getPropertyValue("--dn");
+
+    function layout(ctx) {
+      const dpr = devicePixelRatio || 1;
+      const cssW = canvas.clientWidth || 900;
+      const cssH = Math.max(640, window.innerHeight - 210);
+      canvas.width = cssW * dpr;
+      canvas.height = cssH * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const pad = { l: 52, r: 64, t: 18, b: 18 };
+      const innerH = cssH - pad.t - pad.b;
+      const hPx = innerH * 0.50, hDv = innerH * 0.16, hEfi = innerH * 0.16, hCvd = innerH * 0.18;
+      return {
+        w: cssW, h: cssH, pad,
+        px: { y0: pad.t, y1: pad.t + hPx },
+        dv: { y0: pad.t + hPx + 4, y1: pad.t + hPx + hDv },
+        efi: { y0: pad.t + hPx + hDv + 8, y1: pad.t + hPx + hDv + hEfi },
+        cvd: { y0: pad.t + hPx + hDv + hEfi + 12, y1: cssH - pad.b },
+      };
     }
 
-    function drawLine(canvas, series, color, zero = false) {
+    function yMap(lo, hi, box) {
+      const span = (hi - lo) || 1;
+      return (v) => box.y1 - ((v - lo) / span) * (box.y1 - box.y0);
+    }
+
+    function draw() {
       const ctx = canvas.getContext("2d");
-      const w = canvas.width = canvas.clientWidth * devicePixelRatio;
-      const h = canvas.height = canvas.clientHeight * devicePixelRatio;
-      ctx.clearRect(0, 0, w, h);
-      const vals = series.filter((v) => v != null && !Number.isNaN(v));
-      if (vals.length < 2) return;
-      let lo = Math.min(...vals), hi = Math.max(...vals);
-      if (zero) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
-      if (hi === lo) { hi += 1; lo -= 1; }
-      const pad = (hi - lo) * 0.08;
-      hi += pad; lo -= pad;
-      const x = (i) => (i / (series.length - 1)) * w;
-      const y = (v) => h - ((v - lo) / (hi - lo)) * h;
-      if (zero) {
-        ctx.strokeStyle = "rgba(255,255,255,.25)";
-        ctx.beginPath(); ctx.moveTo(0, y(0)); ctx.lineTo(w, y(0)); ctx.stroke();
-      }
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.6 * devicePixelRatio;
+      const L = layout(ctx);
+      ctx.clearRect(0, 0, L.w, L.h);
+      const bars = state.bars || [];
+      if (bars.length < 2) return;
+      const n = bars.length;
+      const left = L.pad.l, right = L.w - L.pad.r;
+      const slot = (right - left) / n;
+      const xMid = (i) => left + (i + 0.5) * slot;
+
+      const highs = bars.map((b) => b.high);
+      const lows = bars.map((b) => b.low);
+      const vws = bars.map((b) => b.vwap).filter((v) => v != null);
+      let lo = Math.min(...lows), hi = Math.max(...highs);
+      const va = state.va || {};
+      [va.vah, va.val, va.poc, va.pdh, va.pdl, state.vwap].forEach((v) => {
+        if (v) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      });
+      const padPx = (hi - lo) * 0.06 || 8;
+      lo -= padPx; hi += padPx;
+      const yPx = yMap(lo, hi, L.px);
+
+      // grid + levels
+      ctx.lineWidth = 1;
+      const levels = [
+        [va.vah, "#64b5f6", "VAH"],
+        [va.val, "#81c784", "VAL"],
+        [va.poc, "#ffd54f", "POC"],
+        [va.pdh, "#ff5252", "PDH"],
+        [va.pdl, "#00e676", "PDL"],
+      ];
+      levels.forEach(([v, col, name]) => {
+        if (!v) return;
+        const y = yPx(v);
+        ctx.strokeStyle = col;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = col;
+        ctx.font = "10px ui-sans-serif";
+        ctx.fillText(`${name} ${Math.round(v)}`, right + 4, y + 3);
+      });
+
+      // VWAP
+      ctx.strokeStyle = "#ff9800";
+      ctx.lineWidth = 1.6;
       ctx.beginPath();
       let started = false;
-      series.forEach((v, i) => {
-        if (v == null) return;
-        if (!started) { ctx.moveTo(x(i), y(v)); started = true; }
-        else ctx.lineTo(x(i), y(v));
+      bars.forEach((b, i) => {
+        if (b.vwap == null) return;
+        const x = xMid(i), y = yPx(b.vwap);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       });
       ctx.stroke();
+
+      // candles
+      bars.forEach((b, i) => {
+        const up = b.close >= b.open;
+        const x = xMid(i);
+        const yH = yPx(b.high), yL = yPx(b.low), yO = yPx(b.open), yC = yPx(b.close);
+        ctx.strokeStyle = up ? "#26a69a" : "#ef5350";
+        ctx.fillStyle = up ? "#26a69a" : "#ef5350";
+        ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, yL); ctx.stroke();
+        const bw = Math.max(2, slot * 0.62);
+        const top = Math.min(yO, yC), h = Math.max(1, Math.abs(yC - yO));
+        ctx.fillRect(x - bw / 2, top, bw, h);
+      });
+
+      // VA labels above candles
+      const labels = va.labels || [];
+      ctx.save();
+      ctx.font = "9px ui-sans-serif";
+      ctx.fillStyle = "#cfd8dc";
+      labels.forEach((lab) => {
+        const i = Math.min(n - 1, Math.max(0, lab.i ?? n - 1));
+        const x = xMid(i);
+        ctx.save();
+        ctx.translate(x, L.px.y0 + 4);
+        ctx.rotate(-Math.PI / 2);
+        const text = (lab.action || "").slice(0, 28);
+        ctx.fillText(text, 0, 0);
+        ctx.restore();
+      });
+      ctx.restore();
+
+      function paneBars(box, key, zeroLine = true) {
+        const vals = bars.map((b) => +b[key] || 0);
+        let mn = Math.min(...vals, 0), mx = Math.max(...vals, 0);
+        if (mn === mx) { mx += 1; mn -= 1; }
+        const y = yMap(mn, mx, box);
+        if (zeroLine) {
+          ctx.strokeStyle = "rgba(255,255,255,.35)";
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath(); ctx.moveTo(left, y(0)); ctx.lineTo(right, y(0)); ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        const bw = Math.max(2, slot * 0.7);
+        vals.forEach((v, i) => {
+          ctx.fillStyle = v >= 0 ? "rgba(0,230,118,.75)" : "rgba(255,82,82,.75)";
+          const y0 = y(0), y1 = y(v);
+          ctx.fillRect(xMid(i) - bw / 2, Math.min(y0, y1), bw, Math.max(1, Math.abs(y1 - y0)));
+        });
+        ctx.fillStyle = "#8fa4b8";
+        ctx.font = "10px ui-sans-serif";
+        ctx.fillText(key === "delta" ? "ΔV" : key === "efi13" ? "EFI" : "CVD", 8, box.y0 + 12);
+      }
+
+      paneBars(L.dv, "delta");
+      paneBars(L.efi, "efi13");
+
+      // CVD as area + line
+      const cv = bars.map((b) => +b.cvd || 0);
+      let cLo = Math.min(...cv, 0), cHi = Math.max(...cv, 0);
+      if (cLo === cHi) { cHi += 1; cLo -= 1; }
+      const yC = yMap(cLo, cHi, L.cvd);
+      ctx.strokeStyle = "rgba(255,255,255,.35)";
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(left, yC(0)); ctx.lineTo(right, yC(0)); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      bars.forEach((b, i) => {
+        const x = xMid(i), y = yC(b.cvd || 0);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = "#b0bec5";
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      ctx.fillStyle = "#8fa4b8";
+      ctx.font = "10px ui-sans-serif";
+      ctx.fillText("CVD", 8, L.cvd.y0 + 12);
+
+      // time labels
+      ctx.fillStyle = "#8fa4b8";
+      ctx.font = "9px ui-sans-serif";
+      const step = Math.max(1, Math.floor(n / 8));
+      for (let i = 0; i < n; i += step) {
+        ctx.fillText(bars[i].t || "", xMid(i) - 10, L.h - 4);
+      }
     }
 
     function render() {
-      const bars = state.bars || [];
       $("m-spot").textContent = fmt(state.spot, 1);
       $("m-fut").textContent = fmt(state.fut, 1);
       $("m-vwap").textContent = fmt(state.vwap, 1);
@@ -123,29 +235,9 @@
       $("m-bar").textContent = state.bar_tf || "—";
       const act = (state.va && state.va.action) || "NO ENTRY";
       $("va-act").textContent = act;
-      $("va-act").style.color = /SHORT/.test(act) ? paint(false) : /LONG/.test(act) ? paint(true) : "#ff9800";
+      $("va-act").style.color = /SHORT/.test(act) ? "#ef5350" : /LONG/.test(act) ? "#26a69a" : "#ff9800";
       $("va-micro").textContent = (state.va && state.va.micro) || "";
-      drawLine(canvases.px, bars.map((b) => b.close), "#2196F3");
-      // overlay VWAP
-      const ctx = canvases.px.getContext("2d");
-      const vw = bars.map((b) => b.vwap);
-      if (vw.filter((v) => v != null).length > 1) {
-        const w = canvases.px.width, h = canvases.px.height;
-        const closes = bars.map((b) => b.close).filter((v) => v != null);
-        let lo = Math.min(...closes, ...vw.filter((v) => v != null));
-        let hi = Math.max(...closes, ...vw.filter((v) => v != null));
-        const pad = (hi - lo) * 0.08 || 1;
-        hi += pad; lo -= pad;
-        const x = (i) => (i / (bars.length - 1)) * w;
-        const y = (v) => h - ((v - lo) / (hi - lo)) * h;
-        ctx.strokeStyle = "#ff9800";
-        ctx.lineWidth = 1.4 * devicePixelRatio;
-        ctx.beginPath();
-        vw.forEach((v, i) => { if (v == null) return; i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)); });
-        ctx.stroke();
-      }
-      drawLine(canvases.efi, bars.map((b) => b.efi13), state.efi >= 0 ? "#00e676" : "#ff5252", true);
-      drawLine(canvases.cvd, bars.map((b) => b.cvd), "#b0bec5", true);
+      draw();
     }
 
     function connect() {
