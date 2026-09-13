@@ -2449,7 +2449,7 @@ def detect_fp_absorptions(o, h, l, cl, vol, z, mids, min_bars=20):
 def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0):
     """Bar-range footprint proxy: volume split by close location in the bar. Not exchange bid/ask VAP."""
     if dfi is None or dfi.empty or "volume" not in dfi.columns:
-        return None
+        return None, []
     d = dfi.copy()
     if "time_str" not in d.columns:
         d["time"] = pd.to_datetime(d["time"])
@@ -2464,7 +2464,7 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
     step = float(bin_pts) if bin_pts and bin_pts > 0 else 2.0
     edges = np.arange(np.floor(y0 / step) * step, np.ceil(y1 / step) * step + step, step)
     if len(edges) < 3:
-        return None
+        return None, []
     mids = (edges[:-1] + edges[1:]) / 2.0
     z = np.zeros((len(mids), len(xs)))
     bar_dlt = []
@@ -5689,6 +5689,46 @@ def live_dashboard_fragment():
             except Exception:
                 pass
 
+        with st.expander("▼ Δ Footprint absorption (proxy setups)", expanded=False):
+            st.code(
+"""detect_fp_absorptions — last CLOSED bar only, lookback 20 bars, no lookahead
+Not bid/ask tape. Shelf = signed close-location volume in 2-pt bins.
+
+z_sweep_dn = (mean(low[-20:-1]) - this.low) / std(low[-20:-1])
+z_sweep_up = (this.high - mean(high[-20:-1])) / std(high[-20:-1])
+typ, sig   = mean/std of |bin volume| on all prior bins
+sell_low   = sum of negative bins in lower 33% of this bar
+buy_high   = sum of positive bins in upper 33% of this bar
+z_sell     = (sell_low - typ) / sig
+z_buy      = (buy_high - typ) / sig
+loc        = (close - low) / (high - low)
+
+SETUP 1 BID ABS (long / spring)  — green ▲
+  z_sweep_dn >= 1.0
+  loc >= 0.65 and close >= open
+  z_sell >= 1.0
+  Entry: close of that bar
+  Stop:  this.low - 2 pts
+  Target: next resistance / top-5 ask cluster (discretionary)
+
+SETUP 2 OFFER ABS (short / upthrust) — red ▼
+  z_sweep_up >= 1.0
+  loc <= 0.35 and close < open
+  z_buy >= 1.0
+  Entry: close of that bar
+  Stop:  this.high + 2 pts
+  Target: next support / top-5 bid cluster (discretionary)
+
+If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n.
+""",
+                language="text",
+            )
+            evs = st.session_state.get("_fp_abs_evs") or []
+            st.caption(
+                f"Session marks: {sum(1 for e in evs if e.get('side')>0)} bid · "
+                f"{sum(1 for e in evs if e.get('side')<0)} offer"
+            )
+
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
             or_txt = f"{scores['or_low']:.0f}-{scores['or_high']:.0f}" if scores.get("or_low") is not None else "N/A"
@@ -6809,6 +6849,16 @@ def live_dashboard_fragment():
                                     margin=dict(l=40, r=8, t=8, b=8))
                                 st.plotly_chart(fig_b, use_container_width=True)
                         fig_fp = build_delta_footprint_figure(dfi, st.session_state.get("_axis_times"))
+                        if isinstance(fig_fp, tuple):
+                            fig_fp = fig_fp[0]
+                        evs = st.session_state.get("_fp_abs_evs") or []
+                        n_bid = sum(1 for e in evs if e.get("side", 0) > 0)
+                        n_off = sum(1 for e in evs if e.get("side", 0) < 0)
+                        st.caption(
+                            f"Triggers this session: BID ABS {n_bid} · OFFER ABS {n_off}. "
+                            "Need sweep z≥1 vs last 20 highs/lows AND shelf z≥1 AND close in the rejection third. "
+                            "No mark = no bar cleared the gate."
+                        )
                         if fig_fp is not None:
                             st.plotly_chart(fig_fp, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
