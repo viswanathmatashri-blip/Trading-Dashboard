@@ -12,9 +12,17 @@
     * { box-sizing: border-box; }
     html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.35 ui-sans-serif, system-ui, sans-serif; }
     header {
-      display: flex; align-items: baseline; justify-content: space-between;
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
       padding: 8px 12px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 5;
     }
+    header .right { display: flex; align-items: center; gap: 10px; }
+    button#hard {
+      background: #1a2230; color: var(--silver); border: 1px solid var(--line);
+      border-radius: 6px; padding: 6px 10px; font-size: 11px; font-weight: 700; cursor: pointer;
+    }
+    button#hard:disabled { opacity: 0.5; cursor: wait; }
+    .gexbar { margin: 0 12px 8px; padding: 8px 10px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line);
+      display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); }
     h1 { margin: 0; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--silver); }
     #status { font-size: 11px; color: var(--muted); }
     #status.live { color: #00e676; }
@@ -33,7 +41,10 @@
 <body>
   <header>
     <h1>Futures &amp; session flow</h1>
-    <div id="status">connecting…</div>
+    <div class="right">
+      <button id="hard" type="button">Hard refresh GEX</button>
+      <div id="status">connecting…</div>
+    </div>
   </header>
   <div class="metrics">
     <div class="metric"><div class="k">Nifty</div><div class="v" id="m-spot">—</div></div>
@@ -43,6 +54,7 @@
     <div class="metric"><div class="k">CVD</div><div class="v" id="m-cvd">—</div></div>
     <div class="metric"><div class="k">Bar</div><div class="v" id="m-bar">—</div></div>
   </div>
+  <div class="gexbar" id="gexbar">GEX / VEX · hourly snapshot · not on ticks</div>
   <div class="va">
     <div class="act" id="va-act">NO ENTRY</div>
     <div class="micro" id="va-micro">Waiting…</div>
@@ -312,6 +324,13 @@
       $("va-act").textContent = act;
       $("va-act").style.color = /SHORT/.test(act) ? "#ef5350" : /LONG/.test(act) ? "#26a69a" : "#ff9800";
       $("va-micro").textContent = (state.va && state.va.micro) || "";
+      const g = state.gex || {};
+      const net = g.net != null ? Number(g.net).toFixed(1) : "—";
+      const vex = g.vex != null ? Number(g.vex).toFixed(1) : "—";
+      $("gexbar").textContent =
+        `GEX ${net} · VEX ${vex} · IV ${(g.atm_iv != null ? (g.atm_iv * 100).toFixed(1) : "—")}% · ` +
+        `Put ${g.put_wall ?? "—"} · Call ${g.call_wall ?? "—"} · Flip ${g.flip ?? "—"} · ` +
+        `as of ${g.ts || "pending"}` + (g.busy ? " · computing…" : " · auto 1h");
       draw();
     }
 
@@ -340,6 +359,14 @@
       draw();
     });
     canvas.addEventListener("mouseleave", () => { hoverI = null; draw(); });
+    $("hard").addEventListener("click", async () => {
+      $("hard").disabled = true;
+      $("gexbar").textContent = "Queuing GEX refresh (ticks keep running)…";
+      try {
+        await fetch("/api/refresh-gex", { method: "POST" });
+      } catch (e) {}
+      setTimeout(() => { $("hard").disabled = false; }, 8000);
+    });
   </script>
 </body>
 </html>
