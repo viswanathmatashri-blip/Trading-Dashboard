@@ -136,6 +136,8 @@ if "replay_session_on" not in st.session_state:
     st.session_state["replay_session_on"] = False
 if "replay_session_date" not in st.session_state:
     st.session_state["replay_session_date"] = None
+if "regime_mode" not in st.session_state:
+    st.session_state["regime_mode"] = "AUTO"
 if "px_alert_on" not in st.session_state:
     st.session_state["px_alert_on"] = False
 if "px_alert_lvl" not in st.session_state:
@@ -893,6 +895,12 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
         regime = "TREND"
     else:
         regime = "CHOP"
+    auto_regime = regime
+    ovr = str(st.session_state.get("regime_mode") or "AUTO").upper()
+    if ovr in ("RANGEBOUND", "RANGE"):
+        regime = "RANGE"
+    elif ovr in ("TRENDING", "TREND"):
+        regime = "TREND"
     out.update({
         "regime": regime, "score_range": round(s_range, 2), "score_trend": round(s_trend, 2),
         "eff": round(eff, 3), "atr_pct": round(atrp * 100.0, 3), "density": round(dens, 3),
@@ -900,7 +908,13 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
         "vah": float(vah) if vah else None, "val": float(val) if val else None,
         "poc": float(vp.get("poc")) if isinstance(vp, dict) and vp.get("poc") else None,
         "vp": vp if isinstance(vp, dict) else {},
-        "note": f"{regime} dens={dens:.2f} eff={eff:.2f} zVWAP={vz:+.2f} GEX={'+' if gex_sign>0 else ('-' if gex_sign<0 else '0')}",
+        "auto_regime": auto_regime,
+        "regime_src": "AUTO" if ovr == "AUTO" else ovr,
+        "note": (
+            f"{regime} dens={dens:.2f} eff={eff:.2f} zVWAP={vz:+.2f} "
+            f"GEX={'+' if gex_sign>0 else ('-' if gex_sign<0 else '0')}"
+            + ("" if ovr == "AUTO" else f" · override {ovr} (auto was {auto_regime})")
+        ),
     })
     return out
 
@@ -1061,7 +1075,9 @@ def classify_va_setup(dfi: pd.DataFrame, data: dict = None) -> dict:
         "micro": micro + " · " + note, "action": action,
         "price": p_arr, "delta": d_arr, "efi": e_arr, "cvd": c_arr, "obv": d_arr,
         "hover": hover, "efi_zero": False, "efi_note": note,
-        "regime": reg["regime"], "model": code, "loc": loc, "loc_z": loc_z,
+        "regime": reg["regime"], "regime_src": reg.get("regime_src", "AUTO"),
+        "auto_regime": reg.get("auto_regime"),
+        "model": code, "loc": loc, "loc_z": loc_z,
         "vah": vah, "val": val, "poc": poc,
     }
 
@@ -5927,6 +5943,17 @@ def live_dashboard_fragment():
                         key="big_trd_min", label_visibility="collapsed",
                     )
 
+            st.session_state["regime_mode"] = st.radio(
+                "Regime",
+                options=["AUTO", "RANGEBOUND", "TRENDING"],
+                index=["AUTO", "RANGEBOUND", "TRENDING"].index(
+                    st.session_state.get("regime_mode") or "AUTO"
+                ) if (st.session_state.get("regime_mode") or "AUTO") in ("AUTO", "RANGEBOUND", "TRENDING") else 0,
+                horizontal=True,
+                key="regime_mode_radio",
+                help="AUTO = density/efficiency/GEX score. RANGEBOUND forces Model 1. TRENDING forces Model 2.",
+            )
+
             if not df_fchart.empty:
                 df_fchart = df_fchart.copy()
                 df_fchart["tp"] = (df_fchart["high"] + df_fchart["low"] + df_fchart["close"]) / 3.0
@@ -6580,6 +6607,9 @@ def live_dashboard_fragment():
                     try:
                         regime = str((micro or {}).get("regime") or "CHOP").upper()
                         label = {"RANGE": "RANGEBOUND", "TREND": "TRENDING", "CHOP": "CHOP / MIXED"}.get(regime, regime)
+                        src = str((micro or {}).get("regime_src") or "AUTO")
+                        if src != "AUTO":
+                            label = f"{label} (forced)"
                         colr = {"RANGE": "#FFD54F", "TREND": "#00E676", "CHOP": "#90A4AE"}.get(regime, "#90A4AE")
                         x0 = axis_times[0] if axis_times else (dfi["time_str"].iloc[0] if "time_str" in dfi.columns else None)
                         y_lab = y1 if y1 is not None else None
