@@ -119,13 +119,18 @@
       let lo = Math.min(...lows), hi = Math.max(...highs);
       const va = state.va || {};
       const lv0 = state.levels || {};
-      [va.vah, va.val, va.poc, va.pdh, va.pdl, state.vwap, lv0.put_wall, lv0.call_wall, lv0.flip,
-       va.vah80, va.val80, va.vah1, va.val1, va.vah15, va.val15].forEach((v) => {
-        if (v) { lo = Math.min(lo, +v); hi = Math.max(hi, +v); }
+      const sessLo = lo, sessHi = hi, sessSpan = Math.max(hi - lo, 20);
+      function near(v) {
+        v = +v;
+        return v && v >= sessLo - sessSpan * 0.12 && v <= sessHi + sessSpan * 0.12;
+      }
+      [va.vah, va.val, va.poc, va.pdh, va.pdl, state.vwap,
+       va.vah80, va.val80, va.vah1, va.val1].forEach((v) => {
+        if (near(v)) { lo = Math.min(lo, +v); hi = Math.max(hi, +v); }
       });
       (va.zones || []).forEach((z) => {
         [z.vah, z.val, z.poc].forEach((v) => {
-          if (v) { lo = Math.min(lo, +v); hi = Math.max(hi, +v); }
+          if (near(v)) { lo = Math.min(lo, +v); hi = Math.max(hi, +v); }
         });
       });
       const padPx = (hi - lo) * 0.06 || 8;
@@ -187,6 +192,7 @@
       });
       levels.forEach(([v, col, name]) => {
         if (!v) return;
+        if (v < lo - 2 || v > hi + 2) return;
         const y = yPx(v);
         ctx.strokeStyle = col;
         ctx.setLineDash([4, 4]);
