@@ -104,8 +104,9 @@
       const vws = bars.map((b) => b.vwap).filter((v) => v != null);
       let lo = Math.min(...lows), hi = Math.max(...highs);
       const va = state.va || {};
-      [va.vah, va.val, va.poc, va.pdh, va.pdl, state.vwap].forEach((v) => {
-        if (v) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      const lv0 = state.levels || {};
+      [va.vah, va.val, va.poc, va.pdh, va.pdl, state.vwap, lv0.put_wall, lv0.call_wall, lv0.flip].forEach((v) => {
+        if (v) { lo = Math.min(lo, +v); hi = Math.max(hi, +v); }
       });
       const padPx = (hi - lo) * 0.06 || 8;
       lo -= padPx; hi += padPx;
@@ -113,38 +114,31 @@
 
       // Volume profiles: left = signed ΔV, right = session volume
       (function drawProfiles() {
-        const step = 5;
-        const bins = {};
-        bars.forEach((b) => {
-          const mid = 0.5 * (Number(b.high) + Number(b.low));
-          const key = Math.round(mid / step) * step;
-          if (!bins[key]) bins[key] = { vol: 0, delta: 0 };
-          bins[key].vol += Math.abs(Number(b.volume) || 0);
-          bins[key].delta += Number(b.delta) || 0;
+        const prof = va.profile || [];
+        if (!prof.length) return;
+        let maxVol = 1, maxAbsD = 1, pocPx = va.poc;
+        prof.forEach((p) => {
+          maxVol = Math.max(maxVol, p.vol || 0);
+          maxAbsD = Math.max(maxAbsD, Math.abs(p.delta || 0));
+          if (!pocPx || (p.vol || 0) > (prof.find((q) => q.px === pocPx)?.vol || 0)) {
+            if (!va.poc) pocPx = p.px;
+          }
         });
-        const keys = Object.keys(bins).map(Number);
-        if (!keys.length) return;
-        let maxVol = 1, maxAbsD = 1, poc = keys[0];
-        keys.forEach((k) => {
-          if (bins[k].vol > maxVol) { maxVol = bins[k].vol; poc = k; }
-          maxAbsD = Math.max(maxAbsD, Math.abs(bins[k].delta));
-        });
-        const midL = L.pad.l * 0.52;
-        keys.forEach((k) => {
-          const y = yPx(k);
-          if (y < L.px.y0 || y > L.px.y1) return;
-          const bh = Math.max(2, (step / (hi - lo)) * (L.px.y1 - L.px.y0) * 0.9);
-          // left ΔV
-          const dw = (Math.abs(bins[k].delta) / maxAbsD) * (L.pad.l - 16);
-          ctx.fillStyle = bins[k].delta >= 0 ? "rgba(38,166,154,.75)" : "rgba(239,83,80,.75)";
-          if (bins[k].delta >= 0) ctx.fillRect(midL, y - bh / 2, dw, bh);
+        const midL = L.pad.l * 0.50;
+        const bh = Math.max(2, ((prof[1]?.px - prof[0]?.px) || 5) / (hi - lo) * (L.px.y1 - L.px.y0));
+        prof.forEach((p) => {
+          const y = yPx(p.px);
+          if (y < L.px.y0 - 2 || y > L.px.y1 + 2) return;
+          const dw = (Math.abs(p.delta || 0) / maxAbsD) * (L.pad.l - 18);
+          ctx.fillStyle = (p.delta || 0) >= 0 ? "rgba(38,166,154,.8)" : "rgba(239,83,80,.8)";
+          if ((p.delta || 0) >= 0) ctx.fillRect(midL, y - bh / 2, dw, bh);
           else ctx.fillRect(midL - dw, y - bh / 2, dw, bh);
-          // right volume
-          const vw = (bins[k].vol / maxVol) * (L.pad.r - 18);
-          ctx.fillStyle = Math.abs(k - (va.poc || poc)) <= step ? "#ffd54f" : "rgba(100,181,246,.7)";
-          ctx.fillRect(L.w - L.pad.r + 4, y - bh / 2, vw, bh);
+          const vw = ((p.vol || 0) / maxVol) * (L.pad.r - 20);
+          const isPoc = va.poc && Math.abs(p.px - va.poc) <= 3;
+          ctx.fillStyle = isPoc ? "#ffd54f" : "rgba(100,181,246,.75)";
+          ctx.fillRect(L.w - L.pad.r + 6, y - bh / 2, Math.max(vw, 0), bh);
         });
-        ctx.strokeStyle = "rgba(255,255,255,.25)";
+        ctx.strokeStyle = "rgba(255,255,255,.28)";
         ctx.beginPath(); ctx.moveTo(midL, L.px.y0); ctx.lineTo(midL, L.px.y1); ctx.stroke();
       })();
 
@@ -156,6 +150,9 @@
         [va.poc, "#ffd54f", "POC"],
         [va.pdh, "#ff5252", "PDH"],
         [va.pdl, "#00e676", "PDL"],
+        [(state.levels || {}).put_wall, "#00e676", "Put wall"],
+        [(state.levels || {}).call_wall, "#ff5252", "Call wall"],
+        [(state.levels || {}).flip, "#ffb300", "Flip"],
       ];
       levels.forEach(([v, col, name]) => {
         if (!v) return;
