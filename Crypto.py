@@ -2438,16 +2438,22 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
                         vertical_spacing=0.03)
     fig.add_trace(plt_go.Heatmap(
         x=xs, y=mids, z=z, colorscale=[
-            [0.0, "#B71C1C"], [0.45, "#1B1E24"], [0.5, "#1B1E24"], [0.55, "#1B1E24"],
-            [1.0, "#1B5E20"],
+            [0.00, "#FF1744"],
+            [0.35, "#7F1D1D"],
+            [0.48, "#16181D"],
+            [0.52, "#16181D"],
+            [0.65, "#14532D"],
+            [1.00, "#00E676"],
         ],
         zmid=0, colorbar=dict(thickness=10, len=0.6, y=0.72),
+        opacity=0.95,
         hovertemplate="%{x} · %{y:.0f}<br>Δvol %{z:.0f}<extra>footprint</extra>",
     ), row=1, col=1)
     fig.add_trace(plt_go.Candlestick(
         x=xs, open=o, high=h, low=l, close=cl, name="Idx",
-        increasing_line_color="rgba(38,166,154,0.85)", decreasing_line_color="rgba(239,83,80,0.85)",
-        increasing_fillcolor="rgba(38,166,154,0.15)", decreasing_fillcolor="rgba(239,83,80,0.15)",
+        increasing_line_color="#B2FF59", decreasing_line_color="#FF8A80",
+        increasing_fillcolor="rgba(0,0,0,0)", decreasing_fillcolor="rgba(0,0,0,0)",
+        line=dict(width=1.6),
         showlegend=False,
     ), row=1, col=1)
     # delta labels on sparse bars only
