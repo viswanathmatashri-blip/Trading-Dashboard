@@ -34,7 +34,7 @@
     .va { margin: 0 12px 8px; padding: 8px 10px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
     .va .act { font-size: 15px; font-weight: 800; }
     .va .micro { color: var(--muted); margin-top: 3px; font-size: 11px; }
-    .stack { margin: 0 12px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 4px; }
+    .stack { margin: 0 12px 24px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 4px; }
     canvas { width: 100%; display: block; }
   </style>
 </head>
@@ -78,19 +78,21 @@
     function layout(ctx) {
       const dpr = devicePixelRatio || 1;
       const cssW = canvas.clientWidth || 900;
-      const cssH = Math.max(640, window.innerHeight - 210);
+      const view = Math.max(560, window.innerHeight - 200);
+      const hDv = 150, hEfi = 150, hCvd = 170;
+      const pad = { l: 92, r: 96, t: 36, b: 22 };
+      const hPx = view - pad.t - 8;
+      const cssH = pad.t + hPx + hDv + hEfi + hCvd + 40;
       canvas.width = cssW * dpr;
       canvas.height = cssH * dpr;
+      canvas.style.height = cssH + "px";
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      const pad = { l: 92, r: 96, t: 36, b: 22 };
-      const innerH = cssH - pad.t - pad.b;
-      const hPx = innerH * 0.50, hDv = innerH * 0.16, hEfi = innerH * 0.16, hCvd = innerH * 0.18;
       return {
         w: cssW, h: cssH, pad,
         px: { y0: pad.t, y1: pad.t + hPx },
-        dv: { y0: pad.t + hPx + 4, y1: pad.t + hPx + hDv },
-        efi: { y0: pad.t + hPx + hDv + 8, y1: pad.t + hPx + hDv + hEfi },
-        cvd: { y0: pad.t + hPx + hDv + hEfi + 12, y1: cssH - pad.b },
+        dv: { y0: pad.t + hPx + 8, y1: pad.t + hPx + 8 + hDv },
+        efi: { y0: pad.t + hPx + 16 + hDv, y1: pad.t + hPx + 16 + hDv + hEfi },
+        cvd: { y0: pad.t + hPx + 24 + hDv + hEfi, y1: pad.t + hPx + 24 + hDv + hEfi + hCvd },
       };
     }
 
