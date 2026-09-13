@@ -222,10 +222,8 @@
         ctx.fillRect(x - bw / 2, top, bw, h);
       });
 
-      // VA trigger tags — horizontal pills on the candle high
+      // Vertical labels 90° CCW, base sitting on that candle's high
       const labels = va.labels || [];
-      ctx.font = "bold 10px ui-sans-serif";
-      const used = [];
       labels.forEach((lab) => {
         const i = Math.min(n - 1, Math.max(0, Number.isFinite(+lab.i) ? +lab.i : n - 1));
         const text = String(lab.action || "").trim();
@@ -233,24 +231,17 @@
         const x = xMid(i);
         const t = lab.t || (bars[i] && bars[i].t) || "";
         const short = `${t} ${text}`.trim();
-        const tw = Math.min(ctx.measureText(short).width + 8, 220);
-        let y = yPx(bars[i].high) - 8;
-        used.forEach((oy) => { if (Math.abs(y - oy) < 12) y -= 12; });
-        y = Math.max(L.px.y0 + 10, Math.min(y, L.px.y1 - 10));
-        used.push(y);
+        const yHigh = yPx(bars[i].high);
         const col = /SHORT/.test(text) ? "#ef5350" : /LONG/.test(text) ? "#26a69a" : "#ffd54f";
-        ctx.strokeStyle = col;
-        ctx.globalAlpha = 0.55;
-        ctx.beginPath();
-        ctx.moveTo(x, y + 4);
-        ctx.lineTo(x, yPx(bars[i].high));
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-        const bx = Math.max(left, Math.min(x - 4, right - tw));
         ctx.fillStyle = col;
-        ctx.fillRect(bx, y - 9, tw, 13);
-        ctx.fillStyle = "#0a0a0b";
-        ctx.fillText(short, bx + 4, y + 1);
+        ctx.font = "bold 10px ui-sans-serif";
+        ctx.save();
+        ctx.translate(x + 3, yHigh - 4);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText(short, 0, 0);
+        ctx.restore();
       });
 
       function paneBars(box, key, zeroLine = true) {
