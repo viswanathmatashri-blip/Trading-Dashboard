@@ -1,3 +1,7 @@
+
+
+Files
+#!/usr/bin/env python3
 """
 Live Nifty tape sidecar — prices + VWAP + EFI + CVD + VA triggers only.
 
@@ -85,6 +89,7 @@ SNAPSHOT = {
     "bar_tf": f"{BAR_SECONDS // 60} min",
     "bars": [],
     "va": {"action": "NO ENTRY", "micro": "starting"},
+    "levels": {},
 }
 CLIENTS: set[asyncio.Queue] = set()
 LOOP: asyncio.AbstractEventLoop | None = None
@@ -290,6 +295,38 @@ def _value_area(df: pd.DataFrame) -> dict:
             taken += max(left, 0)
     mid = (bins[:-1] + bins[1:]) / 2.0
     return {"poc": float(mid[poc_i]), "val": float(bins[a]), "vah": float(bins[b + 1])}
+
+
+def _profile_bins(df: pd.DataFrame, step: float = 5.0) -> list:
+    if df is None or df.empty:
+        return []
+    lo = float(min(df["low"].min() if "low" in df.columns else df["close"].min(), df["close"].min()))
+    hi = float(max(df["high"].max() if "high" in df.columns else df["close"].max(), df["close"].max()))
+    if hi <= lo:
+        hi = lo + step
+    lo = math.floor(lo / step) * step
+    hi = math.ceil(hi / step) * step
+    edges = np.arange(lo, hi + step * 0.5, step)
+    n_bins = max(len(edges) - 1, 1)
+    vol = np.zeros(n_bins)
+    delta = np.zeros(n_bins)
+    for _, r in df.iterrows():
+        v = float(r.get("volume") or 0)
+        dlt = float(r.get("delta") or 0)
+        l = float(r["low"] if "low" in r else r["close"])
+        h = float(r["high"] if "high" in r else r["close"])
+        if h <= l:
+            h = l + 1e-6
+        span = h - l
+        for i in range(n_bins):
+            a, b = float(edges[i]), float(edges[i + 1])
+            overlap = max(0.0, min(h, b) - max(l, a))
+            if overlap > 0:
+                frac = overlap / span
+                vol[i] += v * frac
+                delta[i] += dlt * frac
+    mids = (edges[:-1] + edges[1:]) / 2.0
+    return [{"px": float(mids[i]), "vol": float(vol[i]), "delta": float(delta[i])} for i in range(n_bins)]
 
 
 def _eff(df: pd.DataFrame, n=20) -> float:
@@ -518,6 +555,7 @@ def apply_bar_state(spot, fut):
         va["labels"] = _va_labels(tail_for_va.reset_index(drop=True))
         va["pdh"] = pdh
         va["pdl"] = pdl
+        va["profile"] = _profile_bins(tail_for_va)
     with LOCK:
         SNAPSHOT.update({
             "spot": spot,
@@ -527,8 +565,86 @@ def apply_bar_state(spot, fut):
             "cvd": float(last["cvd"]) if last is not None else None,
             "bars": bars_out,
             "va": va,
+            "levels": dict(SNAPSHOT.get("levels") or {}),
         })
     _publish()
+
+
+def fetch_structure_levels(api, spot: float) -> dict:
+    """Put wall / call wall / flip from nearest NIFTY expiry OI (no full GEX)."""
+    out = {}
+    if not api or not spot:
+        return out
+    try:
+        with urllib.request.urlopen(SCRIP_MASTER_URL, timeout=30) as resp:
+            rows = json.loads(resp.read().decode())
+        today = date.today()
+        opts = []
+        for r in rows:
+            if str(r.get("name", "")).upper() != "NIFTY":
+                continue
+            if str(r.get("exch_seg", "")).upper() != "NFO":
+                continue
+            if str(r.get("instrumenttype", "")).upper() != "OPTIDX":
+                continue
+            exp = pd.to_datetime(r.get("expiry"), format="%d%b%Y", errors="coerce")
+            if pd.isna(exp) or exp.date() < today:
+                continue
+            strike = float(r.get("strike") or 0) / 100.0
+            if strike > 1e6:
+                strike /= 100.0
+            if abs(strike - spot) > 600:
+                continue
+            opts.append((exp.date(), strike, str(r.get("symbol", "")), str(r.get("token", ""))))
+        if not opts:
+            return out
+        near_exp = min(o[0] for o in opts)
+        opts = [o for o in opts if o[0] == near_exp]
+        tokens = [o[3] for o in opts if o[3]]
+        market = {}
+        for i in range(0, len(tokens), 40):
+            chunk = tokens[i:i + 40]
+            res = api.getMarketData("FULL", {"NFO": chunk})
+            fetched = ((res or {}).get("data") or {}).get("fetched") or []
+            for item in fetched:
+                market[str(item.get("symbolToken"))] = item
+            time.sleep(0.35)
+        rows_oi = []
+        for exp, strike, sym, tok in opts:
+            rec = market.get(tok) or {}
+            oi = float(rec.get("opnInterest") or rec.get("oi") or 0)
+            typ = "CE" if str(sym).endswith("CE") else "PE"
+            rows_oi.append({"strike": strike, "type": typ, "oi": oi})
+        if not rows_oi:
+            return out
+        dfo = pd.DataFrame(rows_oi)
+        ce = dfo[dfo["type"] == "CE"]
+        pe = dfo[dfo["type"] == "PE"]
+        above = ce[ce["strike"] >= spot]
+        below = pe[pe["strike"] <= spot]
+        if not above.empty:
+            out["call_wall"] = float(above.sort_values("oi", ascending=False).iloc[0]["strike"])
+        if not below.empty:
+            out["put_wall"] = float(below.sort_values("oi", ascending=False).iloc[0]["strike"])
+        # crude flip: strike nearest where CE OI and PE OI swap dominance
+        both = []
+        for k in sorted(set(dfo["strike"])):
+            c = float(ce.loc[ce["strike"] == k, "oi"].sum()) if not ce.empty else 0
+            p = float(pe.loc[pe["strike"] == k, "oi"].sum()) if not pe.empty else 0
+            both.append((k, p - c))
+        flip = None
+        for i in range(1, len(both)):
+            if both[i - 1][1] == 0:
+                continue
+            if both[i - 1][1] * both[i][1] <= 0:
+                flip = both[i][0] if abs(both[i][1]) < abs(both[i - 1][1]) else both[i - 1][0]
+                break
+        if flip:
+            out["flip"] = float(flip)
+        print("levels", out)
+    except Exception as e:
+        print("structure levels failed", e)
+    return out
 
 
 # ---------- Angel WS thread ----------
@@ -593,6 +709,21 @@ def angel_thread():
             apply_bar_state(last_spot["px"], last_fut["px"])
 
     seed_history()
+
+    def levels_loop():
+        while True:
+            try:
+                px = last_spot["px"] or last_fut["px"]
+                lv = fetch_structure_levels(api, float(px or 0))
+                if lv:
+                    with LOCK:
+                        SNAPSHOT["levels"] = lv
+                    apply_bar_state(last_spot["px"], last_fut["px"] or last_spot["px"])
+            except Exception as e:
+                print("levels loop", e)
+            time.sleep(60)
+
+    threading.Thread(target=levels_loop, daemon=True).start()
 
     def on_data(_ws, msg):
         try:
