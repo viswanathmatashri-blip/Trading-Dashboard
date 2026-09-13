@@ -256,51 +256,137 @@ def _eff(df: pd.DataFrame, n=20) -> float:
     return net / max(path, 1e-9)
 
 
+def _ols_slope(y):
+    y = pd.to_numeric(y, errors="coerce").dropna().astype(float)
+    n = len(y)
+    if n < 6:
+        return 0.0, 1.0
+    x = np.arange(n, dtype=float)
+    x = x - x.mean()
+    yv = y.values - y.values.mean()
+    den = float((x * x).sum())
+    if den <= 1e-18:
+        return 0.0, 1.0
+    sl = float((x * yv).sum() / den)
+    resid = yv - sl * x
+    se = float(np.sqrt((resid * resid).sum() / max(n - 2, 1) / den))
+    if se <= 1e-18:
+        return sl, 0.0
+    t = sl / se
+    p = float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(t) / math.sqrt(2.0)))))
+    return sl, p
+
+
 def classify_va(df: pd.DataFrame) -> dict:
+    """Same M1/M2 playbook as Options Simulator (no GEX term)."""
     empty = {"action": "NO ENTRY", "micro": "not enough bars", "model": "CHOP"}
     if df is None or len(df) < 12:
         return empty
-    last = float(df["close"].iloc[-1])
+    px = df["close"].astype(float)
+    last = float(px.iloc[-1])
     vp = _value_area(df)
     vah, val, poc = vp.get("vah"), vp.get("val"), vp.get("poc")
     eff = _eff(df)
-    dens_inside = 0.0
-    if vah and val:
+    dens = 0.0
+    if vah and val and float(df["volume"].sum()) > 0:
         m = (df["close"] >= val) & (df["close"] <= vah)
-        dens_inside = float(df.loc[m, "volume"].sum() / max(float(df["volume"].sum()), 1e-9))
-    regime = "RANGE" if dens_inside >= 0.55 and eff < 0.28 else ("TREND" if eff >= 0.36 else "CHOP")
-    std = float(df["close"].tail(20).std(ddof=1) or 1.0)
-    loc = "INSIDE"
-    if vah and last >= float(vah) + 0.35 * std:
-        loc = "ABOVE_VAH"
-    elif val and last <= float(val) - 0.35 * std:
-        loc = "BELOW_VAL"
-    elif vah and last > float(vah):
-        loc = "VAH_EDGE"
-    elif val and last < float(val):
-        loc = "VAL_EDGE"
-    efi = df["efi13"]
-    px = df["close"].astype(float)
-    efi_up = len(efi) and float(efi.iloc[-1]) > float(efi.tail(8).mean())
-    efi_dn = len(efi) and float(efi.iloc[-1]) < float(efi.tail(8).mean())
-    dv = float(df["delta"].tail(5).sum())
+        dens = float(df.loc[m, "volume"].sum() / float(df["volume"].sum()))
+    std = float(px.tail(20).std(ddof=1) or 1.0)
+    h = df["high"].astype(float) if "high" in df.columns else px
+    l = df["low"].astype(float) if "low" in df.columns else px
+    prev = px.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    atr_abs = float(tr.tail(14).mean() or 0)
+    sess_rng = float(h.max() - l.min()) if len(h) else 1.0
+    realized = sess_rng / max(atr_abs * math.sqrt(max(len(df), 1) / 14.0), 1e-6)
+    s_range = 0.0
+    s_trend = 0.0
+    s_range += 1.2 if dens >= 0.62 else (0.4 if dens >= 0.50 else -0.4)
+    s_range += 1.0 if eff < 0.22 else (0.2 if eff < 0.32 else -0.6)
+    s_range += 0.4 if realized < 1.15 else -0.3
+    s_trend += 1.2 if eff >= 0.38 else (0.4 if eff >= 0.28 else -0.5)
+    s_trend += 1.0 if dens <= 0.48 else (0.2 if dens <= 0.58 else -0.6)
+    s_trend += 0.5 if realized >= 1.25 else -0.2
+    if s_range >= 1.4 and s_range >= s_trend + 0.35:
+        regime = "RANGE"
+    elif s_trend >= 1.4 and s_trend >= s_range + 0.35:
+        regime = "TREND"
+    else:
+        regime = "CHOP"
+    buf = max(0.35 * std, 0.35 * atr_abs, 1.0)
+    loc, loc_z = "INSIDE", 0.0
+    if vah is not None and val is not None:
+        z_h = (last - float(vah)) / max(std, 1e-6)
+        z_l = (float(val) - last) / max(std, 1e-6)
+        if last >= float(vah) + buf:
+            loc, loc_z = "ABOVE_VAH", z_h
+        elif last <= float(val) - buf:
+            loc, loc_z = "BELOW_VAL", z_l
+        elif last > float(vah):
+            loc, loc_z = "VAH_EDGE", z_h
+        elif last < float(val):
+            loc, loc_z = "VAL_EDGE", z_l
+    efi = df["efi13"] if "efi13" in df.columns else pd.Series(dtype=float)
+    delta_s = df["delta"] if "delta" in df.columns else px.diff().fillna(0.0)
+    efi_sl, efi_p = _ols_slope(efi.tail(12)) if len(efi) else (0.0, 1.0)
+    px_sl, px_p = _ols_slope(px.tail(12))
+    dv_tail = delta_s.tail(5)
+    dv_sum = float(dv_tail.sum()) if len(dv_tail) else 0.0
+    dv_abs = float(dv_tail.abs().sum()) if len(dv_tail) else 1.0
+    absorb_up = (px_sl > 0 and px_p < 0.12) and (dv_sum <= 0.15 * max(dv_abs, 1.0))
+    absorb_dn = (px_sl < 0 and px_p < 0.12) and (dv_sum >= -0.15 * max(dv_abs, 1.0))
+    efi_div_up = px_sl > 0 and efi_sl <= 0
+    efi_div_dn = px_sl < 0 and efi_sl >= 0
+    efi_exp_up = efi_sl > 0 and (float(efi.iloc[-1]) if len(efi) else 0) > 0
+    efi_exp_dn = efi_sl < 0 and (float(efi.iloc[-1]) if len(efi) else 0) < 0
+    persist_h = bool(vah and (px.tail(3) > float(vah)).sum() >= 2)
+    persist_l = bool(val and (px.tail(3) < float(val)).sum() >= 2)
+    last_dv = float(delta_s.iloc[-1]) if len(delta_s) else 0.0
+    tight = False
+    if len(df) >= 8:
+        sl = df.tail(8)
+        hh = float(sl["high"].max()) if "high" in sl.columns else float(sl["close"].max())
+        ll = float(sl["low"].min()) if "low" in sl.columns else float(sl["close"].min())
+        tight = (hh - ll) <= max(0.90 * atr_abs, 1.0)
     code = "CHOP"
     if regime == "RANGE":
-        if loc in ("ABOVE_VAH", "VAH_EDGE"):
-            code = "M1S_ENTRY" if efi_dn and dv <= 0 else "M1S_WATCH"
-        elif loc in ("BELOW_VAL", "VAL_EDGE"):
-            code = "M1L_ENTRY" if efi_up and dv >= 0 else "M1L_WATCH"
+        if loc in ("ABOVE_VAH", "VAH_EDGE") and loc_z >= 0.35:
+            code = "M1S_ENTRY" if (absorb_up and efi_div_up) else "M1S_WATCH"
+        elif loc in ("BELOW_VAL", "VAL_EDGE") and loc_z >= 0.35:
+            code = "M1L_ENTRY" if (absorb_dn and efi_div_dn) else "M1L_WATCH"
+        elif loc == "INSIDE" and vah and last < float(vah) and last_dv < 0 and float(px.iloc[-2]) >= float(vah) * 0.999:
+            code = "M1S_ADD"
+        elif loc == "INSIDE" and val and last > float(val) and last_dv > 0 and float(px.iloc[-2]) <= float(val) * 1.001:
+            code = "M1L_ADD"
         else:
             code = "INSIDE"
     elif regime == "TREND":
-        if loc == "ABOVE_VAH":
-            code = "M2L_ENTRY" if efi_up and dv > 0 else "M2L_WATCH"
+        if loc == "ABOVE_VAH" and persist_h and loc_z >= 0.45:
+            code = "M2L_ENTRY" if (efi_exp_up and dv_sum > 0 and (tight or persist_h)) else "M2L_WATCH"
+        elif loc == "BELOW_VAL" and persist_l and loc_z >= 0.45:
+            code = "M2S_ENTRY" if (efi_exp_dn and dv_sum < 0 and (tight or persist_l)) else "M2S_WATCH"
+        elif vah and last >= float(vah) and last_dv >= 0 and tight:
+            code = "M2L_ADD"
+        elif val and last <= float(val) and last_dv <= 0 and tight:
+            code = "M2S_ADD"
+        elif loc == "ABOVE_VAH":
+            code = "M2L_WATCH"
         elif loc == "BELOW_VAL":
-            code = "M2S_ENTRY" if efi_dn and dv < 0 else "M2S_WATCH"
+            code = "M2S_WATCH"
+        else:
+            code = "CHOP"
+    else:
+        if loc == "ABOVE_VAH" and loc_z >= 0.80 and absorb_up:
+            code = "M1S_WATCH"
+        elif loc == "BELOW_VAL" and loc_z >= 0.80 and absorb_dn:
+            code = "M1L_WATCH"
         else:
             code = "CHOP"
     micro, action = VA_PLAYBOOK.get(code, VA_PLAYBOOK["CHOP"])
-    note = f"{regime} {loc} eff={eff:.2f} dens={dens_inside:.2f} VAH {vah} VAL {val} POC {poc}"
+    note = (
+        f"{regime} {loc} z={loc_z:+.2f} dens={dens:.2f} eff={eff:.2f} "
+        f"ΔΣ5={dv_sum:.0f} EFIsl={efi_sl:+.2f} VAH {vah} VAL {val} POC {poc}"
+    )
     return {
         "action": action, "micro": f"{micro} · {note}", "model": code, "regime": regime,
         "vah": vah, "val": val, "poc": poc, "loc": loc,
@@ -308,24 +394,24 @@ def classify_va(df: pd.DataFrame) -> dict:
 
 
 def _va_labels(df: pd.DataFrame) -> list:
-    """Action when it changes, for vertical labels above candles."""
+    """Every action change, same idea as pdec_session_history in the Streamlit file."""
     out = []
     if df is None or len(df) < 12:
         return out
     prev = None
-    step = max(1, len(df) // 40)
-    for i in range(11, len(df), step):
+    for i in range(11, len(df)):
         rec = classify_va(df.iloc[: i + 1])
         act = rec.get("action") or ""
-        if not act or act == prev:
+        if act == prev:
             continue
         prev = act
-        ts = df.iloc[i].get("t0")
-        out.append({"i": int(i), "t": str(ts), "action": act})
-    rec = classify_va(df)
-    if rec.get("action") and rec.get("action") != prev:
-        out.append({"i": int(len(df) - 1), "t": str(df.iloc[-1].get("t0")), "action": rec["action"]})
-    return out[-12:]
+        t0 = df.iloc[i].get("t0")
+        try:
+            tstr = pd.to_datetime(t0, unit="s", utc=True).tz_convert("Asia/Kolkata").strftime("%H:%M")
+        except Exception:
+            tstr = ""
+        out.append({"i": int(i), "t": tstr, "action": act, "model": rec.get("model")})
+    return out[-24:]
 
 
 def apply_bar_state(spot, fut):
