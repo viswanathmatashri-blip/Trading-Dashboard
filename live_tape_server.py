@@ -1,6 +1,3 @@
-
-
-Files
 #!/usr/bin/env python3
 """
 Live Nifty tape sidecar — prices + VWAP + EFI + CVD + VA triggers only.
