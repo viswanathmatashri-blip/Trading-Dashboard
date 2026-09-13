@@ -747,16 +747,16 @@ def compute_hourly_greeks(api, spot: float) -> dict:
         net_gex = 0.0
         net_vex = 0.0
         gex_curve = []
+        gex_scale = LOT * (spot ** 2) * 0.01
         for k, sides in sorted(by.items()):
             d1 = (math.log(max(spot, 1e-9) / max(k, 1e-9)) + 0.5 * sig * sig * T) / max(sig * math.sqrt(T), 1e-9)
-            d2 = d1 - sig * math.sqrt(T)
             gam = _norm_pdf(d1) / max(spot * sig * math.sqrt(T), 1e-9)
-            van = -_norm_pdf(d1) * d2 / max(sig, 1e-9)
+            vega = spot * _norm_pdf(d1) * math.sqrt(max(T, 1e-9)) * 0.01
             ce_oi = float((sides.get("CE") or {}).get("oi") or 0)
             pe_oi = float((sides.get("PE") or {}).get("oi") or 0)
-            # dealer short gamma convention: calls add +GEX, puts add +GEX if dealers short options
-            gex_k = gam * (ce_oi + pe_oi) * LOT * spot * spot / 1e7
-            vex_k = van * (ce_oi + pe_oi) * LOT / 1e5
+            # Streamlit: call_gex - put_gex
+            gex_k = gam * ce_oi * gex_scale - gam * pe_oi * gex_scale
+            vex_k = (vega * ce_oi - vega * pe_oi) * LOT * 0.01
             net_gex += gex_k
             net_vex += vex_k
             gex_curve.append({"k": k, "gex": gex_k, "vex": vex_k})
