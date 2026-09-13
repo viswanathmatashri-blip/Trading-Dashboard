@@ -2395,6 +2395,57 @@ def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
 
 
 
+
+def detect_fp_absorptions(o, h, l, cl, vol, z, mids, min_bars=20):
+    """Causal proxy bid/offer absorption. z is signed bin volume [price x bar]."""
+    n = len(cl)
+    out = []
+    if n < min_bars + 2 or z.size == 0:
+        return out
+    absz = np.abs(z)
+    # typical |bin| from history up to j-1
+    for j in range(min_bars, n):
+        rng = float(h[j] - l[j])
+        if rng <= 0:
+            continue
+        loc = (float(cl[j]) - float(l[j])) / rng
+        prev_l = l[j - min_bars:j]
+        prev_h = h[j - min_bars:j]
+        mu_l, sd_l = float(np.mean(prev_l)), float(np.std(prev_l, ddof=0) or 1.0)
+        mu_h, sd_h = float(np.mean(prev_h)), float(np.std(prev_h, ddof=0) or 1.0)
+        z_sweep_dn = (mu_l - float(l[j])) / sd_l
+        z_sweep_up = (float(h[j]) - mu_h) / sd_h
+        past = absz[:, :j]
+        typ = float(np.nanmean(past[past > 0])) if np.any(past > 0) else 1.0
+        sig = float(np.nanstd(past[past > 0], ddof=0) or typ or 1.0)
+        lo_cut = float(l[j]) + 0.33 * rng
+        hi_cut = float(h[j]) - 0.33 * rng
+        sell_low = 0.0
+        buy_high = 0.0
+        for i, m in enumerate(mids):
+            if m <= lo_cut and z[i, j] < 0:
+                sell_low += -z[i, j]
+            if m >= hi_cut and z[i, j] > 0:
+                buy_high += z[i, j]
+        z_sell = (sell_low - typ) / sig
+        z_buy = (buy_high - typ) / sig
+        # Setup 1 bid absorption
+        if z_sweep_dn >= 1.0 and loc >= 0.65 and z_sell >= 1.0 and cl[j] >= o[j]:
+            out.append({
+                "j": j, "kind": "BID ABS", "side": 1,
+                "stop": float(l[j]) - 2.0,
+                "note": f"sweep z={z_sweep_dn:.2f} shelf z={z_sell:.2f} close {loc:.0%} range",
+            })
+        # Setup 2 offer absorption
+        if z_sweep_up >= 1.0 and loc <= 0.35 and z_buy >= 1.0 and cl[j] < o[j]:
+            out.append({
+                "j": j, "kind": "OFFER ABS", "side": -1,
+                "stop": float(h[j]) + 2.0,
+                "note": f"sweep z={z_sweep_up:.2f} shelf z={z_buy:.2f} close {loc:.0%} range",
+            })
+    return out
+
+
 def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0):
     """Bar-range footprint proxy: volume split by close location in the bar. Not exchange bid/ask VAP."""
     if dfi is None or dfi.empty or "volume" not in dfi.columns:
@@ -2477,6 +2528,32 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
             x=tx, y=ty, mode="text", text=tt, textfont=dict(size=9, color=tc),
             showlegend=False, hoverinfo="skip",
         ), row=1, col=1)
+    evs = detect_fp_absorptions(o, h, l, cl, vol, z, mids)
+    if evs:
+        bx = [xs[e["j"]] for e in evs if e["side"] > 0]
+        by = [h[e["j"]] for e in evs if e["side"] > 0]
+        bt = [e["kind"] for e in evs if e["side"] > 0]
+        sx = [xs[e["j"]] for e in evs if e["side"] < 0]
+        sy = [l[e["j"]] for e in evs if e["side"] < 0]
+        stt = [e["kind"] for e in evs if e["side"] < 0]
+        if bx:
+            fig.add_trace(plt_go.Scatter(
+                x=bx, y=by, mode="markers+text", name="Bid abs",
+                text=bt, textposition="top center",
+                marker=dict(size=11, symbol="triangle-up", color="#00E676",
+                            line=dict(width=1, color="#FFF")),
+                hovertext=[e["note"] + f"  SL {e['stop']:.1f}" for e in evs if e["side"] > 0],
+                hoverinfo="text",
+            ), row=1, col=1)
+        if sx:
+            fig.add_trace(plt_go.Scatter(
+                x=sx, y=sy, mode="markers+text", name="Offer abs",
+                text=stt, textposition="bottom center",
+                marker=dict(size=11, symbol="triangle-down", color="#FF5252",
+                            line=dict(width=1, color="#FFF")),
+                hovertext=[e["note"] + f"  SL {e['stop']:.1f}" for e in evs if e["side"] < 0],
+                hoverinfo="text",
+            ), row=1, col=1)
     fig.add_trace(plt_go.Bar(
         x=xs, y=bar_dlt,
         marker_color=["#00E676" if v >= 0 else "#FF5252" for v in bar_dlt],
