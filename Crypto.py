@@ -171,6 +171,9 @@ if "tick_cvd_history" not in st.session_state:
 if "flow_tape" not in st.session_state:
     st.session_state["flow_tape"] = []
 
+if "va_lock" not in st.session_state:
+    st.session_state["va_lock"] = {}
+
 # ---------- Loading status (sidebar) ----------
 def update_load_status(msg: str):
     if "load_status_placeholder" not in st.session_state:
@@ -654,69 +657,96 @@ def _price_level4(df) -> str:
     return base
 
 
-# --- VALUE-AREA REGIME PLAYBOOK (replaces PDEC / Flow18 / candle books) ---
-# Four models:
-#   M1-S  VAH mean-reversion SHORT   (range)
-#   M1-L  VAL mean-reversion LONG    (range)
-#   M2-L  VAH acceptance TREND LONG  (trend)
-#   M2-S  VAL acceptance TREND SHORT (trend)
-# Location tests are statistical (z vs session σ, persistence, ATR buffer).
+# --- VALUE-AREA BIMODAL ENGINE ---
+# M1-S / M1-L  range fade at locked morning VA
+# M2-L / M2-S  trend acceptance + add at NEW balance VAL/VAH
+# State: FORMING → RANGE|TREND → WATCH → ENTRY → ADD | FAIL
+# GEX is annotation only (not a regime vote).
+
+VA_LOCK_MINUTES = 75          # 09:15 → 10:30 IST formation window
+VA_MIN_BARS_LOCK = 12
+VA_PERSIST_MIN = 12
+VA_SLOPE_MIN = 36
+VA_DELTA_MIN = 15
+VA_BOX_MIN = 24
+VA_ABSORB_VOL_MULT = 1.15
+VA_ABSORB_PX_ATR = 0.35
 
 VA_PLAYBOOK = {
+    "FORMING": (
+        "Value area still forming — morning lock not set",
+        "NO ENTRY",
+    ),
     "M1S_WATCH": (
-        "Range · VAH probe — price statistically above value, absorption forming",
+        "Range · VAH probe — aggressive size, little follow-through",
         "WATCH SHORT (VAH fade)",
     ),
     "M1S_ENTRY": (
-        "Range · VAH mean-reversion SHORT — absorption + EFI divergence at/above VAH",
+        "Range · VAH absorption SHORT — high volume, buyers fail to lift",
         "SHORT MEAN-REVERSION (Target: POC → VAL)",
     ),
     "M1S_ADD": (
-        "Range · VAH failed acceptance — close back inside value, ΔV still offered",
-        "ADD SHORT (Retest VAH from below)",
+        "Range · retest of locked VAH from below after working short",
+        "ADD SHORT (Retest VAH)",
+    ),
+    "M1S_FAIL": (
+        "Range short invalidated — close back over VAH + flow expansion",
+        "FAIL SHORT (flatten)",
     ),
     "M1L_WATCH": (
-        "Range · VAL probe — price statistically below value, demand absorbing",
+        "Range · VAL probe — aggressive size, little follow-through",
         "WATCH LONG (VAL bounce)",
     ),
     "M1L_ENTRY": (
-        "Range · VAL mean-reversion LONG — absorption + EFI divergence at/below VAL",
+        "Range · VAL absorption LONG — high volume, sellers fail to press",
         "LONG MEAN-REVERSION (Target: POC → VAH)",
     ),
     "M1L_ADD": (
-        "Range · VAL failed breakdown — close back inside value, ΔV still bid",
-        "ADD LONG (Retest VAL from above)",
+        "Range · retest of locked VAL from above after working long",
+        "ADD LONG (Retest VAL)",
+    ),
+    "M1L_FAIL": (
+        "Range long invalidated — close back under VAL + flow expansion",
+        "FAIL LONG (flatten)",
     ),
     "M2L_WATCH": (
-        "Trend · VAH break — price holding above value, force not yet confirmed",
+        "Trend · holding above locked VAH — bid not yet confirmed",
         "WATCH LONG (VAH acceptance)",
     ),
     "M2L_ENTRY": (
-        "Trend · VAH acceptance LONG — density building above VAH + EFI expansion + ΔV bid",
-        "LONG BREAKOUT (Hold above VAH / trail under box)",
+        "Trend · acceptance LONG — persist above VAH + bids/big prints hold",
+        "LONG BREAKOUT (Hold above VAH)",
     ),
     "M2L_ADD": (
-        "Trend · VAH retest from above — shallow pullback, ΔV stays non-negative",
-        "ADD LONG (Retest old VAH / new box low)",
+        "Trend · retest of NEW balance VAL (not old VAH)",
+        "ADD LONG (New VAL)",
+    ),
+    "M2L_FAIL": (
+        "Trend long invalidated — close back through locked VAH",
+        "FAIL LONG (flatten)",
     ),
     "M2S_WATCH": (
-        "Trend · VAL break — price holding below value, force not yet confirmed",
+        "Trend · holding below locked VAL — offer not yet confirmed",
         "WATCH SHORT (VAL acceptance)",
     ),
     "M2S_ENTRY": (
-        "Trend · VAL acceptance SHORT — density building below VAL + EFI expansion + ΔV offered",
-        "SHORT BREAKDOWN (Hold below VAL / trail above box)",
+        "Trend · acceptance SHORT — persist below VAL + offers/big prints hold",
+        "SHORT BREAKDOWN (Hold below VAL)",
     ),
     "M2S_ADD": (
-        "Trend · VAL retest from below — shallow bounce, ΔV stays non-positive",
-        "ADD SHORT (Retest old VAL / new box high)",
+        "Trend · retest of NEW balance VAH (not old VAL)",
+        "ADD SHORT (New VAH)",
+    ),
+    "M2S_FAIL": (
+        "Trend short invalidated — close back through locked VAL",
+        "FAIL SHORT (flatten)",
     ),
     "INSIDE": (
-        "Inside value — no edge at the edge of the profile",
+        "Inside locked value — no edge at the profile edge",
         "NO ENTRY",
     ),
     "CHOP": (
-        "Regime mixed / low efficiency — neither clean range nor trend",
+        "Regime mixed after lock — no clean range or trend",
         "NO ENTRY",
     ),
 }
@@ -758,25 +788,69 @@ def _zscore(last, mean, sd):
     return float((last - mean) / sd)
 
 
-def _signed_delta(d: pd.DataFrame) -> pd.Series:
+def _bar_minutes(d: pd.DataFrame) -> float:
+    """Infer bar length in minutes; fall back to sidebar TF."""
+    try:
+        t = pd.to_datetime(d["time"], errors="coerce").dropna()
+        if len(t) >= 3:
+            dt = t.diff().dt.total_seconds().dropna() / 60.0
+            med = float(dt[(dt > 0) & (dt < 120)].median() or 0)
+            if med > 0:
+                return med
+    except Exception:
+        pass
+    lab = ""
+    try:
+        lab = str(st.session_state.get("selected_timeframe") or "")
+    except Exception:
+        lab = ""
+    for n in (1, 2, 3, 5, 10, 15, 30, 60):
+        if lab.startswith(str(n)):
+            return float(n)
+    return 5.0
+
+
+def _bars_for_minutes(d: pd.DataFrame, minutes: float, minimum: int = 2) -> int:
+    bm = max(_bar_minutes(d), 0.5)
+    return max(minimum, int(round(float(minutes) / bm)))
+
+
+def _loc_in_bar_flow(d: pd.DataFrame) -> pd.Series:
+    """Single aggressor series: volume * close location in bar (same as attach_bar_flow)."""
+    if d is None or getattr(d, "empty", True):
+        return pd.Series(dtype=float)
+    if "signed_flow" in d.columns and pd.to_numeric(d["signed_flow"], errors="coerce").notna().any():
+        return _series_num(d["signed_flow"]).fillna(0.0)
+    cl = _series_num(d["close"])
     if "volume" not in d.columns:
         if "open" in d.columns:
-            return _series_num(d["close"]) - _series_num(d["open"])
-        return _series_num(d["close"]).diff().fillna(0.0)
-    o = _series_num(d["open"]) if "open" in d.columns else _series_num(d["close"]).shift(1)
-    sgn = np.sign(_series_num(d["close"]) - o).fillna(0.0)
-    return _series_num(d["volume"]).fillna(0.0) * sgn
+            return cl - _series_num(d["open"])
+        return cl.diff().fillna(0.0)
+    vol = _series_num(d["volume"]).fillna(0.0)
+    hi = _series_num(d["high"] if "high" in d.columns else d["close"])
+    lo = _series_num(d["low"] if "low" in d.columns else d["close"])
+    hl = (hi - lo).replace(0, np.nan)
+    loc = ((cl - lo) / hl * 2.0 - 1.0).fillna(0.0).clip(-1.0, 1.0)
+    return vol * loc
 
 
-def _atr_pct(d: pd.DataFrame, n: int = 14) -> float:
+def _signed_delta(d: pd.DataFrame) -> pd.Series:
+    return _loc_in_bar_flow(d)
+
+
+def _atr_abs(d: pd.DataFrame, n: int = 14) -> float:
     h = _series_num(d["high"] if "high" in d.columns else d["close"])
     l = _series_num(d["low"] if "low" in d.columns else d["close"])
     c = _series_num(d["close"])
     prev = c.shift(1)
     tr = pd.concat([(h - l).abs(), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
-    atr = float(tr.tail(n).mean()) if tr.notna().any() else 0.0
+    return float(tr.tail(n).mean()) if tr.notna().any() else 0.0
+
+
+def _atr_pct(d: pd.DataFrame, n: int = 14) -> float:
+    c = _series_num(d["close"])
     px = float(c.iloc[-1]) if c.notna().any() else 1.0
-    return atr / max(px, 1.0)
+    return _atr_abs(d, n) / max(px, 1.0)
 
 
 def _efficiency_ratio(d: pd.DataFrame, n: int = 20) -> float:
@@ -811,31 +885,51 @@ def _persist_side(series, thresh, side="above", bars=3) -> bool:
     return bool((tail < thresh).sum() >= max(2, bars - 1))
 
 
-def _box_tight(d: pd.DataFrame, n: int = 8, atr_frac: float = 0.85) -> bool:
+def _persist_minutes(series, thresh, side="above", d=None, minutes=VA_PERSIST_MIN) -> bool:
+    bars = _bars_for_minutes(d, minutes) if d is not None else 3
+    return _persist_side(series, thresh, side, bars)
+
+
+def _box_tight(d: pd.DataFrame, minutes: float = VA_BOX_MIN, atr_frac: float = 0.85) -> bool:
+    n = _bars_for_minutes(d, minutes, 3)
     if len(d) < n:
         return False
     sl = d.tail(n)
     h = float(_series_num(sl["high"] if "high" in sl.columns else sl["close"]).max())
     l = float(_series_num(sl["low"] if "low" in sl.columns else sl["close"]).min())
-    atr = _atr_pct(d) * max(float(_series_num(d["close"]).iloc[-1]), 1.0)
+    atr = _atr_abs(d)
     return (h - l) <= max(atr_frac * atr, 1.0)
 
 
-def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
-    """Range vs trend using profile density, efficiency, GEX, VWAP stretch, ATR."""
-    out = {
-        "regime": "CHOP", "score_range": 0.0, "score_trend": 0.0,
-        "eff": 0.0, "atr_pct": 0.0, "density": 0.0, "gex_sign": 0,
-        "vwap_z": 0.0, "note": "",
-    }
-    if dfi is None or getattr(dfi, "empty", True) or len(dfi) < 12:
-        return out
-    d = dfi.copy()
-    px = _series_num(d.get("spot_px", d["close"]))
-    last = float(px.iloc[-1])
-    atrp = _atr_pct(d)
-    eff = _efficiency_ratio(d, 20)
-    vp = {}
+def _session_minutes(d: pd.DataFrame) -> float:
+    try:
+        t = pd.to_datetime(d["time"], errors="coerce").dropna()
+        if t.empty:
+            return float(len(d)) * _bar_minutes(d)
+        t0, t1 = t.iloc[0], t.iloc[-1]
+        return max((t1 - t0).total_seconds() / 60.0, 0.0)
+    except Exception:
+        return float(len(d)) * _bar_minutes(d)
+
+
+def _formation_slice(d: pd.DataFrame) -> pd.DataFrame:
+    """Bars inside the morning lock window (first 75 min of this frame)."""
+    if d is None or d.empty:
+        return d
+    if "time" not in d.columns:
+        n = _bars_for_minutes(d, VA_LOCK_MINUTES)
+        return d.iloc[: max(n, 1)]
+    t = pd.to_datetime(d["time"], errors="coerce")
+    if t.isna().all():
+        n = _bars_for_minutes(d, VA_LOCK_MINUTES)
+        return d.iloc[: max(n, 1)]
+    t0 = t.dropna().iloc[0]
+    cutoff = t0 + pd.Timedelta(minutes=VA_LOCK_MINUTES)
+    sl = d.loc[t <= cutoff]
+    return sl if len(sl) >= 4 else d.iloc[: max(4, len(d))]
+
+
+def _profile_from(d: pd.DataFrame, bin_step: float = 5.0) -> dict:
     try:
         src = d
         if "spot_px" in d.columns and d["spot_px"].notna().sum() >= 8:
@@ -843,14 +937,121 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
                 "open": _series_num(d.get("open", d["close"])),
                 "high": _series_num(d.get("high", d["close"])),
                 "low": _series_num(d.get("low", d["close"])),
-                "close": _series_num(d["spot_px"] if "spot_px" in d.columns else d["close"]),
+                "close": _series_num(d["spot_px"]),
                 "volume": _series_num(d["volume"]) if "volume" in d.columns else 1.0,
+                "time": d["time"] if "time" in d.columns else None,
             })
-        vp = compute_session_volume_profile(src, bin_step=2.0, prominence_factor=0.35)
+        return compute_session_volume_profile(src, bin_step=bin_step, prominence_factor=0.35) or {}
     except Exception:
-        vp = {}
-    vah = vp.get("vah") if isinstance(vp, dict) else None
-    val = vp.get("val") if isinstance(vp, dict) else None
+        return {}
+
+
+def _book_hold(data: dict, side: str) -> dict:
+    """Use last futures book snap if present. side='bid' for longs, 'ask' for shorts."""
+    out = {"ok": False, "hold": False, "bid": 0.0, "ask": 0.0, "imb": 0.0}
+    snap = None
+    if isinstance(data, dict):
+        snap = data.get("fut_book") or data.get("book") or data.get("liq_snap")
+    if not snap:
+        try:
+            hist = st.session_state.get("liq_delta_history") or []
+            snap = hist[-1] if hist else None
+        except Exception:
+            snap = None
+    if not isinstance(snap, dict):
+        return out
+    bid = float(snap.get("bid_qty_lots") or snap.get("bid_qty") or 0)
+    ask = float(snap.get("ask_qty_lots") or snap.get("ask_qty") or 0)
+    tot = bid + ask
+    imb = (bid - ask) / tot if tot > 0 else 0.0
+    hold = (imb >= 0.12) if side == "bid" else (imb <= -0.12)
+    return {"ok": tot > 0, "hold": hold, "bid": bid, "ask": ask, "imb": imb}
+
+
+def _big_prints(d: pd.DataFrame, bars: int = 3) -> bool:
+    if d is None or d.empty or "volume" not in d.columns:
+        return False
+    vol = _series_num(d["volume"]).fillna(0.0)
+    if vol.sum() <= 0:
+        return False
+    try:
+        lot = float(LOT_SIZES.get(st.session_state.get("Index_Name") or "NIFTY", 65) or 65)
+    except Exception:
+        lot = 65.0
+    med = float(vol.replace(0, np.nan).median() or 0)
+    lots = vol / lot if med > 20000 else vol
+    thr = float(st.session_state.get("big_trade_min") or 50)
+    return bool((lots.tail(max(bars, 1)) >= thr).any())
+
+
+def _absorption(d: pd.DataFrame, side: str) -> dict:
+    """
+    Absorption: high volume + aggressors into the level + price does not follow.
+    side='up'  → buyers lift, close does not advance (fade VAH)
+    side='down'→ sellers press, close does not break (fade VAL)
+    Uses the same signed_flow series as CVD.
+    """
+    flow = _loc_in_bar_flow(d)
+    px = _series_num(d["spot_px"] if "spot_px" in d.columns else d["close"])
+    n = _bars_for_minutes(d, VA_DELTA_MIN, 2)
+    tail_f = flow.tail(n)
+    tail_p = px.tail(n)
+    vol = _series_num(d["volume"]).fillna(0.0) if "volume" in d.columns else tail_f.abs()
+    vol_tail = vol.tail(n)
+    med_vol = float(vol.replace(0, np.nan).median() or 0) or 1.0
+    atr = max(_atr_abs(d), 1.0)
+    px_chg = float(tail_p.iloc[-1] - tail_p.iloc[0]) if len(tail_p) >= 2 else 0.0
+    flow_sum = float(tail_f.sum()) if len(tail_f) else 0.0
+    flow_abs = float(tail_f.abs().sum()) if len(tail_f) else 1.0
+    hot = float(vol_tail.sum()) >= VA_ABSORB_VOL_MULT * med_vol * max(len(vol_tail), 1) * 0.35
+    if side == "up":
+        aggr = flow_sum > 0.10 * max(flow_abs, 1.0)
+        no_ft = px_chg <= VA_ABSORB_PX_ATR * atr
+        hit = bool(hot and aggr and no_ft)
+    else:
+        aggr = flow_sum < -0.10 * max(flow_abs, 1.0)
+        no_ft = px_chg >= -VA_ABSORB_PX_ATR * atr
+        hit = bool(hot and aggr and no_ft)
+    return {
+        "ok": hit,
+        "hot": hot,
+        "flow_sum": flow_sum,
+        "px_chg": px_chg,
+        "atr": atr,
+    }
+
+
+def _loc_vs_value(last, vah, val, std, atr_abs):
+    if vah is None or val is None:
+        return "UNKNOWN", 0.0
+    buf = max(0.35 * float(std or 0), 0.35 * float(atr_abs or 0), 4.0)
+    z_h = (last - float(vah)) / max(float(std) or 1.0, 1e-6)
+    z_l = (float(val) - last) / max(float(std) or 1.0, 1e-6)
+    if last >= float(vah) + buf:
+        return "ABOVE_VAH", z_h
+    if last <= float(val) - buf:
+        return "BELOW_VAL", z_l
+    if last > float(vah):
+        return "VAH_EDGE", z_h
+    if last < float(val):
+        return "VAL_EDGE", z_l
+    return "INSIDE", 0.0
+
+
+def _score_regime(d, vah, val, data=None) -> dict:
+    """Range vs trend. GEX recorded but NOT scored (pin target only)."""
+    out = {
+        "regime": "CHOP", "score_range": 0.0, "score_trend": 0.0,
+        "eff": 0.0, "atr_pct": 0.0, "density": 0.0, "gex_sign": 0,
+        "vwap_z": 0.0, "note": "", "vah": vah, "val": val, "poc": None,
+    }
+    if d is None or getattr(d, "empty", True) or len(d) < 8:
+        return out
+    px = _series_num(d.get("spot_px", d["close"]))
+    last = float(px.iloc[-1])
+    atrp = _atr_pct(d)
+    n_eff = _bars_for_minutes(d, 60, 8)
+    eff = _efficiency_ratio(d, n_eff)
     dens = _value_density(d, val, vah)
     vw = None
     if "vwap_idx" in d.columns:
@@ -872,21 +1073,17 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
     atr_abs = atrp * max(last, 1.0)
     realized_vs_atr = sess_rng / max(atr_abs * math.sqrt(max(len(d), 1) / 14.0), 1e-6)
 
-    # Range score: high density in value, low efficiency, long-gamma / pin, mid VWAP
     s_range = 0.0
     s_trend = 0.0
     s_range += 1.2 if dens >= 0.62 else (0.4 if dens >= 0.50 else -0.4)
     s_range += 1.0 if eff < 0.22 else (0.2 if eff < 0.32 else -0.6)
     s_range += 0.7 if abs(vz) < 1.10 else -0.3
-    s_range += 0.6 if gex_sign > 0 else (-0.2 if gex_sign < 0 else 0.1)
     s_range += 0.4 if realized_vs_atr < 1.15 else -0.3
-
     s_trend += 1.2 if eff >= 0.38 else (0.4 if eff >= 0.28 else -0.5)
     s_trend += 1.0 if dens <= 0.48 else (0.2 if dens <= 0.58 else -0.6)
     s_trend += 0.7 if abs(vz) >= 1.15 else -0.2
-    s_trend += 0.6 if gex_sign < 0 else (-0.15 if gex_sign > 0 else 0.05)
     s_trend += 0.5 if realized_vs_atr >= 1.25 else -0.2
-
+    # GEX is a pin/expansion hint only — do not vote on RANGE vs TREND
     if s_range >= 1.4 and s_range >= s_trend + 0.35:
         regime = "RANGE"
     elif s_trend >= 1.4 and s_trend >= s_range + 0.35:
@@ -898,172 +1095,350 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
         "eff": round(eff, 3), "atr_pct": round(atrp * 100.0, 3), "density": round(dens, 3),
         "gex_sign": gex_sign, "vwap_z": round(vz, 2),
         "vah": float(vah) if vah else None, "val": float(val) if val else None,
-        "poc": float(vp.get("poc")) if isinstance(vp, dict) and vp.get("poc") else None,
-        "vp": vp if isinstance(vp, dict) else {},
-        "note": f"{regime} dens={dens:.2f} eff={eff:.2f} zVWAP={vz:+.2f} GEX={'+' if gex_sign>0 else ('-' if gex_sign<0 else '0')}",
+        "note": (
+            f"{regime} dens={dens:.2f} eff={eff:.2f} zVWAP={vz:+.2f} "
+            f"GEX(annot)={'+' if gex_sign>0 else ('-' if gex_sign<0 else '0')}"
+        ),
     })
     return out
 
 
-def _loc_vs_value(last, vah, val, std, atr_abs):
-    """Statistical location vs value area. Buffer = max(0.35σ, 0.35 ATR)."""
-    if vah is None or val is None:
-        return "UNKNOWN", 0.0
-    buf = max(0.35 * float(std or 0), 0.35 * float(atr_abs or 0), 1.0)
-    z_h = (last - float(vah)) / max(float(std) or 1.0, 1e-6)
-    z_l = (float(val) - last) / max(float(std) or 1.0, 1e-6)
-    if last >= float(vah) + buf:
-        return "ABOVE_VAH", z_h
-    if last <= float(val) - buf:
-        return "BELOW_VAL", z_l
-    if last > float(vah):
-        return "VAH_EDGE", z_h
-    if last < float(val):
-        return "VAL_EDGE", z_l
-    return "INSIDE", 0.0
+def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
+    """Public wrapper. Prefers locked morning VA when the session machine has one."""
+    locked = None
+    try:
+        locked = st.session_state.get("va_lock")
+    except Exception:
+        locked = None
+    d = dfi
+    vah = val = poc = None
+    if isinstance(locked, dict) and locked.get("ok"):
+        vah, val, poc = locked.get("vah"), locked.get("val"), locked.get("poc")
+        if locked.get("regime") in ("RANGE", "TREND", "CHOP"):
+            out = _score_regime(d, vah, val, data)
+            out["regime"] = locked["regime"]
+            out["sticky"] = True
+            out["poc"] = poc
+            out["vah"] = vah
+            out["val"] = val
+            out["vp"] = locked.get("vp") or {}
+            return out
+    form = _formation_slice(d) if d is not None else d
+    vp = _profile_from(form if form is not None and len(form) >= 4 else d)
+    vah = vp.get("vah") if isinstance(vp, dict) else None
+    val = vp.get("val") if isinstance(vp, dict) else None
+    out = _score_regime(d, vah, val, data)
+    out["poc"] = float(vp.get("poc")) if isinstance(vp, dict) and vp.get("poc") else None
+    out["vp"] = vp if isinstance(vp, dict) else {}
+    out["sticky"] = False
+    return out
+
+
+def _empty_rec():
+    return {
+        "ok": False, "arrows": "→ → → →", "micro": "", "action": "NO ENTRY",
+        "key": ("=", "=", "=", "="), "hover": "", "regime": "FORMING",
+        "model": "FORMING", "price": "=", "delta": "=", "efi": "=", "cvd": "=",
+        "obv": "=", "efi_zero": False, "efi_note": "",
+        "stop": None, "target1": None, "target2": None, "invalid": None,
+        "size_hint": "none", "loc": "UNKNOWN", "loc_z": 0.0,
+        "vah": None, "val": None, "poc": None, "new_val": None, "new_vah": None,
+        "trade": None,
+    }
+
+
+def _stops_for(code, last, vah, val, poc, atr, new_val=None, new_vah=None):
+    buf = max(0.35 * (atr or 0), 4.0)
+    poc = poc if poc is not None else last
+    if code.startswith("M1S"):
+        return {"stop": (vah or last) + buf, "target1": poc, "target2": val,
+                "invalid": (vah or last) + buf, "size_hint": "small" if "ENTRY" in code else ("add" if "ADD" in code else "watch")}
+    if code.startswith("M1L"):
+        return {"stop": (val or last) - buf, "target1": poc, "target2": vah,
+                "invalid": (val or last) - buf, "size_hint": "small" if "ENTRY" in code else ("add" if "ADD" in code else "watch")}
+    if code.startswith("M2L"):
+        t2 = new_val if new_val is not None else (vah or last)
+        return {"stop": (vah or last) - buf, "target1": last + 2 * buf, "target2": None,
+                "invalid": (vah or last) - buf, "size_hint": "core" if "ENTRY" in code else ("add" if "ADD" in code else "watch"),
+                "trail": t2}
+    if code.startswith("M2S"):
+        t2 = new_vah if new_vah is not None else (val or last)
+        return {"stop": (val or last) + buf, "target1": last - 2 * buf, "target2": None,
+                "invalid": (val or last) + buf, "size_hint": "core" if "ENTRY" in code else ("add" if "ADD" in code else "watch"),
+                "trail": t2}
+    return {"stop": None, "target1": None, "target2": None, "invalid": None, "size_hint": "none"}
+
+
+class VaSessionMachine:
+    """Causal session memory: lock VA once, sticky regime, ENTRY before ADD, FAIL on invalidation."""
+
+    def __init__(self, prior=None):
+        prior = prior or {}
+        self.locked = bool(prior.get("locked"))
+        self.regime = prior.get("regime") or "FORMING"
+        self.vah = prior.get("vah")
+        self.val = prior.get("val")
+        self.poc = prior.get("poc")
+        self.vp = prior.get("vp") or {}
+        self.trade = dict(prior["trade"]) if prior.get("trade") else None
+        self.new_val = prior.get("new_val")
+        self.new_vah = prior.get("new_vah")
+        self.last_code = prior.get("last_code") or "FORMING"
+
+    def snapshot(self):
+        return {
+            "ok": self.locked, "locked": self.locked, "regime": self.regime,
+            "vah": self.vah, "val": self.val, "poc": self.poc, "vp": self.vp,
+            "trade": self.trade, "new_val": self.new_val, "new_vah": self.new_vah,
+            "last_code": self.last_code,
+        }
+
+    def _maybe_lock(self, d, data):
+        if self.locked:
+            return
+        if d is None or len(d) < VA_MIN_BARS_LOCK:
+            return
+        if _session_minutes(d) < VA_LOCK_MINUTES and len(d) < _bars_for_minutes(d, VA_LOCK_MINUTES, VA_MIN_BARS_LOCK):
+            return
+        form = _formation_slice(d)
+        vp = _profile_from(form)
+        vah, val = vp.get("vah"), vp.get("val")
+        if vah is None or val is None:
+            return
+        scored = _score_regime(form, vah, val, data)
+        self.locked = True
+        self.vah, self.val = float(vah), float(val)
+        self.poc = float(vp["poc"]) if vp.get("poc") else None
+        self.vp = vp
+        self.regime = scored["regime"]
+
+    def _update_new_balance(self, d):
+        if not self.locked or self.regime != "TREND":
+            return
+        last = float(_series_num(d["spot_px"] if "spot_px" in d.columns else d["close"]).iloc[-1])
+        if last > float(self.vah):
+            above = d.loc[_series_num(d["spot_px"] if "spot_px" in d.columns else d["close"]) >= float(self.vah)]
+            if len(above) >= 6:
+                vp2 = _profile_from(above, bin_step=5.0)
+                if vp2.get("val") is not None:
+                    self.new_val = float(vp2["val"])
+                    self.new_vah = float(vp2["vah"]) if vp2.get("vah") else self.new_vah
+        elif last < float(self.val):
+            below = d.loc[_series_num(d["spot_px"] if "spot_px" in d.columns else d["close"]) <= float(self.val)]
+            if len(below) >= 6:
+                vp2 = _profile_from(below, bin_step=5.0)
+                if vp2.get("vah") is not None:
+                    self.new_vah = float(vp2["vah"])
+                    self.new_val = float(vp2["val"]) if vp2.get("val") else self.new_val
+
+    def step(self, d, data=None) -> dict:
+        rec = _empty_rec()
+        if d is None or getattr(d, "empty", True) or len(d) < 8:
+            return rec
+        self._maybe_lock(d, data)
+        px = _series_num(d["spot_px"] if "spot_px" in d.columns else d["close"])
+        last = float(px.iloc[-1])
+        hi = float(_series_num(d["high"] if "high" in d.columns else d["close"]).iloc[-1])
+        lo = float(_series_num(d["low"] if "low" in d.columns else d["close"]).iloc[-1])
+        flow = _loc_in_bar_flow(d)
+        efi = _series_num(d["efi13"]) if "efi13" in d.columns else flow.ewm(span=13, adjust=False).mean()
+        cvd = _series_num(d["cvd"]) if "cvd" in d.columns else flow.cumsum()
+        d_arr = _level4(flow)
+        e_arr = _level4(efi) if len(efi) else "-"
+        c_arr = _level4(cvd) if len(cvd) else "-"
+        p_arr = _price_level4(d) if "close" in d.columns else "+"
+        glyphs = " ".join(LEVEL_GLYPH.get(k, "→") for k in (p_arr, d_arr, e_arr, c_arr))
+
+        if not self.locked:
+            rec.update({
+                "ok": True, "key": (p_arr, d_arr, e_arr, c_arr), "arrows": glyphs,
+                "model": "FORMING", "action": "NO ENTRY",
+                "micro": f"VA forming · {_session_minutes(d):.0f}m / {VA_LOCK_MINUTES}m lock",
+                "regime": "FORMING", "hover": "Morning value not locked yet.",
+                "price": p_arr, "delta": d_arr, "efi": e_arr, "cvd": c_arr, "obv": d_arr,
+            })
+            self.last_code = "FORMING"
+            return rec
+
+        self._update_new_balance(d)
+        std = float(_series_num(d["vwap_std"]).iloc[-1]) if "vwap_std" in d.columns else float(px.tail(20).std(ddof=1) or 0)
+        atr_abs = _atr_abs(d)
+        loc, loc_z = _loc_vs_value(last, self.vah, self.val, std, atr_abs)
+        abs_up = _absorption(d, "up")
+        abs_dn = _absorption(d, "down")
+        persist_h = _persist_minutes(px, float(self.vah), "above", d, VA_PERSIST_MIN)
+        persist_l = _persist_minutes(px, float(self.val), "below", d, VA_PERSIST_MIN)
+        efi_sl, efi_p = _ols_slope_p(efi.tail(_bars_for_minutes(d, VA_SLOPE_MIN, 6)))
+        n_dv = _bars_for_minutes(d, VA_DELTA_MIN, 2)
+        dv_sum = float(flow.tail(n_dv).sum())
+        book_bid = _book_hold(data, "bid")
+        book_ask = _book_hold(data, "ask")
+        big = _big_prints(d, _bars_for_minutes(d, VA_PERSIST_MIN, 2))
+        efi_exp_up = efi_sl > 0 and (float(efi.iloc[-1]) if len(efi) else 0) > 0
+        efi_exp_dn = efi_sl < 0 and (float(efi.iloc[-1]) if len(efi) else 0) < 0
+        tight = _box_tight(d)
+
+        # --- FAIL working trade first ---
+        code = None
+        tr = self.trade
+        if tr and tr.get("status") in ("ENTRY", "ADD"):
+            side = tr.get("side")
+            inv = tr.get("invalid")
+            if side == "SHORT" and inv is not None and last >= float(inv) and (efi_exp_up or dv_sum > 0):
+                code = "M1S_FAIL" if str(tr.get("model", "")).startswith("M1") else "M2S_FAIL"
+                self.trade = None
+            elif side == "LONG" and inv is not None and last <= float(inv) and (efi_exp_dn or dv_sum < 0):
+                code = "M1L_FAIL" if str(tr.get("model", "")).startswith("M1") else "M2L_FAIL"
+                self.trade = None
+
+        if code is None:
+            if self.regime == "RANGE":
+                if loc in ("ABOVE_VAH", "VAH_EDGE") and loc_z >= 0.25:
+                    if abs_up["ok"]:
+                        code = "M1S_ENTRY"
+                    else:
+                        code = "M1S_WATCH"
+                elif loc in ("BELOW_VAL", "VAL_EDGE") and loc_z >= 0.25:
+                    if abs_dn["ok"]:
+                        code = "M1L_ENTRY"
+                    else:
+                        code = "M1L_WATCH"
+                elif tr and tr.get("status") in ("ENTRY", "ADD") and tr.get("side") == "SHORT":
+                    # retest VAH from below
+                    if loc in ("INSIDE", "VAH_EDGE") and last <= float(self.vah) and abs(last - float(self.vah)) <= max(0.6 * atr_abs, 6.0):
+                        code = "M1S_ADD"
+                    else:
+                        code = tr.get("model") or "M1S_ENTRY"
+                elif tr and tr.get("status") in ("ENTRY", "ADD") and tr.get("side") == "LONG":
+                    if loc in ("INSIDE", "VAL_EDGE") and last >= float(self.val) and abs(last - float(self.val)) <= max(0.6 * atr_abs, 6.0):
+                        code = "M1L_ADD"
+                    else:
+                        code = tr.get("model") or "M1L_ENTRY"
+                else:
+                    code = "INSIDE"
+            elif self.regime == "TREND":
+                hold_long = persist_h and (book_bid.get("hold") or big or dv_sum > 0)
+                hold_short = persist_l and (book_ask.get("hold") or big or dv_sum < 0)
+                if loc == "ABOVE_VAH" and persist_h and loc_z >= 0.35:
+                    if hold_long and (efi_exp_up or dv_sum > 0):
+                        code = "M2L_ENTRY"
+                    else:
+                        code = "M2L_WATCH"
+                elif loc == "BELOW_VAL" and persist_l and loc_z >= 0.35:
+                    if hold_short and (efi_exp_dn or dv_sum < 0):
+                        code = "M2S_ENTRY"
+                    else:
+                        code = "M2S_WATCH"
+                elif tr and tr.get("side") == "LONG" and self.new_val is not None:
+                    if abs(last - float(self.new_val)) <= max(0.6 * atr_abs, 6.0) and dv_sum >= 0 and tight:
+                        code = "M2L_ADD"
+                    else:
+                        code = tr.get("model") or "M2L_ENTRY"
+                elif tr and tr.get("side") == "SHORT" and self.new_vah is not None:
+                    if abs(last - float(self.new_vah)) <= max(0.6 * atr_abs, 6.0) and dv_sum <= 0 and tight:
+                        code = "M2S_ADD"
+                    else:
+                        code = tr.get("model") or "M2S_ENTRY"
+                elif loc == "ABOVE_VAH":
+                    code = "M2L_WATCH"
+                elif loc == "BELOW_VAL":
+                    code = "M2S_WATCH"
+                else:
+                    code = "CHOP"
+            else:
+                if loc == "ABOVE_VAH" and loc_z >= 0.80 and abs_up["ok"]:
+                    code = "M1S_WATCH"
+                elif loc == "BELOW_VAL" and loc_z >= 0.80 and abs_dn["ok"]:
+                    code = "M1L_WATCH"
+                else:
+                    code = "CHOP"
+
+        # Promote / remember trade — ADD only after ENTRY
+        if code.endswith("_ADD"):
+            if not (tr and tr.get("status") in ("ENTRY", "ADD")):
+                code = code.replace("_ADD", "_WATCH")
+        if code.endswith("_ENTRY"):
+            stops = _stops_for(code, last, self.vah, self.val, self.poc, atr_abs, self.new_val, self.new_vah)
+            side = "SHORT" if "S_" in code or code.startswith("M1S") or code.startswith("M2S") else "LONG"
+            self.trade = {
+                "status": "ENTRY", "model": code, "side": side, "entry": last,
+                "invalid": stops.get("invalid"), "stop": stops.get("stop"),
+                "target1": stops.get("target1"), "target2": stops.get("target2"),
+            }
+        elif code.endswith("_ADD") and self.trade:
+            self.trade["status"] = "ADD"
+            self.trade["model"] = code
+
+        stops = _stops_for(code, last, self.vah, self.val, self.poc, atr_abs, self.new_val, self.new_vah)
+        micro, action = VA_PLAYBOOK.get(code, VA_PLAYBOOK["CHOP"])
+        note = (
+            f"{self.regime} sticky · {loc} z={loc_z:+.2f} · ΔΣ{n_dv}={dv_sum:.0f} · "
+            f"EFIsl={efi_sl:+.2f} p={efi_p:.2f} · big={int(big)} · "
+            f"book imb={book_bid.get('imb', 0):+.2f}"
+        )
+        hover = (
+            f"{glyphs}<br><b>{action}</b><br>{micro}<br>{note}<br>"
+            f"Locked VAH {self.vah} VAL {self.val} POC {self.poc}<br>"
+            f"New VA {self.new_val}/{self.new_vah}<br>"
+            f"Stop {stops.get('stop')}  T1 {stops.get('target1')}  T2 {stops.get('target2')}  size {stops.get('size_hint')}"
+        )
+        rec.update({
+            "ok": True, "key": (p_arr, d_arr, e_arr, c_arr), "arrows": glyphs,
+            "micro": micro + " · " + note, "action": action,
+            "price": p_arr, "delta": d_arr, "efi": e_arr, "cvd": c_arr, "obv": d_arr,
+            "hover": hover, "efi_zero": False, "efi_note": note,
+            "regime": self.regime, "model": code, "loc": loc, "loc_z": loc_z,
+            "vah": self.vah, "val": self.val, "poc": self.poc,
+            "new_val": self.new_val, "new_vah": self.new_vah,
+            "stop": stops.get("stop"), "target1": stops.get("target1"),
+            "target2": stops.get("target2"), "invalid": stops.get("invalid"),
+            "size_hint": stops.get("size_hint"),
+            "trade": dict(self.trade) if self.trade else None,
+        })
+        self.last_code = code
+        return rec
 
 
 def classify_va_setup(dfi: pd.DataFrame, data: dict = None) -> dict:
-    empty = {
-        "ok": False, "arrows": "→ → → →", "micro": "", "action": "NO ENTRY",
-        "key": ("=", "=", "=", "="), "hover": "", "regime": "CHOP",
-        "model": "", "price": "=", "delta": "=", "efi": "=", "cvd": "=",
-        "obv": "=", "efi_zero": False, "efi_note": "",
-    }
-    if dfi is None or getattr(dfi, "empty", True) or len(dfi) < 12:
-        return empty
-    d = dfi.copy()
-    px = _series_num(d["spot_px"] if "spot_px" in d.columns else d["close"])
-    last = float(px.iloc[-1])
-    delta_s = _signed_delta(d)
-    efi = _series_num(d["efi13"]) if "efi13" in d.columns else pd.Series(dtype=float)
-    cvd = _series_num(d["cvd"]) if "cvd" in d.columns else pd.Series(dtype=float)
-    d_arr = _level4(delta_s)
-    e_arr = _level4(efi) if len(efi) else "-"
-    c_arr = _level4(cvd) if len(cvd) else "-"
-    p_arr = _price_level4(d) if "close" in d.columns else "+"
-
-    reg = classify_market_regime(d, data)
-    vah, val, poc = reg.get("vah"), reg.get("val"), reg.get("poc")
-    std = float(_series_num(d["vwap_std"]).iloc[-1]) if "vwap_std" in d.columns else float(px.tail(20).std(ddof=1) or 0)
-    atr_abs = _atr_pct(d) * max(last, 1.0)
-    loc, loc_z = _loc_vs_value(last, vah, val, std, atr_abs)
-
-    efi_sl, efi_p = _ols_slope_p(efi.tail(12)) if len(efi) else (0.0, 1.0)
-    px_sl, px_p = _ols_slope_p(px.tail(12))
-    dv_tail = delta_s.tail(5)
-    dv_sum = float(dv_tail.sum()) if len(dv_tail) else 0.0
-    dv_abs = float(dv_tail.abs().sum()) if len(dv_tail) else 1.0
-    absorb_up = (px_sl > 0 and px_p < 0.12) and (dv_sum <= 0.15 * max(dv_abs, 1.0))
-    absorb_dn = (px_sl < 0 and px_p < 0.12) and (dv_sum >= -0.15 * max(dv_abs, 1.0))
-    efi_div_up = px_sl > 0 and efi_sl <= 0  # higher prices, EFI not expanding
-    efi_div_dn = px_sl < 0 and efi_sl >= 0
-    efi_exp_up = efi_sl > 0 and (float(efi.iloc[-1]) if len(efi) else 0) > 0
-    efi_exp_dn = efi_sl < 0 and (float(efi.iloc[-1]) if len(efi) else 0) < 0
-    persist_h = _persist_side(px, float(vah) if vah else last + 1e9, "above", 3) if vah else False
-    persist_l = _persist_side(px, float(val) if val else last - 1e9, "below", 3) if val else False
-    tight = _box_tight(d, 8, 0.90)
-    last_dv = float(delta_s.iloc[-1]) if len(delta_s) else 0.0
-    inside_now = loc == "INSIDE"
-
-    code = "CHOP"
-    if reg["regime"] == "RANGE":
-        if loc in ("ABOVE_VAH", "VAH_EDGE") and loc_z >= 0.35:
-            if absorb_up and efi_div_up:
-                code = "M1S_ENTRY"
-            elif absorb_up or efi_div_up:
-                code = "M1S_WATCH"
-            else:
-                code = "M1S_WATCH"
-        elif loc in ("BELOW_VAL", "VAL_EDGE") and loc_z >= 0.35:
-            if absorb_dn and efi_div_dn:
-                code = "M1L_ENTRY"
-            else:
-                code = "M1L_WATCH"
-        elif inside_now and vah and last < float(vah) and last_dv < 0 and px.iloc[-2] >= float(vah) * 0.999:
-            code = "M1S_ADD"
-        elif inside_now and val and last > float(val) and last_dv > 0 and px.iloc[-2] <= float(val) * 1.001:
-            code = "M1L_ADD"
-        else:
-            code = "INSIDE"
-    elif reg["regime"] == "TREND":
-        if loc == "ABOVE_VAH" and persist_h and loc_z >= 0.45:
-            if efi_exp_up and dv_sum > 0 and (tight or persist_h):
-                code = "M2L_ENTRY"
-            else:
-                code = "M2L_WATCH"
-        elif loc == "BELOW_VAL" and persist_l and loc_z >= 0.45:
-            if efi_exp_dn and dv_sum < 0 and (tight or persist_l):
-                code = "M2S_ENTRY"
-            else:
-                code = "M2S_WATCH"
-        elif vah and last >= float(vah) and last_dv >= 0 and tight:
-            code = "M2L_ADD"
-        elif val and last <= float(val) and last_dv <= 0 and tight:
-            code = "M2S_ADD"
-        elif loc == "ABOVE_VAH":
-            code = "M2L_WATCH"
-        elif loc == "BELOW_VAL":
-            code = "M2S_WATCH"
-        else:
-            code = "CHOP"
-    else:
-        # chop: only fire watch at statistically extreme location
-        if loc == "ABOVE_VAH" and loc_z >= 0.80 and absorb_up:
-            code = "M1S_WATCH"
-        elif loc == "BELOW_VAL" and loc_z >= 0.80 and absorb_dn:
-            code = "M1L_WATCH"
-        else:
-            code = "CHOP"
-
-    micro, action = VA_PLAYBOOK.get(code, VA_PLAYBOOK["CHOP"])
-    glyphs = " ".join(LEVEL_GLYPH.get(k, "→") for k in (p_arr, d_arr, e_arr, c_arr))
-    note = (
-        f"{reg['note']} · {loc} z={loc_z:+.2f} · ΔΣ5={dv_sum:.0f} · "
-        f"EFIsl={efi_sl:+.2f} p={efi_p:.2f} · Pxsl={px_sl:+.4f}"
-    )
-    hover = (
-        f"{glyphs}<br><b>{action}</b><br>{micro}<br>{note}<br>"
-        f"VAH {vah} VAL {val} POC {poc}"
-    )
-    return {
-        "ok": True, "key": (p_arr, d_arr, e_arr, c_arr), "arrows": glyphs,
-        "micro": micro + " · " + note, "action": action,
-        "price": p_arr, "delta": d_arr, "efi": e_arr, "cvd": c_arr, "obv": d_arr,
-        "hover": hover, "efi_zero": False, "efi_note": note,
-        "regime": reg["regime"], "model": code, "loc": loc, "loc_z": loc_z,
-        "vah": vah, "val": val, "poc": poc,
-    }
+    prior = {}
+    try:
+        prior = st.session_state.get("va_lock") or {}
+    except Exception:
+        prior = {}
+    machine = VaSessionMachine(prior)
+    rec = machine.step(dfi, data if data is not None else (st.session_state.get("data_store") if "st" in dir() else None))
+    try:
+        st.session_state["va_lock"] = machine.snapshot()
+    except Exception:
+        pass
+    return rec
 
 
 def classify_microstructure(dfi: pd.DataFrame, data: dict = None) -> dict:
-    """Value-area models (range fade vs trend acceptance). Signature kept for call sites."""
     rec = classify_va_setup(dfi, data if data is not None else st.session_state.get("data_store"))
     return rec
 
 
 def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 16) -> list:
-    """Causal VA-model action at each bar (data up to that bar only)."""
+    """Causal VA-model action at each bar (local machine, no lookahead)."""
     out = []
     if dfi is None or dfi.empty:
         return out
     n = len(dfi)
     data = st.session_state.get("data_store") if "st" in dir() else None
+    machine = VaSessionMachine()
     prev = None
     for i in range(n):
         if i + 1 < min_bars:
             continue
         sl = dfi.iloc[: i + 1]
         try:
-            rec = classify_va_setup(sl, data)
+            rec = machine.step(sl, data)
         except Exception:
             continue
         if not rec.get("ok"):
             continue
         act = rec.get("action") or ""
-        if act == prev:
-            # still store; chart layer de-dupes consecutive identical labels
-            pass
         prev = act
         hi = sl["high"].iloc[-1] if "high" in sl.columns else sl["close"].iloc[-1]
         t = sl["time_str"].iloc[-1] if "time_str" in sl.columns else str(i)
@@ -1073,29 +1448,28 @@ def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 16) -> list:
             "glyphs": rec.get("arrows") or "",
             "y": float(hi) if pd.notna(hi) else None,
             "model": rec.get("model"),
+            "stop": rec.get("stop"), "target1": rec.get("target1"),
+            "size_hint": rec.get("size_hint"),
         })
+    try:
+        st.session_state["va_lock"] = machine.snapshot()
+    except Exception:
+        pass
     return out
 
 
 def classify_flow_playbook(dfi: pd.DataFrame, data: dict) -> dict:
-    """Compat shim — flow-18 book removed. Surface the VA model as flow chip."""
-    rec = classify_va_setup(dfi, data)
-    if not rec.get("ok"):
-        return {"ok": False, "action": "", "micro": "", "hover": ""}
-    return {
-        "ok": True, "action": rec.get("action") or "NO ENTRY",
-        "micro": rec.get("micro") or "", "hover": rec.get("hover") or "",
-        "price": "f", "cvd": "f", "dex": "f", "prem": "f",
-    }
+    """Flow-18 book removed. Do not surface a second chip."""
+    return {"ok": False, "action": "", "micro": "", "hover": ""}
 
 
 def detect_candle_pattern(df: pd.DataFrame) -> dict:
-    """Candle book removed — kept as inert stub for leftover call sites."""
-    return {"ok": False, "name": "—", "bias": 0, "conf": "Low", "note": "candle book removed"}
+    return {"ok": False, "name": "", "bias": 0, "conf": "", "note": ""}
 
 
 def confirm_pdec_with_candle(action: str, pat: dict) -> tuple:
-    return action or "NO ENTRY", "VA model (no candle gate)"
+    return action or "NO ENTRY", "VA state machine"
+
 
 
 def _telegram_creds():
@@ -2585,7 +2959,7 @@ def attach_bar_flow(df: pd.DataFrame, rebuild: bool = False) -> pd.DataFrame:
     out["cvd"] = out["signed_flow"].cumsum()
     direction = np.sign(cl.diff().fillna(0.0))
     out["obv"] = (direction * vol).cumsum()
-    out["efi13"] = (cl.diff() * vol).ewm(span=13, adjust=False).mean()
+    out["efi13"] = out["signed_flow"].ewm(span=13, adjust=False).mean()
     return out
 
 
@@ -2963,6 +3337,7 @@ with st.sidebar.expander("1. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
         Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"])
+        st.session_state["Index_Name"] = Index_Name
     if st.session_state.get("_last_index") and st.session_state["_last_index"] != Index_Name:
         st.session_state["flow_tape"] = []
         st.session_state.pop("liq_delta_history", None)
@@ -6449,14 +6824,6 @@ def live_dashboard_fragment():
                 st.session_state["_last_dfi"] = dfi
                 st.session_state["_last_scores"] = scores if isinstance(scores, dict) else {}
                 micro = classify_microstructure(dfi)
-                candle_pat = detect_candle_pattern(dfi)
-                raw_act = micro.get("action") if isinstance(micro, dict) else ""
-                filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
-                if isinstance(micro, dict):
-                    micro["action_raw"] = raw_act
-                    micro["action"] = filt_act
-                    micro["candle"] = candle_pat.get("name")
-                    micro["candle_why"] = filt_why
                 flow_pb = classify_flow_playbook(dfi, data)
                 try:
                     process_telegram_alerts(data, dfi, scores if isinstance(scores, dict) else {},
@@ -6492,14 +6859,6 @@ def live_dashboard_fragment():
                 fig_stack.update_yaxes(tickfont=dict(size=8), title_text="CVD", row=4, col=2)
                 if "micro" not in dir() or not isinstance(micro, dict):
                     micro = classify_microstructure(dfi)
-                    candle_pat = detect_candle_pattern(dfi)
-                    raw_act = micro.get("action") if isinstance(micro, dict) else ""
-                    filt_act, filt_why = confirm_pdec_with_candle(raw_act, candle_pat)
-                    if isinstance(micro, dict):
-                        micro["action_raw"] = raw_act
-                        micro["action"] = filt_act
-                        micro["candle"] = candle_pat.get("name")
-                        micro["candle_why"] = filt_why
                 atm_k = data.get("atm_strike")
                 tab_flow, tab_dex, tab_atm_ce, tab_atm_pe = st.tabs([
                     "1 · Index / ΔV / EFI / CVD",
@@ -6509,17 +6868,36 @@ def live_dashboard_fragment():
                 ])
                 with tab_flow:
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
-                    if isinstance(micro, dict) and micro.get("candle"):
-                        st.caption(
-                            f"VA · {micro.get('regime','')} · {micro.get('model','')} · raw {micro.get('action_raw') or '—'} → "
-                            f"{micro.get('action')} · {micro.get('candle_why') or ''}"
-                        )
+                    if isinstance(micro, dict) and micro.get("ok"):
+                        stop = micro.get("stop")
+                        t1 = micro.get("target1")
+                        t2 = micro.get("target2")
+                        bits = [
+                            f"VA · {micro.get('regime','')}",
+                            str(micro.get("model") or ""),
+                            str(micro.get("action") or ""),
+                            f"size {micro.get('size_hint') or '—'}",
+                        ]
+                        if isinstance(stop, (int, float)):
+                            bits.append(f"stop {stop:.0f}")
+                        if isinstance(t1, (int, float)):
+                            bits.append(f"T1 {t1:.0f}")
+                        if isinstance(t2, (int, float)):
+                            bits.append(f"T2 {t2:.0f}")
+                        if micro.get("new_val"):
+                            bits.append(f"newVAL {float(micro['new_val']):.0f}")
+                        if micro.get("new_vah"):
+                            bits.append(f"newVAH {float(micro['new_vah']):.0f}")
+                        st.caption(" · ".join(b for b in bits if b))
                     st.plotly_chart(fig_stack, use_container_width=True)
                     if pdec_hist:
                         with st.expander(f"VA session log ({len(pdec_hist)} bars)", expanded=False):
-                            lines = ["| Time | P Δ E C | Action |", "|---|---|---|"]
+                            lines = ["| Time | P Δ E C | Action | Stop | Size |", "|---|---|---|---|---|"]
                             for rec in pdec_hist:
-                                lines.append(f"| {rec['t']} | {rec['glyphs']} | {rec['action']} |")
+                                lines.append(
+                                    f"| {rec['t']} | {rec['glyphs']} | {rec['action']} | "
+                                    f"{rec.get('stop') or '—'} | {rec.get('size_hint') or '—'} |"
+                                )
                             st.markdown("\n".join(lines))
                     if st.session_state.get("avwap_on"):
                         opts_t = list(dfi["time_str"]) if "time_str" in dfi.columns else []
@@ -6733,14 +7111,7 @@ def live_dashboard_fragment():
                         f"{micro.get('efi_note','')}<br><b>Algo action:</b> {act}",
                         "#00E676",
                     ))
-                    flow = classify_flow_playbook(dfi, data)
-                    if flow.get("ok"):
-                        chips.append(_chip(
-                            f"P{ARROW_GLYPH[flow['price']]} C{ARROW_GLYPH[flow['cvd']]} "
-                            f"D{ARROW_GLYPH[flow['dex']]} $ {ARROW_GLYPH[flow['prem']]}<br>{flow['action']}",
-                            f"<b>Flow playbook (18)</b><br>{flow['hover']}",
-                            "#90CAF9",
-                        ))
+                    # Flow-18 chip removed — VA state machine is the only playbook surface.
                 st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
                 if not st.session_state.get("intel_refresh"):
                     b1, b2 = st.columns([0.50, 0.50])
