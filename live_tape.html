@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Nifty live tape</title>
+  <title>Nifty live tape v3</title>
   <style>
     :root {
       --bg: #0a0a0b; --panel: #11151c; --line: #2a3340; --text: #e8eaed;
@@ -70,7 +70,7 @@
       canvas.width = cssW * dpr;
       canvas.height = cssH * dpr;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      const pad = { l: 52, r: 64, t: 36, b: 22 };
+      const pad = { l: 92, r: 96, t: 36, b: 22 };
       const innerH = cssH - pad.t - pad.b;
       const hPx = innerH * 0.50, hDv = innerH * 0.16, hEfi = innerH * 0.16, hCvd = innerH * 0.18;
       return {
@@ -110,6 +110,43 @@
       const padPx = (hi - lo) * 0.06 || 8;
       lo -= padPx; hi += padPx;
       const yPx = yMap(lo, hi, L.px);
+
+      // Volume profiles: left = signed ΔV, right = session volume
+      (function drawProfiles() {
+        const step = 5;
+        const bins = {};
+        bars.forEach((b) => {
+          const mid = 0.5 * (Number(b.high) + Number(b.low));
+          const key = Math.round(mid / step) * step;
+          if (!bins[key]) bins[key] = { vol: 0, delta: 0 };
+          bins[key].vol += Math.abs(Number(b.volume) || 0);
+          bins[key].delta += Number(b.delta) || 0;
+        });
+        const keys = Object.keys(bins).map(Number);
+        if (!keys.length) return;
+        let maxVol = 1, maxAbsD = 1, poc = keys[0];
+        keys.forEach((k) => {
+          if (bins[k].vol > maxVol) { maxVol = bins[k].vol; poc = k; }
+          maxAbsD = Math.max(maxAbsD, Math.abs(bins[k].delta));
+        });
+        const midL = L.pad.l * 0.52;
+        keys.forEach((k) => {
+          const y = yPx(k);
+          if (y < L.px.y0 || y > L.px.y1) return;
+          const bh = Math.max(2, (step / (hi - lo)) * (L.px.y1 - L.px.y0) * 0.9);
+          // left ΔV
+          const dw = (Math.abs(bins[k].delta) / maxAbsD) * (L.pad.l - 16);
+          ctx.fillStyle = bins[k].delta >= 0 ? "rgba(38,166,154,.75)" : "rgba(239,83,80,.75)";
+          if (bins[k].delta >= 0) ctx.fillRect(midL, y - bh / 2, dw, bh);
+          else ctx.fillRect(midL - dw, y - bh / 2, dw, bh);
+          // right volume
+          const vw = (bins[k].vol / maxVol) * (L.pad.r - 18);
+          ctx.fillStyle = Math.abs(k - (va.poc || poc)) <= step ? "#ffd54f" : "rgba(100,181,246,.7)";
+          ctx.fillRect(L.w - L.pad.r + 4, y - bh / 2, vw, bh);
+        });
+        ctx.strokeStyle = "rgba(255,255,255,.25)";
+        ctx.beginPath(); ctx.moveTo(midL, L.px.y0); ctx.lineTo(midL, L.px.y1); ctx.stroke();
+      })();
 
       // grid + levels
       ctx.lineWidth = 1;
