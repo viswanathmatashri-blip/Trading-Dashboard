@@ -301,7 +301,31 @@ def classify_va(df: pd.DataFrame) -> dict:
             code = "CHOP"
     micro, action = VA_PLAYBOOK.get(code, VA_PLAYBOOK["CHOP"])
     note = f"{regime} {loc} eff={eff:.2f} dens={dens_inside:.2f} VAH {vah} VAL {val} POC {poc}"
-    return {"action": action, "micro": f"{micro} · {note}", "model": code, "regime": regime}
+    return {
+        "action": action, "micro": f"{micro} · {note}", "model": code, "regime": regime,
+        "vah": vah, "val": val, "poc": poc, "loc": loc,
+    }
+
+
+def _va_labels(df: pd.DataFrame) -> list:
+    """Action when it changes, for vertical labels above candles."""
+    out = []
+    if df is None or len(df) < 12:
+        return out
+    prev = None
+    step = max(1, len(df) // 40)
+    for i in range(11, len(df), step):
+        rec = classify_va(df.iloc[: i + 1])
+        act = rec.get("action") or ""
+        if act == prev or act == "NO ENTRY":
+            continue
+        prev = act
+        ts = df.iloc[i].get("t0")
+        out.append({"i": int(i), "t": str(ts), "action": act})
+    rec = classify_va(df)
+    if rec.get("action") and rec.get("action") != prev:
+        out.append({"i": int(len(df) - 1), "t": str(df.iloc[-1].get("t0")), "action": rec["action"]})
+    return out[-12:]
 
 
 def apply_bar_state(spot, fut):
@@ -310,15 +334,40 @@ def apply_bar_state(spot, fut):
     last = df.iloc[-1] if not df.empty else None
     va = classify_va(df) if not df.empty else {"action": "NO ENTRY", "micro": "warming up"}
     bars_out = []
+    pdh = pdl = None
     if not df.empty:
-        tail = df.tail(80)
+        tail = df.tail(120).copy()
+        # previous-day high/low from seeded t0 if present
+        if "t0" in tail.columns:
+            days = pd.to_datetime(tail["t0"], unit="s", errors="coerce")
+            tail["_d"] = days.dt.date
+            uniq = [d for d in tail["_d"].dropna().unique()]
+            if len(uniq) >= 2:
+                prevd = tail[tail["_d"] == uniq[-2]]
+                if not prevd.empty:
+                    pdh = float(prevd["high"].max())
+                    pdl = float(prevd["low"].min())
         for _, r in tail.iterrows():
+            t0 = r.get("t0")
+            try:
+                tstr = pd.to_datetime(t0, unit="s").strftime("%H:%M")
+            except Exception:
+                tstr = ""
             bars_out.append({
+                "t": tstr,
+                "open": float(r["open"]) if "open" in r and pd.notna(r["open"]) else float(r["close"]),
+                "high": float(r["high"]) if "high" in r and pd.notna(r["high"]) else float(r["close"]),
+                "low": float(r["low"]) if "low" in r and pd.notna(r["low"]) else float(r["close"]),
                 "close": float(r["close"]),
-                "vwap": float(r["vwap"]) if pd.notna(r["vwap"]) else None,
-                "efi13": float(r["efi13"]) if pd.notna(r["efi13"]) else 0.0,
-                "cvd": float(r["cvd"]) if pd.notna(r["cvd"]) else 0.0,
+                "volume": float(r["volume"]) if pd.notna(r.get("volume")) else 0.0,
+                "delta": float(r["delta"]) if pd.notna(r.get("delta")) else 0.0,
+                "vwap": float(r["vwap"]) if pd.notna(r.get("vwap")) else None,
+                "efi13": float(r["efi13"]) if pd.notna(r.get("efi13")) else 0.0,
+                "cvd": float(r["cvd"]) if pd.notna(r.get("cvd")) else 0.0,
             })
+        va["labels"] = _va_labels(tail.reset_index(drop=True))
+        va["pdh"] = pdh
+        va["pdl"] = pdl
     with LOCK:
         SNAPSHOT.update({
             "spot": spot,
