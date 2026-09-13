@@ -55,6 +55,8 @@
     const statusEl = $("status");
     const canvas = $("c-all");
     let state = { bars: [], va: {} };
+    let hoverI = null;
+    let geom = null;
 
     function fmt(n, d = 1) {
       if (n == null || Number.isNaN(+n)) return "—";
@@ -68,7 +70,7 @@
       canvas.width = cssW * dpr;
       canvas.height = cssH * dpr;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      const pad = { l: 52, r: 64, t: 18, b: 18 };
+      const pad = { l: 52, r: 64, t: 36, b: 22 };
       const innerH = cssH - pad.t - pad.b;
       const hPx = innerH * 0.50, hDv = innerH * 0.16, hEfi = innerH * 0.16, hCvd = innerH * 0.18;
       return {
@@ -95,6 +97,7 @@
       const left = L.pad.l, right = L.w - L.pad.r;
       const slot = (right - left) / n;
       const xMid = (i) => left + (i + 0.5) * slot;
+      geom = { left, right, slot, n };
 
       const highs = bars.map((b) => b.high);
       const lows = bars.map((b) => b.low);
@@ -154,22 +157,31 @@
         ctx.fillRect(x - bw / 2, top, bw, h);
       });
 
-      // VA labels above candles
+      // VA trigger tags — horizontal pills on the candle high
       const labels = va.labels || [];
-      ctx.save();
-      ctx.font = "9px ui-sans-serif";
-      ctx.fillStyle = "#cfd8dc";
+      ctx.font = "bold 11px ui-sans-serif";
+      const usedY = [];
       labels.forEach((lab) => {
-        const i = Math.min(n - 1, Math.max(0, lab.i ?? n - 1));
+        const i = Math.min(n - 1, Math.max(0, Number.isFinite(+lab.i) ? +lab.i : n - 1));
+        const text = String(lab.action || "").trim();
+        if (!text || text === "NO ENTRY") return;
         const x = xMid(i);
-        ctx.save();
-        ctx.translate(x, L.px.y0 + 4);
-        ctx.rotate(-Math.PI / 2);
-        const text = (lab.action || "").slice(0, 28);
-        ctx.fillText(text, 0, 0);
-        ctx.restore();
+        const short = text.length > 34 ? text.slice(0, 32) + "…" : text;
+        const tw = ctx.measureText(short).width + 10;
+        let y = yPx(bars[i].high) - 16;
+        y = Math.max(L.px.y0 + 12, Math.min(y, L.px.y1 - 14));
+        usedY.forEach((oy) => {
+          if (Math.abs(y - oy) < 14) y -= 14;
+        });
+        usedY.push(y);
+        const leftBox = Math.max(left, Math.min(x - tw / 2, right - tw));
+        const isShort = /SHORT/.test(text);
+        const isLong = /LONG/.test(text);
+        ctx.fillStyle = isShort ? "rgba(239,83,80,.92)" : isLong ? "rgba(38,166,154,.92)" : "rgba(255,193,7,.92)";
+        ctx.fillRect(leftBox, y - 11, tw, 16);
+        ctx.fillStyle = "#0a0a0b";
+        ctx.fillText(short, leftBox + 5, y + 1);
       });
-      ctx.restore();
 
       function paneBars(box, key, zeroLine = true) {
         const vals = bars.map((b) => +b[key] || 0);
@@ -224,6 +236,34 @@
       for (let i = 0; i < n; i += step) {
         ctx.fillText(bars[i].t || "", xMid(i) - 10, L.h - 4);
       }
+
+      if (hoverI != null && bars[hoverI]) {
+        const b = bars[hoverI];
+        const x = xMid(hoverI);
+        ctx.strokeStyle = "rgba(255,255,255,.35)";
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(x, L.px.y0); ctx.lineTo(x, L.cvd.y1); ctx.stroke();
+        ctx.setLineDash([]);
+        const lines = [
+          `${b.t || ""} IST`,
+          `O ${fmt(b.open)}  H ${fmt(b.high)}  L ${fmt(b.low)}  C ${fmt(b.close)}`,
+          `VWAP ${fmt(b.vwap)}  ΔV ${fmt(b.delta, 0)}`,
+          `EFI ${fmt(b.efi13, 0)}  CVD ${fmt(b.cvd, 0)}`,
+        ];
+        ctx.font = "12px ui-sans-serif";
+        const tw = Math.max(...lines.map((s) => ctx.measureText(s).width)) + 16;
+        const th = 18 * lines.length + 10;
+        let bx = x + 12;
+        if (bx + tw > L.w - 8) bx = x - tw - 12;
+        let by = L.px.y0 + 8;
+        ctx.fillStyle = "rgba(16,20,28,.94)";
+        ctx.strokeStyle = "#00e676";
+        ctx.lineWidth = 1;
+        ctx.fillRect(bx, by, tw, th);
+        ctx.strokeRect(bx, by, tw, th);
+        ctx.fillStyle = "#e8eaed";
+        lines.forEach((s, k) => ctx.fillText(s, bx + 8, by + 16 + k * 18));
+      }
     }
 
     function render() {
@@ -256,6 +296,15 @@
     }
     connect();
     window.addEventListener("resize", render);
+    canvas.addEventListener("mousemove", (ev) => {
+      if (!geom) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const i = Math.floor((x - geom.left) / geom.slot);
+      hoverI = (i >= 0 && i < geom.n) ? i : null;
+      draw();
+    });
+    canvas.addEventListener("mouseleave", () => { hoverI = null; draw(); });
   </script>
 </body>
 </html>
