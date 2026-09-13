@@ -185,10 +185,9 @@
         [va.vah15, "#4fc3f7", "VAH1.5σ"],
         [va.val15, "#66bb6a", "VAL1.5σ"],
       ];
-      (va.zones || []).forEach((z, zi) => {
-        levels.push([z.vah, "#4dd0e1", (z.tag || "VA") + "H"]);
-        levels.push([z.val, "#80cbc4", (z.tag || "VA") + "L"]);
-        levels.push([z.poc, "#ffe082", (z.tag || "VA") + "P"]);
+      (va.hvns || []).forEach((px, zi) => {
+        if (Math.abs(px - (va.poc || 0)) < 4) return;
+        levels.push([px, "#4fc3f7", "HVN"]);
       });
       levels.forEach(([v, col, name]) => {
         if (!v) return;
