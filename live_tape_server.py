@@ -300,7 +300,7 @@ def _value_area(df: pd.DataFrame) -> dict:
     return {"poc": float(mid[poc_i]), "val": float(bins[a]), "vah": float(bins[b + 1])}
 
 
-def _profile_bins(df: pd.DataFrame, step: float = 5.0) -> list:
+def _profile_bins(df: pd.DataFrame, step: float = 2.0) -> list:
     if df is None or df.empty:
         return []
     lo = float(min(df["low"].min() if "low" in df.columns else df["close"].min(), df["close"].min()))
@@ -588,7 +588,31 @@ def apply_bar_state(spot, fut):
         va["labels"] = _va_labels(tail_for_va.reset_index(drop=True))
         va["pdh"] = pdh
         va["pdl"] = pdl
-        va["profile"] = _profile_bins(tail_for_va)
+        prof = _profile_bins(tail_for_va, 2.0)
+        va["profile"] = prof
+        if prof:
+            poc_row = max(prof, key=lambda p: p.get("vol") or 0)
+            va["poc"] = float(poc_row["px"])
+            tot = sum(p.get("vol") or 0 for p in prof) or 1.0
+            target = 0.70 * tot
+            prices = [p["px"] for p in prof]
+            vols = [p.get("vol") or 0 for p in prof]
+            i0 = prices.index(poc_row["px"]) if poc_row["px"] in prices else int(max(range(len(vols)), key=lambda i: vols[i]))
+            a = b = i0
+            taken = vols[i0]
+            while taken < target and (a > 0 or b < len(vols) - 1):
+                left = vols[a - 1] if a > 0 else -1
+                right = vols[b + 1] if b < len(vols) - 1 else -1
+                if right >= left:
+                    b = min(b + 1, len(vols) - 1)
+                    taken += vols[b]
+                else:
+                    a = max(a - 1, 0)
+                    taken += vols[a]
+            va["val"] = float(prices[a])
+            va["vah"] = float(prices[b])
+        for k in ("vah1", "val1", "vah15", "val15", "vah80", "val80", "zones"):
+            va.pop(k, None)
     with LOCK:
         SNAPSHOT.update({
             "spot": spot,
@@ -1028,4 +1052,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()s
