@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from va_core import classify_va_setup, pdec_session_history
+from va_core import classify_va_setup, pdec_session_history, compute_session_volume_profile
 
 load_dotenv()
 
@@ -541,6 +541,17 @@ def apply_bar_state(spot, fut):
             "poc": rec.get("poc"),
             "loc": rec.get("loc"),
         }
+        try:
+            vp = compute_session_volume_profile(sess_df, bin_step=2.0)
+            if vp.get("ok"):
+                for k in ("vah1", "val1", "vah15", "val15", "vah80", "val80", "zones"):
+                    if k in vp:
+                        va[k] = vp[k]
+                va["vah"] = vp.get("vah", va.get("vah"))
+                va["val"] = vp.get("val", va.get("val"))
+                va["poc"] = vp.get("poc", va.get("poc"))
+        except Exception:
+            pass
         va["labels"] = pdec_session_history(sess_df, gex_data, min_bars=16)
         # previous-day high/low from seeded t0 if present
         if "t0" in tail.columns:
@@ -754,8 +765,10 @@ def compute_hourly_greeks(api, spot: float) -> dict:
             vega = spot * _norm_pdf(d1) * math.sqrt(max(T, 1e-9)) * 0.01
             ce_oi = float((sides.get("CE") or {}).get("oi") or 0)
             pe_oi = float((sides.get("PE") or {}).get("oi") or 0)
-            # Streamlit: call_gex - put_gex
-            gex_k = gam * ce_oi * gex_scale - gam * pe_oi * gex_scale
+            # Streamlit: call_gex - put_gex; no fake gamma on deep ITM
+            call_g = gam if k >= spot - 150 else 0.0
+            put_g = gam if k <= spot + 150 else 0.0
+            gex_k = call_g * ce_oi * gex_scale - put_g * pe_oi * gex_scale
             vex_k = (vega * ce_oi - vega * pe_oi) * LOT * 0.01
             net_gex += gex_k
             net_vex += vex_k
