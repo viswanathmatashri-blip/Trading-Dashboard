@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Nifty live tape v3</title>
+  <title>Nifty live tape v4</title>
   <style>
     :root {
       --bg: #0a0a0b; --panel: #11151c; --line: #2a3340; --text: #e8eaed;
@@ -196,28 +196,29 @@
 
       // VA trigger tags — horizontal pills on the candle high
       const labels = va.labels || [];
-      ctx.font = "bold 11px ui-sans-serif";
-      const usedY = [];
       labels.forEach((lab) => {
         const i = Math.min(n - 1, Math.max(0, Number.isFinite(+lab.i) ? +lab.i : n - 1));
         const text = String(lab.action || "").trim();
         if (!text || text === "NO ENTRY") return;
         const x = xMid(i);
-        const short = text.length > 34 ? text.slice(0, 32) + "…" : text;
-        const tw = ctx.measureText(short).width + 10;
-        let y = yPx(bars[i].high) - 16;
-        y = Math.max(L.px.y0 + 12, Math.min(y, L.px.y1 - 14));
-        usedY.forEach((oy) => {
-          if (Math.abs(y - oy) < 14) y -= 14;
-        });
-        usedY.push(y);
-        const leftBox = Math.max(left, Math.min(x - tw / 2, right - tw));
-        const isShort = /SHORT/.test(text);
-        const isLong = /LONG/.test(text);
-        ctx.fillStyle = isShort ? "rgba(239,83,80,.92)" : isLong ? "rgba(38,166,154,.92)" : "rgba(255,193,7,.92)";
-        ctx.fillRect(leftBox, y - 11, tw, 16);
-        ctx.fillStyle = "#0a0a0b";
-        ctx.fillText(short, leftBox + 5, y + 1);
+        const t = lab.t || (bars[i] && bars[i].t) || "";
+        const short = `${t} ${text}`.trim();
+        const col = /SHORT/.test(text) ? "#ef5350" : /LONG/.test(text) ? "#26a69a" : "#ffd54f";
+        ctx.strokeStyle = col;
+        ctx.globalAlpha = 0.4;
+        ctx.beginPath();
+        ctx.moveTo(x, L.px.y0 + 4);
+        ctx.lineTo(x, yPx(bars[i].high));
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = col;
+        ctx.font = "bold 11px ui-sans-serif";
+        ctx.save();
+        ctx.translate(x + 4, L.px.y0 + 8);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = "right";
+        ctx.fillText(short, 0, 0);
+        ctx.restore();
       });
 
       function paneBars(box, key, zeroLine = true) {
