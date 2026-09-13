@@ -44,6 +44,7 @@ GEX_SECONDS = int(os.getenv("TAPE_GEX_SECONDS", "3600"))  # hourly; ticks never 
 LOT = 65
 GEX_WAKE = threading.Event()
 API_HOLD = {"api": None}
+INDEX_PDHL = {"pdh": None, "pdl": None}
 
 
 def resolve_nifty_fut_token() -> str:
@@ -586,29 +587,31 @@ def apply_bar_state(spot, fut):
                 "cvd": float(r["cvd"]) if pd.notna(r.get("cvd")) else 0.0,
             })
         va["labels"] = _va_labels(tail_for_va.reset_index(drop=True))
-        va["pdh"] = pdh
-        va["pdl"] = pdl
+        va["pdh"] = INDEX_PDHL.get("pdh") or pdh
+        va["pdl"] = INDEX_PDHL.get("pdl") or pdl
         prof = _profile_bins(tail_for_va, 2.0)
         va["profile"] = prof
         if prof:
-            poc_row = max(prof, key=lambda p: p.get("vol") or 0)
-            va["poc"] = float(poc_row["px"])
-            tot = sum(p.get("vol") or 0 for p in prof) or 1.0
-            target = 0.70 * tot
             prices = [p["px"] for p in prof]
-            vols = [p.get("vol") or 0 for p in prof]
-            i0 = prices.index(poc_row["px"]) if poc_row["px"] in prices else int(max(range(len(vols)), key=lambda i: vols[i]))
-            a = b = i0
-            taken = vols[i0]
-            while taken < target and (a > 0 or b < len(vols) - 1):
-                left = vols[a - 1] if a > 0 else -1
-                right = vols[b + 1] if b < len(vols) - 1 else -1
-                if right >= left:
-                    b = min(b + 1, len(vols) - 1)
-                    taken += vols[b]
-                else:
-                    a = max(a - 1, 0)
-                    taken += vols[a]
+            vols = [float(p.get("vol") or 0) for p in prof]
+            poc_i = int(max(range(len(vols)), key=lambda i: vols[i]))
+            va["poc"] = float(prices[poc_i])
+            peak = vols[poc_i] or 1.0
+            # HVNs = local volume peaks (the fat pockets you marked)
+            hvns = []
+            for i in range(1, len(vols) - 1):
+                if vols[i] >= vols[i - 1] and vols[i] >= vols[i + 1] and vols[i] >= 0.32 * peak:
+                    if any(abs(prices[i] - h) < 8 for h in hvns):
+                        continue
+                    hvns.append(float(prices[i]))
+            hvns.sort()
+            va["hvns"] = hvns
+            # Tight VA around POC: stop at first valley under 28% of peak
+            a = b = poc_i
+            while a > 0 and vols[a - 1] >= 0.28 * peak:
+                a -= 1
+            while b < len(vols) - 1 and vols[b + 1] >= 0.28 * peak:
+                b += 1
             va["val"] = float(prices[a])
             va["vah"] = float(prices[b])
         for k in ("vah1", "val1", "vah15", "val15", "vah80", "val80", "zones"):
@@ -877,6 +880,26 @@ def angel_thread():
 
     seed_history()
     API_HOLD["api"] = api
+    try:
+        from datetime import datetime, timedelta
+        to_dt = datetime.now()
+        from_dt = to_dt - timedelta(days=7)
+        res = api.getCandleData({
+            "exchange": "NSE",
+            "symboltoken": str(NIFTY_TOKEN),
+            "interval": "ONE_DAY",
+            "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+            "todate": to_dt.strftime("%Y-%m-%d 15:30"),
+        })
+        days = (res or {}).get("data") or []
+        if len(days) >= 2:
+            prev = days[-2]
+            INDEX_PDHL["pdh"] = float(prev[2])
+            INDEX_PDHL["pdl"] = float(prev[3])
+            print("Nifty PDH/PDL", INDEX_PDHL)
+            apply_bar_state(last_spot["px"], last_fut["px"] or last_spot["px"])
+    except Exception as e:
+        print("nifty pdh/pdl failed", e)
 
     def gex_loop():
         while True:
