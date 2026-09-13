@@ -317,7 +317,7 @@ def _va_labels(df: pd.DataFrame) -> list:
     for i in range(11, len(df), step):
         rec = classify_va(df.iloc[: i + 1])
         act = rec.get("action") or ""
-        if act == prev or act == "NO ENTRY":
+        if not act or act == prev:
             continue
         prev = act
         ts = df.iloc[i].get("t0")
@@ -350,7 +350,11 @@ def apply_bar_state(spot, fut):
         for _, r in tail.iterrows():
             t0 = r.get("t0")
             try:
-                tstr = pd.to_datetime(t0, unit="s").strftime("%H:%M")
+                tstr = (
+                    pd.to_datetime(t0, unit="s", utc=True)
+                    .tz_convert("Asia/Kolkata")
+                    .strftime("%H:%M")
+                )
             except Exception:
                 tstr = ""
             bars_out.append({
@@ -500,6 +504,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
             self.end_headers()
             self.wfile.write(data)
             return
