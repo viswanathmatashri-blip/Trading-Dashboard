@@ -220,6 +220,26 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 2.0, prom
         return {"vah": float(mids[hi_i]), "val": float(mids[lo_i]), "poc": float(mids[seed_i])}
 
     va70 = _expand(poc_i, 0.70)
+    va80 = _expand(poc_i, 0.80)
+    # extra fat nodes: local volume peaks away from POC
+    zones = []
+    poc_vol = float(vol_at[poc_i]) or 1.0
+    for i in range(2, n_bins - 2):
+        if vol_at[i] <= vol_at[i - 1] or vol_at[i] <= vol_at[i + 1]:
+            continue
+        if vol_at[i] < 0.38 * poc_vol:
+            continue
+        if abs(i - poc_i) < 6:
+            continue
+        loc = _expand(i, 0.70)
+        zones.append({
+            "tag": f"VA{len(zones)+2}",
+            "vah": loc["vah"],
+            "val": loc["val"],
+            "poc": loc["poc"],
+        })
+        if len(zones) >= 4:
+            break
     return {
         "ok": True,
         "mids": mids,
@@ -228,8 +248,15 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 2.0, prom
         "poc_vol": float(vol_at[poc_i]),
         "wmean": wmean,
         "wstd": wstd,
+        "vah1": wmean + wstd,
+        "val1": wmean - wstd,
+        "vah15": wmean + 1.5 * wstd,
+        "val15": wmean - 1.5 * wstd,
         "vah": float(va70["vah"]),
         "val": float(va70["val"]),
+        "vah80": float(va80["vah"]),
+        "val80": float(va80["val"]),
+        "zones": zones,
         "bin_step": bin_step,
     }
 
