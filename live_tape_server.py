@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Live Nifty tape sidecar — prices + VWAP + EFI + CVD + VA triggers only.
 
@@ -226,6 +225,52 @@ def _value_area(df: pd.DataFrame) -> dict:
     if len(bins) < 3:
         poc = float(px.iloc[-1])
         return {"poc": poc, "vah": poc, "val": poc}
+    # Prefer high-low volume distribution (Streamlit profile). Fallback: close bins.
+    use_hl = "high" in df.columns and "low" in df.columns
+    if use_hl:
+        lo = float(min(df["low"].min(), df["close"].min()))
+        hi = float(max(df["high"].max(), df["close"].max()))
+        if hi <= lo:
+            hi = lo + step
+        lo = np.floor(lo / step) * step
+        hi = np.ceil(hi / step) * step
+        edges = np.arange(lo, hi + step * 0.5, step)
+        if len(edges) < 3:
+            last = float(df["close"].iloc[-1])
+            return {"poc": last, "vah": last, "val": last}
+        n_bins = len(edges) - 1
+        vol = np.zeros(n_bins)
+        for _, r in df.iterrows():
+            v = float(r.get("volume") or 0)
+            if v <= 0:
+                continue
+            l = float(r["low"]); h = float(r["high"])
+            if h <= l:
+                h = l + 1e-6
+            span = h - l
+            for i in range(n_bins):
+                a, b = edges[i], edges[i + 1]
+                overlap = max(0.0, min(h, b) - max(l, a))
+                if overlap > 0:
+                    vol[i] += v * (overlap / span)
+        if vol.sum() <= 0:
+            last = float(df["close"].iloc[-1])
+            return {"poc": last, "vah": last, "val": last}
+        mid = (edges[:-1] + edges[1:]) / 2.0
+        poc_i = int(vol.argmax())
+        target = float(vol.sum()) * 0.70
+        a = b = poc_i
+        taken = float(vol[poc_i])
+        while taken < target and (a > 0 or b < n_bins - 1):
+            left = float(vol[a - 1]) if a > 0 else -1
+            right = float(vol[b + 1]) if b < n_bins - 1 else -1
+            if right >= left:
+                b = min(b + 1, n_bins - 1)
+                taken += float(vol[b])
+            else:
+                a = max(a - 1, 0)
+                taken += float(vol[a])
+        return {"poc": float(mid[poc_i]), "val": float(mid[a]), "vah": float(mid[b])}
     idx = np.clip(np.digitize(px, bins) - 1, 0, len(bins) - 2)
     vol = np.zeros(len(bins) - 1)
     for i, v in zip(idx, df["volume"].astype(float)):
@@ -354,9 +399,9 @@ def classify_va(df: pd.DataFrame) -> dict:
             code = "M1S_ENTRY" if (absorb_up and efi_div_up) else "M1S_WATCH"
         elif loc in ("BELOW_VAL", "VAL_EDGE") and loc_z >= 0.35:
             code = "M1L_ENTRY" if (absorb_dn and efi_div_dn) else "M1L_WATCH"
-        elif loc == "INSIDE" and vah and last < float(vah) and last_dv < 0 and float(px.iloc[-2]) >= float(vah) * 0.999:
+        elif loc == "INSIDE" and vah and last < float(vah) and last_dv < 0 and float(df["high"].iloc[-2] if "high" in df.columns else px.iloc[-2]) >= float(vah) * 0.9995:
             code = "M1S_ADD"
-        elif loc == "INSIDE" and val and last > float(val) and last_dv > 0 and float(px.iloc[-2]) <= float(val) * 1.001:
+        elif loc == "INSIDE" and val and last > float(val) and last_dv > 0 and float(df["low"].iloc[-2] if "low" in df.columns else px.iloc[-2]) <= float(val) * 1.0005:
             code = "M1L_ADD"
         else:
             code = "INSIDE"
@@ -422,7 +467,22 @@ def apply_bar_state(spot, fut):
     bars_out = []
     pdh = pdl = None
     if not df.empty:
-        tail = df.tail(120).copy()
+        tail = df.tail(160).copy()
+        if "t0" in tail.columns:
+            days = pd.to_datetime(tail["t0"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+            last_day = days.dt.date.dropna()
+            if len(last_day):
+                sess = tail[days.dt.date == last_day.iloc[-1]].copy()
+                if len(sess) >= 12:
+                    tail_for_va = sess
+                else:
+                    tail_for_va = tail
+            else:
+                tail_for_va = tail
+        else:
+            tail_for_va = tail
+        va = classify_va(tail_for_va.reset_index(drop=True))
+        va["labels"] = _va_labels(tail_for_va.reset_index(drop=True))
         # previous-day high/low from seeded t0 if present
         if "t0" in tail.columns:
             days = pd.to_datetime(tail["t0"], unit="s", errors="coerce")
@@ -433,7 +493,7 @@ def apply_bar_state(spot, fut):
                 if not prevd.empty:
                     pdh = float(prevd["high"].max())
                     pdl = float(prevd["low"].min())
-        for _, r in tail.iterrows():
+        for _, r in tail_for_va.iterrows():
             t0 = r.get("t0")
             try:
                 tstr = (
@@ -455,7 +515,7 @@ def apply_bar_state(spot, fut):
                 "efi13": float(r["efi13"]) if pd.notna(r.get("efi13")) else 0.0,
                 "cvd": float(r["cvd"]) if pd.notna(r.get("cvd")) else 0.0,
             })
-        va["labels"] = _va_labels(tail.reset_index(drop=True))
+        va["labels"] = _va_labels(tail_for_va.reset_index(drop=True))
         va["pdh"] = pdh
         va["pdl"] = pdl
     with LOCK:
