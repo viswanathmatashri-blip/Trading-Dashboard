@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+from va_core import classify_va_setup, pdec_session_history
 
 load_dotenv()
 
@@ -39,6 +40,10 @@ NIFTY_TOKEN = os.getenv("NIFTY_TOKEN", "99926000")
 FUT_TOKEN = os.getenv("FUT_TOKEN", "")
 FUT_EXCHANGE_TYPE = int(os.getenv("FUT_EXCHANGE_TYPE", "2"))  # NFO = 2
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+GEX_SECONDS = int(os.getenv("TAPE_GEX_SECONDS", "3600"))  # hourly; ticks never run this
+LOT = 65
+GEX_WAKE = threading.Event()
+API_HOLD = {"api": None}
 
 
 def resolve_nifty_fut_token() -> str:
@@ -87,6 +92,7 @@ SNAPSHOT = {
     "bars": [],
     "va": {"action": "NO ENTRY", "micro": "starting"},
     "levels": {},
+    "gex": {"ts": None, "net": None, "busy": False},
 }
 CLIENTS: set[asyncio.Queue] = set()
 LOOP: asyncio.AbstractEventLoop | None = None
@@ -515,8 +521,27 @@ def apply_bar_state(spot, fut):
                 tail_for_va = tail
         else:
             tail_for_va = tail
-        va = classify_va(tail_for_va.reset_index(drop=True))
-        va["labels"] = _va_labels(tail_for_va.reset_index(drop=True))
+        sess_df = tail_for_va.reset_index(drop=True)
+        if "vwap" in sess_df.columns and "vwap_idx" not in sess_df.columns:
+            sess_df["vwap_idx"] = sess_df["vwap"]
+        if "time_str" not in sess_df.columns:
+            try:
+                sess_df["time_str"] = pd.to_datetime(sess_df["t0"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.strftime("%H:%M")
+            except Exception:
+                sess_df["time_str"] = ""
+        gex_data = {"total_net_gex_oi": (SNAPSHOT.get("levels") or {}).get("gex", 0)}
+        rec = classify_va_setup(sess_df, gex_data)
+        va = {
+            "action": rec.get("action") or "NO ENTRY",
+            "micro": rec.get("micro") or "",
+            "model": rec.get("model"),
+            "regime": rec.get("regime"),
+            "vah": rec.get("vah"),
+            "val": rec.get("val"),
+            "poc": rec.get("poc"),
+            "loc": rec.get("loc"),
+        }
+        va["labels"] = pdec_session_history(sess_df, gex_data, min_bars=16)
         # previous-day high/low from seeded t0 if present
         if "t0" in tail.columns:
             days = pd.to_datetime(tail["t0"], unit="s", errors="coerce")
@@ -644,6 +669,115 @@ def fetch_structure_levels(api, spot: float) -> dict:
     return out
 
 
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def compute_hourly_greeks(api, spot: float) -> dict:
+    """GEX / VEX snapshot. Called hourly or on Hard refresh — never from ticks."""
+    pack = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "net": None,
+        "vex": None,
+        "put_wall": None,
+        "call_wall": None,
+        "flip": None,
+        "atm_iv": 0.15,
+        "strikes": [],
+        "busy": False,
+        "gex": 0.0,
+    }
+    if not api or not spot:
+        return pack
+    lv = fetch_structure_levels(api, spot)
+    pack.update({k: lv[k] for k in lv})
+    try:
+        with urllib.request.urlopen(SCRIP_MASTER_URL, timeout=30) as resp:
+            rows = json.loads(resp.read().decode())
+        today = date.today()
+        opts = []
+        for r in rows:
+            if str(r.get("name", "")).upper() != "NIFTY":
+                continue
+            if str(r.get("exch_seg", "")).upper() != "NFO":
+                continue
+            if str(r.get("instrumenttype", "")).upper() != "OPTIDX":
+                continue
+            exp = pd.to_datetime(r.get("expiry"), format="%d%b%Y", errors="coerce")
+            if pd.isna(exp) or exp.date() < today:
+                continue
+            strike = float(r.get("strike") or 0) / 100.0
+            if strike > 1e6:
+                strike /= 100.0
+            if abs(strike - spot) > 500:
+                continue
+            opts.append((exp.date(), strike, str(r.get("symbol", "")), str(r.get("token", ""))))
+        if not opts:
+            return pack
+        near = min(o[0] for o in opts)
+        opts = [o for o in opts if o[0] == near]
+        T = max((near - today).days, 1) / 365.0
+        tokens = [o[3] for o in opts if o[3]]
+        market = {}
+        for i in range(0, len(tokens), 40):
+            res = api.getMarketData("FULL", {"NFO": tokens[i:i + 40]})
+            fetched = ((res or {}).get("data") or {}).get("fetched") or []
+            for item in fetched:
+                market[str(item.get("symbolToken"))] = item
+            time.sleep(0.35)
+        # ATM IV from straddle / spot
+        atm = min({o[1] for o in opts}, key=lambda k: abs(k - spot))
+        ce_atm = pe_atm = None
+        by = {}
+        for exp, strike, sym, tok in opts:
+            rec = market.get(tok) or {}
+            ltp = float(rec.get("ltp") or 0)
+            oi = float(rec.get("opnInterest") or rec.get("oi") or 0)
+            typ = "CE" if str(sym).endswith("CE") else "PE"
+            by.setdefault(strike, {})[typ] = {"ltp": ltp, "oi": oi}
+            if strike == atm and typ == "CE":
+                ce_atm = ltp
+            if strike == atm and typ == "PE":
+                pe_atm = ltp
+        sig = 0.15
+        if ce_atm and pe_atm and spot > 0 and T > 0:
+            # crude IV: straddle / (spot * sqrt(T) * 0.8)
+            sig = max(0.05, min(0.80, (ce_atm + pe_atm) / (spot * math.sqrt(T) * 0.8)))
+        pack["atm_iv"] = sig
+        net_gex = 0.0
+        net_vex = 0.0
+        gex_curve = []
+        for k, sides in sorted(by.items()):
+            d1 = (math.log(max(spot, 1e-9) / max(k, 1e-9)) + 0.5 * sig * sig * T) / max(sig * math.sqrt(T), 1e-9)
+            d2 = d1 - sig * math.sqrt(T)
+            gam = _norm_pdf(d1) / max(spot * sig * math.sqrt(T), 1e-9)
+            van = -_norm_pdf(d1) * d2 / max(sig, 1e-9)
+            ce_oi = float((sides.get("CE") or {}).get("oi") or 0)
+            pe_oi = float((sides.get("PE") or {}).get("oi") or 0)
+            # dealer short gamma convention: calls add +GEX, puts add +GEX if dealers short options
+            gex_k = gam * (ce_oi + pe_oi) * LOT * spot * spot / 1e7
+            vex_k = van * (ce_oi + pe_oi) * LOT / 1e5
+            net_gex += gex_k
+            net_vex += vex_k
+            gex_curve.append({"k": k, "gex": gex_k, "vex": vex_k})
+        pack["net"] = net_gex
+        pack["gex"] = net_gex
+        pack["vex"] = net_vex
+        pack["strikes"] = gex_curve
+        pack["expiry"] = str(near)
+        # flip: gex sign change
+        prev = None
+        for row in gex_curve:
+            if prev is not None and prev["gex"] * row["gex"] < 0:
+                pack["flip"] = row["k"]
+                break
+            prev = row
+        print("hourly greeks net_gex", round(net_gex, 2), "vex", round(net_vex, 2))
+    except Exception as e:
+        print("hourly greeks failed", e)
+    return pack
+
+
 # ---------- Angel WS thread ----------
 def angel_thread():
     from SmartApi import SmartConnect
@@ -706,21 +840,35 @@ def angel_thread():
             apply_bar_state(last_spot["px"], last_fut["px"])
 
     seed_history()
+    API_HOLD["api"] = api
 
-    def levels_loop():
+    def gex_loop():
         while True:
             try:
+                with LOCK:
+                    SNAPSHOT.setdefault("gex", {})["busy"] = True
                 px = last_spot["px"] or last_fut["px"]
-                lv = fetch_structure_levels(api, float(px or 0))
-                if lv:
-                    with LOCK:
-                        SNAPSHOT["levels"] = lv
-                    apply_bar_state(last_spot["px"], last_fut["px"] or last_spot["px"])
+                pack = compute_hourly_greeks(api, float(px or 0))
+                pack["busy"] = False
+                with LOCK:
+                    SNAPSHOT["gex"] = pack
+                    lv = SNAPSHOT.get("levels") or {}
+                    lv.update({
+                        "put_wall": pack.get("put_wall"),
+                        "call_wall": pack.get("call_wall"),
+                        "flip": pack.get("flip"),
+                        "gex": pack.get("net") or 0,
+                    })
+                    SNAPSHOT["levels"] = lv
+                apply_bar_state(last_spot["px"], last_fut["px"] or last_spot["px"])
             except Exception as e:
-                print("levels loop", e)
-            time.sleep(60)
+                print("gex loop", e)
+                with LOCK:
+                    SNAPSHOT.setdefault("gex", {})["busy"] = False
+            GEX_WAKE.clear()
+            GEX_WAKE.wait(timeout=max(GEX_SECONDS, 60))
 
-    threading.Thread(target=levels_loop, daemon=True).start()
+    threading.Thread(target=gex_loop, daemon=True).start()
 
     def on_data(_ws, msg):
         try:
@@ -785,6 +933,28 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/ws":
             self._ws()
+            return
+        if self.path.startswith("/api/gex"):
+            with LOCK:
+                body = json.dumps(SNAPSHOT.get("gex") or {}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_error(404)
+
+    def do_POST(self):
+        if self.path.startswith("/api/refresh-gex"):
+            GEX_WAKE.set()
+            msg = json.dumps({"ok": True, "msg": "GEX refresh queued"}).encode()
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
             return
         self.send_error(404)
 
