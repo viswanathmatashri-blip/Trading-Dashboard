@@ -5523,21 +5523,31 @@ def live_dashboard_fragment():
     live_now, _, _, _ = market_session_state(_ist_now(), idx_live)
     if live_now:
         st.session_state["_closed_refresh_skip"] = False
-    if (st.session_state.get("enable_main_refresh", False) or need_tf) and (live_now or need_tf or st.session_state.get("data_store") is None):
-        now_s = datetime.datetime.now().timestamp()
-        last_full = float(st.session_state.get("_full_fetch_ts") or 0)
-        have = st.session_state.get("data_store")
-        # Full chain+IV+GEX at most every 20s; 5s ticks only refresh index/futures candles.
-        if need_tf or have is None or (now_s - last_full) >= 20:
-            refreshed_data = fetch_live_data(want_tf)
-            if refreshed_data:
-                refreshed_data["selected_expiry"] = selected_expiry_str
-                refreshed_data["bar_tf"] = want_tf
-                st.session_state["data_store"] = refreshed_data
-                st.session_state["_full_fetch_ts"] = now_s
-        elif live_now:
-            st.session_state["data_store"] = refresh_index_tapes(have, want_tf)
-    elif st.session_state.get("enable_main_refresh") and not live_now:
+    auto = bool(st.session_state.get("enable_main_refresh", False))
+    intel = bool(st.session_state.get("intel_refresh", False))
+    have = st.session_state.get("data_store")
+    now_s = datetime.datetime.now().timestamp()
+    if have is None or need_tf:
+        refreshed_data = fetch_live_data(want_tf)
+        if refreshed_data:
+            refreshed_data["selected_expiry"] = selected_expiry_str
+            refreshed_data["bar_tf"] = want_tf
+            st.session_state["data_store"] = refreshed_data
+            st.session_state["_full_fetch_ts"] = now_s
+    elif auto and live_now:
+        # Intelligent: candles + VA only. Never re-pull chain/GEX/IV/ATM.
+        st.session_state["data_store"] = refresh_index_tapes(have, want_tf)
+        st.session_state["_tape_ts"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
+        if not intel:
+            last_full = float(st.session_state.get("_full_fetch_ts") or 0)
+            if (now_s - last_full) >= 60:
+                refreshed_data = fetch_live_data(want_tf)
+                if refreshed_data:
+                    refreshed_data["selected_expiry"] = selected_expiry_str
+                    refreshed_data["bar_tf"] = want_tf
+                    st.session_state["data_store"] = refreshed_data
+                    st.session_state["_full_fetch_ts"] = now_s
+    elif auto and not live_now:
         st.session_state["_closed_refresh_skip"] = True
 
     data = st.session_state["data_store"]
@@ -5553,7 +5563,7 @@ def live_dashboard_fragment():
         st.markdown(
             f"<div style='display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;'>"
             f"<h1 class='custom-heading' style='margin:0;font-size:17px;'>📊 Market Summary</h1>"
-            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')}</span>"
+            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')} · tape {st.session_state.get('_tape_ts') or '—'}</span>"
             f"</div>",
             unsafe_allow_html=True
         )
@@ -5569,7 +5579,7 @@ def live_dashboard_fragment():
             "Intelligent refresh",
             value=st.session_state.get("intel_refresh", False),
             key="cb_intel_refresh",
-            help="Only index candles + ATM. Skip GEX/DEX/IV/Vanna/heatmap/book.",
+            help="Only index/futures candles + VA triggers. No chain, GEX, IV, ATM, book.",
         )
         if cb_main != st.session_state["enable_main_refresh"]:
             st.session_state["enable_main_refresh"] = cb_main
@@ -6878,7 +6888,9 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     st.markdown("</div>", unsafe_allow_html=True)
                 def _render_atm_tab(tok, lab):
 
-                    if st.session_state.get("enable_main_refresh") and not st.session_state.get("atm_live_ok") and not st.session_state.get("intel_refresh"):
+                    if st.session_state.get("intel_refresh") or (
+                        st.session_state.get("enable_main_refresh") and not st.session_state.get("atm_live_ok")
+                    ):
                         st.caption("ATM tape paused during 5s index refresh. Enable “ATM live” to fetch.")
                         cached = st.session_state.get(f"_atm_fig_{lab}")
                         if cached:
