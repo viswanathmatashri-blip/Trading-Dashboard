@@ -2431,14 +2431,14 @@ def detect_fp_absorptions(o, h, l, cl, vol, z, mids, min_bars=20):
         z_sell = (sell_low - typ) / sig
         z_buy = (buy_high - typ) / sig
         # Setup 1 bid absorption — stricter so mid-range wicks do not print
-        if z_sweep_dn >= 1.6 and loc >= 0.72 and z_sell >= 1.4 and cl[j] >= o[j]:
+        if z_sweep_dn >= 1.35 and loc >= 0.68 and z_sell >= 1.15 and cl[j] >= o[j]:
             out.append({
                 "j": j, "kind": "BID ABS", "side": 1,
                 "stop": float(l[j]) - 2.0,
                 "note": f"sweep z={z_sweep_dn:.2f} shelf z={z_sell:.2f} close {loc:.0%} range",
             })
         # Setup 2 offer absorption
-        if z_sweep_up >= 1.6 and loc <= 0.28 and z_buy >= 1.4 and cl[j] < o[j]:
+        if z_sweep_up >= 1.35 and loc <= 0.32 and z_buy >= 1.15 and cl[j] < o[j]:
             out.append({
                 "j": j, "kind": "OFFER ABS", "side": -1,
                 "stop": float(h[j]) + 2.0,
@@ -2448,7 +2448,7 @@ def detect_fp_absorptions(o, h, l, cl, vol, z, mids, min_bars=20):
     keep, last = [], {-1: -99, 1: -99}
     for e in out:
         s = e["side"]
-        if e["j"] - last[s] < 8:
+        if e["j"] - last[s] < 5:
             continue
         keep.append(e)
         last[s] = e["j"]
@@ -2470,7 +2470,8 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
     cl = d["close"].astype(float).values
     vol = d["volume"].astype(float).values
     y0, y1 = float(np.nanmin(l)), float(np.nanmax(h))
-    step = float(bin_pts) if bin_pts and bin_pts > 0 else 2.0
+    span_px = max(y1 - y0, 1.0)
+    step = max(float(bin_pts or 2.0), span_px / 48.0)
     edges = np.arange(np.floor(y0 / step) * step, np.ceil(y1 / step) * step + step, step)
     if len(edges) < 3:
         return None, []
@@ -2534,10 +2535,12 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
         tc.append("#00E676" if dv >= 0 else "#FF5252")
     if tx:
         fig.add_trace(plt_go.Scatter(
-            x=tx, y=ty, mode="text", text=tt, textfont=dict(size=9, color=tc),
+            x=tx, y=ty, mode="text", text=tt,
+            textfont=dict(size=9, color="#B0BEC5"),
             showlegend=False, hoverinfo="skip",
         ), row=1, col=1)
     evs = detect_fp_absorptions(o, h, l, cl, vol, z, mids)
+    st.session_state["_fp_abs_evs"] = evs
     if evs:
         bx = [xs[e["j"]] for e in evs if e["side"] > 0]
         by = [h[e["j"]] for e in evs if e["side"] > 0]
@@ -2569,7 +2572,8 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
         showlegend=False, name="Bar Δ",
     ), row=2, col=1)
     fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=1)
-    times = list(axis_times) if axis_times else xs
+    # Use this tape's bars only — session categoryarray leaves a blank left pad on MCX
+    times = xs
     xr = [-0.5, max(len(times) - 0.5, 0.5)]
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
@@ -2583,7 +2587,7 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
                      range=xr, nticks=8, row=2, col=1)
     fig.update_yaxes(title_text="Px", row=1, col=1)
     fig.update_yaxes(title_text="Δ", row=2, col=1)
-    return fig
+    return fig, evs
 
 
 def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", axis_times=None):
