@@ -1927,7 +1927,42 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
     return ""
 
 # --- HOLIDAY / WEEKEND FALLBACK ENGINE FOR CANDLE CHARTS ---
-def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX"):
+
+def _tape_gap_window(cached, now_dt, index_name, api_interval):
+    """If cache exists, pull from last bar (minus 1 TF) to now. Full session if empty."""
+    sh = session_hours(index_name)
+    step = 3
+    lab = str(api_interval or "")
+    if "FIFTEEN" in lab or "15" in lab:
+        step = 15
+    elif "TEN" in lab:
+        step = 10
+    elif "FIVE" in lab or lab.endswith("5"):
+        step = 5
+    elif "THREE" in lab:
+        step = 3
+    elif "ONE" in lab and "HOUR" not in lab:
+        step = 1
+    elif "TWO" in lab:
+        step = 2
+    open_s = f"{now_dt.strftime('%Y-%m-%d')} {sh[4]}"
+    if cached is None or getattr(cached, "empty", True) or "time" not in getattr(cached, "columns", []):
+        return open_s, now_dt.strftime(f"%Y-%m-%d %H:%M"), True
+    last = pd.to_datetime(cached["time"], errors="coerce").max()
+    if pd.isna(last):
+        return open_s, now_dt.strftime(f"%Y-%m-%d %H:%M"), True
+    if last.tzinfo is None:
+        last = pytz.timezone("Asia/Kolkata").localize(last)
+    last = last.astimezone(pytz.timezone("Asia/Kolkata"))
+    start = last - datetime.timedelta(minutes=max(step, 1))
+    open_dt = datetime.datetime.strptime(open_s, "%Y-%m-%d %H:%M")
+    open_dt = pytz.timezone("Asia/Kolkata").localize(open_dt)
+    if start < open_dt:
+        start = open_dt
+    return start.strftime("%Y-%m-%d %H:%M"), now_dt.strftime("%Y-%m-%d %H:%M"), False
+
+
+def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX", tail_minutes=None):
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
     live, today, _, _ = market_session_state(now_dt, index_name)
@@ -1940,16 +1975,27 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
         if live and target_to.date() != today:
             continue
         sh = session_hours(index_name)
-        # off-hours: still pull that session's full window, never lookback=0 on a blank day
         days_back = 0 if live else max(int(lookback_days or 0), 0)
         target_from = target_to if days_back <= 0 else target_to - datetime.timedelta(days=days_back)
-        candle_param = {
-            "exchange": exchange,
-            "symboltoken": spot_token,
-            "interval": api_interval,
-            "fromdate": target_from.strftime(f"%Y-%m-%d {sh[4]}"),
-            "todate": target_to.strftime(f"%Y-%m-%d {sh[5]}")
-        }
+        from_clock = sh[4]
+        to_clock = sh[5]
+        if live:
+            fd, td, _full = _tape_gap_window(cached, now_dt, index_name, api_interval)
+            candle_param = {
+                "exchange": exchange,
+                "symboltoken": spot_token,
+                "interval": api_interval,
+                "fromdate": fd,
+                "todate": td,
+            }
+        else:
+            candle_param = {
+                "exchange": exchange,
+                "symboltoken": spot_token,
+                "interval": api_interval,
+                "fromdate": target_from.strftime(f"%Y-%m-%d {from_clock}"),
+                "todate": target_to.strftime(f"%Y-%m-%d {to_clock}")
+            }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
         time.sleep(0.20)
         if candle_res and candle_res.get("status") and candle_res.get("data"):
@@ -2941,7 +2987,7 @@ def fetch_india_vix_sessions(smart_api, lookback_days=10):
     return df, pct, last_d
 
 
-def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15):
+def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15, tail_minutes=None):
     """
     Fetch near-month futures candles + real VWAP.
     Outside market hours → falls back to the most recent trading session and flags it.
@@ -2970,13 +3016,25 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
         if target_to.weekday() >= 5:
             continue
         target_from = target_to if int(lookback_days or 0) <= 0 else target_to - datetime.timedelta(days=lookback_days)
-        candle_param = {
-            "exchange": fut_exch,
-            "symboltoken": str(fut_token),
-            "interval": api_interval,
-            "fromdate": target_from.strftime(f"%Y-%m-%d {session_hours(index_name)[4]}"),
-            "todate": target_to.strftime(f"%Y-%m-%d {session_hours(index_name)[5]}")
-        }
+        sh = session_hours(index_name)
+        from_clock, to_clock = sh[4], sh[5]
+        if not currently_closed:
+            fd, td, _full = _tape_gap_window(cached, now_dt, index_name, api_interval)
+            candle_param = {
+                "exchange": fut_exch,
+                "symboltoken": str(fut_token),
+                "interval": api_interval,
+                "fromdate": fd,
+                "todate": td,
+            }
+        else:
+            candle_param = {
+                "exchange": fut_exch,
+                "symboltoken": str(fut_token),
+                "interval": api_interval,
+                "fromdate": target_from.strftime(f"%Y-%m-%d {from_clock}"),
+                "todate": target_to.strftime(f"%Y-%m-%d {to_clock}")
+            }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
         time.sleep(0.20)
         if not (candle_res and candle_res.get("status") and candle_res.get("data")):
@@ -5439,10 +5497,9 @@ def refresh_index_tapes(data, want_tf):
         if not smart_api:
             return data
         api_interval, lookback_days = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
-        if "1 min" in str(want_tf) or "2 min" in str(want_tf):
-            lookback_days = 0
-        else:
-            lookback_days = min(int(lookback_days or 5), 2)
+        live_now, _, _, _ = market_session_state(_ist_now(), Index_Name)
+        # 5s path: today only + merge into frames already in data_store
+        lookback_days = 0 if live_now else min(int(lookback_days or 5), 2)
         spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
         fut_tok, _ = get_near_month_futures_token(df_master, Index_Name, opt_exch)
         if not spot_token and fut_tok:
@@ -5459,17 +5516,22 @@ def refresh_index_tapes(data, want_tf):
             spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=ltp_sym, symboltoken=spot_token)
             if spot_resp and spot_resp.get("status") and spot_resp.get("data"):
                 data["spot_price"] = float(spot_resp["data"]["ltp"])
+        have_sess = data.get("df_candles")
+        tail = 25 if (have_sess is not None and not getattr(have_sess, "empty", True) and len(have_sess) >= 8) else None
         df_candles, is_fb = fetch_candles_with_holiday_fallback(
-            smart_api, spot_token, spot_exch, api_interval, lookback_days, Index_Name
+            smart_api, spot_token, spot_exch, api_interval, lookback_days, Index_Name,
+            tail_minutes=tail,
         )
         if df_candles is not None and not df_candles.empty:
-            data["df_candles"] = df_candles
+            data["df_candles"] = merge_candle_frames(data.get("df_candles"), df_candles)
             data["is_holiday_fallback"] = is_fb
+        have_f = data.get("df_futures")
+        tail_f = 25 if (have_f is not None and not getattr(have_f, "empty", True) and len(have_f) >= 8) else None
         df_futures, fut_fb, basis_info, fut_msg = fetch_futures_candles_with_vwap(
-            smart_api, Index_Name, df_master, api_interval, lookback_days
+            smart_api, Index_Name, df_master, api_interval, lookback_days, tail_minutes=tail_f,
         )
         if df_futures is not None and not df_futures.empty:
-            data["df_futures"] = df_futures
+            data["df_futures"] = merge_candle_frames(data.get("df_futures"), df_futures)
             data["fut_is_fallback"] = fut_fb
             data["basis_info"] = basis_info
             data["fut_fallback_msg"] = fut_msg
@@ -6844,6 +6906,18 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                             f"VA · {micro.get('regime','')} · {micro.get('model','')} · raw {micro.get('action_raw') or '—'} → "
                             f"{micro.get('action')} · {micro.get('candle_why') or ''}"
                         )
+                    _fsig = (
+                        str(Index_Name),
+                        str(st.session_state.get("selected_timeframe")),
+                        str(dfi["time"].iloc[-1]) if len(dfi) else "",
+                        float(dfi["close"].iloc[-1]) if len(dfi) else 0.0,
+                        int(len(dfi)),
+                    )
+                    if st.session_state.get("_fig_sig") == _fsig and st.session_state.get("_fig_stack") is not None:
+                        fig_stack = st.session_state["_fig_stack"]
+                    else:
+                        st.session_state["_fig_stack"] = fig_stack
+                        st.session_state["_fig_sig"] = _fsig
                     st.plotly_chart(fig_stack, use_container_width=True)
                     if pdec_hist:
                         with st.expander(f"VA session log ({len(pdec_hist)} bars)", expanded=False):
