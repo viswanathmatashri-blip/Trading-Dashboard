@@ -1043,17 +1043,27 @@ def classify_microstructure(dfi: pd.DataFrame, data: dict = None) -> dict:
 
 
 def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 16) -> list:
-    """Causal VA-model action at each bar (data up to that bar only)."""
+    """Causal VA action. Incremental + last-60-bar window (full-day loop was the load stall)."""
     out = []
     if dfi is None or dfi.empty:
         return out
     n = len(dfi)
     data = st.session_state.get("data_store") if "st" in dir() else None
-    prev = None
-    for i in range(n):
-        if i + 1 < min_bars:
-            continue
-        sl = dfi.iloc[: i + 1]
+    sig = (
+        str(dfi["time"].iloc[-1]) if "time" in dfi.columns else n,
+        int(n),
+        float(dfi["close"].iloc[-1]),
+    )
+    prev_sig = st.session_state.get("_va_hist_sig")
+    prev_out = list(st.session_state.get("_va_hist") or [])
+    start = min_bars - 1
+    if prev_sig and prev_out and prev_sig[1] <= n and prev_sig[0] != sig[0]:
+        start = max(start, int(prev_out[-1]["i"]))
+        out = [r for r in prev_out if r["i"] < n]
+    elif prev_sig == sig and prev_out:
+        return prev_out
+    for i in range(start, n):
+        sl = dfi.iloc[max(0, i + 1 - 60): i + 1]
         try:
             rec = classify_va_setup(sl, data)
         except Exception:
@@ -1061,10 +1071,6 @@ def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 16) -> list:
         if not rec.get("ok"):
             continue
         act = rec.get("action") or ""
-        if act == prev:
-            # still store; chart layer de-dupes consecutive identical labels
-            pass
-        prev = act
         hi = sl["high"].iloc[-1] if "high" in sl.columns else sl["close"].iloc[-1]
         t = sl["time_str"].iloc[-1] if "time_str" in sl.columns else str(i)
         out.append({
@@ -1074,6 +1080,8 @@ def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 16) -> list:
             "y": float(hi) if pd.notna(hi) else None,
             "model": rec.get("model"),
         })
+    st.session_state["_va_hist"] = out
+    st.session_state["_va_hist_sig"] = sig
     return out
 
 
@@ -6233,7 +6241,10 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                 with c1:
                     st.session_state["avwap_on"] = st.checkbox("AVWAP", key="avwap_chk")
                 with c2:
-                    st.session_state["pdec_labels_on"] = st.checkbox("VA", key="pdec_lbl_chk")
+                    st.session_state["pdec_labels_on"] = st.checkbox(
+                        "VA", value=True, key="pdec_lbl_chk",
+                        help="90° VA labels above candles. NO ENTRY is never printed.",
+                    )
                 with c3:
                     st.session_state["big_trade_on"] = st.checkbox("Big Δ", key="big_trd_chk")
                 with c4:
@@ -6569,45 +6580,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                             hovertemplate="%{x} · %{customdata:.0f} lots<extra>big Δ</extra>",
                             customdata=lots[msk],
                         ), row=1, col=2)
-                pdec_hist = pdec_session_history(dfi)
-                if st.session_state.get("pdec_labels_on") and pdec_hist:
-                    hi_s = pd.to_numeric(idx_h, errors="coerce")
-                    t_s = pd.to_datetime(dfi["time"]) if "time" in dfi.columns else None
-                    cap = hi_s.copy()
-                    if t_s is not None:
-                        hhmm = t_s.dt.hour * 60 + t_s.dt.minute
-                        mask = (hhmm >= 9 * 60 + 30) & (hhmm <= 15 * 60 + 15)
-                        if mask.any():
-                            cap = hi_s[mask.values] if len(hi_s) == len(mask) else hi_s
-                    peak = float(cap.max()) if cap.notna().any() else float(hi_s.max())
-                    rng = float(hi_s.max() - hi_s.min()) if hi_s.notna().any() else 20.0
-                    y_lab = peak + max(rng * 0.018, 3.0)
-                    # keep candle pane tall enough for vertical words
-                    try:
-                        if y1 is not None:
-                            y1 = max(y1, y_lab + rng * 0.12)
-                    except Exception:
-                        pass
-                    prev = None
-                    for rec in pdec_hist:
-                        act = rec["action"]
-                        if not act or "NO ENTRY" in str(act).upper():
-                            continue
-                        if act == prev:
-                            continue
-                        prev = act
-                        short = act if len(act) <= 28 else act[:26] + "…"
-                        fig_stack.add_annotation(
-                            x=rec["t"], y=y_lab,
-                            text=short,
-                            showarrow=False,
-                            textangle=-90,
-                            xanchor="center",
-                            yanchor="bottom",
-                            font=dict(size=8, color="#CFD8DC"),
-                            bgcolor="rgba(14,17,23,0.20)",
-                            row=1, col=2,
-                        )
+                pdec_hist = pdec_session_history(dfi) if st.session_state.get("pdec_labels_on") else []
                 lv_w = data.get("levels") or {}
                 spot_w = float(data.get("spot_price") or (dfi["spot_px"].iloc[-1] if "spot_px" in dfi.columns else 0) or 0)
                 call_w = put_w = None
@@ -6864,6 +6837,36 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                 fig_stack.update_xaxes(type="linear", showticklabels=True, showgrid=False, row=1, col=1)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=1, col=2)
+
+                if st.session_state.get("pdec_labels_on") and pdec_hist:
+                    hi_s = pd.to_numeric(idx_h, errors="coerce")
+                    peak = float(hi_s.max()) if hi_s.notna().any() else float(y1 or 0)
+                    rng = float(hi_s.max() - hi_s.min()) if hi_s.notna().any() else 20.0
+                    y_lab = peak + max(rng * 0.04, 8.0)
+                    y1 = max(float(y1 or peak), y_lab + rng * 0.10)
+                    fig_stack.update_yaxes(range=[y0, y1], row=1, col=2)
+                    prev = None
+                    nlab = 0
+                    for rec in pdec_hist:
+                        act = str(rec.get("action") or "")
+                        if (not act) or ("NO ENTRY" in act.upper()):
+                            continue
+                        if act == prev:
+                            continue
+                        prev = act
+                        xt = str(rec.get("t") or "")
+                        if len(xt) > 5:
+                            xt = xt[:5]
+                        fig_stack.add_annotation(
+                            x=xt, y=y_lab, text=act[:28],
+                            showarrow=False, textangle=-90,
+                            xanchor="center", yanchor="bottom",
+                            font=dict(size=9, color="#FFF59D"),
+                            bgcolor="rgba(20,24,32,0.55)",
+                            row=1, col=2,
+                        )
+                        nlab += 1
+                    st.session_state["_va_nlab"] = nlab
                 fig_stack.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=3)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=2, col=2)
@@ -6912,6 +6915,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                         str(dfi["time"].iloc[-1]) if len(dfi) else "",
                         float(dfi["close"].iloc[-1]) if len(dfi) else 0.0,
                         int(len(dfi)),
+                        bool(st.session_state.get("pdec_labels_on")),
                     )
                     if st.session_state.get("_fig_sig") == _fsig and st.session_state.get("_fig_stack") is not None:
                         fig_stack = st.session_state["_fig_stack"]
