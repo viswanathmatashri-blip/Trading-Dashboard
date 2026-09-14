@@ -42,6 +42,15 @@
   <header>
     <h1>Futures &amp; session flow</h1>
     <div class="right">
+      <select id="idx" style="background:#1a2230;color:#c8ccd4;border:1px solid #2a3340;border-radius:6px;padding:5px 8px;font-size:12px;">
+        <option>NIFTY</option>
+        <option>BANKNIFTY</option>
+        <option>FINNIFTY</option>
+        <option>MIDCPNIFTY</option>
+        <option>SENSEX</option>
+        <option>GOLDM</option>
+        <option>CRUDEOIL</option>
+      </select>
       <button id="hard" type="button">Hard refresh GEX</button>
       <div id="status">connecting…</div>
     </div>
@@ -333,6 +342,7 @@
     }
 
     function render() {
+      if (state.index && $("idx") && $("idx").value !== state.index) $("idx").value = state.index;
       $("m-spot").textContent = fmt(state.spot, 1);
       $("m-fut").textContent = fmt(state.fut, 1);
       $("m-vwap").textContent = fmt(state.vwap, 1);
@@ -378,6 +388,17 @@
       draw();
     });
     canvas.addEventListener("mouseleave", () => { hoverI = null; draw(); });
+    $("idx").addEventListener("change", async () => {
+      const name = $("idx").value;
+      $("status").textContent = "switching " + name;
+      try {
+        await fetch("/api/index", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ index: name }),
+        });
+      } catch (e) {}
+    });
     $("hard").addEventListener("click", async () => {
       $("hard").disabled = true;
       $("gexbar").textContent = "Queuing GEX refresh (ticks keep running)…";
