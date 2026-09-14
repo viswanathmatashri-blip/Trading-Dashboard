@@ -51,7 +51,8 @@ INDEX_MAP = {
     "CRUDEOIL": {"spot": "", "spot_ex": "MCX", "spot_ws": 5, "fut_ex": "MCX", "fut_ws": 5, "fut_type": "FUTCOM", "opt_ex": "", "lot": 100},
 }
 ACTIVE = {"name": os.getenv("TAPE_INDEX", "NIFTY")}
-WS_HOLD = {"sws": None, "api": None, "spot": "", "fut": "", "cfg": INDEX_MAP["NIFTY"]}
+WS_HOLD = {"sws": None, "api": None, "spot": "", "fut": "", "cfg": INDEX_MAP["NIFTY"], "sub": []}
+LAST = {"spot": None, "fut": None, "vol": 0.0}
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 GEX_SECONDS = int(os.getenv("TAPE_GEX_SECONDS", "3600"))  # hourly; ticks never run this
 LOT = 65
@@ -859,8 +860,8 @@ def angel_thread():
     cfg0 = INDEX_MAP[name0]
     fut_token = resolve_fut_token(name0, cfg0)
     spot_token = cfg0.get("spot") or ""
-    last_spot = {"px": None}
-    last_fut = {"px": None, "vol": 0.0}
+    LAST["spot"] = LAST["fut"] = None
+    LAST["vol"] = 0.0
     WS_HOLD.update({"sws": sws, "api": api, "spot": spot_token, "fut": fut_token, "cfg": cfg0})
     SNAPSHOT["index"] = name0
     SNAPSHOT["indexes"] = list(INDEX_MAP.keys())
@@ -897,8 +898,10 @@ def angel_thread():
             vol = float(row[5] or 0)
             BARS.seed_bar(t0, o, h, l, c, vol, spot=c)
         if BARS.rows:
-            last_fut["px"] = float(BARS.rows[-1]["close"])
-            apply_bar_state(last_spot["px"], last_fut["px"])
+            LAST["fut"] = float(BARS.rows[-1]["close"])
+            if not WS_HOLD.get("spot"):
+                LAST["spot"] = LAST["fut"]
+            apply_bar_state(LAST["spot"], LAST["fut"])
 
     seed_history()
     API_HOLD["api"] = api
@@ -919,7 +922,7 @@ def angel_thread():
             INDEX_PDHL["pdh"] = float(prev[2])
             INDEX_PDHL["pdl"] = float(prev[3])
             print("Nifty PDH/PDL", INDEX_PDHL)
-            apply_bar_state(last_spot["px"], last_fut["px"] or last_spot["px"])
+            apply_bar_state(LAST["spot"], LAST["fut"] or LAST["spot"])
     except Exception as e:
         print("nifty pdh/pdl failed", e)
 
@@ -928,7 +931,7 @@ def angel_thread():
             try:
                 with LOCK:
                     SNAPSHOT.setdefault("gex", {})["busy"] = True
-                px = last_spot["px"] or last_fut["px"]
+                px = LAST["spot"] or LAST["fut"]
                 pack = compute_hourly_greeks(api, float(px or 0))
                 pack["busy"] = False
                 with LOCK:
@@ -941,7 +944,7 @@ def angel_thread():
                         "gex": pack.get("net") or 0,
                     })
                     SNAPSHOT["levels"] = lv
-                apply_bar_state(last_spot["px"], last_fut["px"] or last_spot["px"])
+                apply_bar_state(LAST["spot"], LAST["fut"] or LAST["spot"])
             except Exception as e:
                 print("gex loop", e)
                 with LOCK:
@@ -964,18 +967,20 @@ def angel_thread():
             vol = float(msg.get("last_traded_quantity") or msg.get("volume_trade_for_the_day") or 0)
             ts = float(msg.get("exchange_timestamp") or time.time() * 1000) / 1000.0
             if WS_HOLD["spot"] and token == str(WS_HOLD["spot"]):
-                last_spot["px"] = px
+                LAST["spot"] = px
                 if not WS_HOLD["fut"]:
                     BARS.on_tick(ts, px, 0.0, spot=px)
             elif WS_HOLD["fut"] and token == str(WS_HOLD["fut"]):
-                last_fut["px"] = px
+                LAST["fut"] = px
+                if not WS_HOLD["spot"]:
+                    LAST["spot"] = px
                 day_v = float(msg.get("volume_trade_for_the_day") or 0)
                 inc = 0.0
-                if day_v and last_fut["vol"] and day_v >= last_fut["vol"]:
-                    inc = day_v - last_fut["vol"]
-                last_fut["vol"] = day_v or last_fut["vol"]
-                BARS.on_tick(ts, px, inc or max(vol, 0.0), spot=last_spot["px"] or px)
-            apply_bar_state(last_spot["px"], last_fut["px"] or last_spot["px"])
+                if day_v and LAST["vol"] and day_v >= LAST["vol"]:
+                    inc = day_v - LAST["vol"]
+                LAST["vol"] = day_v or LAST["vol"]
+                BARS.on_tick(ts, px, inc or max(vol, 0.0), spot=LAST["spot"] or px)
+            apply_bar_state(LAST["spot"], LAST["fut"] or LAST["spot"])
         except Exception as e:
             print("tick parse", e)
 
@@ -987,6 +992,7 @@ def angel_thread():
         if WS_HOLD["fut"]:
             tokens.append({"exchangeType": cfg["fut_ws"], "tokens": [str(WS_HOLD["fut"])]})
         sws.subscribe("tape01", 3, tokens)
+        WS_HOLD["sub"] = tokens
         print("subscribed", tokens)
 
     sws.on_data = on_data
@@ -1010,9 +1016,12 @@ def switch_index(name: str) -> bool:
     ACTIVE["name"] = name
     cfg = INDEX_MAP[name]
     fut = resolve_fut_token(name, cfg)
+    old_sub = list(WS_HOLD.get("sub") or [])
     WS_HOLD["cfg"] = cfg
     WS_HOLD["spot"] = cfg.get("spot") or ""
     WS_HOLD["fut"] = fut
+    LAST["spot"] = LAST["fut"] = None
+    LAST["vol"] = 0.0
     try:
         BARS.rows.clear()
     except Exception:
@@ -1020,20 +1029,56 @@ def switch_index(name: str) -> bool:
     INDEX_PDHL["pdh"] = INDEX_PDHL["pdl"] = None
     with LOCK:
         SNAPSHOT["index"] = name
+        SNAPSHOT["spot"] = None
+        SNAPSHOT["fut"] = None
+        SNAPSHOT["vwap"] = None
         SNAPSHOT["bars"] = []
         SNAPSHOT["va"] = {"action": "NO ENTRY", "micro": f"switching {name}"}
+        SNAPSHOT["gex"] = {"ts": None, "net": None, "busy": False}
     sws = WS_HOLD.get("sws")
+    tokens = []
+    if WS_HOLD["spot"]:
+        tokens.append({"exchangeType": cfg["spot_ws"], "tokens": [str(WS_HOLD["spot"])]})
+    if fut:
+        tokens.append({"exchangeType": cfg["fut_ws"], "tokens": [str(fut)]})
     if sws:
         try:
-            tokens = []
-            if WS_HOLD["spot"]:
-                tokens.append({"exchangeType": cfg["spot_ws"], "tokens": [str(WS_HOLD["spot"])]})
-            if fut:
-                tokens.append({"exchangeType": cfg["fut_ws"], "tokens": [str(fut)]})
-            sws.subscribe("tape01", 3, tokens)
+            if old_sub:
+                sws.unsubscribe("tape01", 3, old_sub)
+        except Exception as e:
+            print("unsub failed", e)
+        try:
+            if tokens:
+                sws.subscribe("tape01", 3, tokens)
+                WS_HOLD["sub"] = tokens
             print("resubscribed", tokens)
         except Exception as e:
             print("resub failed", e)
+    api = WS_HOLD.get("api")
+    if api and fut:
+        try:
+            from datetime import datetime, timedelta
+            to_dt = datetime.now()
+            from_dt = to_dt - timedelta(days=5)
+            interval = "THREE_MINUTE" if BAR_SECONDS <= 180 else "FIVE_MINUTE"
+            res = api.getCandleData({
+                "exchange": cfg["fut_ex"],
+                "symboltoken": str(fut),
+                "interval": interval,
+                "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
+                "todate": to_dt.strftime("%Y-%m-%d 23:59"),
+            })
+            rows = (res or {}).get("data") or []
+            print(f"seeded {name} {len(rows)} candles")
+            for row in rows:
+                ts = pd.to_datetime(row[0])
+                BARS.seed_bar(ts.timestamp(), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5] or 0), spot=float(row[4]))
+            if BARS.rows:
+                LAST["fut"] = float(BARS.rows[-1]["close"])
+                LAST["spot"] = LAST["fut"] if not WS_HOLD["spot"] else LAST["spot"]
+                apply_bar_state(LAST["spot"], LAST["fut"])
+        except Exception as e:
+            print("switch seed failed", e)
     GEX_WAKE.set()
     return True
 
