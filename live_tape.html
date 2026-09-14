@@ -56,7 +56,7 @@
     </div>
   </header>
   <div class="metrics">
-    <div class="metric"><div class="k">Nifty</div><div class="v" id="m-spot">—</div></div>
+    <div class="metric"><div class="k" id="m-spot-k">Spot</div><div class="v" id="m-spot">—</div></div>
     <div class="metric"><div class="k">Fut</div><div class="v" id="m-fut">—</div></div>
     <div class="metric"><div class="k">VWAP</div><div class="v" id="m-vwap">—</div></div>
     <div class="metric"><div class="k">EFI 13</div><div class="v" id="m-efi">—</div></div>
@@ -118,7 +118,8 @@
       if (bars.length < 2) return;
       const n = bars.length;
       const left = L.pad.l, right = L.w - L.pad.r;
-      const slot = (right - left) / n;
+      const sessionSlots = Math.max(n, 126);
+      const slot = (right - left) / sessionSlots;
       const xMid = (i) => left + (i + 0.5) * slot;
       geom = { left, right, slot, n };
 
@@ -343,6 +344,7 @@
 
     function render() {
       if (state.index && $("idx") && $("idx").value !== state.index) $("idx").value = state.index;
+      if ($("m-spot-k")) $("m-spot-k").textContent = state.index || "Spot";
       $("m-spot").textContent = fmt(state.spot, 1);
       $("m-fut").textContent = fmt(state.fut, 1);
       $("m-vwap").textContent = fmt(state.vwap, 1);
