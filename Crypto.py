@@ -2429,21 +2429,29 @@ def detect_fp_absorptions(o, h, l, cl, vol, z, mids, min_bars=20):
                 buy_high += z[i, j]
         z_sell = (sell_low - typ) / sig
         z_buy = (buy_high - typ) / sig
-        # Setup 1 bid absorption
-        if z_sweep_dn >= 1.0 and loc >= 0.65 and z_sell >= 1.0 and cl[j] >= o[j]:
+        # Setup 1 bid absorption — stricter so mid-range wicks do not print
+        if z_sweep_dn >= 1.6 and loc >= 0.72 and z_sell >= 1.4 and cl[j] >= o[j]:
             out.append({
                 "j": j, "kind": "BID ABS", "side": 1,
                 "stop": float(l[j]) - 2.0,
                 "note": f"sweep z={z_sweep_dn:.2f} shelf z={z_sell:.2f} close {loc:.0%} range",
             })
         # Setup 2 offer absorption
-        if z_sweep_up >= 1.0 and loc <= 0.35 and z_buy >= 1.0 and cl[j] < o[j]:
+        if z_sweep_up >= 1.6 and loc <= 0.28 and z_buy >= 1.4 and cl[j] < o[j]:
             out.append({
                 "j": j, "kind": "OFFER ABS", "side": -1,
                 "stop": float(h[j]) + 2.0,
                 "note": f"sweep z={z_sweep_up:.2f} shelf z={z_buy:.2f} close {loc:.0%} range",
             })
-    return out
+    # one mark per side per 8 bars
+    keep, last = [], {-1: -99, 1: -99}
+    for e in out:
+        s = e["side"]
+        if e["j"] - last[s] < 8:
+            continue
+        keep.append(e)
+        last[s] = e["j"]
+    return keep
 
 
 def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0):
@@ -5480,7 +5488,7 @@ def refresh_index_tapes(data, want_tf):
     return data
 
 
-@st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
+@st.fragment(run_every=5)
 def live_dashboard_fragment():
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
@@ -5511,7 +5519,11 @@ def live_dashboard_fragment():
     want_tf = st.session_state.get("selected_timeframe", "5 min")
     stored = st.session_state.get("data_store") or {}
     need_tf = stored.get("bar_tf") != want_tf
-    if st.session_state.get("enable_main_refresh", False) or need_tf:
+    idx_live = Index_Name or st.session_state.get("_last_index") or "NIFTY"
+    live_now, _, _, _ = market_session_state(_ist_now(), idx_live)
+    if live_now:
+        st.session_state["_closed_refresh_skip"] = False
+    if (st.session_state.get("enable_main_refresh", False) or need_tf) and (live_now or need_tf or st.session_state.get("data_store") is None):
         now_s = datetime.datetime.now().timestamp()
         last_full = float(st.session_state.get("_full_fetch_ts") or 0)
         have = st.session_state.get("data_store")
@@ -5523,8 +5535,10 @@ def live_dashboard_fragment():
                 refreshed_data["bar_tf"] = want_tf
                 st.session_state["data_store"] = refreshed_data
                 st.session_state["_full_fetch_ts"] = now_s
-        else:
+        elif live_now:
             st.session_state["data_store"] = refresh_index_tapes(have, want_tf)
+    elif st.session_state.get("enable_main_refresh") and not live_now:
+        st.session_state["_closed_refresh_skip"] = True
 
     data = st.session_state["data_store"]
     lvls = data.get("levels", {})
@@ -5543,8 +5557,8 @@ def live_dashboard_fragment():
             f"</div>",
             unsafe_allow_html=True
         )
-        if data.get("is_holiday_fallback", False):
-            st.caption("⚠️ Non-trading day – showing last session")
+        if data.get("is_holiday_fallback", False) or st.session_state.get("_closed_refresh_skip"):
+            st.caption("Market closed — last session on screen. Auto-refresh will not re-hit the API until the next open (change TF or Fetch to reload).")
     with head_r:
         cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
         st.session_state["atm_live_ok"] = st.checkbox(
@@ -5704,17 +5718,17 @@ z_buy      = (buy_high - typ) / sig
 loc        = (close - low) / (high - low)
 
 SETUP 1 BID ABS (long / spring)  — green ▲
-  z_sweep_dn >= 1.0
-  loc >= 0.65 and close >= open
-  z_sell >= 1.0
+  z_sweep_dn >= 1.6
+  loc >= 0.72 and close >= open
+  z_sell >= 1.4
   Entry: close of that bar
   Stop:  this.low - 2 pts
   Target: next resistance / top-5 ask cluster (discretionary)
 
 SETUP 2 OFFER ABS (short / upthrust) — red ▼
-  z_sweep_up >= 1.0
-  loc <= 0.35 and close < open
-  z_buy >= 1.0
+  z_sweep_up >= 1.6
+  loc <= 0.28 and close < open
+  z_buy >= 1.4
   Entry: close of that bar
   Stop:  this.high + 2 pts
   Target: next support / top-5 bid cluster (discretionary)
@@ -6856,7 +6870,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                         n_off = sum(1 for e in evs if e.get("side", 0) < 0)
                         st.caption(
                             f"Triggers this session: BID ABS {n_bid} · OFFER ABS {n_off}. "
-                            "Need sweep z≥1 vs last 20 highs/lows AND shelf z≥1 AND close in the rejection third. "
+                            "Need sweep z≥1.6, shelf z≥1.4, close in outer 28%, then 8-bar cooldown per side. "
                             "No mark = no bar cleared the gate."
                         )
                         if fig_fp is not None:
