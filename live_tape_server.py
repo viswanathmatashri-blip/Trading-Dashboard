@@ -36,9 +36,22 @@ HOST = os.getenv("TAPE_HOST", "0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
 PORT = int(os.getenv("PORT") or os.getenv("TAPE_PORT", "8765"))
 BAR_SECONDS = int(os.getenv("TAPE_BAR_SECONDS", "180"))  # 3-min bars by default
 NIFTY_TOKEN = os.getenv("NIFTY_TOKEN", "99926000")
-# Optional override. If empty, nearest Nifty futures token is downloaded from Angel.
 FUT_TOKEN = os.getenv("FUT_TOKEN", "")
-FUT_EXCHANGE_TYPE = int(os.getenv("FUT_EXCHANGE_TYPE", "2"))  # NFO = 2
+FUT_EXCHANGE_TYPE = int(os.getenv("FUT_EXCHANGE_TYPE", "2"))
+
+# Same universe as Options Simulator INDEX_TOKEN_MAP
+# ws_ex: Angel WS exchangeType 1 NSE, 2 NFO, 3 BSE, 4 BFO, 5 MCX
+INDEX_MAP = {
+    "NIFTY": {"spot": "99926000", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 65},
+    "BANKNIFTY": {"spot": "99926009", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 30},
+    "FINNIFTY": {"spot": "99926037", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 60},
+    "MIDCPNIFTY": {"spot": "99926074", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 120},
+    "SENSEX": {"spot": "99919000", "spot_ex": "BSE", "spot_ws": 3, "fut_ex": "BFO", "fut_ws": 4, "fut_type": "FUTIDX", "opt_ex": "BFO", "lot": 20},
+    "GOLDM": {"spot": "", "spot_ex": "MCX", "spot_ws": 5, "fut_ex": "MCX", "fut_ws": 5, "fut_type": "FUTCOM", "opt_ex": "", "lot": 100},
+    "CRUDEOIL": {"spot": "", "spot_ex": "MCX", "spot_ws": 5, "fut_ex": "MCX", "fut_ws": 5, "fut_type": "FUTCOM", "opt_ex": "", "lot": 100},
+}
+ACTIVE = {"name": os.getenv("TAPE_INDEX", "NIFTY")}
+WS_HOLD = {"sws": None, "api": None, "spot": "", "fut": "", "cfg": INDEX_MAP["NIFTY"]}
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 GEX_SECONDS = int(os.getenv("TAPE_GEX_SECONDS", "3600"))  # hourly; ticks never run this
 LOT = 65
@@ -47,21 +60,22 @@ API_HOLD = {"api": None}
 INDEX_PDHL = {"pdh": None, "pdl": None}
 
 
-def resolve_nifty_fut_token() -> str:
-    """Nearest unexpired NIFTY index future on NFO. Same idea as the Streamlit app."""
-    if FUT_TOKEN:
+def resolve_fut_token(name: str, cfg: dict) -> str:
+    if FUT_TOKEN and name == "NIFTY":
         return str(FUT_TOKEN)
     try:
         with urllib.request.urlopen(SCRIP_MASTER_URL, timeout=30) as resp:
             rows = json.loads(resp.read().decode())
         today = date.today()
         best = None
+        want_ex = cfg["fut_ex"]
+        want_ty = cfg["fut_type"]
         for r in rows:
-            if str(r.get("name", "")).upper() != "NIFTY":
+            if str(r.get("name", "")).upper() != name:
                 continue
-            if str(r.get("exch_seg", "")).upper() != "NFO":
+            if str(r.get("exch_seg", "")).upper() != want_ex:
                 continue
-            if str(r.get("instrumenttype", "")).upper() != "FUTIDX":
+            if str(r.get("instrumenttype", "")).upper() != want_ty:
                 continue
             exp = pd.to_datetime(r.get("expiry"), format="%d%b%Y", errors="coerce")
             if pd.isna(exp) or exp.date() < today:
@@ -72,7 +86,7 @@ def resolve_nifty_fut_token() -> str:
             if best is None or exp.date() < best[0]:
                 best = (exp.date(), tok, r.get("symbol"))
         if best:
-            print(f"auto futures token {best[2]} expiry {best[0]} token {best[1]}")
+            print(f"auto futures {name} {best[2]} expiry {best[0]} token {best[1]}")
             return best[1]
     except Exception as e:
         print("fut token lookup failed", e)
@@ -641,7 +655,7 @@ def fetch_structure_levels(api, spot: float) -> dict:
         today = date.today()
         opts = []
         for r in rows:
-            if str(r.get("name", "")).upper() != "NIFTY":
+            if str(r.get("name", "")).upper() != ACTIVE.get("name", "NIFTY"):
                 continue
             if str(r.get("exch_seg", "")).upper() != "NFO":
                 continue
@@ -735,7 +749,7 @@ def compute_hourly_greeks(api, spot: float) -> dict:
         today = date.today()
         opts = []
         for r in rows:
-            if str(r.get("name", "")).upper() != "NIFTY":
+            if str(r.get("name", "")).upper() != ACTIVE.get("name", "NIFTY"):
                 continue
             if str(r.get("exch_seg", "")).upper() != "NFO":
                 continue
@@ -785,7 +799,8 @@ def compute_hourly_greeks(api, spot: float) -> dict:
         net_gex = 0.0
         net_vex = 0.0
         gex_curve = []
-        gex_scale = LOT * (spot ** 2) * 0.01
+        lot = int((WS_HOLD.get("cfg") or {}).get("lot") or LOT)
+        gex_scale = lot * (spot ** 2) * 0.01
         for k, sides in sorted(by.items()):
             d1 = (math.log(max(spot, 1e-9) / max(k, 1e-9)) + 0.5 * sig * sig * T) / max(sig * math.sqrt(T), 1e-9)
             gam = _norm_pdf(d1) / max(spot * sig * math.sqrt(T), 1e-9)
@@ -795,7 +810,7 @@ def compute_hourly_greeks(api, spot: float) -> dict:
             if abs(k - spot) > 250:
                 continue
             gex_k = gam * ce_oi * gex_scale - gam * pe_oi * gex_scale
-            vex_k = (vega * ce_oi - vega * pe_oi) * LOT * 0.01
+            vex_k = (vega * ce_oi - vega * pe_oi) * lot * 0.01
             net_gex += gex_k
             net_vex += vex_k
             gex_curve.append({"k": k, "gex": gex_k, "vex": vex_k})
@@ -840,12 +855,19 @@ def angel_thread():
     feed = api.getfeedToken()
     sws = SmartWebSocketV2(jwt, api_key, client, feed)
 
-    fut_token = resolve_nifty_fut_token()
+    name0 = ACTIVE["name"] if ACTIVE["name"] in INDEX_MAP else "NIFTY"
+    cfg0 = INDEX_MAP[name0]
+    fut_token = resolve_fut_token(name0, cfg0)
+    spot_token = cfg0.get("spot") or ""
     last_spot = {"px": None}
     last_fut = {"px": None, "vol": 0.0}
+    WS_HOLD.update({"sws": sws, "api": api, "spot": spot_token, "fut": fut_token, "cfg": cfg0})
+    SNAPSHOT["index"] = name0
+    SNAPSHOT["indexes"] = list(INDEX_MAP.keys())
 
     def seed_history():
         """Load last session 3-min futures candles so charts/VA are not empty."""
+        fut_token = WS_HOLD.get("fut") or ""
         if not fut_token:
             print("no fut token — skip candle seed")
             return
@@ -854,7 +876,7 @@ def angel_thread():
         from_dt = to_dt - timedelta(days=5)
         interval = "THREE_MINUTE" if BAR_SECONDS <= 180 else "FIVE_MINUTE"
         param = {
-            "exchange": "NFO",
+            "exchange": WS_HOLD["cfg"]["fut_ex"],
             "symboltoken": str(fut_token),
             "interval": interval,
             "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
@@ -885,8 +907,8 @@ def angel_thread():
         to_dt = datetime.now()
         from_dt = to_dt - timedelta(days=7)
         res = api.getCandleData({
-            "exchange": "NSE",
-            "symboltoken": str(NIFTY_TOKEN),
+            "exchange": WS_HOLD["cfg"]["spot_ex"] or WS_HOLD["cfg"]["fut_ex"],
+            "symboltoken": str(WS_HOLD["spot"] or fut_token),
             "interval": "ONE_DAY",
             "fromdate": from_dt.strftime("%Y-%m-%d 09:15"),
             "todate": to_dt.strftime("%Y-%m-%d 15:30"),
@@ -941,11 +963,11 @@ def angel_thread():
                 px = px / 100.0
             vol = float(msg.get("last_traded_quantity") or msg.get("volume_trade_for_the_day") or 0)
             ts = float(msg.get("exchange_timestamp") or time.time() * 1000) / 1000.0
-            if token == str(NIFTY_TOKEN):
+            if WS_HOLD["spot"] and token == str(WS_HOLD["spot"]):
                 last_spot["px"] = px
-                if not fut_token:
+                if not WS_HOLD["fut"]:
                     BARS.on_tick(ts, px, 0.0, spot=px)
-            elif fut_token and token == str(fut_token):
+            elif WS_HOLD["fut"] and token == str(WS_HOLD["fut"]):
                 last_fut["px"] = px
                 day_v = float(msg.get("volume_trade_for_the_day") or 0)
                 inc = 0.0
@@ -958,9 +980,12 @@ def angel_thread():
             print("tick parse", e)
 
     def on_open(_ws):
-        tokens = [{"exchangeType": 1, "tokens": [str(NIFTY_TOKEN)]}]
-        if fut_token:
-            tokens.append({"exchangeType": FUT_EXCHANGE_TYPE, "tokens": [str(fut_token)]})
+        tokens = []
+        cfg = WS_HOLD["cfg"]
+        if WS_HOLD["spot"]:
+            tokens.append({"exchangeType": cfg["spot_ws"], "tokens": [str(WS_HOLD["spot"])]})
+        if WS_HOLD["fut"]:
+            tokens.append({"exchangeType": cfg["fut_ws"], "tokens": [str(WS_HOLD["fut"])]})
         sws.subscribe("tape01", 3, tokens)
         print("subscribed", tokens)
 
@@ -976,6 +1001,41 @@ import hashlib
 import struct
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def switch_index(name: str) -> bool:
+    name = (name or "").upper().strip()
+    if name not in INDEX_MAP:
+        return False
+    ACTIVE["name"] = name
+    cfg = INDEX_MAP[name]
+    fut = resolve_fut_token(name, cfg)
+    WS_HOLD["cfg"] = cfg
+    WS_HOLD["spot"] = cfg.get("spot") or ""
+    WS_HOLD["fut"] = fut
+    try:
+        BARS.rows.clear()
+    except Exception:
+        pass
+    INDEX_PDHL["pdh"] = INDEX_PDHL["pdl"] = None
+    with LOCK:
+        SNAPSHOT["index"] = name
+        SNAPSHOT["bars"] = []
+        SNAPSHOT["va"] = {"action": "NO ENTRY", "micro": f"switching {name}"}
+    sws = WS_HOLD.get("sws")
+    if sws:
+        try:
+            tokens = []
+            if WS_HOLD["spot"]:
+                tokens.append({"exchangeType": cfg["spot_ws"], "tokens": [str(WS_HOLD["spot"])]})
+            if fut:
+                tokens.append({"exchangeType": cfg["fut_ws"], "tokens": [str(fut)]})
+            sws.subscribe("tape01", 3, tokens)
+            print("resubscribed", tokens)
+        except Exception as e:
+            print("resub failed", e)
+    GEX_WAKE.set()
+    return True
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1006,6 +1066,22 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        if self.path.startswith("/api/index"):
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n else b"{}"
+            try:
+                body = json.loads(raw.decode() or "{}")
+            except Exception:
+                body = {}
+            name = str(body.get("index") or "")
+            ok = switch_index(name)
+            msg = json.dumps({"ok": ok, "index": ACTIVE["name"], "indexes": list(INDEX_MAP)}).encode()
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            return
         if self.path.startswith("/api/refresh-gex"):
             GEX_WAKE.set()
             msg = json.dumps({"ok": True, "msg": "GEX refresh queued"}).encode()
