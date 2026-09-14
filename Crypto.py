@@ -5543,15 +5543,18 @@ def live_dashboard_fragment():
         # Intelligent: candles + VA only. Never re-pull chain/GEX/IV/ATM.
         st.session_state["data_store"] = refresh_index_tapes(have, want_tf)
         st.session_state["_tape_ts"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
-        if not intel:
-            last_full = float(st.session_state.get("_full_fetch_ts") or 0)
-            if (now_s - last_full) >= 60:
-                refreshed_data = fetch_live_data(want_tf)
-                if refreshed_data:
-                    refreshed_data["selected_expiry"] = selected_expiry_str
-                    refreshed_data["bar_tf"] = want_tf
-                    st.session_state["data_store"] = refreshed_data
-                    st.session_state["_full_fetch_ts"] = now_s
+        gex_sec = int(st.session_state.get("gex_refresh_sel") or st.session_state.get("gex_refresh_min") or 5) * 60
+        last_full = float(st.session_state.get("_full_fetch_ts") or 0)
+        if (now_s - last_full) >= gex_sec:
+            refreshed_data = fetch_live_data(want_tf)
+            if refreshed_data:
+                refreshed_data["selected_expiry"] = selected_expiry_str
+                refreshed_data["bar_tf"] = want_tf
+                st.session_state["data_store"] = refreshed_data
+                st.session_state["_full_fetch_ts"] = now_s
+                st.session_state["_gex_ts"] = datetime.datetime.now(
+                    pytz.timezone("Asia/Kolkata")
+                ).strftime("%H:%M:%S")
     elif auto and not live_now:
         st.session_state["_closed_refresh_skip"] = True
 
@@ -5568,7 +5571,7 @@ def live_dashboard_fragment():
         st.markdown(
             f"<div style='display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;'>"
             f"<h1 class='custom-heading' style='margin:0;font-size:17px;'>📊 Market Summary</h1>"
-            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')} · tape {st.session_state.get('_tape_ts') or '—'}</span>"
+            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')} · tape {st.session_state.get('_tape_ts') or '—'} · GEX {st.session_state.get('_gex_ts') or '—'}</span>"
             f"</div>",
             unsafe_allow_html=True
         )
@@ -5584,7 +5587,14 @@ def live_dashboard_fragment():
             "Intelligent refresh",
             value=st.session_state.get("intel_refresh", False),
             key="cb_intel_refresh",
-            help="Only index/futures candles + VA triggers. No chain, GEX, IV, ATM, book.",
+            help="Candles + VA every 5s. GEX/chain on the interval below.",
+        )
+        st.session_state["gex_refresh_min"] = st.selectbox(
+            "GEX / chain",
+            options=[3, 5],
+            index=1 if st.session_state.get("gex_refresh_min", 5) == 5 else 0,
+            format_func=lambda m: f"every {m} min",
+            key="gex_refresh_sel",
         )
         if cb_main != st.session_state["enable_main_refresh"]:
             st.session_state["enable_main_refresh"] = cb_main
@@ -5605,7 +5615,18 @@ def live_dashboard_fragment():
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ========== SUPERHUMAN DECISION ENGINE ==========
-    scores = compute_superhuman_scores(data, data.get("df_futures") if data.get("df_futures") is not None and not data.get("df_futures").empty else data.get("df_candles", pd.DataFrame()))
+    _sc_src = data.get("df_futures") if data.get("df_futures") is not None and not getattr(data.get("df_futures"), "empty", True) else data.get("df_candles", pd.DataFrame())
+    _sc_sig = (
+        st.session_state.get("_gex_ts"),
+        float(data.get("spot_price") or 0),
+        int(len(_sc_src)) if _sc_src is not None and hasattr(_sc_src, "__len__") else 0,
+    )
+    if st.session_state.get("_scores_sig") == _sc_sig and isinstance(st.session_state.get("_scores_cache"), dict):
+        scores = st.session_state["_scores_cache"]
+    else:
+        scores = compute_superhuman_scores(data, _sc_src if _sc_src is not None else pd.DataFrame())
+        st.session_state["_scores_cache"] = scores
+        st.session_state["_scores_sig"] = _sc_sig
 
     if "error" not in scores:
         # ----- Decision Log (persist bias changes during the day) -----
@@ -6802,14 +6823,21 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                         micro["candle"] = candle_pat.get("name")
                         micro["candle_why"] = filt_why
                 atm_k = data.get("atm_strike")
-                tab_flow, tab_dex, tab_fp, tab_atm_ce, tab_atm_pe = st.tabs([
-                    "1 · Index / ΔV / EFI / CVD",
-                    "2 · DEX / Premium",
-                    "3 · Δ Footprint",
-                    f"4 · ATM CE {atm_k:.0f}" if atm_k else "4 · ATM CE",
-                    f"5 · ATM PE {atm_k:.0f}" if atm_k else "5 · ATM PE",
-                ])
-                with tab_flow:
+                flow_choice = st.radio(
+                    "Tape",
+                    [
+                        "1 · Index / ΔV / EFI / CVD",
+                        "2 · DEX / Premium",
+                        "3 · Δ Footprint",
+                        f"4 · ATM CE {atm_k:.0f}" if atm_k else "4 · ATM CE",
+                        f"5 · ATM PE {atm_k:.0f}" if atm_k else "5 · ATM PE",
+                    ],
+                    horizontal=True,
+                    key="flow_tab_radio",
+                    label_visibility="collapsed",
+                )
+                tab_flow = tab_dex = tab_fp = tab_atm_ce = tab_atm_pe = None
+                if str(flow_choice).startswith("1"):
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     if isinstance(micro, dict) and micro.get("candle"):
                         st.caption(
@@ -6837,7 +6865,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                                 st.session_state["avwap_time"] = pick
                                 st.rerun()
                     st.markdown("</div>", unsafe_allow_html=True)
-                with tab_fp:
+                elif str(flow_choice).startswith("3"):
                     st.markdown("<div class='chart-card'><div class='card-title'>Δ Footprint + top-5 book</div>", unsafe_allow_html=True)
                     st.caption("Top 5 = **resting** futures book (SmartAPI FULL depth), not executed lots. Bar heatmap is still close-location volume.")
                     b5 = st.session_state.get("book5_hist") or []
@@ -6930,15 +6958,15 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                             st.plotly_chart(fig_o, use_container_width=True)
                     except Exception as e:
                         st.caption(f"ATM {lab} unavailable.")
-                with tab_atm_ce:
+                if str(flow_choice).startswith("4"):
                     st.markdown("<div class='chart-card'><div class='card-title'>ATM CE</div>", unsafe_allow_html=True)
                     _render_atm_tab(data.get("atm_ce_token"), "CE")
                     st.markdown("</div>", unsafe_allow_html=True)
-                with tab_atm_pe:
+                if str(flow_choice).startswith("5"):
                     st.markdown("<div class='chart-card'><div class='card-title'>ATM PE</div>", unsafe_allow_html=True)
                     _render_atm_tab(data.get("atm_pe_token"), "PE")
                     st.markdown("</div>", unsafe_allow_html=True)
-                with tab_dex:
+                if str(flow_choice).startswith("2"):
 
                     sess_day = latest_session or _ist_now().date()
                     tape = load_flow_tape(Index_Name, sess_day) or list(st.session_state.get("flow_tape") or [])
@@ -7205,9 +7233,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
 
 live_dashboard_fragment()
 
-# --- Full-width: Institutional Order Flow, then Raw Z-Score details ---
-st.markdown("---")
-institutional_order_flow_scanner_fragment()
+# --- Raw Z-Score details ---
 st.markdown("---")
 zscore_analysis_fragment(mode="raw")
 
