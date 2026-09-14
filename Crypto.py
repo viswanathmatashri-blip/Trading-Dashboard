@@ -1119,9 +1119,10 @@ def send_telegram_alert(text: str) -> bool:
         return False
 
 
-def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st):
+def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st, index_name=None):
     """Edge-triggered alerts. No token in logs. Skip when market closed."""
-    live, _, _, _ = market_session_state()
+    idx = index_name or st.session_state.get("_last_index") or "INDEX"
+    live, _, _, _ = market_session_state(index_name=idx)
     if not live:
         return
     tok, chat = _telegram_creds()
@@ -1183,7 +1184,7 @@ def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st):
 
     if pcd and pcd != prev.get("pcd"):
         interesting = any(w in pcd.upper() for w in ("PREPARE", "ENTER", "LONG", "SHORT"))
-        if interesting and "NO ENTRY" not in pcd.upper() and not cooled("pcd"):
+        if False and interesting and "NO ENTRY" not in pcd.upper() and not cooled("pcd"):
             events.append(f"PCD$  {prev.get('pcd') or '—'} → {pcd}")
         prev["pcd"] = pcd
 
@@ -5830,7 +5831,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
         tech_left, tech_gex = st.columns([0.50, 0.50])
 
         with tech_left:
-            tab_bb, tab_osc = st.tabs(["NIFTY + BB", "MACD / RSI"])
+            tab_bb, tab_osc = st.tabs([f"{Index_Name} + BB", "MACD / RSI"])
             with tab_bb:
                 fig_px = plt_go.Figure()
                 fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot", line=dict(color="#00E676", width=2)))
@@ -6048,7 +6049,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
                     f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
                     f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
-                    f"📉 NIFTY spot + fut VWAP→index + VP ({expiry_txt})</span>"
+                    f"📉 {Index_Name} spot + fut VWAP→index + VP ({expiry_txt})</span>"
                     f"<div class='micro-tip'><b>Line</b> = index spot.<br>"
                     f"<b>VWAP / σ</b> = futures VWAP minus bar basis (F−S).<br>"
                     f"VWAP_idx = VWAP_fut − (Fut − Spot).<br>"
@@ -6453,7 +6454,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                 ])
                 fig_stack.add_trace(plt_go.Candlestick(
                     x=dfi["time_str"], open=idx_o, high=idx_h, low=idx_l, close=idx_c,
-                    name="NIFTY", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
+                    name=str(Index_Name), increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
                     increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350",
                     showlegend=True,
                 ), row=1, col=2)
@@ -6503,7 +6504,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     prev = None
                     for rec in pdec_hist:
                         act = rec["action"]
-                        if not act:
+                        if not act or "NO ENTRY" in str(act).upper():
                             continue
                         if act == prev:
                             continue
@@ -6755,7 +6756,8 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                 flow_pb = classify_flow_playbook(dfi, data)
                 try:
                     process_telegram_alerts(data, dfi, scores if isinstance(scores, dict) else {},
-                                            micro, flow_pb, cvd_st if "cvd_st" in dir() else {})
+                                            micro, flow_pb, cvd_st if "cvd_st" in dir() else {},
+                                            index_name=Index_Name)
                 except Exception:
                     pass
 
@@ -6957,7 +6959,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                         x=dfi["time_str"], y=dfi.get("vwap_idx", dfi["vwap"]), mode="lines", name="VWAP (idx)",
                         line=dict(color="#FF9800", width=2), hoverinfo="skip"), row=1, col=1)
                     fig_dex.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
+                        x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name=str(Index_Name),
                         line=dict(color="#2196F3", width=2)), row=1, col=1)
                     if vp.get("ok"):
                         fig_dex.add_trace(plt_go.Bar(
@@ -7050,52 +7052,26 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                         f"<div class='micro-tip'>{tip}</div></div>"
                     )
                 chips = []
-                sc = f"NIFTY {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else "NIFTY —"
+                sc = f"{Index_Name} {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else f"{Index_Name} —"
                 fc = f"FUT {fut_chg[0]:,.0f} {fut_chg[1]:+.0f} {fut_chg[2]:+.2f}%" if fut_chg else "FUT —"
                 chips.append(_chip(
                     f"{sc}<br>{fc}",
-                    "Index spot and near-month futures session open→close. GEX walls use spot; VWAP uses futures.",
+                    f"{Index_Name} spot and near-month futures session open→close.",
                     "#00E676" if (spot_chg and spot_chg[2] >= 0) else "#FF5252",
                 ))
-                if isinstance(scores, dict) and "error" not in scores:
+                act = (micro or {}).get("action") or ""
+                if micro.get("ok") and act and "NO ENTRY" not in str(act).upper():
                     chips.append(_chip(
-                        f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})",
-                        f"<b>Superhuman</b><br>{scores.get('clarity','')}<br>{scores.get('action','')}<br>"
-                        f"Quiet + long γ → PIN<br>Big range + long γ → REVERSION<br>"
-                        f"Short γ / wall break → TREND<br>|C|≤15 → NO EDGE<br>else → MILD DIR",
-                        scores.get("colour", "#00E676"),
-                    ))
-                tname = (trig or {}).get("trigger", "NO TRIGGER")
-                tbits = []
-                for ch in (trig or {}).get("checks") or []:
-                    side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
-                    tbits.append(f"{ch.get('name','')} <b>{side}</b> · {ch.get('note','')}")
-                chips.append(_chip(
-                    tname,
-                    f"<b>{tname}</b><br>{(trig or {}).get('summary','')}<br><br>" + "<br>".join(tbits),
-                    (trig or {}).get("colour", "#FF9800"),
-                ))
-                if micro.get("ok"):
-                    act = micro["action"]
-                    tag = " EFI≈0" if micro.get("efi_zero") else ""
-                    chips.append(_chip(
-                        f"P{LEVEL_GLYPH.get(micro['price'], micro['price'])} "
-                        f"Δ{LEVEL_GLYPH.get(micro.get('delta', micro.get('obv','-')), '')} "
-                        f"E{LEVEL_GLYPH.get(micro['efi'], micro['efi'])} "
-                        f"C{LEVEL_GLYPH.get(micro['cvd'], micro['cvd'])}<br>{act}",
-                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br>"
-                        f"{micro.get('efi_note','')}<br><b>Algo action:</b> {act}",
+                        f"VA<br>{act}",
+                        f"<b>VA</b><br>{micro.get('micro','')}<br>{micro.get('efi_note','')}<br>"
+                        f"regime {micro.get('regime','')} · {micro.get('model','')}",
                         "#00E676",
                     ))
-                    flow = classify_flow_playbook(dfi, data)
-                    if flow.get("ok"):
-                        chips.append(_chip(
-                            f"P{ARROW_GLYPH[flow['price']]} C{ARROW_GLYPH[flow['cvd']]} "
-                            f"D{ARROW_GLYPH[flow['dex']]} $ {ARROW_GLYPH[flow['prem']]}<br>{flow['action']}",
-                            f"<b>Flow playbook (18)</b><br>{flow['hover']}",
-                            "#90CAF9",
-                        ))
-                st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+                ch1, ch2 = st.columns([0.18, 0.82])
+                with ch1:
+                    st.markdown("<div style='margin-top:4px;'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+                with ch2:
+                    st.empty()
                 if not st.session_state.get("intel_refresh"):
                     b1, b2 = st.columns([0.50, 0.50])
                     with b1:
