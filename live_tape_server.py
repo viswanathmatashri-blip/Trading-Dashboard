@@ -42,13 +42,13 @@ FUT_EXCHANGE_TYPE = int(os.getenv("FUT_EXCHANGE_TYPE", "2"))
 # Same universe as Options Simulator INDEX_TOKEN_MAP
 # ws_ex: Angel WS exchangeType 1 NSE, 2 NFO, 3 BSE, 4 BFO, 5 MCX
 INDEX_MAP = {
-    "NIFTY": {"spot": "99926000", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 65},
-    "BANKNIFTY": {"spot": "99926009", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 30},
-    "FINNIFTY": {"spot": "99926037", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 60},
-    "MIDCPNIFTY": {"spot": "99926074", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 120},
-    "SENSEX": {"spot": "99919000", "spot_ex": "BSE", "spot_ws": 3, "fut_ex": "BFO", "fut_ws": 4, "fut_type": "FUTIDX", "opt_ex": "BFO", "lot": 20},
-    "GOLDM": {"spot": "", "spot_ex": "MCX", "spot_ws": 5, "fut_ex": "MCX", "fut_ws": 5, "fut_type": "FUTCOM", "opt_ex": "", "lot": 100},
-    "CRUDEOIL": {"spot": "", "spot_ex": "MCX", "spot_ws": 5, "fut_ex": "MCX", "fut_ws": 5, "fut_type": "FUTCOM", "opt_ex": "", "lot": 100},
+    "NIFTY": {"spot": "99926000", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 65, "slots": 126},
+    "BANKNIFTY": {"spot": "99926009", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 30, "slots": 126},
+    "FINNIFTY": {"spot": "99926037", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 60, "slots": 126},
+    "MIDCPNIFTY": {"spot": "99926074", "spot_ex": "NSE", "spot_ws": 1, "fut_ex": "NFO", "fut_ws": 2, "fut_type": "FUTIDX", "opt_ex": "NFO", "lot": 120, "slots": 126},
+    "SENSEX": {"spot": "99919000", "spot_ex": "BSE", "spot_ws": 3, "fut_ex": "BFO", "fut_ws": 4, "fut_type": "FUTIDX", "opt_ex": "BFO", "lot": 20, "slots": 126},
+    "GOLDM": {"spot": "", "spot_ex": "MCX", "spot_ws": 5, "fut_ex": "MCX", "fut_ws": 5, "fut_type": "FUTCOM", "opt_ex": "", "lot": 100, "slots": 290},
+    "CRUDEOIL": {"spot": "", "spot_ex": "MCX", "spot_ws": 5, "fut_ex": "MCX", "fut_ws": 5, "fut_type": "FUTCOM", "opt_ex": "", "lot": 100, "slots": 290},
 }
 ACTIVE = {"name": os.getenv("TAPE_INDEX", "NIFTY")}
 WS_HOLD = {"sws": None, "api": None, "spot": "", "fut": "", "cfg": INDEX_MAP["NIFTY"], "sub": []}
@@ -613,12 +613,20 @@ def apply_bar_state(spot, fut):
             va["poc"] = float(prices[poc_i])
             peak = vols[poc_i] or 1.0
             # HVNs = local volume peaks (the fat pockets you marked)
-            hvns = []
+            raw = []
+            span = max(prices) - min(prices) or 1
+            min_sep = max(span * 0.05, (prices[1] - prices[0]) * 4 if len(prices) > 1 else 8)
             for i in range(1, len(vols) - 1):
-                if vols[i] >= vols[i - 1] and vols[i] >= vols[i + 1] and vols[i] >= 0.32 * peak:
-                    if any(abs(prices[i] - h) < 8 for h in hvns):
-                        continue
-                    hvns.append(float(prices[i]))
+                if vols[i] >= vols[i - 1] and vols[i] >= vols[i + 1] and vols[i] >= 0.45 * peak:
+                    raw.append((vols[i], float(prices[i])))
+            raw.sort(reverse=True)
+            hvns = []
+            for _, px in raw:
+                if any(abs(px - h) < min_sep for h in hvns):
+                    continue
+                hvns.append(px)
+                if len(hvns) >= 5:
+                    break
             hvns.sort()
             va["hvns"] = hvns
             # Tight VA around POC: stop at first valley under 28% of peak
@@ -641,6 +649,8 @@ def apply_bar_state(spot, fut):
             "bars": bars_out,
             "va": va,
             "levels": dict(SNAPSHOT.get("levels") or {}),
+            "index": ACTIVE.get("name"),
+            "session_slots": int((WS_HOLD.get("cfg") or {}).get("slots") or 126),
         })
     _publish()
 
@@ -954,6 +964,36 @@ def angel_thread():
 
     threading.Thread(target=gex_loop, daemon=True).start()
 
+    def ltp_loop():
+        """Fallback: pull LTP every 1s so the last candle never sits stale."""
+        while True:
+            time.sleep(1.0)
+            api = WS_HOLD.get("api")
+            fut = WS_HOLD.get("fut")
+            cfg = WS_HOLD.get("cfg") or {}
+            if not api or not fut:
+                continue
+            try:
+                exch = cfg.get("fut_ex") or "NFO"
+                res = api.getMarketData("LTP", {exch: [str(fut)]})
+                fetched = ((res or {}).get("data") or {}).get("fetched") or []
+                if not fetched:
+                    continue
+                px = float(fetched[0].get("ltp") or 0)
+                if px > 100000:
+                    px = px / 100.0
+                if px <= 0:
+                    continue
+                LAST["fut"] = px
+                if not WS_HOLD.get("spot"):
+                    LAST["spot"] = px
+                BARS.on_tick(time.time(), px, 0.0, spot=LAST["spot"] or px)
+                apply_bar_state(LAST["spot"], LAST["fut"])
+            except Exception as e:
+                print("ltp loop", e)
+
+    threading.Thread(target=ltp_loop, daemon=True).start()
+
     def on_data(_ws, msg):
         try:
             token = str(msg.get("token") or "")
@@ -965,7 +1005,13 @@ def angel_thread():
             if px > 100000:
                 px = px / 100.0
             vol = float(msg.get("last_traded_quantity") or msg.get("volume_trade_for_the_day") or 0)
-            ts = float(msg.get("exchange_timestamp") or time.time() * 1000) / 1000.0
+            raw_ts = msg.get("exchange_timestamp")
+            if raw_ts:
+                ts = float(raw_ts)
+                if ts > 1e12:
+                    ts /= 1000.0
+            else:
+                ts = time.time()
             if WS_HOLD["spot"] and token == str(WS_HOLD["spot"]):
                 LAST["spot"] = px
                 if not WS_HOLD["fut"]:
