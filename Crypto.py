@@ -5888,16 +5888,27 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
 
     if not df_full.empty and len(df_full) >= 3:
         latest_row = df_full.iloc[-1]
-        rsi_val = latest_row["rsi"]
+        def _cell(col, default=float("nan")):
+            try:
+                if col in df_full.columns:
+                    v = latest_row[col]
+                    return float(v) if pd.notna(v) else default
+            except Exception:
+                pass
+            return default
+        rsi_val = _cell("rsi", 50.0)
         rsi_status = "Oversold" if rsi_val < 30 else ("Overbought" if rsi_val > 70 else "Neutral")
         rsi_badge_cls = "badge-bearish" if rsi_val > 70 else ("badge-bullish" if rsi_val < 30 else "badge-neutral")
-        macd_val = latest_row["macd"]
-        macd_sig = latest_row["macd_signal"]
+        macd_val = _cell("macd", 0.0)
+        macd_sig = _cell("macd_signal", 0.0)
         macd_status = "Bullish XO" if macd_val > macd_sig else "Bearish XO"
         macd_badge_cls = "badge-bullish" if macd_val > macd_sig else "badge-bearish"
-        recent_bw = df_full["bb_bandwidth"].tail(20)
-        bw_threshold = recent_bw.quantile(0.20)
-        is_sqz = latest_row["bb_bandwidth"] <= bw_threshold
+        if "bb_bandwidth" in df_full.columns:
+            recent_bw = pd.to_numeric(df_full["bb_bandwidth"], errors="coerce").tail(20)
+            bw_threshold = float(recent_bw.quantile(0.20) or 0)
+            is_sqz = _cell("bb_bandwidth", 0.0) <= bw_threshold
+        else:
+            is_sqz = False
         sqz_status = "Squeeze" if is_sqz else "Expand"
         sqz_badge_cls = "badge-neutral" if is_sqz else "badge-bullish"
         badge_html = (
