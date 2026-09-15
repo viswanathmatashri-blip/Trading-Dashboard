@@ -1962,6 +1962,9 @@ def _tape_gap_window(cached, now_dt, index_name, api_interval):
     if last.tzinfo is None:
         last = pytz.timezone("Asia/Kolkata").localize(last)
     last = last.astimezone(pytz.timezone("Asia/Kolkata"))
+    # Never ask SmartAPI for a window that crosses midnight — it returns nothing
+    if last.date() != now_dt.date():
+        return open_s, now_dt.strftime("%Y-%m-%d %H:%M"), True
     start = last - datetime.timedelta(minutes=max(step, 1))
     open_dt = datetime.datetime.strptime(open_s, "%Y-%m-%d %H:%M")
     open_dt = pytz.timezone("Asia/Kolkata").localize(open_dt)
@@ -2904,7 +2907,13 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
         chosen = today if today in counts.index else None
         used_prior = chosen is None
         if chosen is None:
-            return empty
+            # Live but today's bars not in frame yet — keep prior session visible
+            weekdays = [(d, n) for d, n in counts.items() if d.weekday() < 5]
+            if weekdays:
+                chosen = max(weekdays, key=lambda x: x[0])[0]
+                used_prior = True
+            else:
+                return empty
     else:
         for d, n in list(counts.items())[::-1]:
             if d.weekday() >= 5:
@@ -6112,6 +6121,8 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
         y0 = y1 = None
         sigma_mult = 1.5
 
+        if df_fchart is None or getattr(df_fchart, "empty", True):
+            st.warning("Index tape empty this cycle — waiting for today's futures candles (09:15→now). Click Fetch if this stays.")
         with left_col:
             fut_header_col, tf_col, basis_col, band_col = st.columns([0.52, 0.20, 0.14, 0.14])
             with tf_col:
