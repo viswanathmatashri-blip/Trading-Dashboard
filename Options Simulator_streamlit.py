@@ -5777,12 +5777,24 @@ def _multi_va_labels(dfi, key):
 
 
 def _va_short_label(act: str) -> str:
-    s = str(act or "")
-    s = s.replace("MEAN-REVERSION", "ME").replace("BREAKOUT", "B").replace("BREAKDOWN", "B")
-    s = s.replace("WATCH SHORT", "WATCH S").replace("WATCH LONG", "WATCH L")
-    s = s.replace("ADD SHORT", "ADD S").replace("ADD LONG", "ADD L")
-    s = s.replace("(", "").replace(")", "")
-    return s.strip()[:14]
+    s = str(act or "").upper()
+    if "WATCH SHORT" in s:
+        return "WATCH-S"
+    if "WATCH LONG" in s:
+        return "WATCH-L"
+    if "ADD SHORT" in s:
+        return "ADD-S"
+    if "ADD LONG" in s:
+        return "ADD-L"
+    if "SHORT" in s and ("BREAK" in s or s.startswith("SHORT B")):
+        return "SHORT-B"
+    if "LONG" in s and ("BREAK" in s or s.startswith("LONG B")):
+        return "LONG-B"
+    if "SHORT" in s:
+        return "SHORT-ME"
+    if "LONG" in s:
+        return "LONG-ME"
+    return str(act or "").strip()[:12]
 
 
 def build_multi_index_figure(index_name, dfi, vp):
@@ -5816,11 +5828,12 @@ def build_multi_index_figure(index_name, dfi, vp):
         name=str(index_name), increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
         increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350", showlegend=False,
     ), row=1, col=1)
-    smin = float(np.nanmin([idx_l.min(), dfi["vwap_lower_idx"].min() if "vwap_lower_idx" in dfi.columns else idx_l.min()]))
-    smax = float(np.nanmax([idx_h.max(), dfi["vwap_upper_idx"].max() if "vwap_upper_idx" in dfi.columns else idx_h.max()]))
-    pad = (smax - smin) * 0.06 if smax > smin else 20
-    band = max((smax - smin) * 0.22, pad * 3)
-    y0, y1 = smin - pad, smax + band
+    candle_hi = float(np.nanmax(idx_h))
+    candle_lo = float(np.nanmin(idx_l))
+    smin = float(np.nanmin([candle_lo, dfi["vwap_lower_idx"].min() if "vwap_lower_idx" in dfi.columns else candle_lo]))
+    smax = float(np.nanmax([candle_hi, dfi["vwap_upper_idx"].max() if "vwap_upper_idx" in dfi.columns else candle_hi]))
+    pad = (smax - smin) * 0.04 if smax > smin else 12
+    y0, y1 = smin - pad, max(smax, candle_hi) + pad * 0.35
     last_basis = float(dfi["basis"].iloc[-1]) if "basis" in dfi.columns else 0.0
     vp2 = dict(vp) if isinstance(vp, dict) else {"ok": False}
     if vp2.get("ok"):
@@ -5879,14 +5892,16 @@ def build_multi_index_figure(index_name, dfi, vp):
                 bgcolor="rgba(14,17,23,0.45)", row=1, col=1,
             )
     labels = _multi_va_labels(dfi, index_name)
-    y_lab = smax + band * 0.55
     for rec in labels[-12:]:
         fig.add_annotation(
-            x=rec["t"], y=y_lab, text=rec["act"],
-            showarrow=False, textangle=-90, xanchor="center", yanchor="bottom",
-            font=dict(size=11, color="#FFF59D", family="Arial Black"),
-            bgcolor="rgba(10,14,22,0.75)",
-            bordercolor="#FFF59D", borderwidth=1, borderpad=2,
+            x=rec["t"], y=candle_hi, text=rec["act"],
+            showarrow=False, textangle=-90,
+            xanchor="center", yanchor="bottom",
+            yshift=4,
+            font=dict(size=12, color="#FFE082", family="Arial"),
+            bgcolor="rgba(8,10,16,0.88)",
+            bordercolor="#FFE082", borderwidth=1, borderpad=3,
+            cliponaxis=False,
             row=1, col=1,
         )
     xr = None
@@ -5900,7 +5915,7 @@ def build_multi_index_figure(index_name, dfi, vp):
         xr = None
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-        height=420, margin=dict(l=36, r=6, t=28, b=22),
+        height=400, margin=dict(l=36, r=6, t=52, b=22),
         xaxis_rangeslider_visible=False, showlegend=False, hovermode="x unified",
     )
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
