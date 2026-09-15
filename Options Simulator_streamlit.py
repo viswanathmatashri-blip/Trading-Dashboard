@@ -195,7 +195,7 @@ if "flow_tape" not in st.session_state:
 if "multi_index_mode" not in st.session_state:
     st.session_state["multi_index_mode"] = False
 if "multi_tf" not in st.session_state:
-    st.session_state["multi_tf"] = "5 min"
+    st.session_state["multi_tf"] = "15 min"
 if "multi_enabled" not in st.session_state:
     st.session_state["multi_enabled"] = {
         "NIFTY": True, "BANKNIFTY": True, "FINNIFTY": False,
@@ -5766,17 +5766,23 @@ def _multi_va_labels(dfi, key):
         up = act.upper()
         if (not act) or ("NO ENTRY" in up) or ("INSIDE" in up) or ("CHOP" in up):
             continue
-        short = act.replace("MEAN-REVERSION", "ME").replace("BREAKOUT", "B").replace("BREAKDOWN", "B")
-        short = short.replace("WATCH SHORT", "WATCH S").replace("WATCH LONG", "WATCH L")
-        short = short.replace("ADD SHORT", "ADD S").replace("ADD LONG", "ADD L")
-        short = short.replace("SHORT ", "SHORT ").replace("LONG ", "LONG ")
-        if short == last_act:
+        short = _va_short_label(act)
+        if not short or short == last_act:
             continue
         tlab = sl["time_str"].iloc[-1] if "time_str" in sl.columns else str(i)
-        out.append({"t": tlab, "act": short[:16], "i": i, "n": n})
+        out.append({"t": tlab, "act": short, "i": i, "n": n})
         last_act = short
     st.session_state[store_key] = out[-16:]
     return st.session_state[store_key]
+
+
+def _va_short_label(act: str) -> str:
+    s = str(act or "")
+    s = s.replace("MEAN-REVERSION", "ME").replace("BREAKOUT", "B").replace("BREAKDOWN", "B")
+    s = s.replace("WATCH SHORT", "WATCH S").replace("WATCH LONG", "WATCH L")
+    s = s.replace("ADD SHORT", "ADD S").replace("ADD LONG", "ADD L")
+    s = s.replace("(", "").replace(")", "")
+    return s.strip()[:14]
 
 
 def build_multi_index_figure(index_name, dfi, vp):
@@ -5786,8 +5792,8 @@ def build_multi_index_figure(index_name, dfi, vp):
     if not axis_times:
         axis_times = list(dfi["time_str"])
     fig = make_subplots(
-        rows=1, cols=2, column_widths=[0.84, 0.16],
-        shared_yaxes=True, horizontal_spacing=0.01,
+        rows=1, cols=2, column_widths=[0.82, 0.18],
+        shared_yaxes=True, horizontal_spacing=0.012,
         specs=[[{}, {}]],
     )
     idx_o = dfi["spot_px"].astype(float) + (dfi["open"].astype(float) - dfi["close"].astype(float))
@@ -5812,16 +5818,17 @@ def build_multi_index_figure(index_name, dfi, vp):
     ), row=1, col=1)
     smin = float(np.nanmin([idx_l.min(), dfi["vwap_lower_idx"].min() if "vwap_lower_idx" in dfi.columns else idx_l.min()]))
     smax = float(np.nanmax([idx_h.max(), dfi["vwap_upper_idx"].max() if "vwap_upper_idx" in dfi.columns else idx_h.max()]))
-    pad = (smax - smin) * 0.08 if smax > smin else 20
-    y0, y1 = smin - pad, smax + pad
-    if vp.get("ok"):
-        last_basis = float(dfi["basis"].iloc[-1]) if "basis" in dfi.columns else 0.0
-        vp2 = dict(vp)
+    pad = (smax - smin) * 0.06 if smax > smin else 20
+    band = max((smax - smin) * 0.22, pad * 3)
+    y0, y1 = smin - pad, smax + band
+    last_basis = float(dfi["basis"].iloc[-1]) if "basis" in dfi.columns else 0.0
+    vp2 = dict(vp) if isinstance(vp, dict) else {"ok": False}
+    if vp2.get("ok"):
         try:
             if vp2.get("mids") is not None:
                 vp2["mids"] = [float(m) - last_basis for m in vp2["mids"]]
-            for k in ("poc", "vah", "val"):
-                if vp2.get(k) is not None:
+            for k in ("poc", "vah", "val", "vah1", "val1", "vah15", "val15"):
+                if vp2.get(k) is not None and not isinstance(vp2.get(k), (list, np.ndarray)):
                     vp2[k] = float(vp2[k]) - last_basis
             nodes = []
             for n in (vp2.get("nodes") or []):
@@ -5833,38 +5840,45 @@ def build_multi_index_figure(index_name, dfi, vp):
             if nodes:
                 vp2["nodes"] = nodes
         except Exception:
-            vp2 = vp
-        vols = vp2.get("vols") or vp.get("vols") or []
-        mids = vp2.get("mids") or vp.get("mids") or []
-        colors = []
+            vp2 = dict(vp)
+        raw_mids = list(vp2.get("mids") or [])
+        raw_vols = list(vp2.get("vol") or vp2.get("vols") or [])
+        mids, vols, colors = [], [], []
         poc = vp2.get("poc")
-        for m in mids:
-            colors.append("#FFD54F" if poc is not None and abs(float(m) - float(poc)) < 1.5 else "#64B5F6")
+        for m, v in zip(raw_mids, raw_vols):
+            if not (y0 <= float(m) <= (smax + pad)):
+                continue
+            mids.append(float(m))
+            vols.append(float(v))
+            colors.append("#FFD54F" if poc is not None and abs(float(m) - float(poc)) < 1e-6 else "rgba(100,181,246,0.75)")
         if mids and vols:
             fig.add_trace(plt_go.Bar(
-                x=vols, y=mids, orientation="h", showlegend=False,
-                marker=dict(color=colors), hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra>VP</extra>",
+                x=vols, y=mids, orientation="h", showlegend=False, name="VP",
+                marker=dict(color=colors),
+                hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra>VP</extra>",
             ), row=1, col=2)
         x_lab = axis_times[-1] if axis_times else dfi["time_str"].iloc[-1]
         for lv in vp_chart_levels(vp2):
             yv = float(lv["price"])
-            if not (y0 <= yv <= y1):
+            if not (smin - pad <= yv <= smax + pad):
                 continue
             fig.add_hline(y=yv, line_color=lv["color"], line_width=lv["width"], line_dash=lv["dash"], row=1, col=1)
             fig.add_annotation(
                 x=x_lab, y=yv, text=f"{lv['name']} {yv:.0f}",
                 showarrow=False, xanchor="right",
-                font=dict(size=8, color=lv["color"]),
-                bgcolor="rgba(14,17,23,0.35)", row=1, col=1,
+                font=dict(size=9, color=lv["color"]),
+                bgcolor="rgba(14,17,23,0.45)", row=1, col=1,
             )
     labels = _multi_va_labels(dfi, index_name)
-    y_lab = y1 - (y1 - y0) * 0.02
-    for rec in labels[-10:]:
+    y_lab = smax + band * 0.55
+    for rec in labels[-12:]:
         fig.add_annotation(
             x=rec["t"], y=y_lab, text=rec["act"],
             showarrow=False, textangle=-90, xanchor="center", yanchor="bottom",
-            font=dict(size=8, color="#FFF59D"),
-            bgcolor="rgba(20,24,32,0.45)", row=1, col=1,
+            font=dict(size=11, color="#FFF59D", family="Arial Black"),
+            bgcolor="rgba(10,14,22,0.75)",
+            bordercolor="#FFF59D", borderwidth=1, borderpad=2,
+            row=1, col=1,
         )
     xr = None
     try:
@@ -5877,14 +5891,14 @@ def build_multi_index_figure(index_name, dfi, vp):
         xr = None
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-        height=340, margin=dict(l=36, r=8, t=8, b=18),
+        height=420, margin=dict(l=36, r=6, t=28, b=22),
         xaxis_rangeslider_visible=False, showlegend=False, hovermode="x unified",
     )
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                     range=xr, nticks=8, row=1, col=1)
+                     range=xr, nticks=7, row=1, col=1)
     fig.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
     fig.update_yaxes(range=[y0, y1], tickfont=dict(size=8), row=1, col=1)
-    fig.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
+    fig.update_yaxes(range=[y0, y1], showticklabels=False, showgrid=False, row=1, col=2)
     return fig
 
 
@@ -6013,7 +6027,7 @@ def refresh_multi_index_gex():
 
 
 def render_multi_index_mode():
-    want_tf = st.session_state.get("multi_tf", "5 min")
+    want_tf = st.session_state.get("multi_tf", "15 min")
     auto = bool(st.session_state.get("enable_main_refresh", False))
     enabled = [k for k, v in (st.session_state.get("multi_enabled") or {}).items() if v]
     live_now, _, _, _ = market_session_state(_ist_now(), enabled[0] if enabled else "NIFTY")
@@ -6039,7 +6053,7 @@ def render_multi_index_mode():
         st.caption("Index + VA triggers + right VP only · VEX/CEX/IV/Z-score/basket off · Net GEX every 5 min")
     with h2:
         tf = st.radio("Bar", ["3 min", "5 min", "15 min"], horizontal=True, key="multi_tf_radio",
-                      index=["3 min", "5 min", "15 min"].index(want_tf) if want_tf in ("3 min", "5 min", "15 min") else 1)
+                      index=["3 min", "5 min", "15 min"].index(want_tf) if want_tf in ("3 min", "5 min", "15 min") else 2)
         if tf != st.session_state.get("multi_tf"):
             st.session_state["multi_tf"] = tf
             st.session_state["selected_timeframe"] = tf
@@ -6061,33 +6075,36 @@ def render_multi_index_mode():
         st.error(f"Missing credentials or failed to generate SmartAPI session! {detail}")
         return
 
-    for name in enabled:
+
+    def _render_one(name):
         pack = store.get(name) or {}
         hide_key = f"multi_hide_{name}"
-        head, hide_c, gex_c = st.columns([0.55, 0.15, 0.30])
+        head, hide_c, gex_c = st.columns([0.50, 0.18, 0.32])
         with hide_c:
             hidden = st.checkbox("Hide", value=bool(st.session_state.get(hide_key, False)), key=hide_key)
+        last = pack.get("spot_price")
+        gex_txt = fmt_compact_num(pack.get("net_gex_oi")) if pack.get("net_gex_oi") is not None else "—"
         with head:
-            last = pack.get("spot_price")
-            act = ""
             st.markdown(
-                f"<div class='chart-card'><div class='card-title'>{name}"
+                f"<div style='font-size:13px;font-weight:800;color:#00E676;'>{name}"
                 f"{' · ' + f'{last:,.0f}' if last else ''} · {pack.get('ts') or ''}</div>",
                 unsafe_allow_html=True,
             )
         with gex_c:
-            st.metric("Net GEX", fmt_compact_num(pack.get("net_gex_oi")) if pack.get("net_gex_oi") is not None else "—")
+            st.markdown(
+                f"<div style='text-align:right;font-size:12px;color:#8FA4B8;'>Net GEX "
+                f"<span style='color:#00E676;font-weight:800;'>{gex_txt}</span></div>",
+                unsafe_allow_html=True,
+            )
         if hidden:
-            st.caption(f"{name} hidden — API tape skipped next cycle if you also uncheck it in the sidebar.")
-            st.markdown("</div>", unsafe_allow_html=True)
-            continue
+            st.caption("Hidden — tape skipped.")
+            return
         dfi, _sess = _multi_prepare_session(
             pack.get("df_futures"), pack.get("df_candles"), pack.get("spot_price"), want_tf,
         )
         if dfi is None or dfi.empty:
-            st.caption(f"{name}: no session tape yet. Click Fetch or wait for auto-refresh.")
-            st.markdown("</div>", unsafe_allow_html=True)
-            continue
+            st.caption(f"{name}: no session tape yet.")
+            return
         vp_src = pd.DataFrame({
             "open": dfi["open"].astype(float),
             "high": dfi["high"].astype(float),
@@ -6098,30 +6115,41 @@ def render_multi_index_mode():
         vp = compute_session_volume_profile(vp_src, bin_step=2.0, prominence_factor=0.35)
         try:
             micro = classify_microstructure(dfi)
-            act = micro.get("action") or ""
-            if act:
-                st.caption(f"VA · {micro.get('regime', '')} · {act}")
+            act = _va_short_label(micro.get("action") or "")
+            raw = str(micro.get("action") or "")
+            up = raw.upper()
+            if act and ("NO ENTRY" not in up) and ("CHOP" not in up) and ("INSIDE" not in up):
+                col = "#FF5252" if "SHORT" in up else "#00E676"
+                st.markdown(
+                    f"<div style='margin:2px 0 4px 0;padding:6px 10px;border:1px solid {col};"
+                    f"border-radius:6px;background:rgba(20,24,32,0.9);color:{col};"
+                    f"font-weight:800;font-size:13px;letter-spacing:0.04em;'>"
+                    f"VA TRIGGER · {micro.get('regime','')} · {raw}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption(f"VA · {micro.get('regime','')} · {raw or '—'}")
         except Exception:
             pass
         fig = build_multi_index_figure(name, dfi, vp)
         if fig is not None:
             st.plotly_chart(fig, use_container_width=True, key=f"multi_fig_{name}")
-        rows = pack.get("gex_rows") or []
-        if rows:
-            gdf = pd.DataFrame(rows)
-            figg = plt_go.Figure()
-            cols = np.where(pd.to_numeric(gdf["Net_GEX_OI"], errors="coerce").fillna(0) >= 0, "#00E676", "#FF5252")
-            figg.add_trace(plt_go.Bar(x=gdf["Strike"], y=gdf["Net_GEX_OI"], marker_color=cols, showlegend=False))
-            if pack.get("spot_price"):
-                figg.add_vline(x=float(pack["spot_price"]), line_dash="dash", line_color="#FAFAFA")
-            figg.update_layout(
-                template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
-                height=160, margin=dict(l=6, r=6, t=6, b=6), showlegend=False,
-            )
-            figg.update_xaxes(tickformat="d")
-            st.plotly_chart(figg, use_container_width=True, key=f"multi_gex_{name}")
-        st.markdown("</div>", unsafe_allow_html=True)
 
+    visible = [n for n in enabled if not st.session_state.get(f"multi_hide_{n}")]
+    hidden_only = [n for n in enabled if st.session_state.get(f"multi_hide_{n}")]
+    for i in range(0, len(visible), 2):
+        pair = visible[i:i+2]
+        cols = st.columns(2, gap="small")
+        for c, name in zip(cols, pair):
+            with c:
+                _render_one(name)
+        if len(pair) == 1:
+            with cols[1]:
+                st.empty()
+    if hidden_only:
+        st.caption("Hidden: " + ", ".join(hidden_only))
+        for name in hidden_only:
+            st.checkbox("Hide", value=True, key=f"multi_hide_{name}")
 
 @st.fragment(run_every=5)
 def live_dashboard_fragment():
