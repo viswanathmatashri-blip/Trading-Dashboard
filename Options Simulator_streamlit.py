@@ -192,6 +192,19 @@ if "tick_cvd_history" not in st.session_state:
     st.session_state["tick_cvd_history"] = []
 if "flow_tape" not in st.session_state:
     st.session_state["flow_tape"] = []
+if "multi_index_mode" not in st.session_state:
+    st.session_state["multi_index_mode"] = False
+if "multi_tf" not in st.session_state:
+    st.session_state["multi_tf"] = "5 min"
+if "multi_enabled" not in st.session_state:
+    st.session_state["multi_enabled"] = {
+        "NIFTY": True, "BANKNIFTY": True, "FINNIFTY": False,
+        "MIDCPNIFTY": False, "SENSEX": True, "GOLDM": False, "CRUDEOIL": False,
+    }
+if "multi_store" not in st.session_state:
+    st.session_state["multi_store"] = {}
+if "multi_gex_ts" not in st.session_state:
+    st.session_state["multi_gex_ts"] = 0.0
 
 # ---------- Loading status (sidebar) ----------
 def update_load_status(msg: str):
@@ -3377,6 +3390,21 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
             else:
                 st.info("Cache is empty.")
 
+with st.sidebar.expander("3. Multi Index Mode", expanded=False):
+    st.session_state["multi_index_mode"] = st.toggle(
+        "Multi Index Mode",
+        value=bool(st.session_state.get("multi_index_mode")),
+        help="Stack compact index + VA + right VP charts. Disables VEX/CEX/IV/Z-score/basket panels.",
+        key="multi_index_toggle",
+    )
+    st.caption("Enable only the indices you watch. Disabled charts skip API calls.")
+    en = dict(st.session_state.get("multi_enabled") or {})
+    for _idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]:
+        en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, False)), key=f"multi_en_{_idx}")
+    st.session_state["multi_enabled"] = en
+    n_on = sum(1 for v in en.values() if v)
+    st.caption(f"{n_on} live · tapes 5s · Net GEX 5 min")
+
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
 
 interval_mapping = {
@@ -5616,8 +5644,490 @@ def refresh_index_tapes(data, want_tf):
     return data
 
 
+def _multi_option_frame(index_name):
+    _, _, exch = INDEX_TOKEN_MAP.get(index_name, ("99926000", "NSE", "NFO"))
+    if index_name in MCX_NAME_ALIASES:
+        aliases = [a.upper() for a in MCX_NAME_ALIASES[index_name]]
+        df_opt = df_master[
+            (df_master["exch_seg"].isin(["MCX", "NCO"]))
+            & (df_master["instrumenttype"].isin(["OPTFUT", "OPTCOM"]))
+            & (df_master["name"].astype(str).str.upper().isin(aliases + [index_name]))
+        ].copy()
+    else:
+        df_opt = df_master[
+            (df_master["exch_seg"] == exch)
+            & (df_master["name"] == index_name)
+            & (df_master["instrumenttype"].isin(["OPTIDX", "OPTSTK", "OPTFUT"]))
+        ].copy()
+    if df_opt.empty:
+        return df_opt, exch, None
+    df_opt["expiry_dt"] = pd.to_datetime(df_opt["expiry"], format="%d%b%Y", errors="coerce")
+    today_dt = pd.to_datetime(datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date())
+    valid = sorted(df_opt[df_opt["expiry_dt"] >= today_dt]["expiry_dt"].dropna().unique())
+    exp = valid[0] if len(valid) else None
+    return df_opt, exch, exp
+
+
+def _multi_prepare_session(df_fut, df_spot, spot_px, want_tf):
+    if df_fut is None or getattr(df_fut, "empty", True) or "time" not in df_fut.columns:
+        return pd.DataFrame(), None
+    df_fut = attach_bar_flow(df_fut.copy())
+    tf_min = {"3 min": 3, "5 min": 5, "15 min": 15}.get(want_tf, 5)
+    try:
+        t = series_to_ist(df_fut["time"])
+        dt = t.diff().dt.total_seconds().median()
+        native = float(dt) / 60.0 if pd.notna(dt) and dt else tf_min
+        if native > 0 and tf_min > native + 0.6:
+            g = df_fut.copy()
+            g["time"] = t
+            g = g.set_index("time").sort_index()
+            agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+            ohlc = g.resample(f"{int(tf_min)}min", label="right", closed="right").agg(agg).dropna(subset=["close"])
+            if len(ohlc) >= 5:
+                df_fut = ohlc.reset_index()
+    except Exception:
+        pass
+    dfc, latest, _ = pick_last_nse_session(df_fut, min_bars=12, prefer_today=True)
+    if dfc is None or getattr(dfc, "empty", True):
+        df_fut = df_fut.copy()
+        df_fut["time"] = series_to_ist(df_fut["time"])
+        df_fut["session_date"] = df_fut["time"].dt.date
+        if df_fut["session_date"].notna().any():
+            latest = sorted(df_fut["session_date"].dropna().unique())[-1]
+            dfc = df_fut[df_fut["session_date"] == latest].copy().reset_index(drop=True)
+        else:
+            return pd.DataFrame(), None
+    dfc = dfc.copy().reset_index(drop=True)
+    dfc["time"] = series_to_ist(dfc["time"])
+    dfc["time_str"] = dfc["time"].dt.strftime("%H:%M")
+    dfc["tp"] = (dfc["high"] + dfc["low"] + dfc["close"]) / 3.0
+    cum_vol = cum_tp = cum_sq = 0.0
+    vwaps, stds = [], []
+    for i in range(len(dfc)):
+        vol = float(dfc.loc[i, "volume"]) if "volume" in dfc.columns else 1.0
+        tp = float(dfc.loc[i, "tp"])
+        cum_vol += vol
+        cum_tp += tp * vol
+        vwap = cum_tp / cum_vol if cum_vol > 0 else tp
+        cum_sq += vol * (tp - vwap) ** 2
+        vwaps.append(vwap)
+        stds.append(math.sqrt(max(cum_sq / cum_vol if cum_vol > 0 else 0.0, 0.0)))
+    dfc["vwap"] = vwaps
+    dfc["vwap_upper"] = [v + 1.5 * s for v, s in zip(vwaps, stds)]
+    dfc["vwap_lower"] = [v - 1.5 * s for v, s in zip(vwaps, stds)]
+    dfc["spot_px"] = np.nan
+    if df_spot is not None and not getattr(df_spot, "empty", True) and "close" in df_spot.columns:
+        try:
+            sp = df_spot.copy()
+            sp["time"] = series_to_ist(sp["time"])
+            sp = sp.dropna(subset=["time"]).sort_values("time")
+            if latest is not None:
+                sp = sp[sp["time"].dt.date == latest]
+            mapped = pd.merge_asof(
+                dfc[["time"]].sort_values("time"),
+                sp[["time", "close"]].rename(columns={"close": "spot_px"}).sort_values("time"),
+                on="time", direction="nearest", tolerance=pd.Timedelta("6min"),
+            )
+            dfc["spot_px"] = pd.to_numeric(mapped["spot_px"], errors="coerce").values
+        except Exception:
+            pass
+    if int(pd.to_numeric(dfc["spot_px"], errors="coerce").notna().sum()) < max(4, len(dfc) // 4):
+        last_f = float(dfc["close"].iloc[-1])
+        basis_q = last_f - float(spot_px or 0) if spot_px else 0.0
+        dfc["spot_px"] = dfc["close"].astype(float) - basis_q
+    else:
+        dfc["spot_px"] = pd.to_numeric(dfc["spot_px"], errors="coerce").ffill().bfill()
+    dfc["basis"] = (dfc["close"].astype(float) - dfc["spot_px"].astype(float)).ewm(span=5, min_periods=1, adjust=False).mean()
+    dfc["vwap_idx"] = dfc["vwap"].astype(float) - dfc["basis"]
+    dfc["vwap_upper_idx"] = dfc["vwap_upper"].astype(float) - dfc["basis"]
+    dfc["vwap_lower_idx"] = dfc["vwap_lower"].astype(float) - dfc["basis"]
+    return dfc, latest
+
+
+def _multi_va_labels(dfi, key):
+    out = []
+    if dfi is None or dfi.empty or len(dfi) < 16:
+        return out
+    n = len(dfi)
+    store_key = f"_multi_va_{key}"
+    prev = list(st.session_state.get(store_key) or [])
+    start = max(15, n - 48)
+    if prev and prev[-1].get("n", 0) <= n:
+        start = max(start, int(prev[-1].get("i", start)))
+        out = [r for r in prev if r.get("i", 0) < n]
+    last_act = out[-1]["act"] if out else ""
+    for i in range(start, n):
+        sl = dfi.iloc[: i + 1]
+        try:
+            rec = classify_microstructure(sl)
+        except Exception:
+            continue
+        act = str(rec.get("action") or "")
+        up = act.upper()
+        if (not act) or ("NO ENTRY" in up) or ("INSIDE" in up) or ("CHOP" in up):
+            continue
+        short = act.replace("MEAN-REVERSION", "ME").replace("BREAKOUT", "B").replace("BREAKDOWN", "B")
+        short = short.replace("WATCH SHORT", "WATCH S").replace("WATCH LONG", "WATCH L")
+        short = short.replace("ADD SHORT", "ADD S").replace("ADD LONG", "ADD L")
+        short = short.replace("SHORT ", "SHORT ").replace("LONG ", "LONG ")
+        if short == last_act:
+            continue
+        tlab = sl["time_str"].iloc[-1] if "time_str" in sl.columns else str(i)
+        out.append({"t": tlab, "act": short[:16], "i": i, "n": n})
+        last_act = short
+    st.session_state[store_key] = out[-16:]
+    return st.session_state[store_key]
+
+
+def build_multi_index_figure(index_name, dfi, vp):
+    if dfi is None or dfi.empty:
+        return None
+    axis_times = session_axis_labels(st.session_state.get("multi_tf"), index_name)
+    if not axis_times:
+        axis_times = list(dfi["time_str"])
+    fig = make_subplots(
+        rows=1, cols=2, column_widths=[0.84, 0.16],
+        shared_yaxes=True, horizontal_spacing=0.01,
+        specs=[[{}, {}]],
+    )
+    idx_o = dfi["spot_px"].astype(float) + (dfi["open"].astype(float) - dfi["close"].astype(float))
+    idx_h = dfi["spot_px"].astype(float) + (dfi["high"].astype(float) - dfi["close"].astype(float))
+    idx_l = dfi["spot_px"].astype(float) + (dfi["low"].astype(float) - dfi["close"].astype(float))
+    idx_c = dfi["spot_px"].astype(float)
+    if "vwap_upper_idx" in dfi.columns:
+        fig.add_trace(plt_go.Scatter(
+            x=dfi["time_str"], y=dfi["vwap_upper_idx"], mode="lines", showlegend=False, hoverinfo="skip",
+            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot")), row=1, col=1)
+        fig.add_trace(plt_go.Scatter(
+            x=dfi["time_str"], y=dfi["vwap_lower_idx"], mode="lines", showlegend=False, hoverinfo="skip",
+            line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
+            fill="tonexty", fillcolor="rgba(255,152,0,0.08)"), row=1, col=1)
+    fig.add_trace(plt_go.Scatter(
+        x=dfi["time_str"], y=dfi["vwap_idx"], mode="lines", name="VWAP",
+        line=dict(color="#FF9800", width=2), hoverinfo="skip"), row=1, col=1)
+    fig.add_trace(plt_go.Candlestick(
+        x=dfi["time_str"], open=idx_o, high=idx_h, low=idx_l, close=idx_c,
+        name=str(index_name), increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
+        increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350", showlegend=False,
+    ), row=1, col=1)
+    smin = float(np.nanmin([idx_l.min(), dfi["vwap_lower_idx"].min() if "vwap_lower_idx" in dfi.columns else idx_l.min()]))
+    smax = float(np.nanmax([idx_h.max(), dfi["vwap_upper_idx"].max() if "vwap_upper_idx" in dfi.columns else idx_h.max()]))
+    pad = (smax - smin) * 0.08 if smax > smin else 20
+    y0, y1 = smin - pad, smax + pad
+    if vp.get("ok"):
+        last_basis = float(dfi["basis"].iloc[-1]) if "basis" in dfi.columns else 0.0
+        vp2 = dict(vp)
+        try:
+            if vp2.get("mids") is not None:
+                vp2["mids"] = [float(m) - last_basis for m in vp2["mids"]]
+            for k in ("poc", "vah", "val"):
+                if vp2.get(k) is not None:
+                    vp2[k] = float(vp2[k]) - last_basis
+            nodes = []
+            for n in (vp2.get("nodes") or []):
+                nn = dict(n)
+                for kk in ("poc", "vah", "val"):
+                    if nn.get(kk) is not None:
+                        nn[kk] = float(nn[kk]) - last_basis
+                nodes.append(nn)
+            if nodes:
+                vp2["nodes"] = nodes
+        except Exception:
+            vp2 = vp
+        vols = vp2.get("vols") or vp.get("vols") or []
+        mids = vp2.get("mids") or vp.get("mids") or []
+        colors = []
+        poc = vp2.get("poc")
+        for m in mids:
+            colors.append("#FFD54F" if poc is not None and abs(float(m) - float(poc)) < 1.5 else "#64B5F6")
+        if mids and vols:
+            fig.add_trace(plt_go.Bar(
+                x=vols, y=mids, orientation="h", showlegend=False,
+                marker=dict(color=colors), hovertemplate="Px %{y:.0f}<br>Vol %{x:.0f}<extra>VP</extra>",
+            ), row=1, col=2)
+        x_lab = axis_times[-1] if axis_times else dfi["time_str"].iloc[-1]
+        for lv in vp_chart_levels(vp2):
+            yv = float(lv["price"])
+            if not (y0 <= yv <= y1):
+                continue
+            fig.add_hline(y=yv, line_color=lv["color"], line_width=lv["width"], line_dash=lv["dash"], row=1, col=1)
+            fig.add_annotation(
+                x=x_lab, y=yv, text=f"{lv['name']} {yv:.0f}",
+                showarrow=False, xanchor="right",
+                font=dict(size=8, color=lv["color"]),
+                bgcolor="rgba(14,17,23,0.35)", row=1, col=1,
+            )
+    labels = _multi_va_labels(dfi, index_name)
+    y_lab = y1 - (y1 - y0) * 0.02
+    for rec in labels[-10:]:
+        fig.add_annotation(
+            x=rec["t"], y=y_lab, text=rec["act"],
+            showarrow=False, textangle=-90, xanchor="center", yanchor="bottom",
+            font=dict(size=8, color="#FFF59D"),
+            bgcolor="rgba(20,24,32,0.45)", row=1, col=1,
+        )
+    xr = None
+    try:
+        if axis_times and len(dfi):
+            last = str(dfi["time_str"].iloc[-1])
+            if last in axis_times:
+                i = axis_times.index(last)
+                xr = [max(0, i - 80), min(len(axis_times) - 1, i + 2)]
+    except Exception:
+        xr = None
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+        height=340, margin=dict(l=36, r=8, t=8, b=18),
+        xaxis_rangeslider_visible=False, showlegend=False, hovermode="x unified",
+    )
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                     range=xr, nticks=8, row=1, col=1)
+    fig.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
+    fig.update_yaxes(range=[y0, y1], tickfont=dict(size=8), row=1, col=1)
+    fig.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=2)
+    return fig
+
+
+def refresh_multi_index_tapes(want_tf):
+    api = get_smart_api_client()
+    if not api:
+        return
+    enabled = [
+        k for k, v in (st.session_state.get("multi_enabled") or {}).items()
+        if v and not st.session_state.get(f"multi_hide_{k}")
+    ]
+    api_int, lb = interval_mapping.get(want_tf, ("FIVE_MINUTE", 15))
+    store = dict(st.session_state.get("multi_store") or {})
+    for name in enabled:
+        try:
+            live_now, _, _, _ = market_session_state(_ist_now(), name)
+            lookback = 0 if live_now else min(int(lb or 5), 2)
+            pack = dict(store.get(name) or {})
+            have_f = pack.get("df_futures")
+            tail_f = 25 if have_f is not None and not getattr(have_f, "empty", True) and len(have_f) >= 8 else None
+            df_fut, fut_fb, basis_info, fut_msg = fetch_futures_candles_with_vwap(
+                api, name, df_master, api_int, lookback, tail_minutes=tail_f,
+            )
+            if df_fut is not None and not df_fut.empty:
+                pack["df_futures"] = merge_candle_frames(pack.get("df_futures"), df_fut)
+                pack["basis_info"] = basis_info
+                pack["fut_msg"] = fut_msg
+                pack["fut_fb"] = fut_fb
+            spot_token, spot_exch, _ = INDEX_TOKEN_MAP.get(name, ("99926000", "NSE", "NFO"))
+            if not spot_token:
+                tok, _ = get_near_month_futures_token(df_master, name, INDEX_TOKEN_MAP.get(name, ("", "", "NFO"))[2])
+                spot_token = tok or ""
+            have_s = pack.get("df_candles")
+            tail_s = 25 if have_s is not None and not getattr(have_s, "empty", True) and len(have_s) >= 8 else None
+            if spot_token:
+                df_sp, _ = fetch_candles_with_holiday_fallback(
+                    api, spot_token, spot_exch, api_int, lookback, name, tail_minutes=tail_s,
+                )
+                if df_sp is not None and not df_sp.empty:
+                    pack["df_candles"] = merge_candle_frames(pack.get("df_candles"), df_sp)
+                    pack["spot_price"] = float(df_sp["close"].iloc[-1])
+            if not pack.get("spot_price"):
+                src = pack.get("df_futures")
+                if src is not None and not getattr(src, "empty", True):
+                    pack["spot_price"] = float(src["close"].iloc[-1])
+            pack["bar_tf"] = want_tf
+            pack["ts"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
+            store[name] = pack
+        except Exception:
+            continue
+    st.session_state["multi_store"] = store
+
+
+def refresh_multi_index_gex():
+    api = get_smart_api_client()
+    if not api:
+        return
+    enabled = [
+        k for k, v in (st.session_state.get("multi_enabled") or {}).items()
+        if v and not st.session_state.get(f"multi_hide_{k}")
+    ]
+    store = dict(st.session_state.get("multi_store") or {})
+    r = float(rate_param) if "rate_param" in dir() else 0.07
+    for name in enabled:
+        try:
+            pack = dict(store.get(name) or {})
+            spot = float(pack.get("spot_price") or 0)
+            df_opt, exch, exp = _multi_option_frame(name)
+            if df_opt.empty or exp is None or spot <= 0:
+                continue
+            sub = df_opt[df_opt["expiry_dt"] == exp].copy()
+            sub["strike_num"] = pd.to_numeric(sub["strike"], errors="coerce") / (100.0 if exch == "NFO" else 1.0)
+            if sub["strike_num"].max() > 1000000:
+                sub["strike_num"] = sub["strike_num"] / 100.0
+            strikes = sorted(int(s) for s in sub["strike_num"].dropna().unique())
+            if not strikes:
+                continue
+            atm = min(strikes, key=lambda x: abs(x - spot))
+            ai = strikes.index(atm)
+            window = strikes[max(0, ai - 6): min(len(strikes), ai + 7)]
+            tokens = []
+            mapping = []
+            for k in window:
+                c_tok = get_smartapi_token(sub, name, exp, int(k), "CE")
+                p_tok = get_smartapi_token(sub, name, exp, int(k), "PE")
+                if c_tok:
+                    tokens.append(c_tok)
+                if p_tok:
+                    tokens.append(p_tok)
+                mapping.append((int(k), c_tok, p_tok))
+            md = {}
+            for i in range(0, len(tokens), 40):
+                chunk = [str(t) for t in tokens[i:i + 40] if t]
+                res = safe_api_call(api.getMarketData, "FULL", {exch: chunk})
+                if res and res.get("status") and res.get("data") and res["data"].get("fetched"):
+                    for item in res["data"]["fetched"]:
+                        md[str(item["symbolToken"])] = {
+                            "ltp": float(item.get("ltp", 0.0)),
+                            "oi": int(item.get("opnInterest", 0)),
+                        }
+                time.sleep(0.15)
+            now_dt = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+            T = max((pd.Timestamp(exp).tz_localize("Asia/Kolkata") + pd.Timedelta(hours=15, minutes=30) - now_dt).total_seconds() / (365.0 * 24 * 3600), 1e-5)
+            lot = float(LOT_SIZES.get(name, 65))
+            net = 0.0
+            rows = []
+            for K, ct, pt in mapping:
+                ci = md.get(str(ct), {"ltp": 0.0, "oi": 0})
+                pi = md.get(str(pt), {"ltp": 0.0, "oi": 0})
+                c_iv = VolatilityEngine.calculate_iv(ci["ltp"], spot, K, T, r, "c")
+                p_iv = VolatilityEngine.calculate_iv(pi["ltp"], spot, K, T, r, "p")
+                cg = VolatilityEngine.calculate_greeks(spot, K, T, r, c_iv or 0.0, "c")
+                pg = VolatilityEngine.calculate_greeks(spot, K, T, r, p_iv or 0.0, "p")
+                gex_scale = lot * (spot ** 2) * 0.01
+                net_g = cg["gamma"] * ci["oi"] * gex_scale - pg["gamma"] * pi["oi"] * gex_scale
+                net += net_g
+                rows.append({"Strike": K, "Net_GEX_OI": net_g})
+            pack["net_gex_oi"] = net
+            pack["gex_rows"] = rows
+            pack["gex_ts"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
+            store[name] = pack
+        except Exception:
+            continue
+    st.session_state["multi_store"] = store
+    st.session_state["multi_gex_ts"] = time.time()
+
+
+def render_multi_index_mode():
+    want_tf = st.session_state.get("multi_tf", "5 min")
+    auto = bool(st.session_state.get("enable_main_refresh", False))
+    enabled = [k for k, v in (st.session_state.get("multi_enabled") or {}).items() if v]
+    live_now, _, _, _ = market_session_state(_ist_now(), enabled[0] if enabled else "NIFTY")
+    have = st.session_state.get("multi_store") or {}
+    now_s = time.time()
+    if run_btn or (not have) or any(k not in have for k in enabled):
+        refresh_multi_index_tapes(want_tf)
+        refresh_multi_index_gex()
+    elif auto and live_now:
+        refresh_multi_index_tapes(want_tf)
+        last_g = float(st.session_state.get("multi_gex_ts") or 0)
+        if (now_s - last_g) >= 300:
+            refresh_multi_index_gex()
+    store = st.session_state.get("multi_store") or {}
+
+    st.markdown("<div class='sticky-summary'>", unsafe_allow_html=True)
+    h1, h2, h3 = st.columns([0.42, 0.38, 0.20])
+    with h1:
+        st.markdown(
+            "<h1 class='custom-heading' style='margin:0;font-size:17px;'>📊 Multi Index · Futures & Session flow</h1>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Index + VA triggers + right VP only · VEX/CEX/IV/Z-score/basket off · Net GEX every 5 min")
+    with h2:
+        tf = st.radio("Bar", ["3 min", "5 min", "15 min"], horizontal=True, key="multi_tf_radio",
+                      index=["3 min", "5 min", "15 min"].index(want_tf) if want_tf in ("3 min", "5 min", "15 min") else 1)
+        if tf != st.session_state.get("multi_tf"):
+            st.session_state["multi_tf"] = tf
+            st.session_state["selected_timeframe"] = tf
+            st.rerun()
+    with h3:
+        cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh_multi")
+        if cb_main != st.session_state["enable_main_refresh"]:
+            st.session_state["enable_main_refresh"] = cb_main
+            st.rerun()
+        gts = datetime.datetime.fromtimestamp(float(st.session_state.get("multi_gex_ts") or 0)).strftime("%H:%M:%S") if st.session_state.get("multi_gex_ts") else "—"
+        st.caption(f"GEX {gts}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if not enabled:
+        st.info("Enable at least one index in sidebar → 3. Multi Index Mode.")
+        return
+    if not get_smart_api_client():
+        detail = st.session_state.get("_smart_api_err") or "unknown"
+        st.error(f"Missing credentials or failed to generate SmartAPI session! {detail}")
+        return
+
+    for name in enabled:
+        pack = store.get(name) or {}
+        hide_key = f"multi_hide_{name}"
+        head, hide_c, gex_c = st.columns([0.55, 0.15, 0.30])
+        with hide_c:
+            hidden = st.checkbox("Hide", value=bool(st.session_state.get(hide_key, False)), key=hide_key)
+        with head:
+            last = pack.get("spot_price")
+            act = ""
+            st.markdown(
+                f"<div class='chart-card'><div class='card-title'>{name}"
+                f"{' · ' + f'{last:,.0f}' if last else ''} · {pack.get('ts') or ''}</div>",
+                unsafe_allow_html=True,
+            )
+        with gex_c:
+            st.metric("Net GEX", fmt_compact_num(pack.get("net_gex_oi")) if pack.get("net_gex_oi") is not None else "—")
+        if hidden:
+            st.caption(f"{name} hidden — API tape skipped next cycle if you also uncheck it in the sidebar.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            continue
+        dfi, _sess = _multi_prepare_session(
+            pack.get("df_futures"), pack.get("df_candles"), pack.get("spot_price"), want_tf,
+        )
+        if dfi is None or dfi.empty:
+            st.caption(f"{name}: no session tape yet. Click Fetch or wait for auto-refresh.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            continue
+        vp_src = pd.DataFrame({
+            "open": dfi["open"].astype(float),
+            "high": dfi["high"].astype(float),
+            "low": dfi["low"].astype(float),
+            "close": dfi["close"].astype(float),
+            "volume": dfi["volume"].astype(float) if "volume" in dfi.columns else 1.0,
+        })
+        vp = compute_session_volume_profile(vp_src, bin_step=2.0, prominence_factor=0.35)
+        try:
+            micro = classify_microstructure(dfi)
+            act = micro.get("action") or ""
+            if act:
+                st.caption(f"VA · {micro.get('regime', '')} · {act}")
+        except Exception:
+            pass
+        fig = build_multi_index_figure(name, dfi, vp)
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True, key=f"multi_fig_{name}")
+        rows = pack.get("gex_rows") or []
+        if rows:
+            gdf = pd.DataFrame(rows)
+            figg = plt_go.Figure()
+            cols = np.where(pd.to_numeric(gdf["Net_GEX_OI"], errors="coerce").fillna(0) >= 0, "#00E676", "#FF5252")
+            figg.add_trace(plt_go.Bar(x=gdf["Strike"], y=gdf["Net_GEX_OI"], marker_color=cols, showlegend=False))
+            if pack.get("spot_price"):
+                figg.add_vline(x=float(pack["spot_price"]), line_dash="dash", line_color="#FAFAFA")
+            figg.update_layout(
+                template="plotly_dark", paper_bgcolor="#11151C", plot_bgcolor="#0E1117",
+                height=160, margin=dict(l=6, r=6, t=6, b=6), showlegend=False,
+            )
+            figg.update_xaxes(tickformat="d")
+            st.plotly_chart(figg, use_container_width=True, key=f"multi_gex_{name}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
 @st.fragment(run_every=5)
 def live_dashboard_fragment():
+    if st.session_state.get("multi_index_mode"):
+        render_multi_index_mode()
+        return
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
@@ -7378,8 +7888,9 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
 live_dashboard_fragment()
 
 # --- Raw Z-Score details ---
-st.markdown("---")
-zscore_analysis_fragment(mode="raw")
+if not st.session_state.get("multi_index_mode"):
+    st.markdown("---")
+    zscore_analysis_fragment(mode="raw")
 
 # Clear loading status once full UI has rendered
 try:
