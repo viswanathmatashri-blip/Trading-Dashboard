@@ -132,6 +132,10 @@ if "selected_timeframe" not in st.session_state:
     st.session_state["selected_timeframe"] = "3 min"
 if "chart_window" not in st.session_state:
     st.session_state["chart_window"] = "Session (6h)"
+if "replay_session_on" not in st.session_state:
+    st.session_state["replay_session_on"] = False
+if "replay_session_date" not in st.session_state:
+    st.session_state["replay_session_date"] = None
 if "px_alert_on" not in st.session_state:
     st.session_state["px_alert_on"] = False
 if "px_alert_lvl" not in st.session_state:
@@ -613,174 +617,9 @@ def calculate_support_resistance_targets(chain_data: list, spot_price: float, ma
     }
 
 
-# 81-state microstructure playbook: Price, EFI, CVD, OBV → (label, action)
-# arrows: u=up d=down f=flat
-MICRO_PLAYBOOK = {
-    ("u","u","u","u"): ("Pure Institutional Aggression", "LONG BREAKOUT (Target: Upper 2.0σ)"),
-    ("u","u","u","f"): ("Thin-Book Impulse", "CAUTIOUS LONG (Trailing SL tight)"),
-    ("u","u","u","d"): ("Low-Volume Markup", "CAUTIOUS LONG / PREPARE TRAIL"),
-    ("u","u","f","u"): ("Passive Wall Sweeping", "HOLD LONG"),
-    ("u","u","f","f"): ("Steady Markup", "HOLD LONG"),
-    ("u","u","f","d"): ("Low-Volume Steady Drift", "NO ENTRY (Unstable move)"),
-    ("u","u","d","u"): ("Bullish Passive Limit Accumulation", "HOLD LONG (Institutional support)"),
-    ("u","u","d","f"): ("Absorbed Drift", "HOLD LONG"),
-    ("u","u","d","d"): ("Illiquid Short Squeeze", "NO ENTRY (High reversal risk)"),
-    ("u","f","u","u"): ("High-Volume Choke", "WARNING: Limit sell wall building"),
-    ("u","f","u","f"): ("Mild Buying Friction", "HOLD LONG / NO NEW ENTRIES"),
-    ("u","f","u","d"): ("Fading Buying Effort", "BLOCK LONG ENTRIES"),
-    ("u","f","f","u"): ("High Volume Neutral Drift", "HOLD LONG"),
-    ("u","f","f","f"): ("Low-Volatility Up-Drift", "HOLD EXISTING POSITIONS"),
-    ("u","f","f","d"): ("Volume Drying Upbeat", "PREPARE EXIT LONG"),
-    ("u","f","d","u"): ("Distribution under Cover", "EXIT LONG / PREPARE SHORT"),
-    ("u","f","d","f"): ("Passive Seller Pressure", "EXIT LONG"),
-    ("u","f","d","d"): ("Diverging Drift", "EXIT LONG"),
-    ("u","d","u","u"): ("Institutional Supply Absorption", "EXIT LONG / DYNAMIC ABSORPTION EXIT"),
-    ("u","d","u","f"): ("Buying Force Decay", "EXIT LONG"),
-    ("u","d","u","d"): ("Fading Bullish Push", "EXIT LONG"),
-    ("u","d","f","u"): ("High Volume Momentum Trap", "PREPARE SHORT"),
-    ("u","d","f","f"): ("Momentum Exhaustion", "EXIT LONG"),
-    ("u","d","f","d"): ("Low-Volume Top Building", "PREPARE SHORT"),
-    ("u","d","d","u"): ("Classic Bearish Institutional Distribution", "SHORT MEAN-REVERSION (At Upper Band)"),
-    ("u","d","d","f"): ("Bearish Divergence (Standard)", "SHORT MEAN-REVERSION"),
-    ("u","d","d","d"): ("Triple Bearish Divergence", "SHORT MEAN-REVERSION / SHORT ENTRY"),
-    ("f","u","u","u"): ("Coil Compression (Bullish Push)", "PRE-BREAKOUT LONG PREPARATION"),
-    ("f","u","u","f"): ("Hidden Aggressive Buying", "PRE-BREAKOUT LONG"),
-    ("f","u","u","d"): ("Selective Aggressive Buying", "WATCH FOR BREAKOUT"),
-    ("f","u","f","u"): ("Force Expansion in Consolidation", "WATCH FOR BREAKOUT"),
-    ("f","u","f","f"): ("Quiet Force Building", "NO ENTRY / NO EDGE"),
-    ("f","u","f","d"): ("Low-Volume Force Shift", "NO ENTRY"),
-    ("f","u","d","u"): ("Passive Limit Floor Building", "BULLISH ABSORPTION WATCH"),
-    ("f","u","d","f"): ("Mild Passive Support", "NO ENTRY"),
-    ("f","u","d","d"): ("Conflicted Consolidation", "NO ENTRY"),
-    ("f","f","u","u"): ("Institutional Accumulation Box", "ACCUMULATION WATCH"),
-    ("f","f","u","f"): ("Quiet Delta Accumulation", "ACCUMULATION WATCH"),
-    ("f","f","u","d"): ("Low-Volume Delta Push", "NO ENTRY"),
-    ("f","f","f","u"): ("High-Volume Equilibrium", "ORDER BOOK REBALANCING"),
-    ("f","f","f","f"): ("DEAD MARKET / LUNCH HOUR CHOP", "NO ENTRY (BLOCK ALL SIGNALS)"),
-    ("f","f","f","d"): ("Liquidity Drying Up", "NO ENTRY"),
-    ("f","f","d","u"): ("Institutional Distribution Box", "DISTRIBUTION WATCH"),
-    ("f","f","d","f"): ("Quiet Delta Distribution", "DISTRIBUTION WATCH"),
-    ("f","f","d","d"): ("Low-Volume Slippage", "NO ENTRY"),
-    ("f","d","u","u"): ("Passive Limit Wall Blocking Force", "NO ENTRY"),
-    ("f","d","u","f"): ("Fading Buying Impulse in Range", "NO ENTRY"),
-    ("f","d","u","d"): ("Low-Volume Friction", "NO ENTRY"),
-    ("f","d","f","u"): ("High-Volume Bearish Force", "WATCH FOR BREAKDOWN"),
-    ("f","d","f","f"): ("Quiet Force Decay", "NO ENTRY"),
-    ("f","d","f","d"): ("Low-Volume Force Breakdown", "NO ENTRY"),
-    ("f","d","d","u"): ("Coil Compression (Bearish Push)", "PRE-BREAKDOWN SHORT PREPARATION"),
-    ("f","d","d","f"): ("Hidden Aggressive Selling", "PRE-BREAKDOWN SHORT"),
-    ("f","d","d","d"): ("Triple Bearish Compression", "SHORT BREAKDOWN PREPARATION"),
-    ("d","u","u","u"): ("Triple Bullish Divergence", "LONG MEAN-REVERSION / LONG ENTRY"),
-    ("d","u","u","f"): ("Bullish Divergence (Standard)", "LONG MEAN-REVERSION"),
-    ("d","u","u","d"): ("Classic Bullish Institutional Accumulation", "LONG MEAN-REVERSION (At Lower Band)"),
-    ("d","u","f","u"): ("High-Volume Bottom Building", "PREPARE LONG"),
-    ("d","u","f","f"): ("Momentum Floor", "EXIT SHORT"),
-    ("d","u","f","d"): ("Low-Volume Bottom Building", "PREPARE LONG"),
-    ("d","u","d","u"): ("Institutional Demand Absorption", "EXIT SHORT / DYNAMIC ABSORPTION EXIT"),
-    ("d","u","d","f"): ("Selling Force Decay", "EXIT SHORT"),
-    ("d","u","d","d"): ("Fading Bearish Push", "EXIT SHORT"),
-    ("d","f","u","u"): ("Accumulation under Cover", "EXIT SHORT / PREPARE LONG"),
-    ("d","f","u","f"): ("Passive Buyer Pressure", "EXIT SHORT"),
-    ("d","f","u","d"): ("Diverging Down-Drift", "EXIT SHORT"),
-    ("d","f","f","u"): ("High Volume Neutral Down-Drift", "HOLD SHORT"),
-    ("d","f","f","f"): ("Low-Volatility Down-Drift", "HOLD EXISTING POSITIONS"),
-    ("d","f","f","d"): ("Volume Drying Downbeat", "PREPARE EXIT SHORT"),
-    ("d","f","d","u"): ("High-Volume Friction", "WARNING: Limit buy wall building"),
-    ("d","f","d","f"): ("Mild Selling Friction", "HOLD SHORT / NO NEW ENTRIES"),
-    ("d","f","d","d"): ("Fading Selling Effort", "BLOCK SHORT ENTRIES"),
-    ("d","d","u","u"): ("Bullish Passive Limit Absorption", "HOLD SHORT (Institutional resistance)"),
-    ("d","d","u","f"): ("Absorbed Down-Drift", "HOLD SHORT"),
-    ("d","d","u","d"): ("Illiquid Long Squeeze", "NO ENTRY (High reversal risk)"),
-    ("d","d","f","u"): ("Passive Wall Sweeping Down", "HOLD SHORT"),
-    ("d","d","f","f"): ("Steady Markdown", "HOLD SHORT"),
-    ("d","d","f","d"): ("Low-Volume Steady Down-Drift", "NO ENTRY (Unstable move)"),
-    ("d","d","d","u"): ("Low-Volume Markdown", "CAUTIOUS SHORT / PREPARE TRAIL"),
-    ("d","d","d","f"): ("Thin-Book Down-Impulse", "CAUTIOUS SHORT (Trailing SL tight)"),
-    ("d","d","d","d"): ("Pure Institutional Aggression (Bearish)", "SHORT BREAKOUT (Target: Lower 2.0σ)"),
-}
+
 ARROW_GLYPH = {"u": "↑", "f": "→", "d": "↓"}
-
-# 27 states used ONLY when EFI is statistically near 0 (Price, CVD, OBV)
-EFI_ZERO_PLAYBOOK = {
-    ("f","u","u"): ("Supply Absorption Trap", "EXIT LONG / PREPARE SHORT (Reversal Watch)"),
-    ("f","u","f"): ("Aggressive Buyer Friction", "WARNING: Limit sell wall testing / No New Longs"),
-    ("f","u","d"): ("Fading Buying Effort", "BLOCK LONG ENTRIES / EXIT CALLS"),
-    ("f","f","u"): ("Passive Wall Sweeping", "NEUTRAL WATCH (Vol expansion coming)"),
-    ("f","f","f"): ("Pure Market Stagnation", "NO ENTRY / LUNCH CHOP"),
-    ("f","f","d"): ("Volume Drying Neutral", "NO ENTRY (High slippage)"),
-    ("f","d","u"): ("Covert Distribution", "EXIT LONG / PREPARE SHORT"),
-    ("f","d","f"): ("Aggressive Seller Friction", "WARNING: Limit buy floor testing / No New Shorts"),
-    ("f","d","d"): ("Demand Absorption Floor", "EXIT SHORT / PREPARE LONG"),
-    ("u","u","u"): ("Stealth Mark-Up", "CAUTIOUS LONG (Tight trail)"),
-    ("u","u","f"): ("Delta-Driven Grind", "HOLD EXISTING LONGS"),
-    ("u","u","d"): ("Exhaustion Up-Drift", "TAKE PROFITS / BLOCK NEW LONGS"),
-    ("u","f","u"): ("Passive Ask Pull", "HOLD LONGS"),
-    ("u","f","f"): ("Low-Volatility Up-Drift", "HOLD EXISTING LONGS (Do not chase)"),
-    ("u","f","d"): ("Illiquid Drift Up", "PREPARE EXIT LONG"),
-    ("u","d","u"): ("Distribution Under Cover", "EXIT LONG / PREPARE SHORT"),
-    ("u","d","f"): ("Passive Seller Pressure", "EXIT LONG"),
-    ("u","d","d"): ("Bearish Diverging Drift", "EXIT LONG / PREPARE SHORT"),
-    ("d","u","u"): ("Bullish Diverging Slide", "EXIT SHORT / PREPARE LONG"),
-    ("d","u","f"): ("Passive Absorption Bleed", "WARNING: Downside stalling"),
-    ("d","u","d"): ("Fading Downside Effort", "EXIT SHORT"),
-    ("d","f","u"): ("Passive Bid Removal", "HOLD SHORTS"),
-    ("d","f","f"): ("Low-Volatility Bleed", "HOLD EXISTING SHORTS"),
-    ("d","f","d"): ("Illiquid Drift Down", "HOLD SHORTS (Trail close)"),
-    ("d","d","u"): ("Aggressive Mark-Down Friction", "HOLD SHORTS"),
-    ("d","d","f"): ("Stealth Mark-Down", "HOLD EXISTING SHORTS"),
-    ("d","d","d"): ("Clean Passive Mark-Down", "HOLD SHORTS (Target −2.0σ VWAP)"),
-}
-
-# 18-state flow book: Price, CVD, DEX, Premium  (tape is a note, not a fake print)
-FLOW_PLAYBOOK = {
-    ("u","u","u","u"): ("Pure Institutional Call Sweep", "LONG BREAKOUT"),
-    ("u","f","u","f"): ("Gamma Squeeze Drift", "HOLD LONG"),
-    ("u","u","d","d"): ("Distribution under Cover", "EXIT LONG / PREPARE SHORT"),
-    ("u","d","d","d"): ("Institutional Call Liquidation", "PREPARE SHORT"),
-    ("f","u","u","u"): ("Coil Compression (Bullish)", "PRE-BREAKOUT LONG"),
-    ("f","f","f","f"): ("Gamma Pin / Quiet Regime", "NO ENTRY / SELL NEUTRAL STRADDLE"),
-    ("f","d","d","u"): ("Institutional Distribution Box", "PRE-BREAKDOWN SHORT"),
-    ("d","d","d","d"): ("Pure Institutional Markdown", "SHORT BREAKOUT"),
-    ("d","f","d","f"): ("Short Gamma Drag", "HOLD SHORT"),
-    ("d","d","u","u"): ("Institutional Demand Absorption", "EXIT SHORT / PREPARE LONG"),
-    ("d","u","u","d"): ("Put Shorting / Floor Building", "PREPARE LONG"),
-    ("d","f","f","f"): ("Low-Volume Slippage", "NO ENTRY / BLOCK SHORT ENTRIES"),
-    ("u","d","u","u"): ("Short Gamma Squeeze", "RIDE LONG"),
-    ("d","u","d","u"): ("Short Gamma Unwind", "RIDE SHORT"),
-    ("u","u","f","d"): ("Futures-Driven Momentum", "CAUTIOUS LONG"),
-    ("u","d","u","d"): ("Short Covering Ramp", "HOLD LONG"),
-    ("d","u","d","d"): ("Long Unwinding Bleed", "HOLD SHORT"),
-    ("f","u","d","u"): ("Cross / Strangle Creation", "STAND ASIDE (Vol expansion)"),
-}
-
-
-def _robust_arrow(series: pd.Series, z_th: float = 0.90, ema_span: int = 8) -> str:
-    """Require EMA agreement + z-score of last change vs its own noise. Flat if weak."""
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < 10:
-        return "f"
-    last = float(s.iloc[-1])
-    ema = float(s.ewm(span=ema_span, adjust=False).mean().iloc[-1])
-    chg = s.diff().dropna()
-    if len(chg) < 6:
-        return "f"
-    sd = float(chg.tail(20).std(ddof=1) or 0.0)
-    if sd <= 1e-12:
-        return "f"
-    z = float(chg.iloc[-1]) / sd
-    lvl_sd = float(s.tail(20).std(ddof=1) or sd)
-    z_lvl = (last - float(s.tail(20).mean())) / max(lvl_sd, 1e-12)
-    score = 0.65 * z + 0.35 * z_lvl
-    if last > ema and score >= z_th:
-        return "u"
-    if last < ema and score <= -z_th:
-        return "d"
-    return "f"
-
-
-
 LEVEL_GLYPH = {"++": "⇈", "+": "↑", "-": "↓", "--": "⇊", "=": "→"}
-PDEC_ORDER = ("++", "+", "-", "--")
 
 
 def _level4(series, z_hi=1.10, z_mid=0.45) -> str:
@@ -800,8 +639,9 @@ def _price_level4(df) -> str:
     px = pd.to_numeric(df["close"], errors="coerce")
     last = float(px.iloc[-1])
     base = _level4(px)
-    if "vwap" in df.columns:
-        vw = float(df["vwap"].iloc[-1])
+    vwcol = "vwap_idx" if "vwap_idx" in df.columns else ("vwap" if "vwap" in df.columns else None)
+    if vwcol:
+        vw = float(df[vwcol].iloc[-1])
         if last >= vw and base in ("-", "--"):
             base = "+"
         if last < vw and base in ("+", "++"):
@@ -814,453 +654,456 @@ def _price_level4(df) -> str:
     return base
 
 
-MICRO_PDEC_PLAYBOOK = {
-    ('++', '++', '++', '++'): ('Pure Trend & Momentum Regime — Pure Institutional Aggression: Aggressive buyers sweeping order book with max volume and momentum.', 'LONG BREAKOUT (Target: Upper 2.0\\sigma)'),
-    ('++', '++', '++', '+'): ('Pure Trend & Momentum Regime — Strong Bullish Breakout with slight CVD lag; aggressive market orders driving price.', 'HOLD LONG (Trail SL below VWAP)'),
-    ('++', '++', '++', '-'): ('Pure Trend & Momentum Regime — Aggressive buying on current bar, but long-term CVD diverging bearishly.', 'CAUTIOUS LONG (Tight SL / Partial Exit)'),
-    ('++', '++', '++', '--'): ('Pure Trend & Momentum Regime — Severe Absorption Trap: Current candle spiked on high volume, but macro CVD is heavily negative.', 'PREPARE SHORT (Exhaustion Top)'),
-    ('++', '++', '+', '++'): ('Pure Trend & Momentum Regime — Steady Buyer Expansion: Volume and CVD strong, force index moderate.', 'HOLD LONG'),
-    ('++', '++', '+', '+'): ('Pure Trend & Momentum Regime — Steady Bullish Trend: Balanced aggressive buying across all metrics.', 'HOLD LONG'),
-    ('++', '++', '+', '-'): ('Pure Trend & Momentum Regime — Buyer pushing price above upper band, but cumulative delta fading.', 'PREPARE TRAIL SL'),
-    ('++', '++', '+', '--'): ('Pure Trend & Momentum Regime — Bullish price spike on thin cumulative book; aggressive short trap forming.', 'EXIT LONG / WATCH REVERSAL'),
-    ('++', '++', '-', '++'): ('Pure Trend & Momentum Regime — High Volume Price Push losing force momentum; buyers taking profits into strength.', 'SCALE OUT LONG'),
-    ('++', '++', '-', '+'): ('Pure Trend & Momentum Regime — Price stretched above VWAP, delta high, but force index collapsing.', 'NO NEW LONG ENTRIES'),
-    ('++', '++', '-', '-'): ('Pure Trend & Momentum Regime — Volume spike on exhaustion move; force and cumulative delta negative.', 'PREPARE SHORT MEAN-REVERSION'),
-    ('++', '++', '-', '--'): ('Pure Trend & Momentum Regime — Classic Bull Trap: Price pushed high on spot volume, but overall flow is aggressively negative.', 'SHORT ENTRY (Target: VWAP)'),
-    ('++', '++', '--', '++'): ('Pure Trend & Momentum Regime — Negative Force Divergence: Price high with strong volume, but velocity dropping fast.', 'TAKE PROFIT LONG'),
-    ('++', '++', '--', '+'): ('Pure Trend & Momentum Regime — Buyer Fatigue: High bar volume failing to maintain upward force or cumulative flow.', 'EXIT LONG'),
-    ('++', '++', '--', '-'): ('Pure Trend & Momentum Regime — Aggressive selling creeping into high price extreme; volume churning.', 'PREPARE SHORT'),
-    ('++', '++', '--', '--'): ('Pure Trend & Momentum Regime — Extreme Climax Top: Price far above VWAP with extreme selling force on cumulative book.', 'SHORT MEAN-REVERSION'),
-    ('++', '+', '++', '++'): ('Pure Trend & Momentum Regime — Thin-Book Impulse: Price lifting easily on moderate volume expansion.', 'CAUTIOUS LONG (Trailing SL tight)'),
-    ('++', '+', '++', '+'): ('Pure Trend & Momentum Regime — Clean Upward Trend: Price and force strong with steady volume.', 'HOLD LONG'),
-    ('++', '+', '++', '-'): ('Pure Trend & Momentum Regime — Upward drift with hidden net selling in CVD.', 'TRAIL SL TIGHT'),
-    ('++', '+', '++', '--'): ('Pure Trend & Momentum Regime — Liquidity Sweep: Price pushed up on moderate delta into heavy resting sell orders.', 'EXIT LONG'),
-    ('++', '+', '+', '++'): ('Pure Trend & Momentum Regime — Healthy Bullish Expansion: All metrics moderately positive above VWAP.', 'HOLD LONG'),
-    ('++', '+', '+', '+'): ('Pure Trend & Momentum Regime — Standard Bullish Trend: Steady markup.', 'HOLD LONG'),
-    ('++', '+', '+', '-'): ('Pure Trend & Momentum Regime — Low Volume Up-Drift with negative CVD pressure.', 'NO ENTRY'),
-    ('++', '+', '+', '--'): ('Pure Trend & Momentum Regime — Passive Seller Wall: Sellers absorbing buyers above upper VWAP band.', 'PREPARE SHORT'),
-    ('++', '+', '-', '++'): ('Pure Trend & Momentum Regime — Price high, force weak, but CVD accumulation intact.', 'HOLD LONG'),
-    ('++', '+', '-', '+'): ('Bullish Absorption & Resistance Dynamics — Buying impulse dying near upper band; force index turned negative.', 'TAKE PROFIT LONG'),
-    ('++', '+', '-', '-'): ('Bullish Absorption & Resistance Dynamics — Triple Divergence forming at highs (Price $++$, Force $-$, CVD $-$).', 'SHORT MEAN-REVERSION'),
-    ('++', '+', '-', '--'): ('Bullish Absorption & Resistance Dynamics — Strong distribution disguised as upward drift.', 'EXIT LONG / SHORT ENTRY'),
-    ('++', '+', '--', '++'): ('Bullish Absorption & Resistance Dynamics — Force collapsing despite price expansion; CVD holding support.', 'BLOCK NEW LONG POSITIONS'),
-    ('++', '+', '--', '+'): ('Bullish Absorption & Resistance Dynamics — Exhaustion Top: Price floating up without underlying thrust.', 'EXIT LONG'),
-    ('++', '+', '--', '-'): ('Bullish Absorption & Resistance Dynamics — Clear Bearish Reversal Setup at extreme upper band.', 'SHORT ENTRY'),
-    ('++', '+', '--', '--'): ('Bullish Absorption & Resistance Dynamics — Extreme Institutional Distribution at high levels.', 'SHORT BREAKDOWN PREPARATION'),
-    ('++', '-', '++', '++'): ('Bullish Absorption & Resistance Dynamics — Passive Sweep: Buyers lifting offers, but market sell orders active ($\\Delta V < 0$).', 'HOLD LONG WITH CAUTION'),
-    ('++', '-', '++', '+'): ('Bullish Absorption & Resistance Dynamics — Price pushing higher on negative delta; thin ask depth.', 'CAUTIOUS LONG'),
-    ('++', '-', '++', '-'): ('Bullish Absorption & Resistance Dynamics — Friction Up-Move: Sellers hitting bids, but price forced higher by market stops.', 'PREPARE EXIT LONG'),
-    ('++', '-', '++', '--'): ('Bullish Absorption & Resistance Dynamics — Short Squeeze in progress: Negative delta/CVD but price exploding upward.', 'NO ENTRY (High Volatility Squeeze)'),
-    ('++', '-', '+', '++'): ('Bullish Absorption & Resistance Dynamics — Price above VWAP, positive force, but spot delta negative.', 'HOLD LONG'),
-    ('++', '-', '+', '+'): ('Bullish Absorption & Resistance Dynamics — Low-Volume Steady Drift: Price expanding without volume backing.', 'NO ENTRY (Unstable move)'),
-    ('++', '-', '+', '-'): ('Bullish Absorption & Resistance Dynamics — Diverging Drift: Negative delta, low volume, price rising purely on lack of ask depth.', 'EXIT LONG'),
-    ('++', '-', '+', '--'): ('Bullish Absorption & Resistance Dynamics — Institutional Supply Absorption: Sellers slamming bids with high volume.', 'DYNAMIC ABSORPTION EXIT'),
-    ('++', '-', '-', '++'): ('Bullish Absorption & Resistance Dynamics — Price high, but Delta and EFI both negative. CVD holding positive.', 'EXIT LONG'),
-    ('++', '-', '-', '+'): ('Bullish Absorption & Resistance Dynamics — Fading Bullish Push: Market buyers losing force on falling volume.', 'EXIT LONG'),
-    ('++', '-', '-', '-'): ('Bullish Absorption & Resistance Dynamics — Standard Bearish Divergence: Price higher, all volume/force metrics negative.', 'SHORT MEAN-REVERSION'),
-    ('++', '-', '-', '--'): ('Bullish Absorption & Resistance Dynamics — Heavy Selling Pressure driving price into resistance zone.', 'SHORT ENTRY'),
-    ('++', '-', '--', '++'): ('Bullish Absorption & Resistance Dynamics — High-Volume Momentum Trap: Heavy force down, but cumulative buying positive.', 'PREPARE SHORT'),
-    ('++', '-', '--', '+'): ('Bullish Absorption & Resistance Dynamics — Momentum Exhaustion: Velocity fading fast as price ticks higher.', 'EXIT LONG'),
-    ('++', '-', '--', '-'): ('Bullish Absorption & Resistance Dynamics — Classic Bearish Institutional Distribution.', 'SHORT MEAN-REVERSION'),
-    ('++', '-', '--', '--'): ('Bullish Absorption & Resistance Dynamics — Triple Bearish Divergence: Price makes higher high while EFI, CVD, $\\Delta V$ all fail.', 'SHORT ENTRY (Target: VWAP)'),
-    ('++', '--', '++', '++'): ('Bullish Absorption & Resistance Dynamics — Heavy aggressive selling being completely absorbed at higher price levels.', 'BULLISH ABSORPTION WATCH'),
-    ('++', '--', '++', '+'): ('Bullish Absorption & Resistance Dynamics — Aggressive market sellers active, but passive limit buyers holding price high.', 'HOLD LONG'),
-    ('++', '--', '++', '-'): ('Upper VWAP Consolidation & Distribution — Strong seller sweep active; force index artificially high on price offset.', 'PREPARE EXIT LONG'),
-    ('++', '--', '++', '--'): ('Upper VWAP Consolidation & Distribution — Aggressive Shorting at resistance; buyers failing to maintain order book depth.', 'SHORT ENTRY'),
-    ('++', '--', '+', '++'): ('Upper VWAP Consolidation & Distribution — Heavy selling delta counteracted by strong overall CVD flow.', 'HOLD LONG'),
-    ('++', '--', '+', '+'): ('Upper VWAP Consolidation & Distribution — Selling absorption; passive bid support above VWAP.', 'HOLD LONG'),
-    ('++', '--', '+', '-'): ('Upper VWAP Consolidation & Distribution — Sellers gaining control above VWAP; delta and CVD negative.', 'PREPARE SHORT'),
-    ('++', '--', '+', '--'): ('Upper VWAP Consolidation & Distribution — Aggressive Selling Expansion: Delta and CVD dropping rapidly.', 'SHORT BREAKOUT PREPARATION'),
-    ('++', '--', '-', '++'): ('Upper VWAP Consolidation & Distribution — Market sellers active; force and delta negative, macro CVD positive.', 'WATCH FOR REVERSAL'),
-    ('++', '--', '-', '+'): ('Upper VWAP Consolidation & Distribution — Bearish pressure accumulating near high levels.', 'EXIT LONG'),
-    ('++', '--', '-', '-'): ('Upper VWAP Consolidation & Distribution — Heavy Sell Delta with matching negative force and CVD.', 'SHORT ENTRY'),
-    ('++', '--', '-', '--'): ('Upper VWAP Consolidation & Distribution — Aggressive Institutional Selling sweeping price down from upper band.', 'SHORT ENTRY'),
-    ('++', '--', '--', '++'): ('Upper VWAP Consolidation & Distribution — High negative force and delta colliding with structural limit bids.', 'NO ENTRY (High Friction Zone)'),
-    ('++', '--', '--', '+'): ('Upper VWAP Consolidation & Distribution — Buyers failing across all momentum metrics; CVD holding weakly.', 'EXIT LONG'),
-    ('++', '--', '--', '-'): ('Upper VWAP Consolidation & Distribution — Institutional Dump: Heavy selling volume, force, and CVD expansion.', 'SHORT BREAKOUT'),
-    ('++', '--', '--', '--'): ('Upper VWAP Consolidation & Distribution — Pure Institutional Markdown from extreme high price.', 'SHORT BREAKOUT (Target: VWAP / Lower Band)'),
-    ('+', '++', '++', '++'): ('Upper VWAP Consolidation & Distribution — Steady Bullish Impulse: Price moderately above VWAP with strong volume/CVD support.', 'LONG ENTRY / HOLD LONG'),
-    ('+', '++', '++', '+'): ('Upper VWAP Consolidation & Distribution — Healthy Bullish Continuation above VWAP.', 'HOLD LONG'),
-    ('+', '++', '++', '-'): ('Upper VWAP Consolidation & Distribution — Buyers active on bar, but overall session CVD lagging.', 'CAUTIOUS LONG'),
-    ('+', '++', '++', '--'): ('Upper VWAP Consolidation & Distribution — Short-Term Buying Surge inside longer-term structural selling.', 'WATCH FOR REVERSAL'),
-    ('+', '++', '+', '++'): ('Upper VWAP Consolidation & Distribution — Steady Markup above VWAP; clean order book execution.', 'HOLD LONG'),
-    ('+', '++', '+', '+'): ('Upper VWAP Consolidation & Distribution — Balanced Bullish Trend continuation.', 'HOLD LONG'),
-    ('+', '++', '+', '-'): ('Upper VWAP Consolidation & Distribution — Buying delta present, but CVD declining into VWAP.', 'NO ENTRY'),
-    ('+', '++', '+', '--'): ('Upper VWAP Consolidation & Distribution — Heavy resting sell orders absorbing moderate price gain above VWAP.', 'PREPARE SHORT'),
-    ('+', '++', '-', '++'): ('Upper VWAP Consolidation & Distribution — Buyer Delta positive, but force index decaying; loss of velocity.', 'HOLD LONG (Tight SL)'),
-    ('+', '++', '-', '+'): ('Upper VWAP Consolidation & Distribution — Price grinding higher above VWAP with declining momentum.', 'HOLD LONG'),
-    ('+', '++', '-', '-'): ('Upper VWAP Consolidation & Distribution — Diverging Bullish Push: High delta but force and CVD negative.', 'EXIT LONG'),
-    ('+', '++', '-', '--'): ('Moderate VWAP Bullish Drift — Passive Wall Blocking Force: Sellers walling price above VWAP.', 'SHORT ENTRY'),
-    ('+', '++', '--', '++'): ('Moderate VWAP Bullish Drift — Price high force negative; volume churning at key level.', 'NO ENTRY'),
-    ('+', '++', '--', '+'): ('Moderate VWAP Bullish Drift — Velocity collapse despite positive buying volume delta.', 'EXIT LONG'),
-    ('+', '++', '--', '-'): ('Moderate VWAP Bullish Drift — High-Volume Friction Zone above VWAP.', 'PREPARE SHORT'),
-    ('+', '++', '--', '--'): ('Moderate VWAP Bullish Drift — Bullish Trap at VWAP upper boundary.', 'SHORT ENTRY'),
-    ('+', '+', '++', '++'): ('Moderate VWAP Bullish Drift — Smooth Bullish Trend above VWAP.', 'HOLD LONG'),
-    ('+', '+', '++', '+'): ('Moderate VWAP Bullish Drift — Clean Moderate Up-Trend.', 'HOLD LONG'),
-    ('+', '+', '++', '-'): ('Moderate VWAP Bullish Drift — Price slightly above VWAP with negative CVD drift.', 'TRAIL SL TIGHT'),
-    ('+', '+', '++', '--'): ('Moderate VWAP Bullish Drift — Liquidity Trap: Moderate buying into strong net selling flow.', 'EXIT LONG'),
-    ('+', '+', '+', '++'): ('Moderate VWAP Bullish Drift — Steady Upward Markup.', 'HOLD LONG'),
-    ('+', '+', '+', '+'): ('Moderate VWAP Bullish Drift — Standard Trend Following State.', 'HOLD LONG'),
-    ('+', '+', '+', '-'): ('Moderate VWAP Bullish Drift — Mild Passive Resistance holding price near VWAP.', 'NO ENTRY'),
-    ('+', '+', '+', '--'): ('Moderate VWAP Bullish Drift — Negative CVD pressure conflicting with positive price offset.', 'NO ENTRY'),
-    ('+', '+', '-', '++'): ('Moderate VWAP Bullish Drift — Price above VWAP, CVD strong, but force index dipping.', 'HOLD LONG'),
-    ('+', '+', '-', '+'): ('Moderate VWAP Bullish Drift — Fading Impulse above VWAP.', 'PREPARE EXIT LONG'),
-    ('+', '+', '-', '-'): ('Moderate VWAP Bullish Drift — Weak Buy Pressure: Price drifting, volume/force negative.', 'EXIT LONG'),
-    ('+', '+', '-', '--'): ('Moderate VWAP Bullish Drift — Bearish Divergence above VWAP.', 'SHORT MEAN-REVERSION'),
-    ('+', '+', '--', '++'): ('Moderate VWAP Bullish Drift — Price holding above VWAP despite collapsing momentum force.', 'NO ENTRY'),
-    ('+', '+', '--', '+'): ('Moderate VWAP Bullish Drift — Slow drift up with negative force index.', 'EXIT LONG'),
-    ('+', '+', '--', '-'): ('Moderate VWAP Bullish Drift — Bearish momentum building above VWAP.', 'PREPARE SHORT'),
-    ('+', '+', '--', '--'): ('Moderate VWAP Bullish Drift — Institutional Sellers driving down force and CVD above VWAP.', 'SHORT ENTRY'),
-    ('+', '-', '++', '++'): ('Moderate VWAP Bullish Drift — Buyers sweeping thin ask book above VWAP.', 'HOLD LONG'),
-    ('+', '-', '++', '+'): ('Moderate VWAP Bullish Drift — Force positive, but spot delta negative; low-volume drift.', 'CAUTIOUS LONG'),
-    ('+', '-', '++', '-'): ('Moderate VWAP Bullish Drift — Friction Up-Drift above VWAP.', 'NO ENTRY'),
-    ('+', '-', '++', '--'): ('Moderate VWAP Bullish Drift — Short Squeeze inside minor resistance level.', 'NO ENTRY'),
-    ('+', '-', '+', '++'): ('Neutral VWAP Friction & Churn — Mild positive force with net positive CVD flow above VWAP.', 'HOLD LONG'),
-    ('+', '-', '+', '+'): ('Neutral VWAP Friction & Churn — Low-Volume Steady Drift above VWAP.', 'NO ENTRY'),
-    ('+', '-', '+', '-'): ('Neutral VWAP Friction & Churn — Diverging Drift: Price up, delta and CVD down.', 'EXIT LONG'),
-    ('+', '-', '+', '--'): ('Neutral VWAP Friction & Churn — Passive Supply Absorption above VWAP.', 'PREPARE SHORT'),
-    ('+', '-', '-', '++'): ('Neutral VWAP Friction & Churn — Mixed Signals: Negative delta/force, positive CVD above VWAP.', 'NO ENTRY'),
-    ('+', '-', '-', '+'): ('Neutral VWAP Friction & Churn — Fading Momentum above VWAP.', 'EXIT LONG'),
-    ('+', '-', '-', '-'): ('Neutral VWAP Friction & Churn — Weakness accumulating above VWAP.', 'SHORT MEAN-REVERSION'),
-    ('+', '-', '-', '--'): ('Neutral VWAP Friction & Churn — Clean Bearish Reversal Setup at VWAP upper boundary.', 'SHORT ENTRY'),
-    ('+', '-', '--', '++'): ('Neutral VWAP Friction & Churn — Momentum collapse above VWAP with positive long-term CVD.', 'NO ENTRY'),
-    ('+', '-', '--', '+'): ('Neutral VWAP Friction & Churn — Buyer Fatigue above VWAP.', 'EXIT LONG'),
-    ('+', '-', '--', '-'): ('Neutral VWAP Friction & Churn — Bearish Continuation setup down to VWAP.', 'SHORT ENTRY'),
-    ('+', '-', '--', '--'): ('Neutral VWAP Friction & Churn — Institutional Selling pushing price back down toward VWAP.', 'SHORT ENTRY'),
-    ('+', '--', '++', '++'): ('Neutral VWAP Friction & Churn — Heavy selling delta absorbed by strong bid side liquidity.', 'BULLISH ABSORPTION WATCH'),
-    ('+', '--', '++', '+'): ('Neutral VWAP Friction & Churn — Aggressive sellers active, price holding above VWAP.', 'HOLD LONG'),
-    ('+', '--', '++', '-'): ('Neutral VWAP Friction & Churn — Sellers driving delta down above VWAP.', 'PREPARE SHORT'),
-    ('+', '--', '++', '--'): ('Neutral VWAP Friction & Churn — Strong Selling Pressure above VWAP; bid failure likely.', 'SHORT ENTRY'),
-    ('+', '--', '+', '++'): ('Neutral VWAP Friction & Churn — Absorption above VWAP: Buyers taking all market sell orders.', 'HOLD LONG'),
-    ('+', '--', '+', '+'): ('Neutral VWAP Friction & Churn — Passive Bid Floor holding price above VWAP.', 'HOLD LONG'),
-    ('+', '--', '+', '-'): ('Neutral VWAP Friction & Churn — Sellers gaining ground above VWAP.', 'PREPARE SHORT'),
-    ('+', '--', '+', '--'): ('Neutral VWAP Friction & Churn — Heavy Net Selling pushing price toward VWAP test.', 'SHORT ENTRY'),
-    ('+', '--', '-', '++'): ('Neutral VWAP Friction & Churn — High Negative Delta with declining force; CVD positive.', 'NO ENTRY'),
-    ('+', '--', '-', '+'): ('Neutral VWAP Friction & Churn — Distribution above VWAP.', 'EXIT LONG'),
-    ('+', '--', '-', '-'): ('Neutral VWAP Friction & Churn — Clear Bearish Flow pushing price back down to VWAP.', 'SHORT ENTRY'),
-    ('+', '--', '-', '--'): ('Neutral VWAP Friction & Churn — Strong Institutional Distribution above VWAP.', 'SHORT BREAKOUT PREPARATION'),
-    ('+', '--', '--', '++'): ('Neutral VWAP Friction & Churn — Churning at VWAP: Heavy sell force vs structural buyers.', 'NO ENTRY'),
-    ('+', '--', '--', '+'): ('VWAP Crossover & Mid-Band Transition — Buyer failure above VWAP; momentum turned negative.', 'EXIT LONG / SHORT WATCH'),
-    ('+', '--', '--', '-'): ('VWAP Crossover & Mid-Band Transition — Bearish Impulse back toward VWAP.', 'SHORT ENTRY'),
-    ('+', '--', '--', '--'): ('VWAP Crossover & Mid-Band Transition — Max Bearish Alignment above VWAP: Aggressive breakdown impending.', 'SHORT BREAKOUT (Target: Lower VWAP Band)'),
-    ('-', '++', '++', '++'): ('VWAP Crossover & Mid-Band Transition — Bullish Reversal at VWAP: Strong buying delta & force pushing price up.', 'LONG ENTRY (Target: Upper VWAP Band)'),
-    ('-', '++', '++', '+'): ('VWAP Crossover & Mid-Band Transition — Bullish Impulse from below VWAP.', 'LONG ENTRY'),
-    ('-', '++', '++', '-'): ('VWAP Crossover & Mid-Band Transition — Aggressive buyers hitting ask below VWAP; CVD lagging.', 'CAUTIOUS LONG'),
-    ('-', '++', '++', '--'): ('VWAP Crossover & Mid-Band Transition — Short Cover Surge below VWAP.', 'PREPARE LONG'),
-    ('-', '++', '+', '++'): ('VWAP Crossover & Mid-Band Transition — Steady Buyer Accumulation below VWAP.', 'LONG ENTRY'),
-    ('-', '++', '+', '+'): ('VWAP Crossover & Mid-Band Transition — Bullish Mean-Reversion setup back to VWAP.', 'LONG MEAN-REVERSION'),
-    ('-', '++', '+', '-'): ('VWAP Crossover & Mid-Band Transition — Buying delta active below VWAP, but CVD negative.', 'NO ENTRY'),
-    ('-', '++', '+', '--'): ('VWAP Crossover & Mid-Band Transition — Passive Limit Sellers holding price down below VWAP.', 'HOLD SHORT'),
-    ('-', '++', '-', '++'): ('VWAP Crossover & Mid-Band Transition — High Buy Delta below VWAP, but force index negative.', 'NO ENTRY'),
-    ('-', '++', '-', '+'): ('VWAP Crossover & Mid-Band Transition — Buyer Absorption below VWAP.', 'PREPARE LONG'),
-    ('-', '++', '-', '-'): ('VWAP Crossover & Mid-Band Transition — Buying volume delta failing to reverse negative force.', 'HOLD SHORT'),
-    ('-', '++', '-', '--'): ('VWAP Crossover & Mid-Band Transition — Bullish trap below VWAP; heavy macro selling pressure.', 'SHORT ENTRY'),
-    ('-', '++', '--', '++'): ('VWAP Crossover & Mid-Band Transition — Divergent Buy Surge below VWAP; velocity collapsing.', 'NO ENTRY'),
-    ('-', '++', '--', '+'): ('VWAP Crossover & Mid-Band Transition — Weak buy delta trying to lift price below VWAP.', 'EXIT SHORT'),
-    ('-', '++', '--', '-'): ('VWAP Crossover & Mid-Band Transition — High-Volume Friction below VWAP.', 'PREPARE LONG'),
-    ('-', '++', '--', '--'): ('VWAP Crossover & Mid-Band Transition — Sellers slamming limit bids into buying market orders.', 'SHORT ENTRY'),
-    ('-', '+', '++', '++'): ('VWAP Crossover & Mid-Band Transition — Steady Bullish Reversion setup from below VWAP.', 'LONG ENTRY'),
-    ('-', '+', '++', '+'): ('VWAP Crossover & Mid-Band Transition — Mild Bullish Recovery toward VWAP.', 'LONG MEAN-REVERSION'),
-    ('-', '+', '++', '-'): ('VWAP Crossover & Mid-Band Transition — Up-drift below VWAP with negative CVD flow.', 'NO ENTRY'),
-    ('-', '+', '++', '--'): ('VWAP Crossover & Mid-Band Transition — Short Cover rally dying near VWAP.', 'PREPARE SHORT'),
-    ('-', '+', '+', '++'): ('VWAP Crossover & Mid-Band Transition — Accumulation below VWAP with positive CVD.', 'LONG ENTRY'),
-    ('-', '+', '+', '+'): ('VWAP Crossover & Mid-Band Transition — Mild Bullish Drift back toward VWAP.', 'HOLD LONG / MEAN-REVERSION'),
-    ('-', '+', '+', '-'): ('Lower VWAP Consolidation & Drift — Low Volume Up-Drift below VWAP.', 'NO ENTRY'),
-    ('-', '+', '+', '--'): ('Lower VWAP Consolidation & Drift — Heavy Sellers blocking recovery below VWAP.', 'SHORT ENTRY'),
-    ('-', '+', '-', '++'): ('Lower VWAP Consolidation & Drift — Positive CVD but price and force remaining negative.', 'PREPARE LONG'),
-    ('-', '+', '-', '+'): ('Lower VWAP Consolidation & Drift — Weak Buyer attempt below VWAP.', 'EXIT SHORT'),
-    ('-', '+', '-', '-'): ('Lower VWAP Consolidation & Drift — Steady Downtrend continuation below VWAP.', 'HOLD SHORT'),
-    ('-', '+', '-', '--'): ('Lower VWAP Consolidation & Drift — Bearish Pressure below VWAP; buyers fading.', 'HOLD SHORT'),
-    ('-', '+', '--', '++'): ('Lower VWAP Consolidation & Drift — High negative force offsetting minor positive buy delta.', 'NO ENTRY'),
-    ('-', '+', '--', '+'): ('Lower VWAP Consolidation & Drift — Fading Buyer Impulse below VWAP.', 'EXIT SHORT'),
-    ('-', '+', '--', '-'): ('Lower VWAP Consolidation & Drift — Bearish Expansion building below VWAP.', 'SHORT ENTRY'),
-    ('-', '+', '--', '--'): ('Lower VWAP Consolidation & Drift — Strong Institutional Markdown continuation.', 'SHORT ENTRY'),
-    ('-', '-', '++', '++'): ('Lower VWAP Consolidation & Drift — Price below VWAP, force positive, sweep on thin asks.', 'PREPARE LONG'),
-    ('-', '-', '++', '+'): ('Lower VWAP Consolidation & Drift — Force positive below VWAP despite minor negative delta.', 'CAUTIOUS LONG'),
-    ('-', '-', '++', '-'): ('Lower VWAP Consolidation & Drift — Friction zone below VWAP.', 'NO ENTRY'),
-    ('-', '-', '++', '--'): ('Lower VWAP Consolidation & Drift — Squeeze Dynamic below VWAP.', 'NO ENTRY'),
-    ('-', '-', '+', '++'): ('Lower VWAP Consolidation & Drift — Quiet Delta Accumulation below VWAP.', 'ACCUMULATION WATCH'),
-    ('-', '-', '+', '+'): ('Lower VWAP Consolidation & Drift — Slow drift below VWAP.', 'NO ENTRY'),
-    ('-', '-', '+', '-'): ('Lower VWAP Consolidation & Drift — Low-Volume Down-Drift below VWAP.', 'HOLD SHORT'),
-    ('-', '-', '+', '--'): ('Lower VWAP Consolidation & Drift — Passive Sellers pushing price down below VWAP.', 'HOLD SHORT'),
-    ('-', '-', '-', '++'): ('Lower VWAP Consolidation & Drift — Bullish Divergence setup: CVD high while price/delta low.', 'LONG MEAN-REVERSION WATCH'),
-    ('-', '-', '-', '+'): ('Lower VWAP Consolidation & Drift — Quiet Downward Drift below VWAP.', 'HOLD SHORT'),
-    ('-', '-', '-', '-'): ('Lower VWAP Consolidation & Drift — Standard Bearish Drift below VWAP.', 'HOLD SHORT'),
-    ('-', '-', '-', '--'): ('Lower VWAP Consolidation & Drift — Steady Markdown below VWAP.', 'HOLD SHORT'),
-    ('-', '-', '--', '++'): ('Lower VWAP Consolidation & Drift — High negative force below VWAP, CVD holding positive.', 'NO ENTRY'),
-    ('-', '-', '--', '+'): ('Lower VWAP Consolidation & Drift — Momentum collapse below VWAP.', 'HOLD SHORT'),
-    ('-', '-', '--', '-'): ('Lower VWAP Consolidation & Drift — Bearish Force Expansion below VWAP.', 'SHORT ENTRY'),
-    ('-', '-', '--', '--'): ('Sub-VWAP Bearish Acceleration — Clean Downtrend continuation below VWAP.', 'SHORT ENTRY'),
-    ('-', '--', '++', '++'): ('Sub-VWAP Bearish Acceleration — Heavy sell delta absorbed by strong limit bids below VWAP.', 'BULLISH ABSORPTION WATCH'),
-    ('-', '--', '++', '+'): ('Sub-VWAP Bearish Acceleration — Passive buyer defense below VWAP.', 'PREPARE LONG'),
-    ('-', '--', '++', '-'): ('Sub-VWAP Bearish Acceleration — High selling volume counteracted by positive price force.', 'NO ENTRY'),
-    ('-', '--', '++', '--'): ('Sub-VWAP Bearish Acceleration — Aggressive Shorting below VWAP.', 'SHORT ENTRY'),
-    ('-', '--', '+', '++'): ('Sub-VWAP Bearish Acceleration — Accumulation below VWAP despite heavy market selling.', 'PREPARE LONG'),
-    ('-', '--', '+', '+'): ('Sub-VWAP Bearish Acceleration — Passive Buyers absorbing market sell orders below VWAP.', 'HOLD LONG / EXIT SHORT'),
-    ('-', '--', '+', '-'): ('Sub-VWAP Bearish Acceleration — Selling Pressure building below VWAP.', 'HOLD SHORT'),
-    ('-', '--', '+', '--'): ('Sub-VWAP Bearish Acceleration — Steady Markdown below VWAP with high delta/CVD selling.', 'SHORT ENTRY'),
-    ('-', '--', '-', '++'): ('Sub-VWAP Bearish Acceleration — Heavy sell delta below VWAP; macro CVD positive.', 'NO ENTRY'),
-    ('-', '--', '-', '+'): ('Sub-VWAP Bearish Acceleration — Fading selling impulse below VWAP.', 'EXIT SHORT'),
-    ('-', '--', '-', '-'): ('Sub-VWAP Bearish Acceleration — Strong Bearish Expansion below VWAP.', 'SHORT ENTRY'),
-    ('-', '--', '-', '--'): ('Sub-VWAP Bearish Acceleration — Institutional Selling sweep below VWAP.', 'SHORT ENTRY'),
-    ('-', '--', '--', '++'): ('Sub-VWAP Bearish Acceleration — High Negative Force and Delta below VWAP; CVD diverging.', 'PREPARE LONG (Divergence Setup)'),
-    ('-', '--', '--', '+'): ('Sub-VWAP Bearish Acceleration — Sellers driving price down, but CVD holding ground.', 'EXIT SHORT'),
-    ('-', '--', '--', '-'): ('Sub-VWAP Bearish Acceleration — Aggressive Bearish Breakdown below VWAP.', 'SHORT BREAKOUT'),
-    ('-', '--', '--', '--'): ('Sub-VWAP Bearish Acceleration — Pure Institutional Markdown below VWAP.', 'SHORT BREAKOUT (Target: Lower 2.0\\sigma)'),
-    ('--', '++', '++', '++'): ('Sub-VWAP Bearish Acceleration — Bullish Reversal at Lower Band: High volume & force absorption.', 'LONG MEAN-REVERSION'),
-    ('--', '++', '++', '+'): ('Sub-VWAP Bearish Acceleration — Strong Buy Surge at extreme lower band.', 'LONG MEAN-REVERSION'),
-    ('--', '++', '++', '-'): ('Sub-VWAP Bearish Acceleration — Short Covering Spike at extreme lows.', 'EXIT SHORT / PREPARE LONG'),
-    ('--', '++', '++', '--'): ('Sub-VWAP Bearish Acceleration — Short Squeeze at lower band: High buy delta into negative CVD.', 'NO ENTRY'),
-    ('--', '++', '+', '++'): ('Sub-VWAP Bearish Acceleration — Classic Bullish Bottom Building at lower band.', 'LONG MEAN-REVERSION'),
-    ('--', '++', '+', '+'): ('Sub-VWAP Bearish Acceleration — Buyers stepping in at extreme lower band.', 'LONG MEAN-REVERSION'),
-    ('--', '++', '+', '-'): ('Sub-VWAP Bearish Acceleration — Buy delta active at low, but overall flow negative.', 'EXIT SHORT'),
-    ('--', '++', '+', '--'): ('Sub-VWAP Bearish Acceleration — Passive Sellers blocking recovery at lower band.', 'HOLD SHORT'),
-    ('--', '++', '-', '++'): ('Lower VWAP Band Oversold & Reversa — Bullish Divergence at Lower Band: Force negative, CVD high.', 'PREPARE LONG'),
-    ('--', '++', '-', '+'): ('Lower VWAP Band Oversold & Reversa — Buyer attempt at extreme low price.', 'EXIT SHORT'),
-    ('--', '++', '-', '-'): ('Lower VWAP Band Oversold & Reversa — Selling pressure active despite positive buy delta bar.', 'HOLD SHORT'),
-    ('--', '++', '-', '--'): ('Lower VWAP Band Oversold & Reversa — Bearish Trap at lower band.', 'SHORT ENTRY'),
-    ('--', '++', '--', '++'): ('Lower VWAP Band Oversold & Reversa — Velocity collapse at extreme lows with strong CVD accumulation.', 'PREPARE LONG'),
-    ('--', '++', '--', '+'): ('Lower VWAP Band Oversold & Reversa — Buyers trying to lift extreme low price.', 'EXIT SHORT'),
-    ('--', '++', '--', '-'): ('Lower VWAP Band Oversold & Reversa — High-Volume Churn at lower VWAP band.', 'NO ENTRY'),
-    ('--', '++', '--', '--'): ('Lower VWAP Band Oversold & Reversa — Heavy selling pressure sweeping buyers at lower band.', 'SHORT BREAKDOWN'),
-    ('--', '+', '++', '++'): ('Lower VWAP Band Oversold & Reversa — Clean Bullish Mean-Reversion from lower band.', 'LONG MEAN-REVERSION'),
-    ('--', '+', '++', '+'): ('Lower VWAP Band Oversold & Reversa — Upward rebound from extreme lower VWAP band.', 'LONG MEAN-REVERSION'),
-    ('--', '+', '++', '-'): ('Lower VWAP Band Oversold & Reversa — Low volume bounce from lower band.', 'CAUTIOUS LONG'),
-    ('--', '+', '++', '--'): ('Lower VWAP Band Oversold & Reversa — Liquidity Sweep at low: Buyers lifting ask on thin book.', 'EXIT SHORT'),
-    ('--', '+', '+', '++'): ('Lower VWAP Band Oversold & Reversa — Steady Bottom Building at lower band.', 'LONG MEAN-REVERSION'),
-    ('--', '+', '+', '+'): ('Lower VWAP Band Oversold & Reversa — Standard Oversold Reversal Setup.', 'LONG MEAN-REVERSION'),
-    ('--', '+', '+', '-'): ('Lower VWAP Band Oversold & Reversa — Weak rebound from lower band.', 'NO ENTRY'),
-    ('--', '+', '+', '--'): ('Lower VWAP Band Oversold & Reversa — Sellers walling price at extreme lows.', 'HOLD SHORT'),
-    ('--', '+', '-', '++'): ('Lower VWAP Band Oversold & Reversa — Triple Bullish Divergence (Price $--$, Delta $+$, CVD $++$).', 'LONG ENTRY (Target: VWAP)'),
-    ('--', '+', '-', '+'): ('Lower VWAP Band Oversold & Reversa — Fading selling velocity at lower band.', 'EXIT SHORT'),
-    ('--', '+', '-', '-'): ('Lower VWAP Band Oversold & Reversa — Slow markdown continuation along lower band.', 'HOLD SHORT'),
-    ('--', '+', '-', '--'): ('Lower VWAP Band Oversold & Reversa — Bearish Flow accelerating at lower band.', 'SHORT ENTRY'),
-    ('--', '+', '--', '++'): ('Lower VWAP Band Oversold & Reversa — Price low, force negative, but cumulative flow accumulated.', 'PREPARE LONG'),
-    ('--', '+', '--', '+'): ('Lower VWAP Band Oversold & Reversa — Weak buying attempt at oversold extreme.', 'EXIT SHORT'),
-    ('--', '+', '--', '-'): ('Lower VWAP Band Oversold & Reversa — Bearish Pressure pushing lower band outward.', 'SHORT ENTRY'),
-    ('--', '+', '--', '--'): ('Lower VWAP Band Oversold & Reversa — Institutional Selling expanding volatility downward.', 'SHORT BREAKDOWN'),
-    ('--', '-', '++', '++'): ('Lower VWAP Band Oversold & Reversa — Thin-Book Rebound from extreme lower band.', 'CAUTIOUS LONG'),
-    ('--', '-', '++', '+'): ('Extreme Downward Breakdown & Flash Moves — Force positive at lower band; short cover surge.', 'EXIT SHORT'),
-    ('--', '-', '++', '-'): ('Extreme Downward Breakdown & Flash Moves — Low Volume Drift along lower band.', 'HOLD SHORT'),
-    ('--', '-', '++', '--'): ('Extreme Downward Breakdown & Flash Moves — Short Squeeze dynamic in progress at extreme low.', 'NO ENTRY'),
-    ('--', '-', '+', '++'): ('Extreme Downward Breakdown & Flash Moves — Quiet Accumulation Box at lower band support.', 'ACCUMULATION WATCH'),
-    ('--', '-', '+', '+'): ('Extreme Downward Breakdown & Flash Moves — Slow steady bounce from extreme low.', 'LONG MEAN-REVERSION'),
-    ('--', '-', '+', '-'): ('Extreme Downward Breakdown & Flash Moves — Low-Volume Steady Drift downward.', 'NO ENTRY (Unstable move)'),
-    ('--', '-', '+', '--'): ('Extreme Downward Breakdown & Flash Moves — Passive Seller Wall blocking lower band recovery.', 'HOLD SHORT'),
-    ('--', '-', '-', '++'): ('Extreme Downward Breakdown & Flash Moves — Bullish Divergence (Standard): Positive CVD on falling price.', 'LONG MEAN-REVERSION'),
-    ('--', '-', '-', '+'): ('Extreme Downward Breakdown & Flash Moves — Fading selling pressure at lower band.', 'EXIT SHORT'),
-    ('--', '-', '-', '-'): ('Extreme Downward Breakdown & Flash Moves — Standard Bearish Drift along lower VWAP band.', 'HOLD SHORT'),
-    ('--', '-', '-', '--'): ('Extreme Downward Breakdown & Flash Moves — Steady Bearish Volatility Expansion downward.', 'SHORT ENTRY'),
-    ('--', '-', '--', '++'): ('Extreme Downward Breakdown & Flash Moves — Momentum collapse at lower band, CVD positive.', 'PREPARE LONG'),
-    ('--', '-', '--', '+'): ('Extreme Downward Breakdown & Flash Moves — Buyer support attempting to form at extreme low.', 'EXIT SHORT'),
-    ('--', '-', '--', '-'): ('Extreme Downward Breakdown & Flash Moves — Strong Bearish Expansion pushing lower band.', 'SHORT BREAKDOWN'),
-    ('--', '-', '--', '--'): ('Extreme Downward Breakdown & Flash Moves — Classic Bearish Institutional Distribution expansion.', 'SHORT BREAKDOWN'),
-    ('--', '--', '++', '++'): ('Extreme Downward Breakdown & Flash Moves — Bullish Demand Absorption: Massive selling absorbed by institutional bids.', 'DYNAMIC ABSORPTION EXIT / LONG WATCH'),
-    ('--', '--', '++', '+'): ('Extreme Downward Breakdown & Flash Moves — Passive buyer floor holding lower VWAP band.', 'EXIT SHORT'),
-    ('--', '--', '++', '-'): ('Extreme Downward Breakdown & Flash Moves — Selling force active at lower band extreme.', 'HOLD SHORT'),
-    ('--', '--', '++', '--'): ('Extreme Downward Breakdown & Flash Moves — Aggressive Shorting slamming bids at lower band.', 'SHORT BREAKDOWN'),
-    ('--', '--', '+', '++'): ('Extreme Downward Breakdown & Flash Moves — High sell delta absorbed by institutional bid wall.', 'PREPARE LONG'),
-    ('--', '--', '+', '+'): ('Extreme Downward Breakdown & Flash Moves — Buying bids holding price extreme.', 'EXIT SHORT'),
-    ('--', '--', '+', '-'): ('Extreme Downward Breakdown & Flash Moves — Bearish Pressure expanding lower VWAP envelope.', 'SHORT BREAKDOWN'),
-    ('--', '--', '+', '--'): ('Extreme Downward Breakdown & Flash Moves — Heavy selling volume pushing extreme price discovery down.', 'SHORT BREAKDOWN'),
-    ('--', '--', '-', '++'): ('Extreme Downward Breakdown & Flash Moves — Divergent Sell Dump: Extreme selling delta into rising CVD.', 'PREPARE LONG'),
-    ('--', '--', '-', '+'): ('Extreme Downward Breakdown & Flash Moves — Selling velocity fading at lower extreme.', 'EXIT SHORT'),
-    ('--', '--', '-', '-'): ('Extreme Downward Breakdown & Flash Moves — Aggressive Selling Expansion: Delta, force, CVD all negative.', 'SHORT BREAKDOWN'),
-    ('--', '--', '-', '--'): ('Extreme Downward Breakdown & Flash Moves — Institutional Panic Liquidation / Aggressive Shorting.', 'SHORT BREAKDOWN'),
-    ('--', '--', '--', '++'): ('Extreme Downward Breakdown & Flash Moves — High Negative Force Trap: Sellers driving price down into macro CVD support.', 'PREPARE LONG MEAN-REVERSION'),
-    ('--', '--', '--', '+'): ('Extreme Downward Breakdown & Flash Moves — Selling force losing cumulative backing at extreme low.', 'EXIT SHORT'),
-    ('--', '--', '--', '-'): ('Extreme Downward Breakdown & Flash Moves — Severe Bearish Breakdown along lower VWAP band.', 'SHORT BREAKDOWN'),
-    ('--', '--', '--', '--'): ('Extreme Downward Breakdown & Flash Moves — Pure Institutional Aggression (Bearish): Max selling volume, force, and CVD.', 'SHORT BREAKOUT (Target: Lower 2.0\\sigma Expansion)'),
+# --- VALUE-AREA REGIME PLAYBOOK (replaces PDEC / Flow18 / candle books) ---
+# Four models:
+#   M1-S  VAH mean-reversion SHORT   (range)
+#   M1-L  VAL mean-reversion LONG    (range)
+#   M2-L  VAH acceptance TREND LONG  (trend)
+#   M2-S  VAL acceptance TREND SHORT (trend)
+# Location tests are statistical (z vs session σ, persistence, ATR buffer).
+
+VA_PLAYBOOK = {
+    "M1S_WATCH": (
+        "Range · VAH probe — price statistically above value, absorption forming",
+        "WATCH SHORT (VAH fade)",
+    ),
+    "M1S_ENTRY": (
+        "Range · VAH mean-reversion SHORT — absorption + EFI divergence at/above VAH",
+        "SHORT MEAN-REVERSION (Target: POC → VAL)",
+    ),
+    "M1S_ADD": (
+        "Range · VAH failed acceptance — close back inside value, ΔV still offered",
+        "ADD SHORT (Retest VAH from below)",
+    ),
+    "M1L_WATCH": (
+        "Range · VAL probe — price statistically below value, demand absorbing",
+        "WATCH LONG (VAL bounce)",
+    ),
+    "M1L_ENTRY": (
+        "Range · VAL mean-reversion LONG — absorption + EFI divergence at/below VAL",
+        "LONG MEAN-REVERSION (Target: POC → VAH)",
+    ),
+    "M1L_ADD": (
+        "Range · VAL failed breakdown — close back inside value, ΔV still bid",
+        "ADD LONG (Retest VAL from above)",
+    ),
+    "M2L_WATCH": (
+        "Trend · VAH break — price holding above value, force not yet confirmed",
+        "WATCH LONG (VAH acceptance)",
+    ),
+    "M2L_ENTRY": (
+        "Trend · VAH acceptance LONG — density building above VAH + EFI expansion + ΔV bid",
+        "LONG BREAKOUT (Hold above VAH / trail under box)",
+    ),
+    "M2L_ADD": (
+        "Trend · VAH retest from above — shallow pullback, ΔV stays non-negative",
+        "ADD LONG (Retest old VAH / new box low)",
+    ),
+    "M2S_WATCH": (
+        "Trend · VAL break — price holding below value, force not yet confirmed",
+        "WATCH SHORT (VAL acceptance)",
+    ),
+    "M2S_ENTRY": (
+        "Trend · VAL acceptance SHORT — density building below VAL + EFI expansion + ΔV offered",
+        "SHORT BREAKDOWN (Hold below VAL / trail above box)",
+    ),
+    "M2S_ADD": (
+        "Trend · VAL retest from below — shallow bounce, ΔV stays non-positive",
+        "ADD SHORT (Retest old VAL / new box high)",
+    ),
+    "INSIDE": (
+        "Inside value — no edge at the edge of the profile",
+        "NO ENTRY",
+    ),
+    "CHOP": (
+        "Regime mixed / low efficiency — neither clean range nor trend",
+        "NO ENTRY",
+    ),
 }
 
 
+def _series_num(s):
+    return pd.to_numeric(s, errors="coerce")
 
-def classify_microstructure(dfi: pd.DataFrame) -> dict:
-    """P / Delta / EFI / CVD 256-state book. PCD$ flow book unchanged."""
-    empty = {"ok": False, "arrows": "→ → → →", "micro": "", "action": "NO ENTRY",
-             "key": ("-","-","-","-"), "hover": ""}
-    if dfi is None or dfi.empty:
+
+def _ols_slope_p(y):
+    y = _series_num(y).dropna().astype(float)
+    n = len(y)
+    if n < 6:
+        return 0.0, 1.0
+    x = np.arange(n, dtype=float)
+    x = x - x.mean()
+    yv = y.values - y.values.mean()
+    den = float((x * x).sum())
+    if den <= 1e-18:
+        return 0.0, 1.0
+    sl = float((x * yv).sum() / den)
+    resid = yv - sl * x
+    dof = n - 2
+    se = float(np.sqrt((resid * resid).sum() / max(dof, 1) / den))
+    if se <= 1e-18:
+        return sl, 0.0
+    t = sl / se
+    try:
+        p = float(2.0 * si.t.sf(abs(t), dof))
+    except Exception:
+        p = float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(t) / math.sqrt(2.0)))))
+    return sl, p
+
+
+def _zscore(last, mean, sd):
+    sd = float(sd) if sd and sd == sd else 0.0
+    if sd <= 1e-12:
+        return 0.0
+    return float((last - mean) / sd)
+
+
+def _signed_delta(d: pd.DataFrame) -> pd.Series:
+    if "volume" not in d.columns:
+        if "open" in d.columns:
+            return _series_num(d["close"]) - _series_num(d["open"])
+        return _series_num(d["close"]).diff().fillna(0.0)
+    o = _series_num(d["open"]) if "open" in d.columns else _series_num(d["close"]).shift(1)
+    sgn = np.sign(_series_num(d["close"]) - o).fillna(0.0)
+    return _series_num(d["volume"]).fillna(0.0) * sgn
+
+
+def _atr_pct(d: pd.DataFrame, n: int = 14) -> float:
+    h = _series_num(d["high"] if "high" in d.columns else d["close"])
+    l = _series_num(d["low"] if "low" in d.columns else d["close"])
+    c = _series_num(d["close"])
+    prev = c.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    atr = float(tr.tail(n).mean()) if tr.notna().any() else 0.0
+    px = float(c.iloc[-1]) if c.notna().any() else 1.0
+    return atr / max(px, 1.0)
+
+
+def _efficiency_ratio(d: pd.DataFrame, n: int = 20) -> float:
+    c = _series_num(d["close"]).dropna()
+    if len(c) < max(8, n // 2):
+        return 0.0
+    w = c.tail(n)
+    net = abs(float(w.iloc[-1] - w.iloc[0]))
+    path = float(w.diff().abs().sum())
+    return net / max(path, 1e-9)
+
+
+def _value_density(d: pd.DataFrame, val, vah) -> float:
+    if val is None or vah is None or "volume" not in d.columns:
+        return 0.0
+    c = _series_num(d["close"])
+    v = _series_num(d["volume"]).fillna(0.0)
+    tot = float(v.sum())
+    if tot <= 0:
+        return 0.0
+    inside = ((c >= float(val)) & (c <= float(vah))).astype(float)
+    return float((v * inside).sum() / tot)
+
+
+def _persist_side(series, thresh, side="above", bars=3) -> bool:
+    s = _series_num(series).dropna()
+    if len(s) < bars:
+        return False
+    tail = s.iloc[-bars:]
+    if side == "above":
+        return bool((tail > thresh).sum() >= max(2, bars - 1))
+    return bool((tail < thresh).sum() >= max(2, bars - 1))
+
+
+def _box_tight(d: pd.DataFrame, n: int = 8, atr_frac: float = 0.85) -> bool:
+    if len(d) < n:
+        return False
+    sl = d.tail(n)
+    h = float(_series_num(sl["high"] if "high" in sl.columns else sl["close"]).max())
+    l = float(_series_num(sl["low"] if "low" in sl.columns else sl["close"]).min())
+    atr = _atr_pct(d) * max(float(_series_num(d["close"]).iloc[-1]), 1.0)
+    return (h - l) <= max(atr_frac * atr, 1.0)
+
+
+def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
+    """Range vs trend using profile density, efficiency, GEX, VWAP stretch, ATR."""
+    out = {
+        "regime": "CHOP", "score_range": 0.0, "score_trend": 0.0,
+        "eff": 0.0, "atr_pct": 0.0, "density": 0.0, "gex_sign": 0,
+        "vwap_z": 0.0, "note": "",
+    }
+    if dfi is None or getattr(dfi, "empty", True) or len(dfi) < 12:
+        return out
+    d = dfi.copy()
+    px = _series_num(d.get("spot_px", d["close"]))
+    last = float(px.iloc[-1])
+    atrp = _atr_pct(d)
+    eff = _efficiency_ratio(d, 20)
+    vp = {}
+    try:
+        src = d
+        if "spot_px" in d.columns and d["spot_px"].notna().sum() >= 8:
+            src = pd.DataFrame({
+                "open": _series_num(d.get("open", d["close"])),
+                "high": _series_num(d.get("high", d["close"])),
+                "low": _series_num(d.get("low", d["close"])),
+                "close": _series_num(d["spot_px"] if "spot_px" in d.columns else d["close"]),
+                "volume": _series_num(d["volume"]) if "volume" in d.columns else 1.0,
+            })
+        vp = compute_session_volume_profile(src, bin_step=2.0, prominence_factor=0.35)
+    except Exception:
+        vp = {}
+    vah = vp.get("vah") if isinstance(vp, dict) else None
+    val = vp.get("val") if isinstance(vp, dict) else None
+    dens = _value_density(d, val, vah)
+    vw = None
+    if "vwap_idx" in d.columns:
+        vw = float(_series_num(d["vwap_idx"]).iloc[-1])
+    elif "vwap" in d.columns:
+        vw = float(_series_num(d["vwap"]).iloc[-1])
+    std = float(_series_num(d["vwap_std"]).iloc[-1]) if "vwap_std" in d.columns else float(px.tail(20).std(ddof=1) or 0)
+    vz = _zscore(last, vw, std) if vw is not None else 0.0
+    gex = 0.0
+    if isinstance(data, dict):
+        try:
+            gex = float(data.get("total_net_gex_oi") or 0)
+        except Exception:
+            gex = 0.0
+    gex_sign = 1 if gex > 0 else (-1 if gex < 0 else 0)
+    sess_hi = float(_series_num(d.get("high", d["close"])).max())
+    sess_lo = float(_series_num(d.get("low", d["close"])).min())
+    sess_rng = max(sess_hi - sess_lo, 1e-6)
+    atr_abs = atrp * max(last, 1.0)
+    realized_vs_atr = sess_rng / max(atr_abs * math.sqrt(max(len(d), 1) / 14.0), 1e-6)
+
+    # Range score: high density in value, low efficiency, long-gamma / pin, mid VWAP
+    s_range = 0.0
+    s_trend = 0.0
+    s_range += 1.2 if dens >= 0.62 else (0.4 if dens >= 0.50 else -0.4)
+    s_range += 1.0 if eff < 0.22 else (0.2 if eff < 0.32 else -0.6)
+    s_range += 0.7 if abs(vz) < 1.10 else -0.3
+    s_range += 0.6 if gex_sign > 0 else (-0.2 if gex_sign < 0 else 0.1)
+    s_range += 0.4 if realized_vs_atr < 1.15 else -0.3
+
+    s_trend += 1.2 if eff >= 0.38 else (0.4 if eff >= 0.28 else -0.5)
+    s_trend += 1.0 if dens <= 0.48 else (0.2 if dens <= 0.58 else -0.6)
+    s_trend += 0.7 if abs(vz) >= 1.15 else -0.2
+    s_trend += 0.6 if gex_sign < 0 else (-0.15 if gex_sign > 0 else 0.05)
+    s_trend += 0.5 if realized_vs_atr >= 1.25 else -0.2
+
+    if s_range >= 1.4 and s_range >= s_trend + 0.35:
+        regime = "RANGE"
+    elif s_trend >= 1.4 and s_trend >= s_range + 0.35:
+        regime = "TREND"
+    else:
+        regime = "CHOP"
+    out.update({
+        "regime": regime, "score_range": round(s_range, 2), "score_trend": round(s_trend, 2),
+        "eff": round(eff, 3), "atr_pct": round(atrp * 100.0, 3), "density": round(dens, 3),
+        "gex_sign": gex_sign, "vwap_z": round(vz, 2),
+        "vah": float(vah) if vah else None, "val": float(val) if val else None,
+        "poc": float(vp.get("poc")) if isinstance(vp, dict) and vp.get("poc") else None,
+        "vp": vp if isinstance(vp, dict) else {},
+        "note": f"{regime} dens={dens:.2f} eff={eff:.2f} zVWAP={vz:+.2f} GEX={'+' if gex_sign>0 else ('-' if gex_sign<0 else '0')}",
+    })
+    return out
+
+
+def _loc_vs_value(last, vah, val, std, atr_abs):
+    """Statistical location vs value area. Buffer = max(0.35σ, 0.35 ATR)."""
+    if vah is None or val is None:
+        return "UNKNOWN", 0.0
+    buf = max(0.35 * float(std or 0), 0.35 * float(atr_abs or 0), 1.0)
+    z_h = (last - float(vah)) / max(float(std) or 1.0, 1e-6)
+    z_l = (float(val) - last) / max(float(std) or 1.0, 1e-6)
+    if last >= float(vah) + buf:
+        return "ABOVE_VAH", z_h
+    if last <= float(val) - buf:
+        return "BELOW_VAL", z_l
+    if last > float(vah):
+        return "VAH_EDGE", z_h
+    if last < float(val):
+        return "VAL_EDGE", z_l
+    return "INSIDE", 0.0
+
+
+def classify_va_setup(dfi: pd.DataFrame, data: dict = None) -> dict:
+    empty = {
+        "ok": False, "arrows": "→ → → →", "micro": "", "action": "NO ENTRY",
+        "key": ("=", "=", "=", "="), "hover": "", "regime": "CHOP",
+        "model": "", "price": "=", "delta": "=", "efi": "=", "cvd": "=",
+        "obv": "=", "efi_zero": False, "efi_note": "",
+    }
+    if dfi is None or getattr(dfi, "empty", True) or len(dfi) < 12:
         return empty
     d = dfi.copy()
-    p_arr = _price_level4(d)
-    # Delta Vol: signed futures volume this bar (close vs open)
-    if "volume" in d.columns:
-        sgn = np.sign(d["close"].astype(float) - (d["open"].astype(float) if "open" in d.columns else d["close"].astype(float).shift(1)))
-        delta_s = d["volume"].astype(float) * sgn.fillna(0.0)
-    elif "open" in d.columns:
-        delta_s = d["close"].astype(float) - d["open"].astype(float)
-    else:
-        delta_s = d["close"].astype(float).diff().fillna(0.0)
+    px = _series_num(d["spot_px"] if "spot_px" in d.columns else d["close"])
+    last = float(px.iloc[-1])
+    delta_s = _signed_delta(d)
+    efi = _series_num(d["efi13"]) if "efi13" in d.columns else pd.Series(dtype=float)
+    cvd = _series_num(d["cvd"]) if "cvd" in d.columns else pd.Series(dtype=float)
     d_arr = _level4(delta_s)
-    e_arr = _level4(d["efi13"]) if "efi13" in d.columns else "-"
-    c_arr = _level4(d["cvd"]) if "cvd" in d.columns else "-"
-    key = (p_arr, d_arr, e_arr, c_arr)
-    micro, action = MICRO_PDEC_PLAYBOOK.get(key, ("Unclassified tape", "NO ENTRY"))
-    efi_note = f"PDEC {p_arr} {d_arr} {e_arr} {c_arr} · 256-state book"
-    glyphs = " ".join(LEVEL_GLYPH[k] for k in key)
+    e_arr = _level4(efi) if len(efi) else "-"
+    c_arr = _level4(cvd) if len(cvd) else "-"
+    p_arr = _price_level4(d) if "close" in d.columns else "+"
+
+    reg = classify_market_regime(d, data)
+    vah, val, poc = reg.get("vah"), reg.get("val"), reg.get("poc")
+    std = float(_series_num(d["vwap_std"]).iloc[-1]) if "vwap_std" in d.columns else float(px.tail(20).std(ddof=1) or 0)
+    atr_abs = _atr_pct(d) * max(last, 1.0)
+    loc, loc_z = _loc_vs_value(last, vah, val, std, atr_abs)
+
+    efi_sl, efi_p = _ols_slope_p(efi.tail(12)) if len(efi) else (0.0, 1.0)
+    px_sl, px_p = _ols_slope_p(px.tail(12))
+    dv_tail = delta_s.tail(5)
+    dv_sum = float(dv_tail.sum()) if len(dv_tail) else 0.0
+    dv_abs = float(dv_tail.abs().sum()) if len(dv_tail) else 1.0
+    absorb_up = (px_sl > 0 and px_p < 0.12) and (dv_sum <= 0.15 * max(dv_abs, 1.0))
+    absorb_dn = (px_sl < 0 and px_p < 0.12) and (dv_sum >= -0.15 * max(dv_abs, 1.0))
+    efi_div_up = px_sl > 0 and efi_sl <= 0  # higher prices, EFI not expanding
+    efi_div_dn = px_sl < 0 and efi_sl >= 0
+    efi_exp_up = efi_sl > 0 and (float(efi.iloc[-1]) if len(efi) else 0) > 0
+    efi_exp_dn = efi_sl < 0 and (float(efi.iloc[-1]) if len(efi) else 0) < 0
+    persist_h = _persist_side(px, float(vah) if vah else last + 1e9, "above", 3) if vah else False
+    persist_l = _persist_side(px, float(val) if val else last - 1e9, "below", 3) if val else False
+    tight = _box_tight(d, 8, 0.90)
+    last_dv = float(delta_s.iloc[-1]) if len(delta_s) else 0.0
+    inside_now = loc == "INSIDE"
+
+    code = "CHOP"
+    if reg["regime"] == "RANGE":
+        if loc in ("ABOVE_VAH", "VAH_EDGE") and loc_z >= 0.35:
+            if absorb_up and efi_div_up:
+                code = "M1S_ENTRY"
+            elif absorb_up or efi_div_up:
+                code = "M1S_WATCH"
+            else:
+                code = "M1S_WATCH"
+        elif loc in ("BELOW_VAL", "VAL_EDGE") and loc_z >= 0.35:
+            if absorb_dn and efi_div_dn:
+                code = "M1L_ENTRY"
+            else:
+                code = "M1L_WATCH"
+        elif inside_now and vah and last < float(vah) and last_dv < 0 and px.iloc[-2] >= float(vah) * 0.999:
+            code = "M1S_ADD"
+        elif inside_now and val and last > float(val) and last_dv > 0 and px.iloc[-2] <= float(val) * 1.001:
+            code = "M1L_ADD"
+        else:
+            code = "INSIDE"
+    elif reg["regime"] == "TREND":
+        if loc == "ABOVE_VAH" and persist_h and loc_z >= 0.45:
+            if efi_exp_up and dv_sum > 0 and (tight or persist_h):
+                code = "M2L_ENTRY"
+            else:
+                code = "M2L_WATCH"
+        elif loc == "BELOW_VAL" and persist_l and loc_z >= 0.45:
+            if efi_exp_dn and dv_sum < 0 and (tight or persist_l):
+                code = "M2S_ENTRY"
+            else:
+                code = "M2S_WATCH"
+        elif vah and last >= float(vah) and last_dv >= 0 and tight:
+            code = "M2L_ADD"
+        elif val and last <= float(val) and last_dv <= 0 and tight:
+            code = "M2S_ADD"
+        elif loc == "ABOVE_VAH":
+            code = "M2L_WATCH"
+        elif loc == "BELOW_VAL":
+            code = "M2S_WATCH"
+        else:
+            code = "CHOP"
+    else:
+        # chop: only fire watch at statistically extreme location
+        if loc == "ABOVE_VAH" and loc_z >= 0.80 and absorb_up:
+            code = "M1S_WATCH"
+        elif loc == "BELOW_VAL" and loc_z >= 0.80 and absorb_dn:
+            code = "M1L_WATCH"
+        else:
+            code = "CHOP"
+
+    micro, action = VA_PLAYBOOK.get(code, VA_PLAYBOOK["CHOP"])
+    glyphs = " ".join(LEVEL_GLYPH.get(k, "→") for k in (p_arr, d_arr, e_arr, c_arr))
+    note = (
+        f"{reg['note']} · {loc} z={loc_z:+.2f} · ΔΣ5={dv_sum:.0f} · "
+        f"EFIsl={efi_sl:+.2f} p={efi_p:.2f} · Pxsl={px_sl:+.4f}"
+    )
     hover = (
-        f"P {LEVEL_GLYPH[p_arr]}  Δ {LEVEL_GLYPH[d_arr]}  "
-        f"EFI {LEVEL_GLYPH[e_arr]}  CVD {LEVEL_GLYPH[c_arr]}<br>"
-        f"<b>{action}</b><br>{micro}<br>{efi_note}"
+        f"{glyphs}<br><b>{action}</b><br>{micro}<br>{note}<br>"
+        f"VAH {vah} VAL {val} POC {poc}"
     )
     return {
-        "ok": True, "key": key, "arrows": glyphs, "micro": micro, "action": action,
+        "ok": True, "key": (p_arr, d_arr, e_arr, c_arr), "arrows": glyphs,
+        "micro": micro + " · " + note, "action": action,
         "price": p_arr, "delta": d_arr, "efi": e_arr, "cvd": c_arr, "obv": d_arr,
-        "hover": hover, "efi_zero": False, "efi_note": efi_note,
+        "hover": hover, "efi_zero": False, "efi_note": note,
+        "regime": reg["regime"], "model": code, "loc": loc, "loc_z": loc_z,
+        "vah": vah, "val": val, "poc": poc,
     }
 
 
-def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 12) -> list:
-    """Causal PDEC action at each bar using only data up to that bar."""
+def classify_microstructure(dfi: pd.DataFrame, data: dict = None) -> dict:
+    """Value-area models (range fade vs trend acceptance). Signature kept for call sites."""
+    rec = classify_va_setup(dfi, data if data is not None else st.session_state.get("data_store"))
+    return rec
+
+
+def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 16) -> list:
+    """Causal VA action. Incremental + last-60-bar window (full-day loop was the load stall)."""
     out = []
     if dfi is None or dfi.empty:
         return out
     n = len(dfi)
-    for i in range(n):
-        if i + 1 < min_bars:
-            continue
-        sl = dfi.iloc[: i + 1]
+    data = st.session_state.get("data_store") if "st" in dir() else None
+    sig = (
+        str(dfi["time"].iloc[-1]) if "time" in dfi.columns else n,
+        int(n),
+        float(dfi["close"].iloc[-1]),
+    )
+    prev_sig = st.session_state.get("_va_hist_sig")
+    prev_out = list(st.session_state.get("_va_hist") or [])
+    start = min_bars - 1
+    if prev_sig and prev_out and prev_sig[1] <= n and prev_sig[0] != sig[0]:
+        start = max(start, int(prev_out[-1]["i"]))
+        out = [r for r in prev_out if r["i"] < n]
+    elif prev_sig == sig and prev_out:
+        return prev_out
+    for i in range(start, n):
+        sl = dfi.iloc[max(0, i + 1 - 60): i + 1]
         try:
-            rec = classify_microstructure(sl)
+            rec = classify_va_setup(sl, data)
         except Exception:
             continue
         if not rec.get("ok"):
             continue
+        act = rec.get("action") or ""
         hi = sl["high"].iloc[-1] if "high" in sl.columns else sl["close"].iloc[-1]
         t = sl["time_str"].iloc[-1] if "time_str" in sl.columns else str(i)
         out.append({
-            "i": i, "t": t, "action": rec.get("action") or "",
+            "i": i, "t": t, "action": act,
             "key": rec.get("key"), "micro": rec.get("micro") or "",
             "glyphs": rec.get("arrows") or "",
             "y": float(hi) if pd.notna(hi) else None,
+            "model": rec.get("model"),
         })
+    st.session_state["_va_hist"] = out
+    st.session_state["_va_hist_sig"] = sig
     return out
 
 
 def classify_flow_playbook(dfi: pd.DataFrame, data: dict) -> dict:
-    empty = {"ok": False, "action": "", "micro": "", "hover": ""}
-    if dfi is None or dfi.empty:
-        return empty
-    p = _robust_arrow(dfi["close"].astype(float), z_th=0.95)
-    if "vwap" in dfi.columns:
-        last_px = float(dfi["close"].iloc[-1]); last_vw = float(dfi["vwap"].iloc[-1])
-        if p == "u" and last_px <= last_vw: p = "f"
-        if p == "d" and last_px >= last_vw: p = "f"
-    c = _robust_arrow(dfi["cvd"], z_th=0.85) if "cvd" in dfi.columns else "f"
-    tape = list(st.session_state.get("flow_tape") or [])
-    if len(tape) >= 6:
-        dex = pd.Series([t.get("dex", 0) for t in tape], dtype=float)
-        pc = pd.Series([t.get("prem_c", 0) for t in tape], dtype=float)
-        pp = pd.Series([t.get("prem_p", 0) for t in tape], dtype=float)
-        d_arr = _robust_arrow(dex, z_th=0.80)
-        net_p = pc - pp
-        prem_arr = _robust_arrow(net_p, z_th=0.80)
-    else:
-        d_arr = prem_arr = "f"
-    key = (p, c, d_arr, prem_arr)
-    micro, action = FLOW_PLAYBOOK.get(key, ("Unclassified flow", "NO ENTRY"))
-    hover = (
-        f"P{ARROW_GLYPH[p]} C{ARROW_GLYPH[c]} DEX{ARROW_GLYPH[d_arr]} Prem{ARROW_GLYPH[prem_arr]}<br>"
-        f"<b>{action}</b><br>{micro}<br>"
-        "DEX/premium arrows need ≥6 live tape snaps. Missing snaps stay →."
-    )
-    return {"ok": True, "action": action, "micro": micro, "hover": hover,
-            "price": p, "cvd": c, "dex": d_arr, "prem": prem_arr}
-
-
-
+    """Compat shim — flow-18 book removed. Surface the VA model as flow chip."""
+    rec = classify_va_setup(dfi, data)
+    if not rec.get("ok"):
+        return {"ok": False, "action": "", "micro": "", "hover": ""}
+    return {
+        "ok": True, "action": rec.get("action") or "NO ENTRY",
+        "micro": rec.get("micro") or "", "hover": rec.get("hover") or "",
+        "price": "f", "cvd": "f", "dex": "f", "prem": "f",
+    }
 
 
 def detect_candle_pattern(df: pd.DataFrame) -> dict:
-    """Last 1–2 bars vs short trend. Playbook patterns only. No lookahead."""
-    empty = {"ok": False, "name": "—", "bias": 0, "conf": "Low", "note": ""}
-    if df is None or len(df) < 3:
-        return empty
-    d = df.tail(8).copy()
-    for col in ("open", "high", "low", "close"):
-        if col not in d.columns:
-            return empty
-        d[col] = pd.to_numeric(d[col], errors="coerce")
-    o, h, l, cl = d["open"], d["high"], d["low"], d["close"]
-    body = (cl - o).abs()
-    rng = (h - l).replace(0, np.nan)
-    upper = h - np.maximum(cl, o)
-    lower = np.minimum(cl, o) - l
-    i, j = len(d) - 1, len(d) - 2
-    # short trend: last 5 closes vs prior 5
-    c5 = float(cl.iloc[-5:].mean()) if len(d) >= 5 else float(cl.iloc[-1])
-    p5 = float(cl.iloc[-10:-5].mean()) if len(d) >= 10 else float(cl.iloc[0])
-    uptrend = c5 > p5
-    downtrend = c5 < p5
-    b, r, u, lo = float(body.iloc[i]), float(rng.iloc[i] or 1e-9), float(upper.iloc[i]), float(lower.iloc[i])
-    bull = float(cl.iloc[i]) >= float(o.iloc[i])
-    small = b <= 0.25 * r
-    doji = b <= 0.08 * r
-    name, bias, conf, note = "None", 0, "Low", "No textbook print"
-    if doji:
-        name, bias, conf, note = "Doji", 0, "Moderate", "Indecision — wait next bar"
-    elif b >= 0.85 * r and u <= 0.08 * r and lo <= 0.08 * r:
-        name = "Bull Marubozu" if bull else "Bear Marubozu"
-        bias = 1 if bull else -1
-        conf, note = "High", "One-sided bar — continuation unless at exhaustion wick cluster"
-    elif lo >= 2.0 * max(b, 1e-9) and u <= 0.35 * b and small:
-        if downtrend:
-            name, bias, conf, note = "Hammer", 1, "Moderate-High", "Sell wick taken back at lows"
-        elif uptrend:
-            name, bias, conf, note = "Hanging Man", -1, "Low-Moderate", "Needs next red bar"
-        else:
-            name, bias, conf, note = "Hammer-like", 1, "Low", "Wick without clear downtrend"
-    elif u >= 2.0 * max(b, 1e-9) and lo <= 0.35 * max(b, 1e-9) and small:
-        if uptrend:
-            name, bias, conf, note = "Shooting Star", -1, "High", "Rally rejected at highs"
-        elif downtrend:
-            name, bias, conf, note = "Inverted Hammer", 1, "Moderate", "Needs next green bar"
-        else:
-            name, bias, conf, note = "Upper-wick reject", -1, "Moderate", "Offer defense"
-    # two-bar
-    if j >= 0:
-        o0, c0 = float(o.iloc[j]), float(cl.iloc[j])
-        o1, c1 = float(o.iloc[i]), float(cl.iloc[i])
-        h0, l0 = float(h.iloc[j]), float(l.iloc[j])
-        h1, l1 = float(h.iloc[i]), float(l.iloc[i])
-        b0, b1 = abs(c0 - o0), abs(c1 - o1)
-        bull0, bull1 = c0 >= o0, c1 >= o1
-        if (not bull0) and bull1 and c1 >= max(o0, c0) and o1 <= min(o0, c0):
-            name, bias, conf, note = "Bullish Engulfing", 1, "High", "Buyers wipe prior red body"
-        elif bull0 and (not bull1) and c1 <= min(o0, c0) and o1 >= max(o0, c0):
-            name, bias, conf, note = "Bearish Engulfing", -1, "High", "Sellers wipe prior green body"
-        elif (not bull0) and bull1 and o1 < l0 and c1 >= o0 - 0.5 * b0 and c1 < o0:
-            name, bias, conf, note = "Piercing Line", 1, "Moderate-High", "Close back through 50% of prior red"
-        elif bull0 and (not bull1) and o1 > h0 and c1 <= o0 + 0.5 * b0 and c1 > o0:
-            name, bias, conf, note = "Dark Cloud Cover", -1, "Moderate-High", "Close back through 50% of prior green"
-        elif (not bull0) and bull1 and b1 < b0 and min(o1, c1) >= min(o0, c0) and max(o1, c1) <= max(o0, c0):
-            name, bias, conf, note = "Bullish Harami", 1, "Moderate", "Down-move stall inside prior body"
-        elif abs(l1 - l0) <= 0.15 * max(h1 - l1, h0 - l0, 1e-9) and downtrend:
-            name, bias, conf, note = "Tweezer Bottom", 1, "Moderate-High", "Same low tested twice"
-    return {"ok": True, "name": name, "bias": bias, "conf": conf, "note": note, "uptrend": uptrend, "downtrend": downtrend}
+    """Candle book removed — kept as inert stub for leftover call sites."""
+    return {"ok": False, "name": "—", "bias": 0, "conf": "Low", "note": "candle book removed"}
 
 
 def confirm_pdec_with_candle(action: str, pat: dict) -> tuple:
-    """Do not rewrite the 256 book. Only veto/downgrade directional fires that fight the last print."""
-    act = action or "NO ENTRY"
-    if not pat or not pat.get("ok"):
-        return act, "no pattern"
-    name, bias, conf = pat.get("name") or "—", int(pat.get("bias") or 0), pat.get("conf") or ""
-    au = act.upper()
-    longish = any(s in au for s in ("LONG", "HOLD LONG", "PREPARE LONG", "CAUTIOUS LONG"))
-    shortish = any(s in au for s in ("SHORT", "HOLD SHORT", "PREPARE SHORT", "CAUTIOUS SHORT"))
-    high = "High" in conf
-    if longish and bias < 0 and high:
-        return "NO ENTRY", f"PDEC long vetoed by {name}"
-    if shortish and bias > 0 and high:
-        return "NO ENTRY", f"PDEC short vetoed by {name}"
-    if longish and bias < 0:
-        return "CAUTIOUS LONG", f"{name} against long book"
-    if shortish and bias > 0:
-        return "CAUTIOUS SHORT", f"{name} against short book"
-    if "ENTRY" in au and bias == 0 and name == "Doji":
-        return "NO ENTRY", "Doji — wait next close"
-    return act, f"{name} ({conf})"
+    return action or "NO ENTRY", "VA model (no candle gate)"
 
 
 def _telegram_creds():
@@ -1284,9 +1127,10 @@ def send_telegram_alert(text: str) -> bool:
         return False
 
 
-def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st):
+def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st, index_name=None):
     """Edge-triggered alerts. No token in logs. Skip when market closed."""
-    live, _, _, _ = market_session_state()
+    idx = index_name or st.session_state.get("_last_index") or "INDEX"
+    live, _, _, _ = market_session_state(index_name=idx)
     if not live:
         return
     tok, chat = _telegram_creds()
@@ -1348,7 +1192,7 @@ def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st):
 
     if pcd and pcd != prev.get("pcd"):
         interesting = any(w in pcd.upper() for w in ("PREPARE", "ENTER", "LONG", "SHORT"))
-        if interesting and "NO ENTRY" not in pcd.upper() and not cooled("pcd"):
+        if False and interesting and "NO ENTRY" not in pcd.upper() and not cooled("pcd"):
             events.append(f"PCD$  {prev.get('pcd') or '—'} → {pcd}")
         prev["pcd"] = pcd
 
@@ -2091,24 +1935,78 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
     return ""
 
 # --- HOLIDAY / WEEKEND FALLBACK ENGINE FOR CANDLE CHARTS ---
-def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX"):
+
+def _tape_gap_window(cached, now_dt, index_name, api_interval):
+    """If cache exists, pull from last bar (minus 1 TF) to now. Full session if empty."""
+    sh = session_hours(index_name)
+    step = 3
+    lab = str(api_interval or "")
+    if "FIFTEEN" in lab or "15" in lab:
+        step = 15
+    elif "TEN" in lab:
+        step = 10
+    elif "FIVE" in lab or lab.endswith("5"):
+        step = 5
+    elif "THREE" in lab:
+        step = 3
+    elif "ONE" in lab and "HOUR" not in lab:
+        step = 1
+    elif "TWO" in lab:
+        step = 2
+    open_s = f"{now_dt.strftime('%Y-%m-%d')} {sh[4]}"
+    if cached is None or getattr(cached, "empty", True) or "time" not in getattr(cached, "columns", []):
+        return open_s, now_dt.strftime(f"%Y-%m-%d %H:%M"), True
+    last = pd.to_datetime(cached["time"], errors="coerce").max()
+    if pd.isna(last):
+        return open_s, now_dt.strftime(f"%Y-%m-%d %H:%M"), True
+    if last.tzinfo is None:
+        last = pytz.timezone("Asia/Kolkata").localize(last)
+    last = last.astimezone(pytz.timezone("Asia/Kolkata"))
+    # Never ask SmartAPI for a window that crosses midnight — it returns nothing
+    if last.date() != now_dt.date():
+        return open_s, now_dt.strftime("%Y-%m-%d %H:%M"), True
+    start = last - datetime.timedelta(minutes=max(step, 1))
+    open_dt = datetime.datetime.strptime(open_s, "%Y-%m-%d %H:%M")
+    open_dt = pytz.timezone("Asia/Kolkata").localize(open_dt)
+    if start < open_dt:
+        start = open_dt
+    return start.strftime("%Y-%m-%d %H:%M"), now_dt.strftime("%Y-%m-%d %H:%M"), False
+
+
+def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX", tail_minutes=None):
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
-    live, today, _, _ = market_session_state(now_dt)
+    live, today, _, _ = market_session_state(now_dt, index_name)
     cached = load_session_cache("spot", index_name, api_interval, today)
-    offsets = [0] if live else list(range(0, 10))
+    offsets = [0] if live else list(range(0, 16))
     for offset in offsets:
         target_to = now_dt - datetime.timedelta(days=offset)
+        if target_to.weekday() >= 5:
+            continue
         if live and target_to.date() != today:
             continue
-        target_from = target_to if int(lookback_days or 0) <= 0 else target_to - datetime.timedelta(days=lookback_days)
-        candle_param = {
-            "exchange": exchange,
-            "symboltoken": spot_token,
-            "interval": api_interval,
-            "fromdate": target_from.strftime(f"%Y-%m-%d {session_hours()[4]}"),
-            "todate": target_to.strftime(f"%Y-%m-%d {session_hours()[5]}")
-        }
+        sh = session_hours(index_name)
+        days_back = 0 if live else max(int(lookback_days or 0), 0)
+        target_from = target_to if days_back <= 0 else target_to - datetime.timedelta(days=days_back)
+        from_clock = sh[4]
+        to_clock = sh[5]
+        if live:
+            fd, td, _full = _tape_gap_window(cached, now_dt, index_name, api_interval)
+            candle_param = {
+                "exchange": exchange,
+                "symboltoken": spot_token,
+                "interval": api_interval,
+                "fromdate": fd,
+                "todate": td,
+            }
+        else:
+            candle_param = {
+                "exchange": exchange,
+                "symboltoken": spot_token,
+                "interval": api_interval,
+                "fromdate": target_from.strftime(f"%Y-%m-%d {from_clock}"),
+                "todate": target_to.strftime(f"%Y-%m-%d {to_clock}")
+            }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
         time.sleep(0.20)
         if candle_res and candle_res.get("status") and candle_res.get("data"):
@@ -2554,6 +2452,201 @@ def scan_cvd_div_events(df: pd.DataFrame, window: int = 20) -> list:
 
 
 
+
+
+def detect_fp_absorptions(o, h, l, cl, vol, z, mids, min_bars=20):
+    """Causal proxy bid/offer absorption. z is signed bin volume [price x bar]."""
+    n = len(cl)
+    out = []
+    if n < min_bars + 2 or z.size == 0:
+        return out
+    absz = np.abs(z)
+    # typical |bin| from history up to j-1
+    for j in range(min_bars, n):
+        rng = float(h[j] - l[j])
+        if rng <= 0:
+            continue
+        loc = (float(cl[j]) - float(l[j])) / rng
+        prev_l = l[j - min_bars:j]
+        prev_h = h[j - min_bars:j]
+        mu_l, sd_l = float(np.mean(prev_l)), float(np.std(prev_l, ddof=0) or 1.0)
+        mu_h, sd_h = float(np.mean(prev_h)), float(np.std(prev_h, ddof=0) or 1.0)
+        z_sweep_dn = (mu_l - float(l[j])) / sd_l
+        z_sweep_up = (float(h[j]) - mu_h) / sd_h
+        past = absz[:, :j]
+        typ = float(np.nanmean(past[past > 0])) if np.any(past > 0) else 1.0
+        sig = float(np.nanstd(past[past > 0], ddof=0) or typ or 1.0)
+        lo_cut = float(l[j]) + 0.33 * rng
+        hi_cut = float(h[j]) - 0.33 * rng
+        sell_low = 0.0
+        buy_high = 0.0
+        for i, m in enumerate(mids):
+            if m <= lo_cut and z[i, j] < 0:
+                sell_low += -z[i, j]
+            if m >= hi_cut and z[i, j] > 0:
+                buy_high += z[i, j]
+        z_sell = (sell_low - typ) / sig
+        z_buy = (buy_high - typ) / sig
+        # Setup 1 bid absorption — stricter so mid-range wicks do not print
+        if z_sweep_dn >= 1.35 and loc >= 0.68 and z_sell >= 1.15 and cl[j] >= o[j]:
+            out.append({
+                "j": j, "kind": "BID ABS", "side": 1,
+                "stop": float(l[j]) - 2.0,
+                "note": f"sweep z={z_sweep_dn:.2f} shelf z={z_sell:.2f} close {loc:.0%} range",
+            })
+        # Setup 2 offer absorption
+        if z_sweep_up >= 1.35 and loc <= 0.32 and z_buy >= 1.15 and cl[j] < o[j]:
+            out.append({
+                "j": j, "kind": "OFFER ABS", "side": -1,
+                "stop": float(h[j]) + 2.0,
+                "note": f"sweep z={z_sweep_up:.2f} shelf z={z_buy:.2f} close {loc:.0%} range",
+            })
+    # one mark per side per 8 bars
+    keep, last = [], {-1: -99, 1: -99}
+    for e in out:
+        s = e["side"]
+        if e["j"] - last[s] < 5:
+            continue
+        keep.append(e)
+        last[s] = e["j"]
+    return keep
+
+
+def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0):
+    """Bar-range footprint proxy: volume split by close location in the bar. Not exchange bid/ask VAP."""
+    if dfi is None or dfi.empty or "volume" not in dfi.columns:
+        return None, []
+    d = dfi.copy()
+    if "time_str" not in d.columns:
+        d["time"] = pd.to_datetime(d["time"])
+        d["time_str"] = d["time"].dt.strftime("%H:%M")
+    xs = list(d["time_str"].astype(str))
+    o = d["open"].astype(float).values
+    h = d["high"].astype(float).values
+    l = d["low"].astype(float).values
+    cl = d["close"].astype(float).values
+    vol = d["volume"].astype(float).values
+    y0, y1 = float(np.nanmin(l)), float(np.nanmax(h))
+    span_px = max(y1 - y0, 1.0)
+    step = max(float(bin_pts or 2.0), span_px / 48.0)
+    edges = np.arange(np.floor(y0 / step) * step, np.ceil(y1 / step) * step + step, step)
+    if len(edges) < 3:
+        return None, []
+    mids = (edges[:-1] + edges[1:]) / 2.0
+    z = np.zeros((len(mids), len(xs)))
+    bar_dlt = []
+    for j in range(len(xs)):
+        v = float(vol[j] or 0)
+        signed = v if cl[j] >= o[j] else -v
+        bar_dlt.append(signed)
+        lo, hi = float(l[j]), float(h[j])
+        if hi <= lo:
+            hi = lo + step
+        span = hi - lo
+        buy_v = v * max(0.0, (cl[j] - lo) / span)
+        sell_v = v * max(0.0, (hi - cl[j]) / span)
+        for i, m in enumerate(mids):
+            a, b = edges[i], edges[i + 1]
+            ov = max(0.0, min(hi, b) - max(lo, a))
+            if ov <= 0:
+                continue
+            frac = ov / span
+            # lower half of bar -> sell, upper half -> buy (close location weights)
+            mid_bar = (lo + hi) / 2.0
+            if m >= mid_bar:
+                z[i, j] += buy_v * frac
+            else:
+                z[i, j] -= sell_v * frac
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.78, 0.22],
+                        vertical_spacing=0.03)
+    fig.add_trace(plt_go.Heatmap(
+        x=xs, y=mids, z=z, colorscale=[
+            [0.00, "#FF1744"],
+            [0.35, "#7F1D1D"],
+            [0.48, "#16181D"],
+            [0.52, "#16181D"],
+            [0.65, "#14532D"],
+            [1.00, "#00E676"],
+        ],
+        zmid=0, colorbar=dict(thickness=10, len=0.6, y=0.72),
+        opacity=0.95,
+        hovertemplate="%{x} · %{y:.0f}<br>Δvol %{z:.0f}<extra>footprint</extra>",
+    ), row=1, col=1)
+    fig.add_trace(plt_go.Candlestick(
+        x=xs, open=o, high=h, low=l, close=cl, name="Idx",
+        increasing_line_color="#B2FF59", decreasing_line_color="#FF8A80",
+        increasing_fillcolor="rgba(0,0,0,0)", decreasing_fillcolor="rgba(0,0,0,0)",
+        line=dict(width=1.6),
+        showlegend=False,
+    ), row=1, col=1)
+    # delta labels on sparse bars only
+    step_l = max(1, len(xs) // 24)
+    tx, ty, tt, tc = [], [], [], []
+    peak = y1 + (y1 - y0) * 0.04
+    for j in range(0, len(xs), step_l):
+        dv = bar_dlt[j]
+        if abs(dv) < 1:
+            continue
+        lab = f"Δ{dv/1000:+.1f}K" if abs(dv) >= 1000 else f"Δ{dv:+.0f}"
+        tx.append(xs[j]); ty.append(peak); tt.append(lab)
+        tc.append("#00E676" if dv >= 0 else "#FF5252")
+    if tx:
+        fig.add_trace(plt_go.Scatter(
+            x=tx, y=ty, mode="text", text=tt,
+            textfont=dict(size=9, color="#B0BEC5"),
+            showlegend=False, hoverinfo="skip",
+        ), row=1, col=1)
+    evs = detect_fp_absorptions(o, h, l, cl, vol, z, mids)
+    st.session_state["_fp_abs_evs"] = evs
+    if evs:
+        bx = [xs[e["j"]] for e in evs if e["side"] > 0]
+        by = [h[e["j"]] for e in evs if e["side"] > 0]
+        bt = [e["kind"] for e in evs if e["side"] > 0]
+        sx = [xs[e["j"]] for e in evs if e["side"] < 0]
+        sy = [l[e["j"]] for e in evs if e["side"] < 0]
+        stt = [e["kind"] for e in evs if e["side"] < 0]
+        if bx:
+            fig.add_trace(plt_go.Scatter(
+                x=bx, y=by, mode="markers+text", name="Bid abs",
+                text=bt, textposition="top center",
+                marker=dict(size=11, symbol="triangle-up", color="#00E676",
+                            line=dict(width=1, color="#FFF")),
+                hovertext=[e["note"] + f"  SL {e['stop']:.1f}" for e in evs if e["side"] > 0],
+                hoverinfo="text",
+            ), row=1, col=1)
+        if sx:
+            fig.add_trace(plt_go.Scatter(
+                x=sx, y=sy, mode="markers+text", name="Offer abs",
+                text=stt, textposition="bottom center",
+                marker=dict(size=11, symbol="triangle-down", color="#FF5252",
+                            line=dict(width=1, color="#FFF")),
+                hovertext=[e["note"] + f"  SL {e['stop']:.1f}" for e in evs if e["side"] < 0],
+                hoverinfo="text",
+            ), row=1, col=1)
+    fig.add_trace(plt_go.Bar(
+        x=xs, y=bar_dlt,
+        marker_color=["#00E676" if v >= 0 else "#FF5252" for v in bar_dlt],
+        showlegend=False, name="Bar Δ",
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=1)
+    # Use this tape's bars only — session categoryarray leaves a blank left pad on MCX
+    times = xs
+    xr = [-0.5, max(len(times) - 0.5, 0.5)]
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+        height=640, margin=dict(l=40, r=8, t=8, b=18),
+        xaxis_rangeslider_visible=False, hovermode="x unified",
+    )
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=times,
+                     range=xr, showticklabels=False, row=1, col=1)
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=times,
+                     range=xr, nticks=8, row=2, col=1)
+    fig.update_yaxes(title_text="Px", row=1, col=1)
+    fig.update_yaxes(title_text="Δ", row=2, col=1)
+    return fig, evs
+
+
 def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", axis_times=None):
     if df_opt is None or df_opt.empty or len(df_opt) < 3:
         return None, "NO DATA"
@@ -2629,18 +2722,30 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
     fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["vwap"], name="VWAP",
                                 line=dict(color="#FF9800", width=1.6)), row=1, col=2)
     day_hi, day_lo = float(d["high"].max()), float(d["low"].min())
-    for pxv, name, colr in (
-        (day_hi, "Day H", "#FF8A80"),
-        (day_lo, "Day L", "#69F0AE"),
-        (vp.get("vah") if vp.get("ok") else None, "VAH", "#F48FB1"),
-        (vp.get("val") if vp.get("ok") else None, "VAL", "#F48FB1"),
-    ):
-        if pxv is None:
+    opt_lvls = [
+        {"price": day_hi, "name": "Day H", "color": "#FF8A80", "width": 1.1, "dash": "dot"},
+        {"price": day_lo, "name": "Day L", "color": "#69F0AE", "width": 1.1, "dash": "dot"},
+    ]
+    if vp.get("ok"):
+        opt_lvls.extend(vp_chart_levels(vp))
+    last_y = None
+    for lv in opt_lvls:
+        if lv.get("price") is None:
             continue
-        fig.add_hline(y=float(pxv), line_dash="dot", line_color=colr, line_width=1.1, row=1, col=2)
+        yv = float(lv["price"])
+        fig.add_hline(
+            y=yv, line_dash=lv.get("dash", "dot"), line_color=lv["color"],
+            line_width=lv.get("width", 1.1), row=1, col=2,
+        )
+        y_txt = yv
+        if last_y is not None and abs(y_txt - last_y) < 2.0:
+            y_txt = last_y + 2.0
+        last_y = y_txt
         fig.add_annotation(
-            x=d["time_str"].iloc[-1], y=float(pxv), text=name, showarrow=False,
-            xanchor="right", font=dict(size=9, color=colr), row=1, col=2,
+            x=d["time_str"].iloc[-1], y=y_txt,
+            text=f"{lv['name']} {yv:.0f}",
+            showarrow=False, xanchor="right",
+            font=dict(size=8, color=lv["color"]), row=1, col=2,
         )
     if st.session_state.get("pdec_labels_on"):
         try:
@@ -2758,10 +2863,12 @@ def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bool = True) -> tuple:
+def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bool = True,
+                          force_date=None) -> tuple:
     """Return (session_df, session_date, used_prior_session).
     During live hours prefer TODAY even with 1–2 bars (Mon 09:16 problem).
     min_bars only applies when falling back to a completed prior session.
+    force_date: pin to that calendar date when present in the frame.
     """
     empty = (pd.DataFrame(), None, True)
     if df is None or df.empty or "time" not in df.columns:
@@ -2781,6 +2888,17 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
     chosen = None
     used_prior = True
     live_now, _, _, _ = market_session_state()
+    if force_date is not None:
+        try:
+            fd = force_date if hasattr(force_date, "year") else pd.to_datetime(force_date).date()
+        except Exception:
+            fd = None
+        if fd is not None and fd in counts.index:
+            sess = out[out["session_date"] == fd].copy().reset_index(drop=True)
+            sess["time_str"] = sess["time"].dt.strftime("%H:%M")
+            return sess, fd, fd != today
+        if fd is not None:
+            return pd.DataFrame(), fd, True
     if prefer_today and today in counts.index and today.weekday() < 5 and int(counts.loc[today]) >= 1:
         chosen = today
         used_prior = False
@@ -2789,7 +2907,13 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
         chosen = today if today in counts.index else None
         used_prior = chosen is None
         if chosen is None:
-            return empty
+            # Live but today's bars not in frame yet — keep prior session visible
+            weekdays = [(d, n) for d, n in counts.items() if d.weekday() < 5]
+            if weekdays:
+                chosen = max(weekdays, key=lambda x: x[0])[0]
+                used_prior = True
+            else:
+                return empty
     else:
         for d, n in list(counts.items())[::-1]:
             if d.weekday() >= 5:
@@ -2809,6 +2933,38 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
     sess = out[out["session_date"] == chosen].copy().reset_index(drop=True)
     sess["time_str"] = sess["time"].dt.strftime("%H:%M")
     return sess, chosen, used_prior
+
+
+def fetch_one_session_ohlcv(smart_api, token, exchange, api_interval, day, index_name="IDX"):
+    """Single NSE/FO session of candles for replay. Returns raw OHLCV or empty."""
+    empty = pd.DataFrame()
+    if not smart_api or not token or day is None:
+        return empty
+    try:
+        day = day if hasattr(day, "year") else pd.to_datetime(day).date()
+    except Exception:
+        return empty
+    _, _, _, _, from_hm, to_hm = session_hours(index_name)
+    param = {
+        "exchange": exchange,
+        "symboltoken": str(token),
+        "interval": api_interval,
+        "fromdate": f"{day.strftime('%Y-%m-%d')} {from_hm}",
+        "todate": f"{day.strftime('%Y-%m-%d')} {to_hm}",
+    }
+    res = safe_api_call(smart_api.getCandleData, param)
+    time.sleep(0.20)
+    if not (res and res.get("status") and res.get("data")):
+        return empty
+    df = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+    df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+    df["time"] = series_to_ist(df["time"])
+    df["session_date"] = df["time"].dt.date
+    df = df[df["session_date"] == day].copy()
+    if df.empty:
+        return empty
+    df["time_str"] = df["time"].dt.strftime("%H:%M")
+    return df.reset_index(drop=True)
 
 
 def fetch_india_vix_sessions(smart_api, lookback_days=10):
@@ -2848,7 +3004,7 @@ def fetch_india_vix_sessions(smart_api, lookback_days=10):
     return df, pct, last_d
 
 
-def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15):
+def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_interval, lookback_days=15, tail_minutes=None):
     """
     Fetch near-month futures candles + real VWAP.
     Outside market hours → falls back to the most recent trading session and flags it.
@@ -2877,13 +3033,25 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
         if target_to.weekday() >= 5:
             continue
         target_from = target_to if int(lookback_days or 0) <= 0 else target_to - datetime.timedelta(days=lookback_days)
-        candle_param = {
-            "exchange": fut_exch,
-            "symboltoken": str(fut_token),
-            "interval": api_interval,
-            "fromdate": target_from.strftime(f"%Y-%m-%d {session_hours(index_name)[4]}"),
-            "todate": target_to.strftime(f"%Y-%m-%d {session_hours(index_name)[5]}")
-        }
+        sh = session_hours(index_name)
+        from_clock, to_clock = sh[4], sh[5]
+        if not currently_closed:
+            fd, td, _full = _tape_gap_window(cached, now_dt, index_name, api_interval)
+            candle_param = {
+                "exchange": fut_exch,
+                "symboltoken": str(fut_token),
+                "interval": api_interval,
+                "fromdate": fd,
+                "todate": td,
+            }
+        else:
+            candle_param = {
+                "exchange": fut_exch,
+                "symboltoken": str(fut_token),
+                "interval": api_interval,
+                "fromdate": target_from.strftime(f"%Y-%m-%d {from_clock}"),
+                "todate": target_to.strftime(f"%Y-%m-%d {to_clock}")
+            }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
         time.sleep(0.20)
         if not (candle_res and candle_res.get("status") and candle_res.get("data")):
@@ -3266,10 +3434,8 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
             spot_price = float(spot_resp["data"]["ltp"])
         elif Index_Name == "SENSEX":
             spot_price = 80000.0
-        elif Index_Name in MCX_NAME_ALIASES:
-            spot_price = 0.0
         else:
-            spot_price = 24500.0
+            spot_price = 0.0
 
         hv_key = f"hv_{Index_Name}_{hv_days}"
         hv_ts = st.session_state.get("_hv_ts") or 0
@@ -3293,6 +3459,11 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         df_futures, fut_is_fallback, basis_info, fut_fallback_msg = fetch_futures_candles_with_vwap(
             smart_api, Index_Name, df_master, api_interval, lookback_days
         )
+        if (not spot_price) or float(spot_price) <= 0:
+            for src in (df_futures, df_candles):
+                if src is not None and not getattr(src, "empty", True) and "close" in src.columns:
+                    spot_price = float(src["close"].iloc[-1])
+                    break
 
         now_dt = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
         expiry_datetime = target_expiry_dt.replace(hour=15, minute=30, second=0).tz_localize("Asia/Kolkata")
@@ -4594,6 +4765,20 @@ def render_futures_cvd_chart(data: dict):
 
 
 
+def _remember_book5(snap: dict):
+    if not snap or not snap.get("ok"):
+        return
+    hist = st.session_state.get("book5_hist") or []
+    now = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
+    hist.append({
+        "t": now,
+        "ltp": snap.get("ltp"),
+        "bids": snap.get("bids5") or [],
+        "asks": snap.get("asks5") or [],
+    })
+    st.session_state["book5_hist"] = hist[-480:]
+
+
 def fetch_futures_book_snapshot(smart_api, index_name: str, fut_token: str) -> dict:
     """One FULL snapshot of near-month futures book. SmartAPI fields vary by version."""
     empty = {"bid_qty": 0.0, "ask_qty": 0.0, "bid_qty_lots": 0.0, "ask_qty_lots": 0.0,
@@ -4642,11 +4827,22 @@ def fetch_futures_book_snapshot(smart_api, index_name: str, fut_token: str) -> d
         traded_vol = float(
             item.get("tradeVolume") or item.get("volume") or item.get("vol") or 0
         )
+        def _lvls(levels, n=5):
+            out = []
+            for lv in (levels or [])[:n]:
+                px = float(lv.get("price", lv.get("pr", 0)) or 0)
+                qty = float(lv.get("quantity", lv.get("qty", 0)) or 0)
+                if px > 0:
+                    out.append({"px": px, "qty": qty})
+            return out
+        bids5 = _lvls(buy_lvls, 5)
+        asks5 = _lvls(sell_lvls, 5)
         return {
             "bid_qty": bid_qty, "ask_qty": ask_qty,
             "bid_qty_lots": bid_lots, "ask_qty_lots": ask_lots,
             "best_bid": best_bid, "best_ask": best_ask,
             "ltp": ltp, "traded_vol": traded_vol,
+            "bids5": bids5, "asks5": asks5,
             "ok": (bid_qty > 0 or ask_qty > 0 or ltp > 0),
         }
     except Exception:
@@ -4846,19 +5042,96 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prom
     wmean = float(np.sum(mids * vol_at) / tot)
     wstd = float(np.sqrt(max(np.sum(vol_at * (mids - wmean) ** 2) / tot, 0.0)))
     hvn, lvn = _prominence_nodes(vol_at, mids, prominence_factor=prominence_factor)
-    # 70% value area expanding from POC
-    target = 0.70 * tot
-    lo_i = hi_i = poc_i
-    acc = float(vol_at[poc_i])
-    while acc < target and (lo_i > 0 or hi_i < n_bins - 1):
-        left = vol_at[lo_i - 1] if lo_i > 0 else -1
-        right = vol_at[hi_i + 1] if hi_i < n_bins - 1 else -1
-        if right >= left:
-            hi_i += 1
-            acc += float(vol_at[hi_i])
-        else:
-            lo_i -= 1
-            acc += float(vol_at[lo_i])
+
+    def _expand(seed_i, frac, mask=None):
+        w = vol_at * mask if mask is not None else vol_at
+        t = float(w.sum())
+        if t <= 0:
+            return None
+        tgt = frac * t
+        lo_i = hi_i = int(np.clip(seed_i, 0, n_bins - 1))
+        acc = float(w[lo_i])
+        guard = 0
+        while acc < tgt and guard < n_bins + 2:
+            guard += 1
+            left = float(w[lo_i - 1]) if lo_i > 0 else -1.0
+            right = float(w[hi_i + 1]) if hi_i < n_bins - 1 else -1.0
+            if right < 0 and left < 0:
+                break
+            if right >= left:
+                hi_i = min(hi_i + 1, n_bins - 1)
+                acc += float(w[hi_i])
+            else:
+                lo_i = max(lo_i - 1, 0)
+                acc += float(w[lo_i])
+        return {
+            "vah": float(mids[hi_i]),
+            "val": float(mids[lo_i]),
+            "poc": float(mids[int(np.clip(seed_i, 0, n_bins - 1))]),
+            "frac": frac,
+        }
+
+    va70 = _expand(poc_i, 0.70)
+    va80 = _expand(poc_i, 0.80)
+    vas = []
+    if va70:
+        vas.append({**va70, "tag": "VA70", "primary": True})
+    if va80:
+        vas.append({**va80, "tag": "VA80", "primary": False})
+
+    # Local value areas around secondary HVNs (basins split by LVNs / midpoints)
+    hvn_idx = []
+    for px in hvn:
+        j = int(np.argmin(np.abs(mids - float(px))))
+        if j not in hvn_idx:
+            hvn_idx.append(j)
+    hvn_idx = sorted(hvn_idx)
+    lvn_idx = sorted({int(np.argmin(np.abs(mids - float(px)))) for px in (lvn or [])})
+    poc_vol = float(vol_at[poc_i]) or 1.0
+    node_n = 1
+    for hi in hvn_idx:
+        if abs(hi - poc_i) < max(3, int(8 / max(bin_step, 1.0))):
+            continue
+        if float(vol_at[hi]) < 0.38 * poc_vol:
+            continue
+        left_cut = 0
+        right_cut = n_bins - 1
+        lefts = [x for x in lvn_idx if x < hi]
+        rights = [x for x in lvn_idx if x > hi]
+        others = [x for x in hvn_idx if x != hi]
+        if lefts:
+            left_cut = max(left_cut, lefts[-1])
+        elif others:
+            lo_o = [x for x in others if x < hi]
+            if lo_o:
+                left_cut = max(left_cut, (lo_o[-1] + hi) // 2)
+        if rights:
+            right_cut = min(right_cut, rights[0])
+        elif others:
+            hi_o = [x for x in others if x > hi]
+            if hi_o:
+                right_cut = min(right_cut, (hi_o[0] + hi) // 2)
+        mask = np.zeros(n_bins, dtype=float)
+        mask[left_cut:right_cut + 1] = 1.0
+        loc = _expand(hi, 0.70, mask=mask)
+        if not loc:
+            continue
+        node_n += 1
+        loc["tag"] = f"VA{node_n}"
+        loc["primary"] = False
+        # drop if almost identical to primary
+        if va70 and abs(loc["vah"] - va70["vah"]) < bin_step * 2 and abs(loc["val"] - va70["val"]) < bin_step * 2:
+            continue
+        vas.append(loc)
+
+    vah = float(va70["vah"]) if va70 else float(mids[min(n_bins - 1, poc_i)])
+    val = float(va70["val"]) if va70 else float(mids[max(0, poc_i)])
+    nodes = _cluster_value_areas(vol_at, mids, bin_step=bin_step, max_nodes=5)
+    # Prefer cluster body that contains session POC as the drawn primary VA
+    for nd in nodes:
+        if nd.get("primary"):
+            # keep classic 70% as model VAH/VAL; drawing uses node body
+            break
     return {
         "ok": True,
         "mids": mids,
@@ -4871,12 +5144,124 @@ def compute_session_volume_profile(df: pd.DataFrame, bin_step: float = 5.0, prom
         "val1": wmean - wstd,
         "vah15": wmean + 1.5 * wstd,
         "val15": wmean - 1.5 * wstd,
-        "vah": float(mids[hi_i]),
-        "val": float(mids[lo_i]),
+        "vah": vah,
+        "val": val,
+        "vah80": float(va80["vah"]) if va80 else vah,
+        "val80": float(va80["val"]) if va80 else val,
+        "vas": vas,
+        "nodes": nodes,
         "hvn": hvn,
         "lvn": lvn,
         "bin_step": bin_step,
     }
+
+
+def _cluster_value_areas(vol_at, mids, bin_step=2.0, max_nodes=5):
+    """Practical VA nodes: body of each significant volume peak, not σ-bands."""
+    vol_at = np.asarray(vol_at, dtype=float)
+    mids = np.asarray(mids, dtype=float)
+    n = len(vol_at)
+    if n < 5:
+        return []
+    # 3-bin smooth for peak finding only
+    sm = vol_at.copy()
+    if n >= 3:
+        sm[1:-1] = 0.25 * vol_at[:-2] + 0.50 * vol_at[1:-1] + 0.25 * vol_at[2:]
+    poc_i = int(np.argmax(vol_at))
+    poc_vol = float(vol_at[poc_i]) or 1.0
+    min_sep = max(4, int(round(12.0 / max(float(bin_step), 1.0))))
+    peaks = []
+    for i in range(1, n - 1):
+        if sm[i] >= sm[i - 1] and sm[i] >= sm[i + 1] and vol_at[i] >= 0.22 * poc_vol:
+            peaks.append(i)
+    # keep highest in each min_sep window
+    peaks = sorted(peaks, key=lambda i: -vol_at[i])
+    kept = []
+    for i in peaks:
+        if all(abs(i - j) >= min_sep for j in kept):
+            kept.append(i)
+        if len(kept) >= max_nodes:
+            break
+    if poc_i not in kept:
+        kept = [poc_i] + [i for i in kept if abs(i - poc_i) >= min_sep]
+        kept = kept[:max_nodes]
+    nodes = []
+    for i in kept:
+        peak_v = float(vol_at[i])
+        floor = max(0.42 * peak_v, 0.10 * poc_vol)
+        lo = hi = i
+        while lo > 0 and vol_at[lo - 1] >= floor:
+            lo -= 1
+        while hi < n - 1 and vol_at[hi + 1] >= floor:
+            hi += 1
+        # snap to first clear trough beyond the body
+        while lo > 0 and vol_at[lo] > vol_at[lo - 1] and vol_at[lo - 1] >= 0.55 * floor:
+            lo -= 1
+        while hi < n - 1 and vol_at[hi] > vol_at[hi + 1] and vol_at[hi + 1] >= 0.55 * floor:
+            hi += 1
+        nodes.append({
+            "i": i, "poc": float(mids[i]), "vah": float(mids[hi]), "val": float(mids[lo]),
+            "vol": peak_v, "primary": i == poc_i,
+        })
+    # merge heavy overlap
+    nodes = sorted(nodes, key=lambda r: -r["vol"])
+    merged = []
+    for nd in nodes:
+        hit = None
+        for m in merged:
+            ov = min(nd["vah"], m["vah"]) - max(nd["val"], m["val"])
+            span = max(nd["vah"] - nd["val"], m["vah"] - m["val"], 1.0)
+            if ov > 0.55 * span:
+                hit = m
+                break
+        if hit:
+            if nd["vol"] > hit["vol"]:
+                hit.update({k: nd[k] for k in ("poc", "vah", "val", "vol", "i")})
+            hit["primary"] = hit["primary"] or nd["primary"]
+        else:
+            merged.append(dict(nd))
+    merged = sorted(merged, key=lambda r: -r["poc"])
+    return merged[:max_nodes]
+
+
+def vp_chart_levels(vp: dict) -> list:
+    """Only practical node VAH/VAL + session POC. No σ / 80% / HVN scatter."""
+    out = []
+    if not isinstance(vp, dict) or not vp.get("ok"):
+        return out
+    step = float(vp.get("bin_step") or 2.0)
+    nodes = list(vp.get("nodes") or [])
+    if not nodes:
+        nodes = [{
+            "vah": vp.get("vah"), "val": vp.get("val"), "poc": vp.get("poc"),
+            "primary": True, "vol": vp.get("poc_vol") or 0,
+        }]
+    specs = [(vp.get("poc"), "POC", "#FFD54F", 1.7, "solid")]
+    prim = next((n for n in nodes if n.get("primary")), nodes[0] if nodes else None)
+    others = [n for n in nodes if n is not prim]
+    # rank other nodes high-to-low price
+    others = sorted(others, key=lambda n: -float(n.get("poc") or 0))
+    if prim:
+        specs.append((prim.get("vah"), "VAH", "#F48FB1", 1.55, "dash"))
+        specs.append((prim.get("val"), "VAL", "#F48FB1", 1.55, "dash"))
+    for k, n in enumerate(others, start=2):
+        specs.append((n.get("vah"), f"VAH{k}", "#F8BBD0", 1.2, "dash"))
+        specs.append((n.get("val"), f"VAL{k}", "#F8BBD0", 1.2, "dash"))
+    used = []
+    for px, name, col, w, dash in specs:
+        if px is None:
+            continue
+        try:
+            px = float(px)
+        except Exception:
+            continue
+        if any(abs(px - u) < max(step * 1.5, 3.0) for u, _ in used):
+            continue
+        used.append((px, name))
+        out.append({"price": px, "name": name, "color": col, "width": w, "dash": dash})
+    out.sort(key=lambda r: -r["price"])
+    return out
+
 
 def book_change_sigmas(hist: list, min_n: int = 8):
     """Std of bid/ask lot changes from the live tape. Returns (bid_sigma, ask_sigma)."""
@@ -5010,6 +5395,8 @@ def render_liquidity_delta_panel(data: dict, df_fchart: pd.DataFrame, index_name
     fut_token = basis.get("fut_token")
     smart_api = get_smart_api_client()
     snap = fetch_futures_book_snapshot(smart_api, index_name, fut_token) if smart_api else {"ok": False}
+    if snap.get("ok"):
+        _remember_book5(snap)
     hist = update_liq_delta_history(snap, index_name) if snap.get("ok") else list(st.session_state.get("liq_delta_history") or [])
     hist = [h for h in hist if h.get("index", index_name) == index_name]
 
@@ -5127,10 +5514,9 @@ def refresh_index_tapes(data, want_tf):
         if not smart_api:
             return data
         api_interval, lookback_days = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
-        if "1 min" in str(want_tf) or "2 min" in str(want_tf):
-            lookback_days = 0
-        else:
-            lookback_days = min(int(lookback_days or 5), 2)
+        live_now, _, _, _ = market_session_state(_ist_now(), Index_Name)
+        # 5s path: today only + merge into frames already in data_store
+        lookback_days = 0 if live_now else min(int(lookback_days or 5), 2)
         spot_token, spot_exch, opt_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
         fut_tok, _ = get_near_month_futures_token(df_master, Index_Name, opt_exch)
         if not spot_token and fut_tok:
@@ -5147,28 +5533,46 @@ def refresh_index_tapes(data, want_tf):
             spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=ltp_sym, symboltoken=spot_token)
             if spot_resp and spot_resp.get("status") and spot_resp.get("data"):
                 data["spot_price"] = float(spot_resp["data"]["ltp"])
+        have_sess = data.get("df_candles")
+        tail = 25 if (have_sess is not None and not getattr(have_sess, "empty", True) and len(have_sess) >= 8) else None
         df_candles, is_fb = fetch_candles_with_holiday_fallback(
-            smart_api, spot_token, spot_exch, api_interval, lookback_days, Index_Name
+            smart_api, spot_token, spot_exch, api_interval, lookback_days, Index_Name,
+            tail_minutes=tail,
         )
         if df_candles is not None and not df_candles.empty:
-            data["df_candles"] = df_candles
+            data["df_candles"] = merge_candle_frames(data.get("df_candles"), df_candles)
             data["is_holiday_fallback"] = is_fb
+        have_f = data.get("df_futures")
+        tail_f = 25 if (have_f is not None and not getattr(have_f, "empty", True) and len(have_f) >= 8) else None
         df_futures, fut_fb, basis_info, fut_msg = fetch_futures_candles_with_vwap(
-            smart_api, Index_Name, df_master, api_interval, lookback_days
+            smart_api, Index_Name, df_master, api_interval, lookback_days, tail_minutes=tail_f,
         )
         if df_futures is not None and not df_futures.empty:
-            data["df_futures"] = df_futures
+            data["df_futures"] = merge_candle_frames(data.get("df_futures"), df_futures)
             data["fut_is_fallback"] = fut_fb
             data["basis_info"] = basis_info
             data["fut_fallback_msg"] = fut_msg
+        if not data.get("spot_price"):
+            src = data.get("df_futures")
+            if src is None or getattr(src, "empty", True):
+                src = data.get("df_candles")
+            if src is not None and not getattr(src, "empty", True):
+                data["spot_price"] = float(src["close"].iloc[-1])
         data["bar_tf"] = want_tf
         data["timestamp"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d-%b-%Y %H:%M:%S IST")
+        try:
+            tok = (data.get("basis_info") or {}).get("fut_token")
+            if tok:
+                sn = fetch_futures_book_snapshot(smart_api, Index_Name, tok)
+                _remember_book5(sn)
+        except Exception:
+            pass
     except Exception:
         pass
     return data
 
 
-@st.fragment(run_every=5 if st.session_state.get("enable_main_refresh", False) else None)
+@st.fragment(run_every=5)
 def live_dashboard_fragment():
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
@@ -5199,20 +5603,39 @@ def live_dashboard_fragment():
     want_tf = st.session_state.get("selected_timeframe", "5 min")
     stored = st.session_state.get("data_store") or {}
     need_tf = stored.get("bar_tf") != want_tf
-    if st.session_state.get("enable_main_refresh", False) or need_tf:
-        now_s = datetime.datetime.now().timestamp()
+    idx_live = Index_Name or st.session_state.get("_last_index") or "NIFTY"
+    live_now, _, _, _ = market_session_state(_ist_now(), idx_live)
+    if live_now:
+        st.session_state["_closed_refresh_skip"] = False
+    auto = bool(st.session_state.get("enable_main_refresh", False))
+    intel = bool(st.session_state.get("intel_refresh", False))
+    have = st.session_state.get("data_store")
+    now_s = datetime.datetime.now().timestamp()
+    if have is None or need_tf:
+        refreshed_data = fetch_live_data(want_tf)
+        if refreshed_data:
+            refreshed_data["selected_expiry"] = selected_expiry_str
+            refreshed_data["bar_tf"] = want_tf
+            st.session_state["data_store"] = refreshed_data
+            st.session_state["_full_fetch_ts"] = now_s
+    elif auto and live_now:
+        # Intelligent: candles + VA only. Never re-pull chain/GEX/IV/ATM.
+        st.session_state["data_store"] = refresh_index_tapes(have, want_tf)
+        st.session_state["_tape_ts"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
+        gex_sec = int(st.session_state.get("gex_refresh_sel") or st.session_state.get("gex_refresh_min") or 5) * 60
         last_full = float(st.session_state.get("_full_fetch_ts") or 0)
-        have = st.session_state.get("data_store")
-        # Full chain+IV+GEX at most every 20s; 5s ticks only refresh index/futures candles.
-        if need_tf or have is None or (now_s - last_full) >= 20:
+        if (now_s - last_full) >= gex_sec:
             refreshed_data = fetch_live_data(want_tf)
             if refreshed_data:
                 refreshed_data["selected_expiry"] = selected_expiry_str
                 refreshed_data["bar_tf"] = want_tf
                 st.session_state["data_store"] = refreshed_data
                 st.session_state["_full_fetch_ts"] = now_s
-        else:
-            st.session_state["data_store"] = refresh_index_tapes(have, want_tf)
+                st.session_state["_gex_ts"] = datetime.datetime.now(
+                    pytz.timezone("Asia/Kolkata")
+                ).strftime("%H:%M:%S")
+    elif auto and not live_now:
+        st.session_state["_closed_refresh_skip"] = True
 
     data = st.session_state["data_store"]
     lvls = data.get("levels", {})
@@ -5227,12 +5650,12 @@ def live_dashboard_fragment():
         st.markdown(
             f"<div style='display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;'>"
             f"<h1 class='custom-heading' style='margin:0;font-size:17px;'>📊 Market Summary</h1>"
-            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')}</span>"
+            f"<span style='color:#7CB342;font-size:11px;'>Updated {data.get('timestamp','')} · tape {st.session_state.get('_tape_ts') or '—'} · GEX {st.session_state.get('_gex_ts') or '—'}</span>"
             f"</div>",
             unsafe_allow_html=True
         )
-        if data.get("is_holiday_fallback", False):
-            st.caption("⚠️ Non-trading day – showing last session")
+        if data.get("is_holiday_fallback", False) or st.session_state.get("_closed_refresh_skip"):
+            st.caption("Market closed — last session on screen. Auto-refresh will not re-hit the API until the next open (change TF or Fetch to reload).")
     with head_r:
         cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
         st.session_state["atm_live_ok"] = st.checkbox(
@@ -5243,7 +5666,14 @@ def live_dashboard_fragment():
             "Intelligent refresh",
             value=st.session_state.get("intel_refresh", False),
             key="cb_intel_refresh",
-            help="Only index candles + ATM. Skip GEX/DEX/IV/Vanna/heatmap/book.",
+            help="Candles + VA every 5s. GEX/chain on the interval below.",
+        )
+        st.session_state["gex_refresh_min"] = st.selectbox(
+            "GEX / chain",
+            options=[3, 5],
+            index=1 if st.session_state.get("gex_refresh_min", 5) == 5 else 0,
+            format_func=lambda m: f"every {m} min",
+            key="gex_refresh_sel",
         )
         if cb_main != st.session_state["enable_main_refresh"]:
             st.session_state["enable_main_refresh"] = cb_main
@@ -5264,7 +5694,18 @@ def live_dashboard_fragment():
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ========== SUPERHUMAN DECISION ENGINE ==========
-    scores = compute_superhuman_scores(data, data.get("df_futures") if data.get("df_futures") is not None and not data.get("df_futures").empty else data.get("df_candles", pd.DataFrame()))
+    _sc_src = data.get("df_futures") if data.get("df_futures") is not None and not getattr(data.get("df_futures"), "empty", True) else data.get("df_candles", pd.DataFrame())
+    _sc_sig = (
+        st.session_state.get("_gex_ts"),
+        float(data.get("spot_price") or 0),
+        int(len(_sc_src)) if _sc_src is not None and hasattr(_sc_src, "__len__") else 0,
+    )
+    if st.session_state.get("_scores_sig") == _sc_sig and isinstance(st.session_state.get("_scores_cache"), dict):
+        scores = st.session_state["_scores_cache"]
+    else:
+        scores = compute_superhuman_scores(data, _sc_src if _sc_src is not None else pd.DataFrame())
+        st.session_state["_scores_cache"] = scores
+        st.session_state["_scores_sig"] = _sc_sig
 
     if "error" not in scores:
         # ----- Decision Log (persist bias changes during the day) -----
@@ -5345,72 +5786,77 @@ def live_dashboard_fragment():
                     for e in decision_log[-8:]:
                         st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
 
-        with st.expander("▼ Micro Playbook (256 PΔEC + Flow 18 + Candles)", expanded=False):
-            items = list(MICRO_PDEC_PLAYBOOK.items())
-            cols = st.columns(3)
-            n = (len(items) + 2) // 3
-            for ci, col in enumerate(cols):
-                chunk = items[ci * n:(ci + 1) * n]
-                rows = ["| # | P Δ EFI CVD | Micro · Action |", "|---|---|---|"]
-                for i, (k, v) in enumerate(chunk, start=ci * n + 1):
-                    g = " ".join(LEVEL_GLYPH[x] for x in k)
-                    rows.append(f"| {i} | {g} | {v[0]} — {v[1]} |")
-                with col:
-                    st.markdown(chr(10).join(rows))
-            st.caption("256-state PDEC: Price vs VWAP, bar Δ, EFI13, CVD. Four levels ⇈ ↑ ↓ ⇊.")
-            st.markdown("**Flow book (18)** — P, CVD, DEX tape, net call−put premium. DEX/prem stay → until ≥6 snaps.")
-            frows = ["| P C DEX Prem | Micro · Action |", "|---|---|"]
-            for k, v in FLOW_PLAYBOOK.items():
-                frows.append(f"| {''.join(ARROW_GLYPH[x] for x in k)} | {v[0]} — {v[1]} |")
-            st.markdown(chr(10).join(frows))
-            st.markdown("**Candle gate (separate from 256 PDEC — no weight inside the book)**")
-            st.code(
-"""detect_candle_pattern(last 8 bars)
-trend: up = mean(close[-5:]) > mean(close[-10:-5:]); down = opposite
-body = |C-O|   range = H-L   upper = H-max(C,O)   lower = min(C,O)-L
+        with st.expander("▼ VA Playbook (range fade vs trend acceptance)", expanded=False):
+            rows = ["| Code | Setup · Action |", "|---|---|"]
+            for k, v in VA_PLAYBOOK.items():
+                rows.append(f"| `{k}` | {v[0]} — **{v[1]}** |")
+            st.markdown("\n".join(rows))
+            st.markdown(
+                """
+**Regime (RANGE vs TREND vs CHOP)** — scored, not a single switch:
+- Value density = session volume sitting between VAL and VAH (high → range / pin).
+- Efficiency ratio = |net move| / Σ|bar moves| over 20 bars (high → trend).
+- VWAP z-score stretch, session range vs ATR√t, net GEX sign (long-γ leans range, short-γ leans trend).
+- RANGE if range-score ≥ 1.4 and beats trend-score by ≥ 0.35; TREND is the mirror; else CHOP.
 
-1-bar (current bar i):
-  Doji              body <= 0.08*range                         bias 0  conf Moderate
-  Marubozu          body >= 0.85*range and wicks <= 0.08*range bias +1/-1 conf High
-  Hammer            lower >= 2*body and upper <= 0.35*body
-                    and body <= 0.25*range and DOWNTREND       bias +1  conf Mod-High
-  Hanging Man       same shape and UPTREND                     bias -1  conf Low-Mod
-  Shooting Star     upper >= 2*body and lower <= 0.35*body
-                    and small body and UPTREND                 bias -1  conf High
-  Inverted Hammer   same shape and DOWNTREND                   bias +1  conf Moderate
+**Location is statistical, not a tick print:**
+- Buffer = max(0.35 × session VWAP-σ, 0.35 × ATR, 1 pt).
+- `ABOVE_VAH` only if last ≥ VAH + buffer; `z = (px − VAH) / σ`.
+- Persistence: ≥2 of last 3 closes on that side of the level.
 
-2-bar (j = i-1) overwrites 1-bar if it matches:
-  Bull Engulf       prior red, this green, this body covers prior body     +1 High
-  Bear Engulf       prior green, this red, this body covers prior body     -1 High
-  Piercing          prior red, this green, open < prior low,
-                    close >= prior open - 50% prior body, close < prior open  +1 Mod-High
-  Dark Cloud        mirror of piercing                                     -1 Mod-High
-  Bull Harami       prior red, this green smaller and inside prior body    +1 Moderate
-  Tweezer Bottom    |this.low - prior.low| <= 0.15*max(ranges) and DOWNTREND +1 Mod-High
-
-confirm_pdec_with_candle(raw_PDEC_action, pattern):
-  PDEC book is NOT changed.
-  LONG-ish  + High + bias<0  -> NO ENTRY
-  SHORT-ish + High + bias>0  -> NO ENTRY
-  LONG-ish  + bias<0         -> CAUTIOUS LONG
-  SHORT-ish + bias>0         -> CAUTIOUS SHORT
-  *ENTRY*   + Doji           -> NO ENTRY (wait next close)
-  else                       -> keep raw PDEC
-""",
-                language="text",
+**ΔV absorption:** last-12 OLS slope of price vs last-5 signed volume. Probe + non-confirming ΔV = absorb.
+**EFI:** last-12 OLS slope. Fade needs EFI *not* expanding with price; acceptance needs EFI expanding *with* ΔV.
+                """
             )
-            cur = ""
-            if isinstance(st.session_state.get("_last_scores"), dict):
-                pass
             try:
                 dfi_now = st.session_state.get("_last_dfi")
                 if dfi_now is not None:
-                    cp = detect_candle_pattern(dfi_now)
+                    rec = classify_va_setup(dfi_now, st.session_state.get("data_store"))
                     st.caption(
-                        f"Now: {cp.get('name')} · bias {cp.get('bias'):+} · {cp.get('conf')} · {cp.get('note')}"
+                        f"Now: {rec.get('regime')} · {rec.get('model')} · {rec.get('action')} · {rec.get('efi_note')}"
                     )
             except Exception:
                 pass
+
+        with st.expander("▼ Δ Footprint absorption (proxy setups)", expanded=False):
+            st.code(
+"""detect_fp_absorptions — last CLOSED bar only, lookback 20 bars, no lookahead
+Not bid/ask tape. Shelf = signed close-location volume in 2-pt bins.
+
+z_sweep_dn = (mean(low[-20:-1]) - this.low) / std(low[-20:-1])
+z_sweep_up = (this.high - mean(high[-20:-1])) / std(high[-20:-1])
+typ, sig   = mean/std of |bin volume| on all prior bins
+sell_low   = sum of negative bins in lower 33% of this bar
+buy_high   = sum of positive bins in upper 33% of this bar
+z_sell     = (sell_low - typ) / sig
+z_buy      = (buy_high - typ) / sig
+loc        = (close - low) / (high - low)
+
+SETUP 1 BID ABS (long / spring)  — green ▲
+  z_sweep_dn >= 1.6
+  loc >= 0.72 and close >= open
+  z_sell >= 1.4
+  Entry: close of that bar
+  Stop:  this.low - 2 pts
+  Target: next resistance / top-5 ask cluster (discretionary)
+
+SETUP 2 OFFER ABS (short / upthrust) — red ▼
+  z_sweep_up >= 1.6
+  loc <= 0.28 and close < open
+  z_buy >= 1.4
+  Entry: close of that bar
+  Stop:  this.high + 2 pts
+  Target: next support / top-5 bid cluster (discretionary)
+
+If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n.
+""",
+                language="text",
+            )
+            evs = st.session_state.get("_fp_abs_evs") or []
+            st.caption(
+                f"Session marks: {sum(1 for e in evs if e.get('side')>0)} bid · "
+                f"{sum(1 for e in evs if e.get('side')<0)} offer"
+            )
 
         # Score Breakdown
         with st.expander("▼ Score Breakdown & Details", expanded=False):
@@ -5440,18 +5886,29 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
     df_fut  = data.get("df_futures", pd.DataFrame())
     basis   = data.get("basis_info", {})
 
-    if not df_full.empty and len(df_full) >= 20:
+    if not df_full.empty and len(df_full) >= 3:
         latest_row = df_full.iloc[-1]
-        rsi_val = latest_row["rsi"]
+        def _cell(col, default=float("nan")):
+            try:
+                if col in df_full.columns:
+                    v = latest_row[col]
+                    return float(v) if pd.notna(v) else default
+            except Exception:
+                pass
+            return default
+        rsi_val = _cell("rsi", 50.0)
         rsi_status = "Oversold" if rsi_val < 30 else ("Overbought" if rsi_val > 70 else "Neutral")
         rsi_badge_cls = "badge-bearish" if rsi_val > 70 else ("badge-bullish" if rsi_val < 30 else "badge-neutral")
-        macd_val = latest_row["macd"]
-        macd_sig = latest_row["macd_signal"]
+        macd_val = _cell("macd", 0.0)
+        macd_sig = _cell("macd_signal", 0.0)
         macd_status = "Bullish XO" if macd_val > macd_sig else "Bearish XO"
         macd_badge_cls = "badge-bullish" if macd_val > macd_sig else "badge-bearish"
-        recent_bw = df_full["bb_bandwidth"].tail(20)
-        bw_threshold = recent_bw.quantile(0.20)
-        is_sqz = latest_row["bb_bandwidth"] <= bw_threshold
+        if "bb_bandwidth" in df_full.columns:
+            recent_bw = pd.to_numeric(df_full["bb_bandwidth"], errors="coerce").tail(20)
+            bw_threshold = float(recent_bw.quantile(0.20) or 0)
+            is_sqz = _cell("bb_bandwidth", 0.0) <= bw_threshold
+        else:
+            is_sqz = False
         sqz_status = "Squeeze" if is_sqz else "Expand"
         sqz_badge_cls = "badge-neutral" if is_sqz else "badge-bullish"
         badge_html = (
@@ -5489,7 +5946,7 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
         tech_left, tech_gex = st.columns([0.50, 0.50])
 
         with tech_left:
-            tab_bb, tab_osc = st.tabs(["NIFTY + BB", "MACD / RSI"])
+            tab_bb, tab_osc = st.tabs([f"{Index_Name} + BB", "MACD / RSI"])
             with tab_bb:
                 fig_px = plt_go.Figure()
                 fig_px.add_trace(plt_go.Scatter(x=df_chart["time_str"], y=df_chart["close"], mode="lines", name="Spot", line=dict(color="#00E676", width=2)))
@@ -5606,8 +6063,49 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                         data["df_futures"] = df_fut
             except Exception:
                 pass
+        replay_on = bool(st.session_state.get("replay_session_on"))
+        replay_day = st.session_state.get("replay_session_date")
+        force_day = replay_day if replay_on and replay_day else None
         if not df_fut.empty and len(df_fut) >= 1:
-            df_fchart, latest_session, _ = pick_last_nse_session(df_fut, min_bars=20, prefer_today=True)
+            df_fchart, latest_session, _ = pick_last_nse_session(
+                df_fut, min_bars=20, prefer_today=not bool(force_day), force_date=force_day,
+            )
+            if df_fchart.empty and force_day:
+                try:
+                    api = get_smart_api_client()
+                    tf_lab = st.session_state.get("selected_timeframe", "5 min")
+                    api_int, _lb = interval_mapping.get(tf_lab, ("FIVE_MINUTE", 15))
+                    fut_tok = (data.get("basis_info") or {}).get("fut_token")
+                    fut_ex = (data.get("basis_info") or {}).get("fut_exchange") or "NFO"
+                    fetched = fetch_one_session_ohlcv(
+                        api, fut_tok, fut_ex, api_int, force_day, Index_Name,
+                    )
+                    if fetched is not None and not fetched.empty:
+                        fetched = attach_bar_flow(fetched, rebuild=True)
+                        df_fchart = fetched
+                        latest_session = force_day
+                        # merge into store so next rerun is cheap
+                        try:
+                            base = data.get("df_futures")
+                            if base is None or getattr(base, "empty", True):
+                                data["df_futures"] = fetched.copy()
+                            else:
+                                data["df_futures"] = pd.concat([base, fetched], ignore_index=True)
+                                data["df_futures"] = data["df_futures"].drop_duplicates(subset=["time"])
+                        except Exception:
+                            pass
+                        # spot tape for that day
+                        try:
+                            spot_tok, spot_ex = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))[:2]
+                            sp = fetch_one_session_ohlcv(api, spot_tok, spot_ex, api_int, force_day, Index_Name)
+                            if sp is not None and not sp.empty:
+                                data["df_candles"] = pd.concat(
+                                    [data.get("df_candles", pd.DataFrame()), sp], ignore_index=True
+                                ) if data.get("df_candles") is not None else sp
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             if df_fchart.empty:
                 df_fut = df_fut.copy()
                 df_fut["time"] = series_to_ist(df_fut["time"])
@@ -5615,7 +6113,7 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 latest_session = sorted(df_fut["session_date"].unique())[-1]
                 df_fchart = df_fut[df_fut["session_date"] == latest_session].copy().reset_index(drop=True)
                 df_fchart["time_str"] = df_fchart["time"].dt.strftime("%H:%M")
-            fut_times = df_fchart["time_str"].tolist()
+            fut_times = df_fchart["time_str"].tolist() if not df_fchart.empty else []
 
         if not df_chain.empty:
             min_strike_val = float(df_chain["Strike"].min()) - 50
@@ -5634,6 +6132,8 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
         y0 = y1 = None
         sigma_mult = 1.5
 
+        if df_fchart is None or getattr(df_fchart, "empty", True):
+            st.warning("Index tape empty this cycle — waiting for today's futures candles (09:15→now). Click Fetch if this stays.")
         with left_col:
             fut_header_col, tf_col, basis_col, band_col = st.columns([0.52, 0.20, 0.14, 0.14])
             with tf_col:
@@ -5666,7 +6166,7 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                     f"<div class='micro-hover' style='display:inline-block;padding:3px 10px;"
                     f"background:#1A1F2B;border:1px solid #3A4150;border-radius:8px;'>"
                     f"<span style='font-weight:700;color:#00E676;font-size:13px;'>"
-                    f"📉 NIFTY spot + fut VWAP→index + VP ({expiry_txt})</span>"
+                    f"📉 {Index_Name} spot + fut VWAP→index + VP ({expiry_txt})</span>"
                     f"<div class='micro-tip'><b>Line</b> = index spot.<br>"
                     f"<b>VWAP / σ</b> = futures VWAP minus bar basis (F−S).<br>"
                     f"VWAP_idx = VWAP_fut − (Fut − Spot).<br>"
@@ -5702,7 +6202,39 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                     format_func=lambda x: f"±{x}σ", key="vwap_sigma_select",
                     label_visibility="collapsed"
                 )
-            tw, al, av = st.columns([0.28, 0.44, 0.28])
+            tw, al, av, rp_chk, rp_date = st.columns([0.18, 0.26, 0.20, 0.12, 0.24])
+            with rp_chk:
+                replay_on = st.checkbox(
+                    "Replay day",
+                    value=bool(st.session_state.get("replay_session_on")),
+                    key="replay_session_chk",
+                    help="Pin this pane to one past trading session.",
+                )
+                st.session_state["replay_session_on"] = replay_on
+            with rp_date:
+                today_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).date()
+                default_day = st.session_state.get("replay_session_date") or today_ist
+                try:
+                    picked = st.date_input(
+                        "Replay date",
+                        value=default_day,
+                        min_value=today_ist - datetime.timedelta(days=60),
+                        max_value=today_ist,
+                        key="replay_session_date_input",
+                        format="DD-MM-YYYY",
+                    )
+                except TypeError:
+                    picked = st.date_input(
+                        "Replay date",
+                        value=default_day,
+                        min_value=today_ist - datetime.timedelta(days=60),
+                        max_value=today_ist,
+                        key="replay_session_date_input",
+                    )
+                if picked and picked != st.session_state.get("replay_session_date"):
+                    st.session_state["replay_session_date"] = picked
+                    if picked != today_ist:
+                        st.session_state["replay_session_on"] = True
             with tw:
                 st.session_state["chart_window"] = st.radio(
                     "Window", ["Session (6h)", "3h", "1h"], horizontal=True,
@@ -5731,7 +6263,10 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 with c1:
                     st.session_state["avwap_on"] = st.checkbox("AVWAP", key="avwap_chk")
                 with c2:
-                    st.session_state["pdec_labels_on"] = st.checkbox("PDEC", key="pdec_lbl_chk")
+                    st.session_state["pdec_labels_on"] = st.checkbox(
+                        "VA", value=True, key="pdec_lbl_chk",
+                        help="90° VA labels above candles. NO ENTRY is never printed.",
+                    )
                 with c3:
                     st.session_state["big_trade_on"] = st.checkbox("Big Δ", key="big_trd_chk")
                 with c4:
@@ -5822,14 +6357,35 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 last_basis = float(dfi["basis"].iloc[-1])
                 if vp.get("ok"):
                     vp = dict(vp)
-                    for k in ("mids", "poc", "val1", "vah1", "val15", "vah15", "vah", "val"):
+                    for k in ("mids", "poc", "val1", "vah1", "val15", "vah15", "vah", "val",
+                              "vah80", "val80", "hvn", "lvn"):
                         if k == "mids" and vp.get("mids") is not None:
                             vp["mids"] = [float(m) - last_basis for m in vp["mids"]]
+                        elif k in ("hvn", "lvn") and vp.get(k):
+                            vp[k] = [float(m) - last_basis for m in vp[k]]
                         elif k in vp and vp[k] is not None and not isinstance(vp[k], (list, np.ndarray)):
                             try:
                                 vp[k] = float(vp[k]) - last_basis
                             except Exception:
                                 pass
+                    if vp.get("vas"):
+                        shifted = []
+                        for va in vp["vas"]:
+                            nv = dict(va)
+                            for kk in ("vah", "val", "poc"):
+                                if nv.get(kk) is not None:
+                                    nv[kk] = float(nv[kk]) - last_basis
+                            shifted.append(nv)
+                        vp["vas"] = shifted
+                    if vp.get("nodes"):
+                        nsh = []
+                        for nd in vp["nodes"]:
+                            nv = dict(nd)
+                            for kk in ("vah", "val", "poc"):
+                                if nv.get(kk) is not None:
+                                    nv[kk] = float(nv[kk]) - last_basis
+                            nsh.append(nv)
+                        vp["nodes"] = nsh
                 close = dfi["close"].astype(float)
                 vol = dfi["volume"].astype(float)
                 if "cvd" not in dfi.columns or dfi["cvd"].isna().all():
@@ -5839,6 +6395,8 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 dfi["obv_ma20"] = dfi["obv"].rolling(20, min_periods=1).mean()
 
                 win = st.session_state.get("chart_window") or "Session (6h)"
+                if st.session_state.get("replay_session_on"):
+                    win = "Session (6h)"
                 if "time" in dfi.columns and win in ("3h", "1h") and len(dfi):
                     tlast = pd.to_datetime(dfi["time"].iloc[-1])
                     hrs = 3 if win == "3h" else 1
@@ -5917,6 +6475,27 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                     vp2 = compute_session_volume_profile(vp_src, bin_step=2.0, prominence_factor=0.35)
                     if vp2.get("ok"):
                         vp = vp2
+                    # Developing VA: last 90 min (or last third of bars)
+                    if "time" in dfi.columns and len(vp_src) >= 18:
+                        tlast = pd.to_datetime(dfi["time"].iloc[-1])
+                        cut = tlast - pd.Timedelta(minutes=90)
+                        if len(vp_src) == len(dfi):
+                            dev_src = vp_src.loc[pd.to_datetime(dfi["time"]) >= cut]
+                        else:
+                            dev_src = vp_src.tail(max(18, len(vp_src) // 3))
+                        if len(dev_src) >= 12:
+                            vpd = compute_session_volume_profile(dev_src, bin_step=2.0, prominence_factor=0.35)
+                            if vpd.get("ok") and isinstance(vp, dict):
+                                vp = dict(vp)
+                                vas = list(vp.get("vas") or [])
+                                vas.append({
+                                    "vah": vpd.get("vah"), "val": vpd.get("val"),
+                                    "poc": vpd.get("poc"), "frac": 0.70, "tag": "dVA", "primary": False,
+                                })
+                                vp["vas"] = vas
+                                vp["dvah"] = vpd.get("vah")
+                                vp["dval"] = vpd.get("val")
+                                vp["dpoc"] = vpd.get("poc")
                 except Exception:
                     pass
                 buy_v = np.zeros(len(dfi), dtype=float)
@@ -5995,7 +6574,7 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 ])
                 fig_stack.add_trace(plt_go.Candlestick(
                     x=dfi["time_str"], open=idx_o, high=idx_h, low=idx_l, close=idx_c,
-                    name="NIFTY", increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
+                    name=str(Index_Name), increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
                     increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350",
                     showlegend=True,
                 ), row=1, col=2)
@@ -6023,45 +6602,7 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                             hovertemplate="%{x} · %{customdata:.0f} lots<extra>big Δ</extra>",
                             customdata=lots[msk],
                         ), row=1, col=2)
-                pdec_hist = pdec_session_history(dfi)
-                if st.session_state.get("pdec_labels_on") and pdec_hist:
-                    hi_s = pd.to_numeric(idx_h, errors="coerce")
-                    t_s = pd.to_datetime(dfi["time"]) if "time" in dfi.columns else None
-                    cap = hi_s.copy()
-                    if t_s is not None:
-                        hhmm = t_s.dt.hour * 60 + t_s.dt.minute
-                        mask = (hhmm >= 9 * 60 + 30) & (hhmm <= 15 * 60 + 15)
-                        if mask.any():
-                            cap = hi_s[mask.values] if len(hi_s) == len(mask) else hi_s
-                    peak = float(cap.max()) if cap.notna().any() else float(hi_s.max())
-                    rng = float(hi_s.max() - hi_s.min()) if hi_s.notna().any() else 20.0
-                    y_lab = peak + max(rng * 0.018, 3.0)
-                    # keep candle pane tall enough for vertical words
-                    try:
-                        if y1 is not None:
-                            y1 = max(y1, y_lab + rng * 0.12)
-                    except Exception:
-                        pass
-                    prev = None
-                    for rec in pdec_hist:
-                        act = rec["action"]
-                        if not act:
-                            continue
-                        if act == prev:
-                            continue
-                        prev = act
-                        short = act if len(act) <= 28 else act[:26] + "…"
-                        fig_stack.add_annotation(
-                            x=rec["t"], y=y_lab,
-                            text=short,
-                            showarrow=False,
-                            textangle=-90,
-                            xanchor="center",
-                            yanchor="bottom",
-                            font=dict(size=8, color="#CFD8DC"),
-                            bgcolor="rgba(14,17,23,0.20)",
-                            row=1, col=2,
-                        )
+                pdec_hist = pdec_session_history(dfi) if st.session_state.get("pdec_labels_on") else []
                 lv_w = data.get("levels") or {}
                 spot_w = float(data.get("spot_price") or (dfi["spot_px"].iloc[-1] if "spot_px" in dfi.columns else 0) or 0)
                 call_w = put_w = None
@@ -6108,15 +6649,28 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 except Exception:
                     pass
                 if vp.get("ok"):
-                    for lvl_px, name in ((vp.get("vah"), "VAH"), (vp.get("val"), "VAL")):
-                        if lvl_px is None:
+                    x_lab = axis_times[-1] if axis_times else dfi["time_str"].iloc[-1]
+                    last_y = None
+                    for lv in vp_chart_levels(vp):
+                        yv = float(lv["price"])
+                        if y0 is not None and y1 is not None and not (y0 <= yv <= y1):
                             continue
-                        fig_stack.add_hline(y=float(lvl_px), line_color="#F48FB1", line_width=1.2,
-                                            line_dash="dot", row=1, col=2)
+                        fig_stack.add_hline(
+                            y=yv, line_color=lv["color"], line_width=lv["width"],
+                            line_dash=lv["dash"], row=1, col=2,
+                        )
+                        y_txt = yv
+                        if last_y is not None and abs(y_txt - last_y) < max((y1 - y0) * 0.012 if y0 is not None else 3.0, 2.0):
+                            y_txt = last_y + max((y1 - y0) * 0.012 if y0 is not None else 3.0, 2.0)
+                        last_y = y_txt
                         fig_stack.add_annotation(
-                            x=axis_times[-1] if axis_times else dfi["time_str"].iloc[-1],
-                            y=float(lvl_px), text=name, showarrow=False, xanchor="right",
-                            font=dict(size=9, color="#F48FB1"), row=1, col=2)
+                            x=x_lab, y=y_txt,
+                            text=f"{lv['name']} {yv:.0f}",
+                            showarrow=False, xanchor="right",
+                            font=dict(size=8, color=lv["color"]),
+                            bgcolor="rgba(14,17,23,0.35)",
+                            row=1, col=2,
+                        )
                 pdh = pdl = None
                 dspot = data.get("df_candles")
                 try:
@@ -6284,7 +6838,8 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 flow_pb = classify_flow_playbook(dfi, data)
                 try:
                     process_telegram_alerts(data, dfi, scores if isinstance(scores, dict) else {},
-                                            micro, flow_pb, cvd_st if "cvd_st" in dir() else {})
+                                            micro, flow_pb, cvd_st if "cvd_st" in dir() else {},
+                                            index_name=Index_Name)
                 except Exception:
                     pass
 
@@ -6304,6 +6859,36 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                 fig_stack.update_xaxes(type="linear", showticklabels=True, showgrid=False, row=1, col=1)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=1, col=2)
+
+                if st.session_state.get("pdec_labels_on") and pdec_hist:
+                    hi_s = pd.to_numeric(idx_h, errors="coerce")
+                    peak = float(hi_s.max()) if hi_s.notna().any() else float(y1 or 0)
+                    rng = float(hi_s.max() - hi_s.min()) if hi_s.notna().any() else 20.0
+                    y_lab = peak + max(rng * 0.04, 8.0)
+                    y1 = max(float(y1 or peak), y_lab + rng * 0.10)
+                    fig_stack.update_yaxes(range=[y0, y1], row=1, col=2)
+                    prev = None
+                    nlab = 0
+                    for rec in pdec_hist:
+                        act = str(rec.get("action") or "")
+                        if (not act) or ("NO ENTRY" in act.upper()):
+                            continue
+                        if act == prev:
+                            continue
+                        prev = act
+                        xt = str(rec.get("t") or "")
+                        if len(xt) > 5:
+                            xt = xt[:5]
+                        fig_stack.add_annotation(
+                            x=xt, y=y_lab, text=act[:28],
+                            showarrow=False, textangle=-90,
+                            xanchor="center", yanchor="bottom",
+                            font=dict(size=9, color="#FFF59D"),
+                            bgcolor="rgba(20,24,32,0.55)",
+                            row=1, col=2,
+                        )
+                        nlab += 1
+                    st.session_state["_va_nlab"] = nlab
                 fig_stack.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=3)
                 fig_stack.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
                                        range=xr, showticklabels=False, row=2, col=2)
@@ -6325,22 +6910,43 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                         micro["candle"] = candle_pat.get("name")
                         micro["candle_why"] = filt_why
                 atm_k = data.get("atm_strike")
-                tab_flow, tab_dex, tab_atm_ce, tab_atm_pe = st.tabs([
-                    "1 · Index / ΔV / EFI / CVD",
-                    "2 · DEX / Premium",
-                    f"3 · ATM CE {atm_k:.0f}" if atm_k else "3 · ATM CE",
-                    f"4 · ATM PE {atm_k:.0f}" if atm_k else "4 · ATM PE",
-                ])
-                with tab_flow:
+                flow_choice = st.radio(
+                    "Tape",
+                    [
+                        "1 · Index / ΔV / EFI / CVD",
+                        "2 · DEX / Premium",
+                        "3 · Δ Footprint",
+                        f"4 · ATM CE {atm_k:.0f}" if atm_k else "4 · ATM CE",
+                        f"5 · ATM PE {atm_k:.0f}" if atm_k else "5 · ATM PE",
+                    ],
+                    horizontal=True,
+                    key="flow_tab_radio",
+                    label_visibility="collapsed",
+                )
+                tab_flow = tab_dex = tab_fp = tab_atm_ce = tab_atm_pe = None
+                if str(flow_choice).startswith("1"):
                     st.markdown("<div class='chart-card'><div class='card-title'>Futures &amp; session flow</div>", unsafe_allow_html=True)
                     if isinstance(micro, dict) and micro.get("candle"):
                         st.caption(
-                            f"Candle · {micro.get('candle')} · PDEC raw {micro.get('action_raw') or '—'} → "
+                            f"VA · {micro.get('regime','')} · {micro.get('model','')} · raw {micro.get('action_raw') or '—'} → "
                             f"{micro.get('action')} · {micro.get('candle_why') or ''}"
                         )
+                    _fsig = (
+                        str(Index_Name),
+                        str(st.session_state.get("selected_timeframe")),
+                        str(dfi["time"].iloc[-1]) if len(dfi) else "",
+                        float(dfi["close"].iloc[-1]) if len(dfi) else 0.0,
+                        int(len(dfi)),
+                        bool(st.session_state.get("pdec_labels_on")),
+                    )
+                    if st.session_state.get("_fig_sig") == _fsig and st.session_state.get("_fig_stack") is not None:
+                        fig_stack = st.session_state["_fig_stack"]
+                    else:
+                        st.session_state["_fig_stack"] = fig_stack
+                        st.session_state["_fig_sig"] = _fsig
                     st.plotly_chart(fig_stack, use_container_width=True)
                     if pdec_hist:
-                        with st.expander(f"PDEC session log ({len(pdec_hist)} bars)", expanded=False):
+                        with st.expander(f"VA session log ({len(pdec_hist)} bars)", expanded=False):
                             lines = ["| Time | P Δ E C | Action |", "|---|---|---|"]
                             for rec in pdec_hist:
                                 lines.append(f"| {rec['t']} | {rec['glyphs']} | {rec['action']} |")
@@ -6359,8 +6965,66 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                                 st.session_state["avwap_time"] = pick
                                 st.rerun()
                     st.markdown("</div>", unsafe_allow_html=True)
+                elif str(flow_choice).startswith("3"):
+                    st.markdown("<div class='chart-card'><div class='card-title'>Δ Footprint + top-5 book</div>", unsafe_allow_html=True)
+                    st.caption("Top 5 = **resting** futures book (SmartAPI FULL depth), not executed lots. Bar heatmap is still close-location volume.")
+                    b5 = st.session_state.get("book5_hist") or []
+                    last = b5[-1] if b5 else {}
+                    cbook, cmap = st.columns([0.22, 0.78])
+                    with cbook:
+                        bids = last.get("bids") or []
+                        asks = list(reversed(last.get("asks") or []))
+                        rows = ["| Side | Px | Qty |", "|---|---:|---:|"]
+                        for a in asks:
+                            rows.append(f"| ASK | {a.get('px'):.1f} | {a.get('qty'):.0f} |")
+                        rows.append(f"| LTP | {float(last.get('ltp') or 0):.1f} |  |")
+                        for b in bids:
+                            rows.append(f"| BID | {b.get('px'):.1f} | {b.get('qty'):.0f} |")
+                        st.markdown("\n".join(rows) if last else "_No book yet — Auto-Refresh in market hours._")
+                    with cmap:
+                        if len(b5) >= 3:
+                            prices, zs, ts = [], [], []
+                            for rec in b5[-180:]:
+                                ts.append(rec.get("t"))
+                            pxset = sorted({lv["px"] for rec in b5[-180:] for lv in (rec.get("bids") or []) + (rec.get("asks") or []) if lv.get("px")})
+                            if pxset:
+                                grid = np.zeros((len(pxset), len(b5[-180:])))
+                                pxi = {p: i for i, p in enumerate(pxset)}
+                                for j, rec in enumerate(b5[-180:]):
+                                    for lv in rec.get("bids") or []:
+                                        if lv["px"] in pxi:
+                                            grid[pxi[lv["px"]], j] += float(lv["qty"] or 0)
+                                    for lv in rec.get("asks") or []:
+                                        if lv["px"] in pxi:
+                                            grid[pxi[lv["px"]], j] -= float(lv["qty"] or 0)
+                                fig_b = plt_go.Figure(plt_go.Heatmap(
+                                    x=[r.get("t") for r in b5[-180:]], y=pxset, z=grid, zmid=0,
+                                    colorscale=[[0, "#B71C1C"], [0.5, "#1B1E24"], [1, "#1B5E20"]],
+                                    hovertemplate="%{x} · %{y:.1f}<br>qty signed %{z:.0f}<extra>book5</extra>",
+                                ))
+                                fig_b.update_layout(template="plotly_dark", height=280,
+                                    paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                                    margin=dict(l=40, r=8, t=8, b=8))
+                                st.plotly_chart(fig_b, use_container_width=True)
+                        fig_fp = build_delta_footprint_figure(dfi, st.session_state.get("_axis_times"))
+                        if isinstance(fig_fp, tuple):
+                            fig_fp = fig_fp[0]
+                        evs = st.session_state.get("_fp_abs_evs") or []
+                        n_bid = sum(1 for e in evs if e.get("side", 0) > 0)
+                        n_off = sum(1 for e in evs if e.get("side", 0) < 0)
+                        st.caption(
+                            f"Triggers this session: BID ABS {n_bid} · OFFER ABS {n_off}. "
+                            "Need sweep z≥1.6, shelf z≥1.4, close in outer 28%, then 8-bar cooldown per side. "
+                            "No mark = no bar cleared the gate."
+                        )
+                        if fig_fp is not None:
+                            st.plotly_chart(fig_fp, use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
                 def _render_atm_tab(tok, lab):
-                    if st.session_state.get("enable_main_refresh") and not st.session_state.get("atm_live_ok") and not st.session_state.get("intel_refresh"):
+
+                    if st.session_state.get("intel_refresh") or (
+                        st.session_state.get("enable_main_refresh") and not st.session_state.get("atm_live_ok")
+                    ):
                         st.caption("ATM tape paused during 5s index refresh. Enable “ATM live” to fetch.")
                         cached = st.session_state.get(f"_atm_fig_{lab}")
                         if cached:
@@ -6389,20 +7053,20 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                             dfo, f"ATM {lab}", Index_Name, used_tf,
                             st.session_state.get("_axis_times"),
                         )
-                        st.caption(f"PDEC · {act_o}")
+                        st.caption(f"VA · {act_o}")
                         if fig_o is not None:
                             st.plotly_chart(fig_o, use_container_width=True)
                     except Exception as e:
                         st.caption(f"ATM {lab} unavailable.")
-                with tab_atm_ce:
+                if str(flow_choice).startswith("4"):
                     st.markdown("<div class='chart-card'><div class='card-title'>ATM CE</div>", unsafe_allow_html=True)
                     _render_atm_tab(data.get("atm_ce_token"), "CE")
                     st.markdown("</div>", unsafe_allow_html=True)
-                with tab_atm_pe:
+                if str(flow_choice).startswith("5"):
                     st.markdown("<div class='chart-card'><div class='card-title'>ATM PE</div>", unsafe_allow_html=True)
                     _render_atm_tab(data.get("atm_pe_token"), "PE")
                     st.markdown("</div>", unsafe_allow_html=True)
-                with tab_dex:
+                if str(flow_choice).startswith("2"):
 
                     sess_day = latest_session or _ist_now().date()
                     tape = load_flow_tape(Index_Name, sess_day) or list(st.session_state.get("flow_tape") or [])
@@ -6427,7 +7091,7 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                         x=dfi["time_str"], y=dfi.get("vwap_idx", dfi["vwap"]), mode="lines", name="VWAP (idx)",
                         line=dict(color="#FF9800", width=2), hoverinfo="skip"), row=1, col=1)
                     fig_dex.add_trace(plt_go.Scatter(
-                        x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name="NIFTY",
+                        x=dfi["time_str"], y=dfi["spot_px"], mode="lines", name=str(Index_Name),
                         line=dict(color="#2196F3", width=2)), row=1, col=1)
                     if vp.get("ok"):
                         fig_dex.add_trace(plt_go.Bar(
@@ -6507,7 +7171,11 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                         "Slope-only is a watch. 15-min sessions have few bars — p-values stay weak.",
                     )
                 if vp.get("ok"):
-                    cap += f" · POC {vp['poc']:.0f} · VA±1σ {vp['val1']:.0f}-{vp['vah1']:.0f}"
+                    bits = [f"POC {vp['poc']:.0f}"]
+                    for lv in vp_chart_levels(vp):
+                        if lv["name"] != "POC":
+                            bits.append(f"{lv['name']} {lv['price']:.0f}")
+                    cap += " · " + " · ".join(bits)
                 st.caption(cap)
                 def _chip(body, tip, color="#00E676"):
                     return (
@@ -6516,52 +7184,26 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
                         f"<div class='micro-tip'>{tip}</div></div>"
                     )
                 chips = []
-                sc = f"NIFTY {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else "NIFTY —"
+                sc = f"{Index_Name} {spot_chg[0]:,.0f} {spot_chg[1]:+.0f} {spot_chg[2]:+.2f}%" if spot_chg else f"{Index_Name} —"
                 fc = f"FUT {fut_chg[0]:,.0f} {fut_chg[1]:+.0f} {fut_chg[2]:+.2f}%" if fut_chg else "FUT —"
                 chips.append(_chip(
                     f"{sc}<br>{fc}",
-                    "Index spot and near-month futures session open→close. GEX walls use spot; VWAP uses futures.",
+                    f"{Index_Name} spot and near-month futures session open→close.",
                     "#00E676" if (spot_chg and spot_chg[2] >= 0) else "#FF5252",
                 ))
-                if isinstance(scores, dict) and "error" not in scores:
+                act = (micro or {}).get("action") or ""
+                if micro.get("ok") and act and "NO ENTRY" not in str(act).upper():
                     chips.append(_chip(
-                        f"{scores.get('bias','')} ({scores.get('composite',0):+.0f})",
-                        f"<b>Superhuman</b><br>{scores.get('clarity','')}<br>{scores.get('action','')}<br>"
-                        f"Quiet + long γ → PIN<br>Big range + long γ → REVERSION<br>"
-                        f"Short γ / wall break → TREND<br>|C|≤15 → NO EDGE<br>else → MILD DIR",
-                        scores.get("colour", "#00E676"),
-                    ))
-                tname = (trig or {}).get("trigger", "NO TRIGGER")
-                tbits = []
-                for ch in (trig or {}).get("checks") or []:
-                    side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
-                    tbits.append(f"{ch.get('name','')} <b>{side}</b> · {ch.get('note','')}")
-                chips.append(_chip(
-                    tname,
-                    f"<b>{tname}</b><br>{(trig or {}).get('summary','')}<br><br>" + "<br>".join(tbits),
-                    (trig or {}).get("colour", "#FF9800"),
-                ))
-                if micro.get("ok"):
-                    act = micro["action"]
-                    tag = " EFI≈0" if micro.get("efi_zero") else ""
-                    chips.append(_chip(
-                        f"P{LEVEL_GLYPH.get(micro['price'], micro['price'])} "
-                        f"Δ{LEVEL_GLYPH.get(micro.get('delta', micro.get('obv','-')), '')} "
-                        f"E{LEVEL_GLYPH.get(micro['efi'], micro['efi'])} "
-                        f"C{LEVEL_GLYPH.get(micro['cvd'], micro['cvd'])}<br>{act}",
-                        f"<b>Underlying Market Microstructure</b><br>{micro['micro']}<br>"
-                        f"{micro.get('efi_note','')}<br><b>Algo action:</b> {act}",
+                        f"VA<br>{act}",
+                        f"<b>VA</b><br>{micro.get('micro','')}<br>{micro.get('efi_note','')}<br>"
+                        f"regime {micro.get('regime','')} · {micro.get('model','')}",
                         "#00E676",
                     ))
-                    flow = classify_flow_playbook(dfi, data)
-                    if flow.get("ok"):
-                        chips.append(_chip(
-                            f"P{ARROW_GLYPH[flow['price']]} C{ARROW_GLYPH[flow['cvd']]} "
-                            f"D{ARROW_GLYPH[flow['dex']]} $ {ARROW_GLYPH[flow['prem']]}<br>{flow['action']}",
-                            f"<b>Flow playbook (18)</b><br>{flow['hover']}",
-                            "#90CAF9",
-                        ))
-                st.markdown("<div class='micro-float'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+                ch1, ch2 = st.columns([0.18, 0.82])
+                with ch1:
+                    st.markdown("<div style='margin-top:4px;'>" + "".join(chips) + "</div>", unsafe_allow_html=True)
+                with ch2:
+                    st.empty()
                 if not st.session_state.get("intel_refresh"):
                     b1, b2 = st.columns([0.50, 0.50])
                     with b1:
@@ -6691,9 +7333,7 @@ confirm_pdec_with_candle(raw_PDEC_action, pattern):
 
 live_dashboard_fragment()
 
-# --- Full-width: Institutional Order Flow, then Raw Z-Score details ---
-st.markdown("---")
-institutional_order_flow_scanner_fragment()
+# --- Raw Z-Score details ---
 st.markdown("---")
 zscore_analysis_fragment(mode="raw")
 
