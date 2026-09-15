@@ -5841,8 +5841,17 @@ def build_multi_index_figure(index_name, dfi, vp):
                 vp2["nodes"] = nodes
         except Exception:
             vp2 = dict(vp)
-        raw_mids = list(vp2.get("mids") or [])
-        raw_vols = list(vp2.get("vol") or vp2.get("vols") or [])
+        def _as_list(val):
+            if val is None:
+                return []
+            if isinstance(val, np.ndarray):
+                return val.tolist()
+            try:
+                return list(val)
+            except TypeError:
+                return []
+        raw_mids = _as_list(vp2.get("mids"))
+        raw_vols = _as_list(vp2.get("vol") if vp2.get("vol") is not None else vp2.get("vols"))
         mids, vols, colors = [], [], []
         poc = vp2.get("poc")
         for m, v in zip(raw_mids, raw_vols):
