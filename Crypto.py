@@ -5886,7 +5886,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
     df_fut  = data.get("df_futures", pd.DataFrame())
     basis   = data.get("basis_info", {})
 
-    if not df_full.empty and len(df_full) >= 20:
+    if not df_full.empty and len(df_full) >= 3:
         latest_row = df_full.iloc[-1]
         rsi_val = latest_row["rsi"]
         rsi_status = "Oversold" if rsi_val < 30 else ("Overbought" if rsi_val > 70 else "Neutral")
