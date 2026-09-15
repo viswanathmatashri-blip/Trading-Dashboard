@@ -5833,7 +5833,7 @@ def build_multi_index_figure(index_name, dfi, vp):
     smin = float(np.nanmin([candle_lo, dfi["vwap_lower_idx"].min() if "vwap_lower_idx" in dfi.columns else candle_lo]))
     smax = float(np.nanmax([candle_hi, dfi["vwap_upper_idx"].max() if "vwap_upper_idx" in dfi.columns else candle_hi]))
     pad = (smax - smin) * 0.04 if smax > smin else 12
-    y0, y1 = smin - pad, max(smax, candle_hi) + pad * 0.35
+    y0, y1 = smin - pad, max(smax, candle_hi) + max(pad * 0.8, (smax - smin) * 0.06 if smax > smin else 8)
     last_basis = float(dfi["basis"].iloc[-1]) if "basis" in dfi.columns else 0.0
     vp2 = dict(vp) if isinstance(vp, dict) else {"ok": False}
     if vp2.get("ok"):
@@ -5892,17 +5892,22 @@ def build_multi_index_figure(index_name, dfi, vp):
                 bgcolor="rgba(14,17,23,0.45)", row=1, col=1,
             )
     labels = _multi_va_labels(dfi, index_name)
+    y_lab = float(candle_hi) + max((y1 - y0) * 0.012, 1.0)
     for rec in labels[-12:]:
         fig.add_annotation(
-            x=rec["t"], y=candle_hi, text=rec["act"],
-            showarrow=False, textangle=-90,
-            xanchor="center", yanchor="bottom",
-            yshift=4,
-            font=dict(size=12, color="#FFE082", family="Arial"),
+            x=str(rec.get("t", "")),
+            y=y_lab,
+            text=str(rec.get("act", "")),
+            showarrow=False,
+            textangle=-90,
+            xanchor="center",
+            yanchor="bottom",
+            font=dict(size=12, color="#FFE082"),
             bgcolor="rgba(8,10,16,0.88)",
-            bordercolor="#FFE082", borderwidth=1, borderpad=3,
-            cliponaxis=False,
-            row=1, col=1,
+            bordercolor="#FFE082",
+            borderwidth=1,
+            row=1,
+            col=1,
         )
     xr = None
     try:
