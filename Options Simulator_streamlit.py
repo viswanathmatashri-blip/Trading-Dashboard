@@ -2190,9 +2190,21 @@ def _ist_now():
 
 
 def session_hours(index_name=None):
-    """Cash/FO 09:15–15:30; MCX GOLDM/SILVERM 09:00–23:30 IST weekdays."""
-    name = index_name or st.session_state.get("_last_index") or st.session_state.get("Index_Name") or "NIFTY"
-    if str(name).upper() in ("GOLDM", "SILVERM", "CRUDEOIL", "CRUDEOILM"):
+    """Cash/FO 09:15–15:30; MCX metals/energy 09:00–23:30 IST weekdays."""
+    name = str(
+        index_name
+        or st.session_state.get("_last_index")
+        or st.session_state.get("Index_Name")
+        or "NIFTY"
+    ).upper()
+    tok = INDEX_TOKEN_MAP.get(name, ("", "", ""))
+    exch = str(tok[2] if len(tok) > 2 else "").upper()
+    mcx_names = {
+        "GOLDM", "GOLD", "SILVERM", "SILVER",
+        "CRUDEOIL", "CRUDEOILM", "CRUDE",
+        "NATGASMINI", "NATURALGAS",
+    }
+    if name in mcx_names or exch == "MCX":
         return 9, 0, 23, 30, "09:00", "23:30"
     return 9, 15, 15, 30, "09:15", "15:30"
 
@@ -2237,7 +2249,7 @@ def _cache_path(kind: str, index_name: str, interval: str, day):
 
 
 def load_session_cache(kind: str, index_name: str, interval: str, day=None):
-    live, today, _, _ = market_session_state()
+    live, today, _, _ = market_session_state(index_name=index_name)
     day = day or today
     path = _cache_path(kind, index_name, interval, day)
     if path.exists():
@@ -2257,7 +2269,7 @@ def load_session_cache(kind: str, index_name: str, interval: str, day=None):
 def save_session_cache(kind: str, index_name: str, interval: str, df: pd.DataFrame, day=None):
     if df is None or getattr(df, "empty", True):
         return
-    live, today, _, _ = market_session_state()
+    live, today, _, _ = market_session_state(index_name=index_name)
     day = day or today
     key = f"sess_cache_{kind}_{index_name}_{interval}_{day}"
     st.session_state[key] = df
@@ -2899,7 +2911,7 @@ def merge_candle_frames(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
 
 
 def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bool = True,
-                          force_date=None) -> tuple:
+                          force_date=None, index_name=None) -> tuple:
     """Return (session_df, session_date, used_prior_session).
     During live hours prefer TODAY even with 1–2 bars (Mon 09:16 problem).
     min_bars only applies when falling back to a completed prior session.
@@ -2911,7 +2923,7 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
     out = df.copy()
     out["time"] = series_to_ist(out["time"])
     out = out.dropna(subset=["time"]).sort_values("time")
-    oh, om, ch, cm, _, _ = session_hours()
+    oh, om, ch, cm, _, _ = session_hours(index_name)
     mins = out["time"].dt.hour * 60 + out["time"].dt.minute
     out = out[(mins >= oh * 60 + om) & (mins <= ch * 60 + cm)]
     if out.empty:
@@ -2922,7 +2934,7 @@ def pick_last_nse_session(df: pd.DataFrame, min_bars: int = 20, prefer_today: bo
     today = datetime.datetime.now(ist).date()
     chosen = None
     used_prior = True
-    live_now, _, _, _ = market_session_state()
+    live_now, _, _, _ = market_session_state(index_name=index_name)
     if force_date is not None:
         try:
             fd = force_date if hasattr(force_date, "year") else pd.to_datetime(force_date).date()
@@ -3132,7 +3144,9 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
         "basis": round(fut_ltp - spot_ltp, 2) if (spot_ltp and fut_ltp) else None
     }
 
-    sess_df, sess_date, used_prior = pick_last_nse_session(best_df, min_bars=20, prefer_today=True)
+    sess_df, sess_date, used_prior = pick_last_nse_session(
+        best_df, min_bars=20, prefer_today=True, index_name=index_name,
+    )
     if sess_df.empty:
         last_bar_time = pd.to_datetime(best_df["time"].iloc[-1])
         session_date_str = last_bar_time.strftime("%d-%b-%Y")
@@ -5668,7 +5682,7 @@ def _multi_option_frame(index_name):
     return df_opt, exch, exp
 
 
-def _multi_prepare_session(df_fut, df_spot, spot_px, want_tf):
+def _multi_prepare_session(df_fut, df_spot, spot_px, want_tf, index_name=None):
     if df_fut is None or getattr(df_fut, "empty", True) or "time" not in df_fut.columns:
         return pd.DataFrame(), None
     df_fut = attach_bar_flow(df_fut.copy())
@@ -5687,7 +5701,7 @@ def _multi_prepare_session(df_fut, df_spot, spot_px, want_tf):
                 df_fut = ohlc.reset_index()
     except Exception:
         pass
-    dfc, latest, _ = pick_last_nse_session(df_fut, min_bars=12, prefer_today=True)
+    dfc, latest, _ = pick_last_nse_session(df_fut, min_bars=12, prefer_today=True, index_name=index_name)
     if dfc is None or getattr(dfc, "empty", True):
         df_fut = df_fut.copy()
         df_fut["time"] = series_to_ist(df_fut["time"])
@@ -6130,6 +6144,7 @@ def render_multi_index_mode():
             return
         dfi, _sess = _multi_prepare_session(
             pack.get("df_futures"), pack.get("df_candles"), pack.get("spot_price"), want_tf,
+            index_name=name,
         )
         if dfi is None or dfi.empty:
             st.caption(f"{name}: no session tape yet.")
@@ -6680,6 +6695,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
         if not df_fut.empty and len(df_fut) >= 1:
             df_fchart, latest_session, _ = pick_last_nse_session(
                 df_fut, min_bars=20, prefer_today=not bool(force_day), force_date=force_day,
+                index_name=Index_Name,
             )
             if df_fchart.empty and force_day:
                 try:
