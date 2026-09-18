@@ -6618,13 +6618,13 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     return fig
                 with gx1:
                     if "Net_GEX_OI" in df_chain.columns:
-                        st.plotly_chart(_gmini(df_chain["Net_GEX_OI"]), use_container_width=True)
+                        st.plotly_chart(_gmini(df_chain["Net_GEX_OI"]), use_container_width=True, key=f"gmini_oi_{Index_Name}")
                 with gx2:
                     if "Net_GEX_Vol" in df_chain.columns:
-                        st.plotly_chart(_gmini(df_chain["Net_GEX_Vol"]), use_container_width=True)
+                        st.plotly_chart(_gmini(df_chain["Net_GEX_Vol"]), use_container_width=True, key=f"gmini_vol_{Index_Name}")
                 with gx3:
                     if "Net_Delta_GEX_OI" in df_chain.columns:
-                        st.plotly_chart(_gmini(df_chain["Net_Delta_GEX_OI"]), use_container_width=True)
+                        st.plotly_chart(_gmini(df_chain["Net_Delta_GEX_OI"]), use_container_width=True, key=f"gmini_dgex_{Index_Name}")
                 with gx4:
                     lotn = float(LOT_SIZES.get(Index_Name, 65))
                     c_d = pd.to_numeric(df_chain.get("C_Δ", 0), errors="coerce").fillna(0.0)
@@ -6632,7 +6632,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     c_oi = pd.to_numeric(df_chain.get("C_OI", 0), errors="coerce").fillna(0.0)
                     p_oi = pd.to_numeric(df_chain.get("P_OI", 0), errors="coerce").fillna(0.0)
                     dex_oi = (c_d * c_oi - p_d.abs() * p_oi) * lotn
-                    st.plotly_chart(_gmini(dex_oi), use_container_width=True)
+                    st.plotly_chart(_gmini(dex_oi), use_container_width=True, key=f"gmini_dex_{Index_Name}")
             else:
                 st.caption("GEX unavailable.")
 
