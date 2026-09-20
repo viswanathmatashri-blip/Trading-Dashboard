@@ -205,6 +205,8 @@ if "multi_store" not in st.session_state:
     st.session_state["multi_store"] = {}
 if "multi_gex_ts" not in st.session_state:
     st.session_state["multi_gex_ts"] = 0.0
+if "app_view" not in st.session_state:
+    st.session_state["app_view"] = "default"
 
 # ---------- Loading status (sidebar) ----------
 def update_load_status(msg: str):
@@ -3284,7 +3286,20 @@ st.sidebar.markdown("### ⚙️ Parameters & Strategy Builder")
 
 df_master = download_master_scrip()
 
-with st.sidebar.expander("1. Market Parameters", expanded=True):
+_view_labels = {
+    "default": "1. Default mode",
+    "multi": "2. Multi Index mode",
+    "scalper": "3. Scalper mode",
+}
+st.session_state["app_view"] = st.sidebar.radio(
+    "View mode",
+    ["default", "multi", "scalper"],
+    format_func=lambda x: _view_labels.get(x, x),
+    key="app_view_radio",
+)
+st.session_state["multi_index_mode"] = st.session_state["app_view"] == "multi"
+
+with st.sidebar.expander("4. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
         Index_Name = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"])
@@ -3353,7 +3368,7 @@ if df_expiry["strike_num"].max() > 1000000:
 
 all_expiry_strikes = sorted([int(s) for s in df_expiry["strike_num"].dropna().unique()])
 
-with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
+with st.sidebar.expander("5. Build Strategy Basket", expanded=False):
     selected_strike = st.selectbox("Option Strike Price", all_expiry_strikes if all_expiry_strikes else [24500], format_func=lambda x: f"{int(x)}")
 
     b_col1, b_col2 = st.columns(2)
@@ -3404,20 +3419,35 @@ with st.sidebar.expander("2. Build Strategy Basket", expanded=True):
             else:
                 st.info("Cache is empty.")
 
-with st.sidebar.expander("3. Multi Index Mode", expanded=False):
-    st.session_state["multi_index_mode"] = st.toggle(
-        "Multi Index Mode",
-        value=bool(st.session_state.get("multi_index_mode")),
-        help="Stack compact index + VA + right VP charts. Disables VEX/CEX/IV/Z-score/basket panels.",
-        key="multi_index_toggle",
-    )
-    st.caption("Enable only the indices you watch. Disabled charts skip API calls.")
-    en = dict(st.session_state.get("multi_enabled") or {})
-    for _idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]:
-        en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, False)), key=f"multi_en_{_idx}")
-    st.session_state["multi_enabled"] = en
-    n_on = sum(1 for v in en.values() if v)
-    st.caption(f"{n_on} live · tapes 5s · Net GEX 5 min")
+if st.session_state.get("app_view") == "multi":
+    with st.sidebar.expander("Multi Index picks", expanded=True):
+        st.caption("Enable only the indices you watch. Hidden/disabled skip API calls.")
+        en = dict(st.session_state.get("multi_enabled") or {})
+        for _idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]:
+            en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, False)), key=f"multi_en_{_idx}")
+        st.session_state["multi_enabled"] = en
+        n_on = sum(1 for v in en.values() if v)
+        st.caption(f"{n_on} live · tapes 5s · Net GEX 5 min")
+elif st.session_state.get("app_view") == "scalper":
+    st.sidebar.caption("Scalper uses the index + expiry from Market Parameters. ATM PE | Spot | ATM CE.")
+
+with st.sidebar.expander("6. Gemini analysis", expanded=False):
+    on = st.checkbox("Gemini on", key="gemini_enabled", help="Off = zero API calls.")
+    if on:
+        try:
+            dfi_g = st.session_state.get("_last_dfi")
+            scores_g = st.session_state.get("_last_scores") or {}
+            data_g = st.session_state.get("data_store") or {}
+            micro_g = classify_microstructure(dfi_g) if dfi_g is not None else {}
+            flow_g = classify_flow_playbook(dfi_g, data_g) if dfi_g is not None else {}
+            digest = build_gemini_digest(data_g, dfi_g, scores_g, micro_g, flow_g, {})
+            maybe_gemini_regular(digest)
+        except Exception:
+            pass
+    st.caption(f"Next regular {st.session_state.get('gemini_regular_wait', 0)}s")
+    st.text(st.session_state.get("gemini_regular") or "Waiting.")
+    st.caption("Trigger feedback")
+    st.text(st.session_state.get("gemini_trigger") or "No trigger yet.")
 
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
 
@@ -6195,34 +6225,136 @@ def render_multi_index_mode():
         for name in hidden_only:
             st.checkbox("Hide", value=True, key=f"multi_hide_{name}")
 
+def _scalper_fetch_opt(api, tok, lab, want_tf):
+    if not api or not tok:
+        return pd.DataFrame(), want_tf
+    api_int, _lb = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
+    exch_opt = Exchange
+    try:
+        data = st.session_state.get("data_store") or {}
+        exch_opt = data.get("opt_exchange") or Exchange
+    except Exception:
+        pass
+    lb = 0 if str(want_tf).startswith(("1 ", "2 ")) else 1
+    dfo, _ = fetch_candles_with_holiday_fallback(
+        api, str(tok), exch_opt, api_int, lb, f"{Index_Name}_{lab}"
+    )
+    used = want_tf
+    if dfo is None or dfo.empty or len(dfo) < 20:
+        dfo, _ = fetch_candles_with_holiday_fallback(
+            api, str(tok), exch_opt, "THREE_MINUTE", 1, f"{Index_Name}_{lab}_3m"
+        )
+        used = "3 min"
+    return dfo if dfo is not None else pd.DataFrame(), used
+
+
+def render_scalper_mode():
+    st.session_state["pdec_labels_on"] = True
+    st.session_state["atm_live_ok"] = True
+    want_tf = st.session_state.get("selected_timeframe", "3 min")
+    if "data_store" not in st.session_state or run_btn:
+        refreshed = fetch_live_data(want_tf)
+        if refreshed:
+            refreshed["selected_expiry"] = selected_expiry_str
+            refreshed["bar_tf"] = want_tf
+            st.session_state["data_store"] = refreshed
+    data = st.session_state.get("data_store")
+    if not data:
+        st.info("Click 🚀 Fetch Chain & Greeks to load ATM tokens and spot.")
+        return
+    auto = bool(st.session_state.get("enable_main_refresh", False))
+    live_now, _, _, _ = market_session_state(_ist_now(), Index_Name)
+    if auto and live_now:
+        st.session_state["data_store"] = refresh_index_tapes(data, want_tf)
+        data = st.session_state["data_store"]
+
+    top_l, top_r = st.columns([0.55, 0.45])
+    with top_l:
+        st.markdown(
+            f"<h1 class='custom-heading' style='margin:0;font-size:16px;'>⚡ Scalper · {Index_Name} "
+            f"{data.get('atm_strike') or ''} · {want_tf}</h1>",
+            unsafe_allow_html=True,
+        )
+        st.caption("ATM PE · Spot · ATM CE  — each pane: VA tags + right VP + Vol / EFI / CVD")
+    with top_r:
+        a, b, c = st.columns(3)
+        with a:
+            cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh_scalp")
+        with b:
+            opts = ["1 min", "3 min", "5 min"]
+            cur = want_tf if want_tf in opts else "3 min"
+            tf = st.radio("Bar", opts, horizontal=True, index=opts.index(cur), key="scalper_tf_radio",
+                          label_visibility="collapsed")
+            if tf != st.session_state.get("selected_timeframe"):
+                st.session_state["selected_timeframe"] = tf
+                st.rerun()
+        with c:
+            st.metric("Spot", f"{float(data.get('spot_price') or 0):,.0f}")
+        if cb_main != st.session_state["enable_main_refresh"]:
+            st.session_state["enable_main_refresh"] = cb_main
+            st.rerun()
+
+    api = get_smart_api_client()
+    pe_df, pe_tf = _scalper_fetch_opt(api, data.get("atm_pe_token"), "PE", want_tf)
+    ce_df, ce_tf = _scalper_fetch_opt(api, data.get("atm_ce_token"), "CE", want_tf)
+    spot_src = data.get("df_candles")
+    if spot_src is None or getattr(spot_src, "empty", True):
+        spot_src = data.get("df_futures")
+    spot_sess, _ = _multi_prepare_session(
+        data.get("df_futures"), data.get("df_candles"), data.get("spot_price"), want_tf,
+        index_name=Index_Name,
+    )
+    if spot_sess is not None and not spot_sess.empty:
+        spot_df = pd.DataFrame({
+            "time": spot_sess["time"],
+            "open": spot_sess["spot_px"].astype(float) + (spot_sess["open"].astype(float) - spot_sess["close"].astype(float)),
+            "high": spot_sess["spot_px"].astype(float) + (spot_sess["high"].astype(float) - spot_sess["close"].astype(float)),
+            "low": spot_sess["spot_px"].astype(float) + (spot_sess["low"].astype(float) - spot_sess["close"].astype(float)),
+            "close": spot_sess["spot_px"].astype(float),
+            "volume": spot_sess["volume"] if "volume" in spot_sess.columns else 1.0,
+        })
+    else:
+        spot_df = spot_src if spot_src is not None else pd.DataFrame()
+
+    axis = session_axis_labels(want_tf, Index_Name)
+    panes = [
+        ("ATM PE", pe_df, pe_tf, "scalp_pe"),
+        ("Spot", spot_df, want_tf, "scalp_sp"),
+        ("ATM CE", ce_df, ce_tf, "scalp_ce"),
+    ]
+    cols = st.columns(3)
+    for col, (title, dfp, tf_used, key) in zip(cols, panes):
+        with col:
+            st.markdown(f"<div class='chart-card'><div class='card-title'>{title} · {tf_used}</div>", unsafe_allow_html=True)
+            fig, act = _option_session_figure(dfp, title, Index_Name, tf_used, axis)
+            if act and "NO" not in str(act).upper() and "CHOP" not in str(act).upper():
+                colr = "#FF5252" if "SHORT" in str(act).upper() else "#00E676"
+                st.markdown(
+                    f"<div style='padding:4px 8px;margin:0 0 4px 0;border:1px solid {colr};border-radius:6px;"
+                    f"color:{colr};font-weight:800;font-size:11px;'>VA · {act}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption(f"VA · {act or '—'}")
+            if fig is not None:
+                fig.update_layout(height=620, margin=dict(l=28, r=4, t=6, b=14))
+                st.plotly_chart(fig, use_container_width=True, key=key)
+            else:
+                st.caption("No tape this cycle.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
 @st.fragment(run_every=5)
 def live_dashboard_fragment():
-    if st.session_state.get("multi_index_mode"):
+    if st.session_state.get("multi_index_mode") or st.session_state.get("app_view") == "multi":
         render_multi_index_mode()
+        return
+    if st.session_state.get("app_view") == "scalper":
+        render_scalper_mode()
         return
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
-    with st.sidebar:
-        with st.expander("Gemini analysis", expanded=False):
-            on = st.checkbox("Gemini on", key="gemini_enabled",
-                             help="Off = zero API calls.")
-            if on:
-                try:
-                    dfi_g = st.session_state.get("_last_dfi")
-                    scores_g = st.session_state.get("_last_scores") or {}
-                    data_g = st.session_state.get("data_store") or {}
-                    micro_g = classify_microstructure(dfi_g) if dfi_g is not None else {}
-                    flow_g = classify_flow_playbook(dfi_g, data_g) if dfi_g is not None else {}
-                    digest = build_gemini_digest(data_g, dfi_g, scores_g, micro_g, flow_g, {})
-                    maybe_gemini_regular(digest)
-                except Exception:
-                    pass
-            st.caption(f"Next regular {st.session_state.get('gemini_regular_wait', 0)}s")
-            st.text(st.session_state.get("gemini_regular") or "Waiting.")
-            st.caption("Trigger feedback")
-            st.text(st.session_state.get("gemini_trigger") or "No trigger yet.")
-
     if st.session_state.get("fut_tf_radio") in ("1 min", "2 min", "3 min", "5 min", "15 min"):
         st.session_state["selected_timeframe"] = st.session_state["fut_tf_radio"]
         st.session_state["tf_select_frag"] = st.session_state["fut_tf_radio"]
@@ -6271,7 +6403,7 @@ def live_dashboard_fragment():
 
     # ========== STICKY COMPACT MARKET SUMMARY (cleaned) ==========
     st.markdown("<div class='sticky-summary'>", unsafe_allow_html=True)
-    head_l, head_r = st.columns([0.72, 0.28])
+    head_l, head_r = st.columns([0.42, 0.58])
     with head_l:
         st.markdown(
             f"<div style='display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;'>"
@@ -6283,24 +6415,30 @@ def live_dashboard_fragment():
         if data.get("is_holiday_fallback", False) or st.session_state.get("_closed_refresh_skip"):
             st.caption("Market closed — last session on screen. Auto-refresh will not re-hit the API until the next open (change TF or Fetch to reload).")
     with head_r:
-        cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
-        st.session_state["atm_live_ok"] = st.checkbox(
-            "ATM live", value=st.session_state.get("atm_live_ok", False),
-            key="cb_atm_live", help="Fetch ATM CE/PE candles on refresh.",
-        )
-        st.session_state["intel_refresh"] = st.checkbox(
-            "Intelligent refresh",
-            value=st.session_state.get("intel_refresh", False),
-            key="cb_intel_refresh",
-            help="Candles + VA every 5s. GEX/chain on the interval below.",
-        )
-        st.session_state["gex_refresh_min"] = st.selectbox(
-            "GEX / chain",
-            options=[3, 5],
-            index=1 if st.session_state.get("gex_refresh_min", 5) == 5 else 0,
-            format_func=lambda m: f"every {m} min",
-            key="gex_refresh_sel",
-        )
+        r_a, r_b, r_c, r_d = st.columns([1.15, 0.85, 1.15, 1.05])
+        with r_a:
+            cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh")
+        with r_b:
+            st.session_state["atm_live_ok"] = st.checkbox(
+                "ATM live", value=st.session_state.get("atm_live_ok", False),
+                key="cb_atm_live", help="Fetch ATM CE/PE candles on refresh.",
+            )
+        with r_c:
+            st.session_state["intel_refresh"] = st.checkbox(
+                "Intelligent refresh",
+                value=st.session_state.get("intel_refresh", False),
+                key="cb_intel_refresh",
+                help="Candles + VA every 5s. GEX/chain on the interval below.",
+            )
+        with r_d:
+            st.session_state["gex_refresh_min"] = st.selectbox(
+                "GEX / chain",
+                options=[3, 5],
+                index=1 if st.session_state.get("gex_refresh_min", 5) == 5 else 0,
+                format_func=lambda m: f"every {m} min",
+                key="gex_refresh_sel",
+                label_visibility="collapsed",
+            )
         if cb_main != st.session_state["enable_main_refresh"]:
             st.session_state["enable_main_refresh"] = cb_main
             st.rerun()
@@ -7961,7 +8099,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
 live_dashboard_fragment()
 
 # --- Raw Z-Score details ---
-if not st.session_state.get("multi_index_mode"):
+if st.session_state.get("app_view", "default") == "default":
     st.markdown("---")
     zscore_analysis_fragment(mode="raw")
 
