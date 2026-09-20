@@ -60,8 +60,9 @@ custom_css = """
 div[data-testid="stFragment"] { opacity: 1 !important; }
 html, body, [data-testid="stAppViewContainer"] { background-color: #0E1117 !important; color: #FAFAFA !important; }
 section[data-testid="stSidebar"] { width: 310px !important; }
-.block-container { padding-top: 0.6rem !important; padding-bottom: 0.6rem !important; }
-header[data-testid="stHeader"] { background-color: rgba(0, 0, 0, 0) !important; }
+.block-container { padding-top: 2.4rem !important; padding-bottom: 0.6rem !important; }
+header[data-testid="stHeader"] { background-color: rgba(0, 0, 0, 0) !important; pointer-events: none !important; }
+header[data-testid="stHeader"] button, header[data-testid="stHeader"] a { pointer-events: auto !important; }
 h1, h2, h3, .custom-heading { color: #00E676 !important; font-size: 18px !important; font-weight: 700 !important; margin-bottom: 0.15rem !important; }
 div[data-testid="stMetricValue"] { font-size: 15px !important; color: #00E676 !important; }
 div[data-testid="stMetricLabel"] { font-size: 11px !important; }
@@ -6268,31 +6269,31 @@ def render_scalper_mode():
         st.session_state["data_store"] = refresh_index_tapes(data, want_tf)
         data = st.session_state["data_store"]
 
-    top_l, top_r = st.columns([0.55, 0.45])
-    with top_l:
-        st.markdown(
-            f"<h1 class='custom-heading' style='margin:0;font-size:16px;'>⚡ Scalper · {Index_Name} "
-            f"{data.get('atm_strike') or ''} · {want_tf}</h1>",
-            unsafe_allow_html=True,
+    st.markdown(
+        f"<h1 class='custom-heading' style='margin:0;font-size:16px;'>⚡ Scalper · {Index_Name} "
+        f"{data.get('atm_strike') or ''} · {want_tf}</h1>",
+        unsafe_allow_html=True,
+    )
+    ctrl1, ctrl2, ctrl3 = st.columns([0.28, 0.42, 0.30])
+    with ctrl1:
+        auto_on = st.toggle(
+            "Auto-Refresh 5s",
+            value=bool(st.session_state.get("enable_main_refresh")),
+            key="scalper_auto_toggle",
         )
-        st.caption("ATM PE · Spot · ATM CE  — each pane: VA tags + right VP + Vol / EFI / CVD")
-    with top_r:
-        a, b, c = st.columns(3)
-        with a:
-            cb_main = st.checkbox("Auto-Refresh 5s", value=st.session_state["enable_main_refresh"], key="cb_main_refresh_scalp")
-        with b:
-            opts = ["1 min", "3 min", "5 min"]
-            cur = want_tf if want_tf in opts else "3 min"
-            tf = st.radio("Bar", opts, horizontal=True, index=opts.index(cur), key="scalper_tf_radio",
-                          label_visibility="collapsed")
-            if tf != st.session_state.get("selected_timeframe"):
-                st.session_state["selected_timeframe"] = tf
-                st.rerun()
-        with c:
-            st.metric("Spot", f"{float(data.get('spot_price') or 0):,.0f}")
-        if cb_main != st.session_state["enable_main_refresh"]:
-            st.session_state["enable_main_refresh"] = cb_main
+        if auto_on != bool(st.session_state.get("enable_main_refresh")):
+            st.session_state["enable_main_refresh"] = auto_on
             st.rerun()
+    with ctrl2:
+        opts = ["1 min", "3 min", "5 min"]
+        cur = want_tf if want_tf in opts else "3 min"
+        tf = st.radio("Bar", opts, horizontal=True, index=opts.index(cur), key="scalper_tf_radio")
+        if tf != st.session_state.get("selected_timeframe"):
+            st.session_state["selected_timeframe"] = tf
+            st.rerun()
+    with ctrl3:
+        st.metric("Spot", f"{float(data.get('spot_price') or 0):,.0f}")
+    st.caption("Spot full width · ATM PE / ATM CE 50-50 below · VA + right VP + Vol / EFI / CVD")
 
     api = get_smart_api_client()
     pe_df, pe_tf = _scalper_fetch_opt(api, data.get("atm_pe_token"), "PE", want_tf)
@@ -6317,31 +6318,32 @@ def render_scalper_mode():
         spot_df = spot_src if spot_src is not None else pd.DataFrame()
 
     axis = session_axis_labels(want_tf, Index_Name)
-    panes = [
-        ("ATM PE", pe_df, pe_tf, "scalp_pe"),
-        ("Spot", spot_df, want_tf, "scalp_sp"),
-        ("ATM CE", ce_df, ce_tf, "scalp_ce"),
-    ]
-    cols = st.columns(3)
-    for col, (title, dfp, tf_used, key) in zip(cols, panes):
-        with col:
-            st.markdown(f"<div class='chart-card'><div class='card-title'>{title} · {tf_used}</div>", unsafe_allow_html=True)
-            fig, act = _option_session_figure(dfp, title, Index_Name, tf_used, axis)
-            if act and "NO" not in str(act).upper() and "CHOP" not in str(act).upper():
-                colr = "#FF5252" if "SHORT" in str(act).upper() else "#00E676"
-                st.markdown(
-                    f"<div style='padding:4px 8px;margin:0 0 4px 0;border:1px solid {colr};border-radius:6px;"
-                    f"color:{colr};font-weight:800;font-size:11px;'>VA · {act}</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.caption(f"VA · {act or '—'}")
-            if fig is not None:
-                fig.update_layout(height=620, margin=dict(l=28, r=4, t=6, b=14))
-                st.plotly_chart(fig, use_container_width=True, key=key)
-            else:
-                st.caption("No tape this cycle.")
-            st.markdown("</div>", unsafe_allow_html=True)
+
+    def _pane(title, dfp, tf_used, key, height=560):
+        st.markdown(f"<div class='chart-card'><div class='card-title'>{title} · {tf_used}</div>", unsafe_allow_html=True)
+        fig, act = _option_session_figure(dfp, title, Index_Name, tf_used, axis)
+        if act and "NO" not in str(act).upper() and "CHOP" not in str(act).upper():
+            colr = "#FF5252" if "SHORT" in str(act).upper() else "#00E676"
+            st.markdown(
+                f"<div style='padding:4px 8px;margin:0 0 4px 0;border:1px solid {colr};border-radius:6px;"
+                f"color:{colr};font-weight:800;font-size:11px;'>VA · {act}</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption(f"VA · {act or '—'}")
+        if fig is not None:
+            fig.update_layout(height=height, margin=dict(l=28, r=4, t=6, b=14))
+            st.plotly_chart(fig, use_container_width=True, key=key)
+        else:
+            st.caption("No tape this cycle.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    _pane("Spot", spot_df, want_tf, "scalp_sp", height=620)
+    pe_col, ce_col = st.columns(2)
+    with pe_col:
+        _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560)
+    with ce_col:
+        _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560)
 
 
 @st.fragment(run_every=5)
