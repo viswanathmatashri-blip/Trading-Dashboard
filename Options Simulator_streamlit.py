@@ -6,6 +6,7 @@ import time
 import datetime
 import math
 import json
+import re
 import random
 import numpy as np
 import pandas as pd
@@ -1527,10 +1528,11 @@ def maybe_gemini_scalper_setups():
         "Do not invent prices that are not in DATA. Prefer high-probability structures "
         "(breakout, breakdown, mean-reversion at VA/VWAP). "
         "If there is no edge write a single setup titled NO TRADE.\n\n"
-        "Output 1 or 2 setups MAX. Each setup MUST use this exact numbered shape:\n"
+        "Output ONLY trade setups. Do NOT write MARKET STATE, PECO, PCD$, PLAYERS, or BIAS sections.\n"
+        "Output 1 or 2 setups MAX. Each setup MUST use this exact numbered shape and nothing else:\n"
         "SETUP n\n"
         "1. Type : <Long BO | Short BD | Long mean-reversion | Short mean-reversion | NO TRADE>\n"
-        "2. Trigger : <index/spot close above/below a level from DATA>\n"
+        "2. Trigger : <Nifty/spot close above/below a level from DATA>\n"
         "3. Entry : <ATM CE or ATM PE price band, e.g. 88-100 ATM CE>\n"
         "4. Target : <price> (<pct %>)\n"
         "5. Stoploss : <price> (<pct %>)\n"
@@ -1552,12 +1554,46 @@ def maybe_gemini_scalper_setups():
         st.session_state["gemini_regular_wait"] = wait_s
 
 
+def _parse_gemini_setups(text: str) -> list:
+    raw = str(text or "")
+    raw = raw.split("\n", 1)[1] if raw.startswith("[") and "]\n" in raw[:80] else raw
+    raw = raw.replace("\r", "")
+    if not raw.strip():
+        return []
+    chunks = re.split(r"(?:^|\n)\s*(?:SETUP\s*\d+\s*[:.\-]?\s*)", raw, flags=re.IGNORECASE)
+    parts = [c.strip() for c in chunks if c.strip() and re.search(r"1\.\s*Type|Type\s*:", c, re.I)]
+    if not parts:
+        parts = [p.strip() for p in re.split(r"\n(?=\s*1\.\s*Type)", raw) if p.strip()]
+    if not parts and raw.strip():
+        parts = [raw.strip()]
+    out = []
+    for p in parts[:2]:
+        if re.search(r"MARKET STATE|PECO|PCD\$", p, re.I) and not re.search(r"1\.\s*Type", p, re.I):
+            continue
+        out.append(p)
+    return out
+
+
+def _setup_card_html(text: str, idx: int) -> str:
+    safe = (
+        str(text or "")
+        .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    short = safe.upper()
+    col = "#FF5252" if "SHORT" in short else ("#00E676" if "LONG" in short else "#90CAF9")
+    return (
+        f"<div style='font-size:11px;line-height:1.35;white-space:pre-wrap;"
+        f"background:#11151C;border:1px solid {col};border-radius:8px;"
+        f"padding:8px 8px;color:#ECEFF1;max-height:620px;overflow:auto;'>"
+        f"<div style='color:{col};font-weight:800;margin-bottom:4px;'>SETUP {idx}</div>"
+        f"{safe}</div>"
+    )
+
+
 def maybe_gemini_regular(digest: str):
     if st.session_state.get("app_view") == "scalper":
         maybe_gemini_scalper_setups()
     return
-    if not st.session_state.get("gemini_enabled"):
-        return
     now = time.time()
     last = float(st.session_state.get("gemini_regular_ts") or 0)
     if now - last < 60:
@@ -6487,19 +6523,7 @@ def render_scalper_mode():
             maybe_gemini_scalper_setups()
         except Exception:
             pass
-    setups = st.session_state.get("gemini_regular") or ""
-    if st.session_state.get("gemini_enabled"):
-        st.markdown("**Gemini high-probability setups**")
-        if setups:
-            st.markdown(
-                f"<div style='white-space:pre-wrap;font-size:13px;line-height:1.45;"
-                f"background:#11151C;border:1px solid #2A3340;border-radius:8px;"
-                f"padding:10px 12px;color:#FAFAFA;'>{setups.replace('<','&lt;')}</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.caption("Waiting for first Gemini pass (needs GEMINI_API_KEY + ATM tapes).")
-
+    cards = _parse_gemini_setups(st.session_state.get("gemini_regular") or "")
     axis = session_axis_labels(want_tf, Index_Name)
 
     def _pane(title, dfp, tf_used, key, height=560):
@@ -6521,7 +6545,21 @@ def render_scalper_mode():
             st.caption("No tape this cycle.")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    _pane("Spot", spot_df, want_tf, "scalp_sp", height=620)
+    side_l, spot_mid, side_r = st.columns([0.17, 0.66, 0.17], gap="small")
+    with side_l:
+        if cards:
+            st.markdown(_setup_card_html(cards[0], 1), unsafe_allow_html=True)
+        elif st.session_state.get("gemini_enabled"):
+            st.caption("Gemini setup 1…")
+    with spot_mid:
+        _pane("Spot", spot_df, want_tf, "scalp_sp", height=620)
+    with side_r:
+        if len(cards) > 1:
+            st.markdown(_setup_card_html(cards[1], 2), unsafe_allow_html=True)
+        elif cards and "NO TRADE" not in cards[0].upper():
+            st.caption("")
+        elif st.session_state.get("gemini_enabled") and not cards:
+            st.caption("Gemini setup 2…")
     pe_col, ce_col = st.columns(2)
     with pe_col:
         _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560)
