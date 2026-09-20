@@ -2713,7 +2713,9 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
     px = pd.to_numeric(d["close"], errors="coerce")
     med = float(px.median() or 0) or 1.0
     if med > 0:
-        d = d[(px > med * 0.15) & (px < med * 6.0)].copy()
+        clipped = d[(px > med * 0.15) & (px < med * 6.0)].copy()
+        if clipped is not None and len(clipped) >= 3:
+            d = clipped
     if d.empty or len(d) < 3:
         return None, "NO DATA"
     d = attach_bar_flow(d.reset_index(drop=True), rebuild=True)
@@ -6226,27 +6228,56 @@ def render_multi_index_mode():
         for name in hidden_only:
             st.checkbox("Hide", value=True, key=f"multi_hide_{name}")
 
-def _scalper_fetch_opt(api, tok, lab, want_tf):
-    if not api or not tok:
-        return pd.DataFrame(), want_tf
-    api_int, _lb = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
-    exch_opt = Exchange
+def _scalper_resolve_atm_token(data, lab):
+    lab = str(lab).upper()
+    tok = data.get("atm_ce_token") if lab == "CE" else data.get("atm_pe_token")
+    if tok and str(tok) not in ("", "nan", "None"):
+        return str(tok)
     try:
-        data = st.session_state.get("data_store") or {}
-        exch_opt = data.get("opt_exchange") or Exchange
+        strike = int(data.get("atm_strike") or 0)
+        if not strike:
+            return ""
+        return str(get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike, lab) or "")
     except Exception:
-        pass
-    lb = 0 if str(want_tf).startswith(("1 ", "2 ")) else 1
-    dfo, _ = fetch_candles_with_holiday_fallback(
-        api, str(tok), exch_opt, api_int, lb, f"{Index_Name}_{lab}"
-    )
+        return ""
+
+
+def _scalper_fetch_opt(api, tok, lab, want_tf):
+    cache_key = f"_scalp_df_{Index_Name}_{lab}_{want_tf}"
+    exch_opt = (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
+    intervals = []
+    primary, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
+    intervals.append((want_tf, primary))
+    for lab_tf, api_int in (("3 min", "THREE_MINUTE"), ("5 min", "FIVE_MINUTE"), ("1 min", "ONE_MINUTE")):
+        if api_int not in [x[1] for x in intervals]:
+            intervals.append((lab_tf, api_int))
+    if not api or not tok:
+        prev = st.session_state.get(cache_key)
+        return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
+    last_df = pd.DataFrame()
     used = want_tf
-    if dfo is None or dfo.empty or len(dfo) < 20:
-        dfo, _ = fetch_candles_with_holiday_fallback(
-            api, str(tok), exch_opt, "THREE_MINUTE", 1, f"{Index_Name}_{lab}_3m"
-        )
-        used = "3 min"
-    return dfo if dfo is not None else pd.DataFrame(), used
+    for tf_lab, api_int in intervals:
+        for attempt in range(2):
+            try:
+                dfo, _ = fetch_candles_with_holiday_fallback(
+                    api, str(tok), exch_opt, api_int, 1, f"{Index_Name}_{lab}"
+                )
+            except Exception:
+                dfo = pd.DataFrame()
+            if dfo is not None and not dfo.empty and len(dfo) >= 8:
+                st.session_state[cache_key] = dfo
+                return dfo, tf_lab
+            if dfo is not None and not dfo.empty:
+                last_df = dfo
+                used = tf_lab
+            time.sleep(0.25 + 0.2 * attempt)
+    if last_df is not None and not last_df.empty:
+        st.session_state[cache_key] = last_df
+        return last_df, used
+    prev = st.session_state.get(cache_key)
+    if isinstance(prev, pd.DataFrame) and not prev.empty:
+        return prev, want_tf
+    return pd.DataFrame(), want_tf
 
 
 def render_scalper_mode():
@@ -6296,8 +6327,11 @@ def render_scalper_mode():
     st.caption("Spot full width · ATM PE / ATM CE 50-50 below · VA + right VP + Vol / EFI / CVD")
 
     api = get_smart_api_client()
-    pe_df, pe_tf = _scalper_fetch_opt(api, data.get("atm_pe_token"), "PE", want_tf)
-    ce_df, ce_tf = _scalper_fetch_opt(api, data.get("atm_ce_token"), "CE", want_tf)
+    ce_tok = _scalper_resolve_atm_token(data, "CE")
+    pe_tok = _scalper_resolve_atm_token(data, "PE")
+    # CE first so a rate-limit on the second call does not blank the call pane
+    ce_df, ce_tf = _scalper_fetch_opt(api, ce_tok, "CE", want_tf)
+    pe_df, pe_tf = _scalper_fetch_opt(api, pe_tok, "PE", want_tf)
     spot_src = data.get("df_candles")
     if spot_src is None or getattr(spot_src, "empty", True):
         spot_src = data.get("df_futures")
