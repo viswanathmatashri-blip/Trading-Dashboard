@@ -169,6 +169,8 @@ if "avwap_time" not in st.session_state:
     st.session_state["avwap_time"] = None
 if "gemini_enabled" not in st.session_state:
     st.session_state["gemini_enabled"] = False
+if "gemini_interval_min" not in st.session_state:
+    st.session_state["gemini_interval_min"] = 5
 if "gemini_regular" not in st.session_state:
     st.session_state["gemini_regular"] = ""
 if "gemini_trigger" not in st.session_state:
@@ -1306,7 +1308,10 @@ GEMINI_REGULAR_MODELS = [
 
 
 def _gemini_key():
-    return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    try:
+        return _secret_or_env("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    except Exception:
+        return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 
 
 def gemini_generate(prompt: str, models: list) -> tuple:
@@ -1321,7 +1326,7 @@ def gemini_generate(prompt: str, models: list) -> tuple:
                 url,
                 params={"key": key},
                 json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.25, "maxOutputTokens": 1100}},
+                      "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1800}},
                 timeout=25,
             )
             if r.status_code == 429:
@@ -1431,7 +1436,126 @@ def build_gemini_digest(data, dfi, scores, micro, flow, cvd_st) -> str:
     return "\n".join(str(x) for x in lines)
 
 
+def _scalper_tape_digest(df, name: str) -> str:
+    if df is None or getattr(df, "empty", True) or "close" not in df.columns:
+        return f"{name}: NO TAPE"
+    d = df.copy()
+    if "cvd" not in d.columns or "efi13" not in d.columns:
+        try:
+            d = attach_bar_flow(d, rebuild=True)
+        except Exception:
+            pass
+    last = d.iloc[-1]
+    first = d.iloc[0]
+    cl = pd.to_numeric(d["close"], errors="coerce")
+    hi = float(pd.to_numeric(d.get("high", cl), errors="coerce").max())
+    lo = float(pd.to_numeric(d.get("low", cl), errors="coerce").min())
+    last_px = float(cl.iloc[-1])
+    open_px = float(pd.to_numeric(d.get("open", cl), errors="coerce").iloc[0])
+    chg = last_px - open_px
+    pct = (chg / open_px * 100.0) if open_px else 0.0
+    va = ""
+    try:
+        rec = classify_microstructure(d)
+        va = f"{rec.get('regime','')} | {rec.get('action','')} | VAH {rec.get('vah')} VAL {rec.get('val')} POC {rec.get('poc')}"
+    except Exception:
+        va = ""
+    path = []
+    n = len(d)
+    step = max(1, n // 12)
+    for i in range(0, n, step):
+        r = d.iloc[i]
+        t = r.get("time_str") or str(r.get("time", ""))[-5:]
+        path.append(
+            f"{t} px={float(r.get('close',0) or 0):.2f}"
+            f" efi={float(r.get('efi13',0) or 0):.1f}"
+            f" cvd={float(r.get('cvd',0) or 0):.0f}"
+        )
+    r = d.iloc[-1]
+    path.append(
+        f"{r.get('time_str', 'now')} px={last_px:.2f}"
+        f" efi={float(r.get('efi13',0) or 0):.1f}"
+        f" cvd={float(r.get('cvd',0) or 0):.0f}"
+    )
+    vw = last.get("vwap") or last.get("vwap_idx")
+    return "\n".join([
+        f"{name}: last={last_px:.2f} open={open_px:.2f} chg={chg:+.2f} ({pct:+.2f}%) high={hi:.2f} low={lo:.2f} vwap={vw}",
+        f"{name} VA: {va}",
+        _ser_stats(d.get("efi13"), f"{name} EFI") if "efi13" in d.columns else f"{name} EFI: NA",
+        _ser_stats(d.get("cvd"), f"{name} CVD") if "cvd" in d.columns else f"{name} CVD: NA",
+        f"{name} PATH: " + " | ".join(path[-14:]),
+    ])
+
+
+def build_scalper_gemini_digest() -> str:
+    data = st.session_state.get("data_store") or {}
+    lv = data.get("levels") or {}
+    lines = [
+        f"INDEX {Index_Name} expiry {data.get('selected_expiry') or selected_expiry_str}",
+        f"Spot {data.get('spot_price')} Fut {data.get('F')} ATM strike {data.get('atm_strike')}",
+        f"Flip {lv.get('Zero_Gamma_Flip')} GEX_sup {lv.get('GEX_Support')} GEX_res {lv.get('GEX_Resistance')} MaxPain {data.get('max_pain_strike')}",
+        f"Net GEX OI {data.get('total_net_gex_oi')} PCR {data.get('pcr')} Straddle {lv.get('Straddle_Cost')}",
+        f"TF {st.session_state.get('selected_timeframe')}",
+        _scalper_tape_digest(st.session_state.get("_scalp_spot_df"), "SPOT/NIFTY"),
+        _scalper_tape_digest(st.session_state.get("_scalp_ce_df"), "ATM CE"),
+        _scalper_tape_digest(st.session_state.get("_scalp_pe_df"), "ATM PE"),
+    ]
+    return "\n".join(str(x) for x in lines)
+
+
+def maybe_gemini_scalper_setups():
+    if st.session_state.get("app_view") != "scalper":
+        return
+    if not st.session_state.get("gemini_enabled"):
+        return
+    if not _gemini_key():
+        st.session_state["gemini_regular"] = "No GEMINI_API_KEY in Streamlit secrets."
+        return
+    now = time.time()
+    last = float(st.session_state.get("gemini_regular_ts") or 0)
+    wait_s = int(float(st.session_state.get("gemini_interval_min") or 5) * 60)
+    if now - last < wait_s:
+        st.session_state["gemini_regular_wait"] = int(wait_s - (now - last))
+        return
+    if st.session_state.get("gemini_in_flight"):
+        return
+    st.session_state["gemini_in_flight"] = True
+    digest = build_scalper_gemini_digest()
+    prompt = (
+        "You are an options scalper for Indian index options (NIFTY/BANKNIFTY/SENSEX etc). "
+        "Use ONLY the DATA snapshot of today's SPOT tape, ATM CE tape and ATM PE tape. "
+        "Do not invent prices that are not in DATA. Prefer high-probability structures "
+        "(breakout, breakdown, mean-reversion at VA/VWAP). "
+        "If there is no edge write a single setup titled NO TRADE.\n\n"
+        "Output 1 or 2 setups MAX. Each setup MUST use this exact numbered shape:\n"
+        "SETUP n\n"
+        "1. Type : <Long BO | Short BD | Long mean-reversion | Short mean-reversion | NO TRADE>\n"
+        "2. Trigger : <index/spot close above/below a level from DATA>\n"
+        "3. Entry : <ATM CE or ATM PE price band, e.g. 88-100 ATM CE>\n"
+        "4. Target : <price> (<pct %>)\n"
+        "5. Stoploss : <price> (<pct %>)\n"
+        "6. Risk : Reward : <ratio like 1 : 2.1>\n"
+        "7. Logic behind setup : <3-5 short sentences using spot VA/VWAP/EFI/CVD and option tape>\n\n"
+        "Rules: Entry, target, stop must be on the SAME option (CE or PE). "
+        "Percentages vs the mid of the entry band. R:R = reward pct / risk pct. "
+        "If CE is missing say so and use PE or NO TRADE.\n\nDATA:\n" + digest
+    )
+    try:
+        txt, model = gemini_generate(prompt, GEMINI_REGULAR_MODELS)
+        st.session_state["gemini_regular_ts"] = time.time()
+        if txt:
+            st.session_state["gemini_regular"] = f"[{model}]\n{txt}"
+        else:
+            st.session_state["gemini_regular"] = f"(no model answered: {model})"
+    finally:
+        st.session_state["gemini_in_flight"] = False
+        st.session_state["gemini_regular_wait"] = wait_s
+
+
 def maybe_gemini_regular(digest: str):
+    if st.session_state.get("app_view") == "scalper":
+        maybe_gemini_scalper_setups()
+    return
     if not st.session_state.get("gemini_enabled"):
         return
     now = time.time()
@@ -3433,24 +3557,28 @@ if st.session_state.get("app_view") == "multi":
         st.caption(f"{n_on} live · tapes 5s · Net GEX 5 min")
 elif st.session_state.get("app_view") == "scalper":
     st.sidebar.caption("Scalper uses the index + expiry from Market Parameters. ATM PE | Spot | ATM CE.")
-
-with st.sidebar.expander("6. Gemini analysis", expanded=False):
-    on = st.checkbox("Gemini on", key="gemini_enabled", help="Off = zero API calls.")
-    if on:
-        try:
-            dfi_g = st.session_state.get("_last_dfi")
-            scores_g = st.session_state.get("_last_scores") or {}
-            data_g = st.session_state.get("data_store") or {}
-            micro_g = classify_microstructure(dfi_g) if dfi_g is not None else {}
-            flow_g = classify_flow_playbook(dfi_g, data_g) if dfi_g is not None else {}
-            digest = build_gemini_digest(data_g, dfi_g, scores_g, micro_g, flow_g, {})
-            maybe_gemini_regular(digest)
-        except Exception:
-            pass
-    st.caption(f"Next regular {st.session_state.get('gemini_regular_wait', 0)}s")
-    st.text(st.session_state.get("gemini_regular") or "Waiting.")
-    st.caption("Trigger feedback")
-    st.text(st.session_state.get("gemini_trigger") or "No trigger yet.")
+    with st.sidebar.expander("6. Gemini analysis", expanded=True):
+        st.checkbox(
+            "Gemini setups",
+            key="gemini_enabled",
+            help="Reads Spot + ATM CE/PE tapes and writes high-probability option setups. Needs GEMINI_API_KEY in secrets.",
+        )
+        st.session_state["gemini_interval_min"] = st.selectbox(
+            "Gemini interval",
+            options=[3, 5, 10, 15],
+            index=1,
+            format_func=lambda m: f"every {m} min",
+            key="gemini_interval_sel",
+        )
+        nxt = int(st.session_state.get("gemini_regular_wait") or 0)
+        st.caption(f"Next call in {nxt}s")
+        if st.button("Generate setups now", use_container_width=True, key="gemini_force_btn"):
+            st.session_state["gemini_regular_ts"] = 0
+            maybe_gemini_scalper_setups()
+        if not _gemini_key():
+            st.warning("Add GEMINI_API_KEY to Streamlit secrets.")
+else:
+    st.session_state["gemini_enabled"] = False
 
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
 
@@ -6350,6 +6478,27 @@ def render_scalper_mode():
         })
     else:
         spot_df = spot_src if spot_src is not None else pd.DataFrame()
+
+    st.session_state["_scalp_spot_df"] = spot_df
+    st.session_state["_scalp_pe_df"] = pe_df
+    st.session_state["_scalp_ce_df"] = ce_df
+    if st.session_state.get("gemini_enabled"):
+        try:
+            maybe_gemini_scalper_setups()
+        except Exception:
+            pass
+    setups = st.session_state.get("gemini_regular") or ""
+    if st.session_state.get("gemini_enabled"):
+        st.markdown("**Gemini high-probability setups**")
+        if setups:
+            st.markdown(
+                f"<div style='white-space:pre-wrap;font-size:13px;line-height:1.45;"
+                f"background:#11151C;border:1px solid #2A3340;border-radius:8px;"
+                f"padding:10px 12px;color:#FAFAFA;'>{setups.replace('<','&lt;')}</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption("Waiting for first Gemini pass (needs GEMINI_API_KEY + ATM tapes).")
 
     axis = session_axis_labels(want_tf, Index_Name)
 
