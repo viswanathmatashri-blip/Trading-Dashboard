@@ -212,6 +212,19 @@ if "multi_gex_ts" not in st.session_state:
 if "app_view" not in st.session_state:
     st.session_state["app_view"] = "default"
 
+
+def active_view() -> str:
+    v = str(st.session_state.get("app_view") or "default")
+    if v not in ("default", "multi", "scalper"):
+        v = "default"
+    st.session_state["multi_index_mode"] = v == "multi"
+    return v
+
+
+def view_is(*names) -> bool:
+    return active_view() in names
+
+
 # ---------- Loading status (sidebar) ----------
 def update_load_status(msg: str):
     if "load_status_placeholder" not in st.session_state:
@@ -3682,7 +3695,9 @@ def get_smart_api_client():
 main_top_progress_holder = st.container()
 
 # --- DATA FETCHING ENGINE ---
-def fetch_live_data(selected_interval_label="5 min", progress_container=None):
+def fetch_live_data(selected_interval_label="5 min", progress_container=None, for_view="default"):
+    if for_view and not view_is(for_view):
+        return None
     p_bar = None
     p_status = None
     if progress_container is not None:
@@ -3987,8 +4002,12 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
 # Full-chain fetch only in Default, and only on Fetch click.
 # Missing data_store is filled inside live_dashboard_fragment so we do not
 # double-call SmartAPI on every script run (that trips AB1004 / rate limits).
-if run_btn and st.session_state.get("app_view", "default") == "default":
-    new_data = fetch_live_data(st.session_state["selected_timeframe"], progress_container=main_top_progress_holder)
+if run_btn and view_is("default"):
+    new_data = fetch_live_data(
+        st.session_state["selected_timeframe"],
+        progress_container=main_top_progress_holder,
+        for_view="default",
+    )
     if new_data:
         new_data["selected_expiry"] = selected_expiry_str
         st.session_state["data_store"] = new_data
@@ -5805,8 +5824,10 @@ def render_live_alert_ribbon(data: dict = None):
 
 # --- LIVE DASHBOARD FRAGMENT ---
 
-def refresh_index_tapes(data, want_tf):
+def refresh_index_tapes(data, want_tf, for_view="default"):
     """5s path: only spot LTP + index/futures candles. Keep last chain/GEX."""
+    if for_view and not view_is(for_view):
+        return data
     if not data:
         return data
     try:
@@ -6475,7 +6496,7 @@ def render_scalper_mode():
     st.session_state["atm_live_ok"] = True
     want_tf = st.session_state.get("selected_timeframe", "3 min")
     if "data_store" not in st.session_state or run_btn:
-        refreshed = fetch_live_data(want_tf)
+        refreshed = fetch_live_data(want_tf, for_view="scalper")
         if refreshed:
             refreshed["selected_expiry"] = selected_expiry_str
             refreshed["bar_tf"] = want_tf
@@ -6487,7 +6508,7 @@ def render_scalper_mode():
     auto = bool(st.session_state.get("enable_main_refresh", False))
     live_now, _, _, _ = market_session_state(_ist_now(), Index_Name)
     if auto and live_now:
-        st.session_state["data_store"] = refresh_index_tapes(data, want_tf)
+        st.session_state["data_store"] = refresh_index_tapes(data, want_tf, for_view="scalper")
         data = st.session_state["data_store"]
 
     st.markdown(
@@ -6595,14 +6616,14 @@ def render_scalper_mode():
 
 @st.fragment(run_every=5 if st.session_state.get("enable_main_refresh") else None)
 def live_dashboard_fragment():
-    view = st.session_state.get("app_view") or "default"
-    if view == "multi" or st.session_state.get("multi_index_mode"):
+    if view_is("multi"):
         render_multi_index_mode()
         return
-    if view == "scalper":
+    if view_is("scalper"):
         render_scalper_mode()
         return
-    # Default only below this line — Scalper/Multi API paths do not run.
+    if not view_is("default"):
+        return
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
@@ -6621,7 +6642,7 @@ def live_dashboard_fragment():
     have = st.session_state.get("data_store")
     now_s = datetime.datetime.now().timestamp()
     if have is None or need_tf:
-        refreshed_data = fetch_live_data(want_tf)
+        refreshed_data = fetch_live_data(want_tf, for_view="default")
         if refreshed_data:
             refreshed_data["selected_expiry"] = selected_expiry_str
             refreshed_data["bar_tf"] = want_tf
@@ -6629,12 +6650,12 @@ def live_dashboard_fragment():
             st.session_state["_full_fetch_ts"] = now_s
     elif auto and live_now:
         # Intelligent: candles + VA only. Never re-pull chain/GEX/IV/ATM.
-        st.session_state["data_store"] = refresh_index_tapes(have, want_tf)
+        st.session_state["data_store"] = refresh_index_tapes(have, want_tf, for_view="default")
         st.session_state["_tape_ts"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
         gex_sec = int(st.session_state.get("gex_refresh_sel") or st.session_state.get("gex_refresh_min") or 5) * 60
         last_full = float(st.session_state.get("_full_fetch_ts") or 0)
         if (now_s - last_full) >= gex_sec:
-            refreshed_data = fetch_live_data(want_tf)
+            refreshed_data = fetch_live_data(want_tf, for_view="default")
             if refreshed_data:
                 refreshed_data["selected_expiry"] = selected_expiry_str
                 refreshed_data["bar_tf"] = want_tf
@@ -7029,6 +7050,31 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
         # ========== ROW2: CVD 50%     | Liq Δ 20% | GEX Vol 30% ==========
         st.markdown("---")
         df_fut = data.get("df_futures", pd.DataFrame())
+        if df_fut is None or getattr(df_fut, "empty", True) or "time" not in getattr(df_fut, "columns", []):
+            try:
+                api = get_smart_api_client()
+                want_fix = st.session_state.get("selected_timeframe", "3 min")
+                api_int, lb = interval_mapping.get(want_fix, ("THREE_MINUTE", 10))
+                df_try, fut_fb, basis_info, fut_msg = fetch_futures_candles_with_vwap(
+                    api, Index_Name, df_master, api_int, 0 if market_session_state(_ist_now(), Index_Name)[0] else 2,
+                )
+                if df_try is None or df_try.empty:
+                    df_try, fut_fb, basis_info, fut_msg = fetch_futures_candles_with_vwap(
+                        api, Index_Name, df_master, "THREE_MINUTE", 1,
+                    )
+                    want_fix = "3 min"
+                if df_try is not None and not df_try.empty:
+                    data["df_futures"] = df_try
+                    data["fut_is_fallback"] = fut_fb
+                    data["basis_info"] = basis_info or data.get("basis_info") or {}
+                    data["fut_fallback_msg"] = fut_msg
+                    data["bar_tf"] = want_fix
+                    df_fut = df_try
+                    st.session_state["data_store"] = data
+                else:
+                    st.warning(f"Default tape fetch empty ({fut_msg or 'no futures bars'}). Wait 20s and click Fetch.")
+            except Exception as _tape_err:
+                st.warning(f"Default tape fetch failed: {_tape_err}")
         df_chain = pd.DataFrame(data.get("chain_results") or [])
         basis = data.get("basis_info", {}) or {}
 
@@ -7521,6 +7567,14 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     up = (dfi["close"].astype(float) >= dfi["open"].astype(float)).values if "open" in dfi.columns else np.ones(len(dfi), bool)
                     buy_v = np.where(up, vol, 0.0)
                     sell_v = np.where(~up, vol, 0.0)
+                if "vwap_idx" not in dfi.columns:
+                    dfi["vwap_idx"] = pd.to_numeric(dfi.get("vwap", dfi["close"]), errors="coerce")
+                if "vwap_upper_idx" not in dfi.columns:
+                    dfi["vwap_upper_idx"] = dfi["vwap_idx"]
+                if "vwap_lower_idx" not in dfi.columns:
+                    dfi["vwap_lower_idx"] = dfi["vwap_idx"]
+                if "time_str" not in dfi.columns:
+                    dfi["time_str"] = pd.to_datetime(dfi["time"]).dt.strftime("%H:%M")
                 fig_stack = make_subplots(
                     rows=4, cols=3,
                     column_widths=[0.13, 0.71, 0.16],
@@ -7960,7 +8014,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     else:
                         st.session_state["_fig_stack"] = fig_stack
                         st.session_state["_fig_sig"] = _fsig
-                    st.plotly_chart(fig_stack, use_container_width=True)
+                    st.plotly_chart(fig_stack, use_container_width=True, key=f"default_fig_stack_{Index_Name}")
                     if pdec_hist:
                         with st.expander(f"VA session log ({len(pdec_hist)} bars)", expanded=False):
                             lines = ["| Time | P Δ E C | Action |", "|---|---|---|"]
