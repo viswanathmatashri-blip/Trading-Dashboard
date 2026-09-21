@@ -1309,15 +1309,14 @@ def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st, index_name=N
 
 
 GEMINI_TRIGGER_MODELS = [
-    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite", "gemini-1.5-flash", "gemini-1.5-flash-8b",
     "gemini-3.5-flash", "gemini-3.5-flash-lite",
-    "gemini-2.5-flash", "gemini-2.0-flash",
-    "gemini-3.1-flash-lite",
 ]
 GEMINI_REGULAR_MODELS = [
+    "gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite", "gemini-1.5-flash", "gemini-1.5-flash-8b",
     "gemini-3.5-flash-lite", "gemini-3.5-flash",
-    "gemini-2.5-flash-lite", "gemini-2.0-flash-lite", "gemini-2.0-flash",
-    "gemini-3.1-flash-lite",
 ]
 
 
@@ -1333,30 +1332,35 @@ def gemini_generate(prompt: str, models: list) -> tuple:
     if not key:
         return "", "NO_KEY"
     last_err = ""
+    versions = ("v1beta", "v1")
     for model in models:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            r = requests.post(
-                url,
-                params={"key": key},
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1800}},
-                timeout=25,
-            )
-            if r.status_code == 429:
-                last_err = f"{model} 429"
+        for ver in versions:
+            try:
+                url = f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent"
+                r = requests.post(
+                    url,
+                    params={"key": key},
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1800}},
+                    timeout=35,
+                )
+                if r.status_code == 429:
+                    last_err = f"{model} {ver} 429 rate-limit"
+                    time.sleep(0.4)
+                    continue
+                if r.status_code >= 400:
+                    last_err = f"{model} {ver} {r.status_code} {str(r.text)[:160]}"
+                    continue
+                js = r.json()
+                parts = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+                txt = "".join(p.get("text", "") for p in parts).strip()
+                if txt:
+                    return txt, model
+                block = ((js.get("candidates") or [{}])[0].get("finishReason") or "")
+                last_err = f"{model} empty ({block or 'no text'})"
+            except Exception as e:
+                last_err = f"{model} {ver} {e}"
                 continue
-            if r.status_code >= 400:
-                last_err = f"{model} {r.status_code}"
-                continue
-            js = r.json()
-            parts = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
-            txt = "".join(p.get("text", "") for p in parts).strip()
-            if txt:
-                return txt, model
-        except Exception as e:
-            last_err = f"{model} {e}"
-            continue
     return "", last_err or "ALL_FAILED"
 
 
@@ -1532,8 +1536,11 @@ def maybe_gemini_scalper_setups():
         st.session_state["gemini_regular_wait"] = int(wait_s - (now - last))
         return
     if st.session_state.get("gemini_in_flight"):
-        return
+        started = float(st.session_state.get("gemini_in_flight_ts") or 0)
+        if started and (now - started) < 45:
+            return
     st.session_state["gemini_in_flight"] = True
+    st.session_state["gemini_in_flight_ts"] = now
     digest = build_scalper_gemini_digest()
     prompt = (
         "You are an options scalper for Indian index options (NIFTY/BANKNIFTY/SENSEX etc). "
@@ -3637,9 +3644,13 @@ elif st.session_state.get("app_view") == "scalper":
         st.caption(f"Next call in {nxt}s")
         if st.button("Generate setups now", use_container_width=True, key="gemini_force_btn"):
             st.session_state["gemini_regular_ts"] = 0
+            st.session_state["gemini_in_flight"] = False
             maybe_gemini_scalper_setups()
         if not _gemini_key():
             st.warning("Add GEMINI_API_KEY to Streamlit secrets.")
+        out = st.session_state.get("gemini_regular") or ""
+        if out:
+            st.text_area("Last Gemini", out, height=180, key="gemini_last_box")
 else:
     st.session_state["gemini_enabled"] = False
 
