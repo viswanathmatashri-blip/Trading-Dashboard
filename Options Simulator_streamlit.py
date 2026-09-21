@@ -2863,12 +2863,14 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
     raw = df_opt.copy()
     raw["time"] = pd.to_datetime(raw["time"])
     try:
-        sess, day, _ = pick_last_nse_session(raw, min_bars=8, prefer_today=True)
+        sess, day, _ = pick_last_nse_session(
+            raw, min_bars=3, prefer_today=True, index_name=index_name,
+        )
         d = sess if sess is not None and not sess.empty else raw
     except Exception:
         d = raw
         d["session_date"] = pd.to_datetime(d["time"]).dt.date
-        last = sorted(d["session_date"].unique())[-1]
+        last = sorted(d["session_date"].dropna().unique())[-1]
         d = d[d["session_date"] == last].copy()
     px = pd.to_numeric(d["close"], errors="coerce")
     med = float(px.median() or 0) or 1.0
@@ -2880,20 +2882,32 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
         return None, "NO DATA"
     d = attach_bar_flow(d.reset_index(drop=True), rebuild=True)
     d["time"] = pd.to_datetime(d["time"])
-    d["time_str"] = d["time"].dt.strftime("%H:%M")
+    d = d.dropna(subset=["time"]).sort_values("time")
+    d = d.drop_duplicates(subset=["time"], keep="last").reset_index(drop=True)
+    ts = d["time"].dt.strftime("%H:%M")
+    if ts.duplicated().any():
+        ts = d["time"].dt.strftime("%H:%M:%S")
+    d["time_str"] = ts.astype(str)
     d["tp"] = (d["high"] + d["low"] + d["close"]) / 3.0
-    cv = d["volume"].astype(float).cumsum().replace(0, np.nan)
-    d["vwap"] = (d["tp"] * d["volume"].astype(float)).cumsum() / cv
-    d["vwap"] = d["vwap"].ffill()
+    vol_s = pd.to_numeric(d.get("volume", 1.0), errors="coerce").fillna(1.0)
+    d["volume"] = vol_s
+    cv = vol_s.cumsum().replace(0, np.nan)
+    d["vwap"] = (d["tp"] * vol_s).cumsum() / cv
+    d["vwap"] = d["vwap"].ffill().fillna(d["close"])
     k_sig = float(st.session_state.get("vwap_sigma_select") or 1.5)
     dev = d["close"].astype(float) - d["vwap"]
-    # rolling, not expanding — expanding 1-min on a short option print fans the cloud
-    d["vwap_std"] = dev.rolling(20, min_periods=12).std()
+    win = 20 if len(d) >= 24 else max(5, min(12, len(d)))
+    d["vwap_std"] = dev.rolling(win, min_periods=max(3, win // 3)).std()
     cap = float(d["close"].astype(float).std() or 1.0) * 3.0
-    d["vwap_std"] = d["vwap_std"].clip(upper=max(cap, 1.0))
+    d["vwap_std"] = d["vwap_std"].clip(upper=max(cap, 1.0)).fillna(0.0)
     d["vwap_u"] = d["vwap"] + k_sig * d["vwap_std"]
     d["vwap_l"] = d["vwap"] - k_sig * d["vwap_std"]
-    axis_times = list(axis_times) if axis_times else session_axis_labels(tf_label, index_name)
+    own = d["time_str"].astype(str).tolist()
+    full_axis = list(axis_times) if axis_times else session_axis_labels(tf_label, index_name)
+    if len(own) < 8 or len(own) < max(12, int(len(full_axis) * 0.35)):
+        axis_times = own
+    else:
+        axis_times = full_axis
     xr = [-0.5, max(len(axis_times) - 0.5, 0.5)]
     y0 = float(min(d["low"].min(), d["vwap"].min()))
     y1 = float(max(d["high"].max(), d["vwap"].max()))
@@ -6428,7 +6442,8 @@ def _scalper_fetch_opt(api, tok, lab, want_tf):
                 )
             except Exception:
                 dfo = pd.DataFrame()
-            if dfo is not None and not dfo.empty and len(dfo) >= 8:
+            need = 40 if api_int == "ONE_MINUTE" else 8
+            if dfo is not None and not dfo.empty and len(dfo) >= need:
                 st.session_state[cache_key] = dfo
                 return dfo, tf_lab
             if dfo is not None and not dfo.empty:
