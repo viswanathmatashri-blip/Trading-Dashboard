@@ -6614,14 +6614,22 @@ def render_scalper_mode():
         _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560)
 
 
-@st.fragment(run_every=5 if st.session_state.get("enable_main_refresh") else None)
+@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("multi")) else None)
+def live_multi_fragment():
+    if not view_is("multi"):
+        return
+    render_multi_index_mode()
+
+
+@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("scalper")) else None)
+def live_scalper_fragment():
+    if not view_is("scalper"):
+        return
+    render_scalper_mode()
+
+
+@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("default")) else None)
 def live_dashboard_fragment():
-    if view_is("multi"):
-        render_multi_index_mode()
-        return
-    if view_is("scalper"):
-        render_scalper_mode()
-        return
     if not view_is("default"):
         return
     if "data_store" not in st.session_state:
@@ -8401,7 +8409,13 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
         render_basket_table_fullwidth(data)
 
 
-live_dashboard_fragment()
+_view_now = active_view()
+if _view_now == "multi":
+    live_multi_fragment()
+elif _view_now == "scalper":
+    live_scalper_fragment()
+else:
+    live_dashboard_fragment()
 
 # --- Raw Z-Score details ---
 if st.session_state.get("app_view", "default") == "default":
