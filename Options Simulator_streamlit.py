@@ -1521,10 +1521,10 @@ def build_scalper_gemini_digest() -> str:
     return "\n".join(str(x) for x in lines)
 
 
-def maybe_gemini_scalper_setups():
-    if st.session_state.get("app_view") != "scalper":
+def maybe_gemini_scalper_setups(force: bool = False):
+    if st.session_state.get("app_view") != "scalper" and not force:
         return
-    if not st.session_state.get("gemini_enabled"):
+    if not force and not st.session_state.get("gemini_enabled"):
         return
     if not _gemini_key():
         st.session_state["gemini_regular"] = "No GEMINI_API_KEY in Streamlit secrets."
@@ -1532,10 +1532,10 @@ def maybe_gemini_scalper_setups():
     now = time.time()
     last = float(st.session_state.get("gemini_regular_ts") or 0)
     wait_s = int(float(st.session_state.get("gemini_interval_min") or 5) * 60)
-    if now - last < wait_s:
+    if (not force) and now - last < wait_s:
         st.session_state["gemini_regular_wait"] = int(wait_s - (now - last))
         return
-    if st.session_state.get("gemini_in_flight"):
+    if (not force) and st.session_state.get("gemini_in_flight"):
         started = float(st.session_state.get("gemini_in_flight_ts") or 0)
         if started and (now - started) < 45:
             return
@@ -1545,22 +1545,25 @@ def maybe_gemini_scalper_setups():
     prompt = (
         "You are an options scalper for Indian index options (NIFTY/BANKNIFTY/SENSEX etc). "
         "Use ONLY the DATA snapshot of today's SPOT tape, ATM CE tape and ATM PE tape. "
-        "Do not invent prices that are not in DATA. Prefer high-probability structures "
-        "(breakout, breakdown, mean-reversion at VA/VWAP). "
+        "Do not invent prices that are not in DATA.\n"
+        "HARD RULE: ONLY BUYING setups. Never sell, short, or write CE/PE premium. "
+        "Bullish index view → BUY ATM CE. Bearish index view → BUY ATM PE. "
+        "If the idea would require selling a call or put, convert it to BUY the other side or output NO TRADE.\n"
         "If there is no edge write a single setup titled NO TRADE.\n\n"
         "Output ONLY trade setups. Do NOT write MARKET STATE, PECO, PCD$, PLAYERS, or BIAS sections.\n"
         "Output 1 or 2 setups MAX. Each setup MUST use this exact numbered shape and nothing else:\n"
         "SETUP n\n"
-        "1. Type : <Long BO | Short BD | Long mean-reversion | Short mean-reversion | NO TRADE>\n"
+        "1. Type : <Long BO (buy CE) | Short BD (buy PE) | Long mean-reversion (buy CE) | Short mean-reversion (buy PE) | NO TRADE>\n"
         "2. Trigger : <Nifty/spot close above/below a level from DATA>\n"
-        "3. Entry : <ATM CE or ATM PE price band, e.g. 88-100 ATM CE>\n"
-        "4. Target : <price> (<pct %>)\n"
-        "5. Stoploss : <price> (<pct %>)\n"
+        "3. Entry : <BUY ATM CE or BUY ATM PE price band, e.g. BUY 88-100 ATM PE>\n"
+        "4. Target : <higher option price> (<pct %>)\n"
+        "5. Stoploss : <lower option price> (<pct %>)\n"
         "6. Risk : Reward : <ratio like 1 : 2.1>\n"
         "7. Logic behind setup : <3-5 short sentences using spot VA/VWAP/EFI/CVD and option tape>\n\n"
-        "Rules: Entry, target, stop must be on the SAME option (CE or PE). "
+        "Rules: This is a debit buy. Target MUST be above entry. Stop MUST be below entry. "
+        "Entry, target, stop on the SAME bought option. "
         "Percentages vs the mid of the entry band. R:R = reward pct / risk pct. "
-        "If CE is missing say so and use PE or NO TRADE.\n\nDATA:\n" + digest
+        "Never say sell CE, short CE, fade CE, or write premium.\n\nDATA:\n" + digest
     )
     try:
         txt, model = gemini_generate(prompt, GEMINI_REGULAR_MODELS)
@@ -3643,9 +3646,22 @@ elif st.session_state.get("app_view") == "scalper":
         nxt = int(st.session_state.get("gemini_regular_wait") or 0)
         st.caption(f"Next call in {nxt}s")
         if st.button("Generate setups now", use_container_width=True, key="gemini_force_btn"):
+            st.session_state["gemini_enabled"] = True
             st.session_state["gemini_regular_ts"] = 0
             st.session_state["gemini_in_flight"] = False
-            maybe_gemini_scalper_setups()
+            if not _gemini_key():
+                st.session_state["gemini_regular"] = "No GEMINI_API_KEY in Streamlit secrets."
+                st.error("Add GEMINI_API_KEY to Streamlit Cloud secrets, then reboot.")
+            else:
+                with st.spinner("Calling Gemini…"):
+                    maybe_gemini_scalper_setups(force=True)
+                out_now = st.session_state.get("gemini_regular") or ""
+                if out_now.startswith("No GEMINI") or out_now.startswith("(no model"):
+                    st.error(out_now)
+                elif out_now:
+                    st.success("Setups ready — see cards beside Spot and the box below.")
+                else:
+                    st.warning("Gemini returned empty. Check the Last Gemini box.")
         if not _gemini_key():
             st.warning("Add GEMINI_API_KEY to Streamlit secrets.")
         out = st.session_state.get("gemini_regular") or ""
@@ -3763,7 +3779,9 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None, fo
         hv_key = f"hv_{Index_Name}_{hv_days}"
         hv_ts = st.session_state.get("_hv_ts") or 0
         now_s = datetime.datetime.now().timestamp()
-        if st.session_state.get(hv_key) and (now_s - hv_ts) < 900:
+        if for_view == "scalper":
+            index_hv = float(st.session_state.get(hv_key) or 0)
+        elif st.session_state.get(hv_key) and (now_s - hv_ts) < 900:
             index_hv = float(st.session_state[hv_key])
         else:
             index_hv = VolatilityEngine.calculate_hv(smart_api, spot_token, spot_exch, days=hv_days)
@@ -3796,6 +3814,39 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None, fo
         atm_strike = min(all_expiry_strikes, key=lambda x: abs(x - spot_price)) if all_expiry_strikes else spot_price
         atm_idx = all_expiry_strikes.index(atm_strike) if all_expiry_strikes else 0
         filtered_strikes = all_expiry_strikes[max(0, atm_idx - strikes_below): min(len(all_expiry_strikes), atm_idx + strikes_above + 1)] if all_expiry_strikes else []
+        if for_view == "scalper":
+            atm_c_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "CE") if atm_strike else ""
+            atm_p_tok = get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, int(atm_strike), "PE") if atm_strike else ""
+            if p_bar: p_bar.empty()
+            if p_status: p_status.empty()
+            return {
+                "index_name": Index_Name,
+                "spot_price": spot_price,
+                "F": float(df_futures["close"].iloc[-1]) if df_futures is not None and not df_futures.empty else spot_price,
+                "df_candles": df_candles,
+                "df_futures": df_futures,
+                "basis_info": basis_info,
+                "fut_is_fallback": fut_is_fallback,
+                "fut_fallback_msg": fut_fallback_msg,
+                "chain_results": [],
+                "market_data": {},
+                "levels": {},
+                "max_pain_strike": atm_strike,
+                "iv_percentile": 0,
+                "pcr": 0,
+                "total_call_oi": 0,
+                "total_put_oi": 0,
+                "total_net_gex_oi": 0,
+                "total_net_gex_vol": 0,
+                "atm_strike": atm_strike,
+                "atm_ce_token": atm_c_tok,
+                "atm_pe_token": atm_p_tok,
+                "opt_exchange": opt_exch,
+                "selected_expiry": selected_expiry_str,
+                "bar_tf": selected_interval_label,
+                "timestamp": now_dt.strftime("%d-%b-%Y %H:%M:%S IST"),
+                "is_holiday_fallback": is_holiday_fallback,
+            }
 
         tokens_to_fetch = set()
         strike_mapping = []
@@ -5865,15 +5916,16 @@ def refresh_index_tapes(data, want_tf, for_view="default"):
             spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=ltp_sym, symboltoken=spot_token)
             if spot_resp and spot_resp.get("status") and spot_resp.get("data"):
                 data["spot_price"] = float(spot_resp["data"]["ltp"])
-        have_sess = data.get("df_candles")
-        tail = 25 if (have_sess is not None and not getattr(have_sess, "empty", True) and len(have_sess) >= 8) else None
-        df_candles, is_fb = fetch_candles_with_holiday_fallback(
-            smart_api, spot_token, spot_exch, api_interval, lookback_days, Index_Name,
-            tail_minutes=tail,
-        )
-        if df_candles is not None and not df_candles.empty:
-            data["df_candles"] = merge_candle_frames(data.get("df_candles"), df_candles)
-            data["is_holiday_fallback"] = is_fb
+        if for_view != "scalper":
+            have_sess = data.get("df_candles")
+            tail = 25 if (have_sess is not None and not getattr(have_sess, "empty", True) and len(have_sess) >= 8) else None
+            df_candles, is_fb = fetch_candles_with_holiday_fallback(
+                smart_api, spot_token, spot_exch, api_interval, lookback_days, Index_Name,
+                tail_minutes=tail,
+            )
+            if df_candles is not None and not df_candles.empty:
+                data["df_candles"] = merge_candle_frames(data.get("df_candles"), df_candles)
+                data["is_holiday_fallback"] = is_fb
         have_f = data.get("df_futures")
         tail_f = 25 if (have_f is not None and not getattr(have_f, "empty", True) and len(have_f) >= 8) else None
         df_futures, fut_fb, basis_info, fut_msg = fetch_futures_candles_with_vwap(
@@ -5892,13 +5944,14 @@ def refresh_index_tapes(data, want_tf, for_view="default"):
                 data["spot_price"] = float(src["close"].iloc[-1])
         data["bar_tf"] = want_tf
         data["timestamp"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d-%b-%Y %H:%M:%S IST")
-        try:
-            tok = (data.get("basis_info") or {}).get("fut_token")
-            if tok:
-                sn = fetch_futures_book_snapshot(smart_api, Index_Name, tok)
-                _remember_book5(sn)
-        except Exception:
-            pass
+        if for_view != "scalper":
+            try:
+                tok = (data.get("basis_info") or {}).get("fut_token")
+                if tok:
+                    sn = fetch_futures_book_snapshot(smart_api, Index_Name, tok)
+                    _remember_book5(sn)
+            except Exception:
+                pass
     except Exception:
         pass
     return data
@@ -6462,39 +6515,27 @@ def _scalper_resolve_atm_token(data, lab):
 
 
 def _scalper_fetch_opt(api, tok, lab, want_tf):
+    """One getCandleData per side. Reuse cache for 4s so Auto-Refresh does not stampede."""
     cache_key = f"_scalp_df_{Index_Name}_{lab}_{want_tf}"
-    exch_opt = (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
-    intervals = []
-    primary, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
-    intervals.append((want_tf, primary))
-    for lab_tf, api_int in (("3 min", "THREE_MINUTE"), ("5 min", "FIVE_MINUTE"), ("1 min", "ONE_MINUTE")):
-        if api_int not in [x[1] for x in intervals]:
-            intervals.append((lab_tf, api_int))
-    if not api or not tok:
-        prev = st.session_state.get(cache_key)
-        return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
-    last_df = pd.DataFrame()
-    used = want_tf
-    for tf_lab, api_int in intervals:
-        for attempt in range(2):
-            try:
-                dfo, _ = fetch_candles_with_holiday_fallback(
-                    api, str(tok), exch_opt, api_int, 1, f"{Index_Name}_{lab}"
-                )
-            except Exception:
-                dfo = pd.DataFrame()
-            need = 40 if api_int == "ONE_MINUTE" else 8
-            if dfo is not None and not dfo.empty and len(dfo) >= need:
-                st.session_state[cache_key] = dfo
-                return dfo, tf_lab
-            if dfo is not None and not dfo.empty:
-                last_df = dfo
-                used = tf_lab
-            time.sleep(0.25 + 0.2 * attempt)
-    if last_df is not None and not last_df.empty:
-        st.session_state[cache_key] = last_df
-        return last_df, used
+    ts_key = cache_key + "_ts"
     prev = st.session_state.get(cache_key)
+    age = time.time() - float(st.session_state.get(ts_key) or 0)
+    if isinstance(prev, pd.DataFrame) and not prev.empty and age < 4:
+        return prev, want_tf
+    if not api or not tok:
+        return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
+    exch_opt = (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
+    api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
+    try:
+        dfo, _ = fetch_candles_with_holiday_fallback(
+            api, str(tok), exch_opt, api_int, 0, f"{Index_Name}_{lab}"
+        )
+    except Exception:
+        dfo = pd.DataFrame()
+    if dfo is not None and not dfo.empty:
+        st.session_state[cache_key] = dfo
+        st.session_state[ts_key] = time.time()
+        return dfo, want_tf
     if isinstance(prev, pd.DataFrame) and not prev.empty:
         return prev, want_tf
     return pd.DataFrame(), want_tf
