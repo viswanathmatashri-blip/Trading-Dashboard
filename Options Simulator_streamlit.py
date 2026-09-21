@@ -6620,7 +6620,7 @@ def render_scalper_mode():
             st.session_state["enable_main_refresh"] = auto_on
             st.rerun()
     with ctrl2:
-        opts = ["1 min", "3 min", "5 min"]
+        opts = ["1 min", "3 min", "5 min", "15 min"]
         cur = want_tf if want_tf in opts else "3 min"
         tf = st.radio("Bar", opts, horizontal=True, index=opts.index(cur), key="scalper_tf_radio")
         if tf != st.session_state.get("selected_timeframe"):
