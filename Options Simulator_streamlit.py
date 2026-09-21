@@ -2194,11 +2194,11 @@ def _tape_gap_window(cached, now_dt, index_name, api_interval):
     return start.strftime("%Y-%m-%d %H:%M"), now_dt.strftime("%Y-%m-%d %H:%M"), False
 
 
-def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX", tail_minutes=None):
+def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX", tail_minutes=None, cache_kind="spot"):
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
     live, today, _, _ = market_session_state(now_dt, index_name)
-    cached = load_session_cache("spot", index_name, api_interval, today)
+    cached = load_session_cache(cache_kind or "spot", index_name, api_interval, today)
     offsets = [0] if live else list(range(0, 16))
     for offset in offsets:
         target_to = now_dt - datetime.timedelta(days=offset)
@@ -2237,7 +2237,7 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
                 df_candles["time"] = series_to_ist(df_candles["time"])
                 if live:
                     df_candles = merge_candle_frames(cached, df_candles)
-                    save_session_cache("spot", index_name, api_interval, df_candles, today)
+                    save_session_cache(cache_kind or "spot", index_name, api_interval, df_candles, today)
                 return compute_technical_indicators(df_candles), (offset > 0 and not live)
     if live and not cached.empty:
         return compute_technical_indicators(cached.copy()), False
@@ -6515,7 +6515,8 @@ def render_multi_index_mode():
 def _scalper_resolve_atm_token(data, lab):
     lab = str(lab).upper()
     tok = data.get("atm_ce_token") if lab == "CE" else data.get("atm_pe_token")
-    if tok and str(tok) not in ("", "nan", "None"):
+    fut_tok = str(((data.get("basis_info") or {}).get("fut_token") or ""))
+    if tok and str(tok) not in ("", "nan", "None") and str(tok) != fut_tok:
         return str(tok), (data.get("opt_exchange") or Exchange)
     strike = float(data.get("atm_strike") or data.get("spot_price") or 0)
     src = df_expiry if df_expiry is not None and not df_expiry.empty else df_options
@@ -6528,7 +6529,9 @@ def _scalper_resolve_atm_token(data, lab):
             d["strike_num"] = d["strike_num"] / 100.0
     sn = pd.to_numeric(d["strike_num"], errors="coerce")
     sym = d["symbol"].astype(str).str.upper()
-    side = sym.str.endswith(lab)
+    side = sym.str.endswith(lab) & ~sym.str.contains("FUT", na=False)
+    if "instrumenttype" in d.columns:
+        side = side & d["instrumenttype"].astype(str).str.upper().str.contains("OPT", na=False)
     near = (sn - strike).abs()
     hit = d[side].copy()
     if hit.empty:
@@ -6557,10 +6560,20 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
         tried.append(ex)
         try:
             dfo, _ = fetch_candles_with_holiday_fallback(
-                api, str(tok), ex, api_int, 0, Index_Name
+                api, str(tok), ex, api_int, 0, Index_Name,
+                cache_kind=f"opt_{lab}_{tok}",
             )
         except Exception:
             dfo = pd.DataFrame()
+        if dfo is not None and not dfo.empty:
+            try:
+                spot_px = float((st.session_state.get("data_store") or {}).get("spot_price") or 0)
+                med = float(pd.to_numeric(dfo["close"], errors="coerce").median() or 0)
+                if spot_px and med > max(50.0, spot_px * 0.25):
+                    dfo = pd.DataFrame()
+                    st.session_state[f"_scalp_miss_{lab}"] = f"tok={tok} looks like futures px {med:.0f}"
+            except Exception:
+                pass
         if dfo is not None and not dfo.empty:
             st.session_state[cache_key] = dfo
             st.session_state[ts_key] = time.time()
