@@ -2390,7 +2390,16 @@ def session_hours(index_name=None):
         "CRUDEOIL", "CRUDEOILM", "CRUDE",
         "NATGASMINI", "NATURALGAS",
     }
-    if name in mcx_names or exch == "MCX":
+    if (
+        name in mcx_names
+        or exch == "MCX"
+        or name.startswith("CRUDE")
+        or name.startswith("GOLD")
+        or name.startswith("SILVER")
+        or name.startswith("NAT")
+        or "_CE" in name
+        or "_PE" in name
+    ) and name not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
         return 9, 0, 23, 30, "09:00", "23:30"
     return 9, 15, 15, 30, "09:15", "15:30"
 
@@ -6507,17 +6516,30 @@ def _scalper_resolve_atm_token(data, lab):
     lab = str(lab).upper()
     tok = data.get("atm_ce_token") if lab == "CE" else data.get("atm_pe_token")
     if tok and str(tok) not in ("", "nan", "None"):
-        return str(tok)
-    try:
-        strike = int(data.get("atm_strike") or 0)
-        if not strike:
-            return ""
-        return str(get_smartapi_token(df_expiry, Index_Name, target_expiry_dt, strike, lab) or "")
-    except Exception:
-        return ""
+        return str(tok), (data.get("opt_exchange") or Exchange)
+    strike = float(data.get("atm_strike") or data.get("spot_price") or 0)
+    src = df_expiry if df_expiry is not None and not df_expiry.empty else df_options
+    if src is None or getattr(src, "empty", True):
+        return "", Exchange
+    d = src.copy()
+    if "strike_num" not in d.columns:
+        d["strike_num"] = pd.to_numeric(d.get("strike_clean", d.get("strike")), errors="coerce")
+        if d["strike_num"].max() and d["strike_num"].max() > 100000:
+            d["strike_num"] = d["strike_num"] / 100.0
+    sn = pd.to_numeric(d["strike_num"], errors="coerce")
+    sym = d["symbol"].astype(str).str.upper()
+    side = sym.str.endswith(lab)
+    near = (sn - strike).abs()
+    hit = d[side].copy()
+    if hit.empty:
+        return "", Exchange
+    hit = hit.assign(_dist=near[side])
+    row = hit.sort_values("_dist").iloc[0]
+    exch = str(row.get("exch_seg") or data.get("opt_exchange") or Exchange)
+    return str(row.get("token") or ""), exch
 
 
-def _scalper_fetch_opt(api, tok, lab, want_tf):
+def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
     """One getCandleData per side. Reuse cache for 4s so Auto-Refresh does not stampede."""
     cache_key = f"_scalp_df_{Index_Name}_{lab}_{want_tf}"
     ts_key = cache_key + "_ts"
@@ -6527,18 +6549,24 @@ def _scalper_fetch_opt(api, tok, lab, want_tf):
         return prev, want_tf
     if not api or not tok:
         return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
-    exch_opt = (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
+    exch_opt = exch_opt or (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
     api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
-    try:
-        dfo, _ = fetch_candles_with_holiday_fallback(
-            api, str(tok), exch_opt, api_int, 0, f"{Index_Name}_{lab}"
-        )
-    except Exception:
-        dfo = pd.DataFrame()
-    if dfo is not None and not dfo.empty:
-        st.session_state[cache_key] = dfo
-        st.session_state[ts_key] = time.time()
-        return dfo, want_tf
+    dfo = pd.DataFrame()
+    tried = []
+    for ex in [exch_opt] + [e for e in ("MCX", "NCO", "NFO") if e != exch_opt]:
+        tried.append(ex)
+        try:
+            dfo, _ = fetch_candles_with_holiday_fallback(
+                api, str(tok), ex, api_int, 0, Index_Name
+            )
+        except Exception:
+            dfo = pd.DataFrame()
+        if dfo is not None and not dfo.empty:
+            st.session_state[cache_key] = dfo
+            st.session_state[ts_key] = time.time()
+            return dfo, want_tf
+    st.session_state[f"_scalp_miss_{lab}"] = f"tok={tok} exch tried {tried}"
+    st.session_state[ts_key] = time.time()
     if isinstance(prev, pd.DataFrame) and not prev.empty:
         return prev, want_tf
     return pd.DataFrame(), want_tf
@@ -6617,10 +6645,10 @@ def render_scalper_mode():
         )
         st.session_state["_scalp_tape_ts"] = time.time()
         data = st.session_state["data_store"]
-    ce_tok = _scalper_resolve_atm_token(data, "CE")
-    pe_tok = _scalper_resolve_atm_token(data, "PE")
-    ce_df, ce_tf = _scalper_fetch_opt(api, ce_tok, "CE", want_tf)
-    pe_df, pe_tf = _scalper_fetch_opt(api, pe_tok, "PE", want_tf)
+    ce_tok, ce_ex = _scalper_resolve_atm_token(data, "CE")
+    pe_tok, pe_ex = _scalper_resolve_atm_token(data, "PE")
+    ce_df, ce_tf = _scalper_fetch_opt(api, ce_tok, "CE", want_tf, ce_ex)
+    pe_df, pe_tf = _scalper_fetch_opt(api, pe_tok, "PE", want_tf, pe_ex)
 
     st.session_state["_scalp_spot_df"] = spot_df
     st.session_state["_scalp_pe_df"] = pe_df
@@ -6667,6 +6695,14 @@ def render_scalper_mode():
         _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560)
     with ce_col:
         _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560)
+    miss = " · ".join(
+        f"{s} {st.session_state.get(f'_scalp_miss_{s}') or ('tok '+str(t) if t else 'no token')}"
+        for s, t in (("PE", pe_tok), ("CE", ce_tok))
+        if (s == "PE" and (pe_df is None or getattr(pe_df, "empty", True)))
+        or (s == "CE" and (ce_df is None or getattr(ce_df, "empty", True)))
+    )
+    if miss:
+        st.caption("ATM tape miss: " + miss)
     if st.session_state.get("gemini_enabled"):
         try:
             maybe_gemini_scalper_setups()
