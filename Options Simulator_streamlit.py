@@ -2229,7 +2229,7 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
                 "todate": target_to.strftime(f"%Y-%m-%d {to_clock}")
             }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
-        time.sleep(0.20)
+        time.sleep(0.05 if live else 0.20)
         if candle_res and candle_res.get("status") and candle_res.get("data"):
             df_candles = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
             df_candles[["open", "high", "low", "close", "volume"]] = df_candles[["open", "high", "low", "close", "volume"]].astype(float)
@@ -3302,7 +3302,10 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
                 "todate": target_to.strftime(f"%Y-%m-%d {to_clock}")
             }
         candle_res = safe_api_call(smart_api.getCandleData, candle_param)
-        time.sleep(0.20)
+        if not currently_closed:
+            time.sleep(0.05)
+        else:
+            time.sleep(0.20)
         if not (candle_res and candle_res.get("status") and candle_res.get("data")):
             continue
         df = pd.DataFrame(candle_res["data"], columns=["time", "open", "high", "low", "close", "volume"])
@@ -5912,7 +5915,7 @@ def refresh_index_tapes(data, want_tf, for_view="default"):
                     ltp_sym = str(hit.iloc[0]["symbol"])
         except Exception:
             pass
-        if spot_token:
+        if spot_token and for_view != "scalper":
             spot_resp = safe_api_call(smart_api.ltpData, exchange=spot_exch, tradingsymbol=ltp_sym, symboltoken=spot_token)
             if spot_resp and spot_resp.get("status") and spot_resp.get("data"):
                 data["spot_price"] = float(spot_resp["data"]["ltp"])
@@ -6559,9 +6562,6 @@ def render_scalper_mode():
         return
     auto = bool(st.session_state.get("enable_main_refresh", False))
     live_now, _, _, _ = market_session_state(_ist_now(), Index_Name)
-    if auto and live_now:
-        st.session_state["data_store"] = refresh_index_tapes(data, want_tf, for_view="scalper")
-        data = st.session_state["data_store"]
 
     st.markdown(
         f"<h1 class='custom-heading' style='margin:0;font-size:16px;'>⚡ Scalper · {Index_Name} "
@@ -6589,15 +6589,10 @@ def render_scalper_mode():
         st.metric("Spot", f"{float(data.get('spot_price') or 0):,.0f}")
     st.caption("Spot full width · ATM PE / ATM CE 50-50 below · VA + right VP + Vol / EFI / CVD")
 
-    api = get_smart_api_client()
-    ce_tok = _scalper_resolve_atm_token(data, "CE")
-    pe_tok = _scalper_resolve_atm_token(data, "PE")
-    # CE first so a rate-limit on the second call does not blank the call pane
-    ce_df, ce_tf = _scalper_fetch_opt(api, ce_tok, "CE", want_tf)
-    pe_df, pe_tf = _scalper_fetch_opt(api, pe_tok, "PE", want_tf)
-    spot_src = data.get("df_candles")
+    # Draw Spot from cache first. Network (fut + CE/PE) runs after so the top chart is not blocked.
+    spot_src = data.get("df_futures")
     if spot_src is None or getattr(spot_src, "empty", True):
-        spot_src = data.get("df_futures")
+        spot_src = data.get("df_candles")
     spot_sess, _ = _multi_prepare_session(
         data.get("df_futures"), data.get("df_candles"), data.get("spot_price"), want_tf,
         index_name=Index_Name,
@@ -6614,14 +6609,22 @@ def render_scalper_mode():
     else:
         spot_df = spot_src if spot_src is not None else pd.DataFrame()
 
+    api = get_smart_api_client()
+    last_tape = float(st.session_state.get("_scalp_tape_ts") or 0)
+    if auto and live_now and (time.time() - last_tape) >= 8:
+        st.session_state["data_store"] = refresh_index_tapes(
+            st.session_state.get("data_store") or data, want_tf, for_view="scalper"
+        )
+        st.session_state["_scalp_tape_ts"] = time.time()
+        data = st.session_state["data_store"]
+    ce_tok = _scalper_resolve_atm_token(data, "CE")
+    pe_tok = _scalper_resolve_atm_token(data, "PE")
+    ce_df, ce_tf = _scalper_fetch_opt(api, ce_tok, "CE", want_tf)
+    pe_df, pe_tf = _scalper_fetch_opt(api, pe_tok, "PE", want_tf)
+
     st.session_state["_scalp_spot_df"] = spot_df
     st.session_state["_scalp_pe_df"] = pe_df
     st.session_state["_scalp_ce_df"] = ce_df
-    if st.session_state.get("gemini_enabled"):
-        try:
-            maybe_gemini_scalper_setups()
-        except Exception:
-            pass
     cards = _parse_gemini_setups(st.session_state.get("gemini_regular") or "")
     axis = session_axis_labels(want_tf, Index_Name)
 
@@ -6664,6 +6667,11 @@ def render_scalper_mode():
         _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560)
     with ce_col:
         _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560)
+    if st.session_state.get("gemini_enabled"):
+        try:
+            maybe_gemini_scalper_setups()
+        except Exception:
+            pass
 
 
 @st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("multi")) else None)
