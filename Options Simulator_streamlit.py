@@ -3984,7 +3984,10 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None):
         st.warning("API Rate limit / sync notice: Retrying on next cycle...")
         return None
 
-if run_btn or "data_store" not in st.session_state:
+# Full-chain fetch only in Default, and only on Fetch click.
+# Missing data_store is filled inside live_dashboard_fragment so we do not
+# double-call SmartAPI on every script run (that trips AB1004 / rate limits).
+if run_btn and st.session_state.get("app_view", "default") == "default":
     new_data = fetch_live_data(st.session_state["selected_timeframe"], progress_container=main_top_progress_holder)
     if new_data:
         new_data["selected_expiry"] = selected_expiry_str
@@ -6157,6 +6160,8 @@ def build_multi_index_figure(index_name, dfi, vp):
 
 
 def refresh_multi_index_tapes(want_tf):
+    if st.session_state.get("app_view") != "multi":
+        return st.session_state.get("multi_store") or {}
     api = get_smart_api_client()
     if not api:
         return
@@ -6207,6 +6212,8 @@ def refresh_multi_index_tapes(want_tf):
 
 
 def refresh_multi_index_gex():
+    if st.session_state.get("app_view") != "multi":
+        return
     api = get_smart_api_client()
     if not api:
         return
@@ -6281,6 +6288,8 @@ def refresh_multi_index_gex():
 
 
 def render_multi_index_mode():
+    if st.session_state.get("app_view") not in ("multi",) and not st.session_state.get("multi_index_mode"):
+        return
     want_tf = st.session_state.get("multi_tf", "15 min")
     auto = bool(st.session_state.get("enable_main_refresh", False))
     enabled = [k for k, v in (st.session_state.get("multi_enabled") or {}).items() if v]
@@ -6460,6 +6469,8 @@ def _scalper_fetch_opt(api, tok, lab, want_tf):
 
 
 def render_scalper_mode():
+    if st.session_state.get("app_view") != "scalper":
+        return
     st.session_state["pdec_labels_on"] = True
     st.session_state["atm_live_ok"] = True
     want_tf = st.session_state.get("selected_timeframe", "3 min")
@@ -6582,14 +6593,16 @@ def render_scalper_mode():
         _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560)
 
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=5 if st.session_state.get("enable_main_refresh") else None)
 def live_dashboard_fragment():
-    if st.session_state.get("multi_index_mode") or st.session_state.get("app_view") == "multi":
+    view = st.session_state.get("app_view") or "default"
+    if view == "multi" or st.session_state.get("multi_index_mode"):
         render_multi_index_mode()
         return
-    if st.session_state.get("app_view") == "scalper":
+    if view == "scalper":
         render_scalper_mode()
         return
+    # Default only below this line — Scalper/Multi API paths do not run.
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
