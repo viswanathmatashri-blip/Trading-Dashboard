@@ -310,6 +310,15 @@ def angel_rate_limited_now() -> bool:
     return (time.time() - float(st.session_state.get("_angel_rl_ts") or 0)) < 12
 
 
+def _mark_alice_rate_limit(msg=""):
+    st.session_state["_ab_rl_ts"] = time.time()
+    st.session_state["_ab_err"] = str(msg or "AliceBlue rate limit")
+
+
+def alice_rate_limited_now() -> bool:
+    return (time.time() - float(st.session_state.get("_ab_rl_ts") or 0)) < 20
+
+
 def safe_api_call(func, *args, max_retries=2, base_delay=0.35, **kwargs):
     """SmartAPI with short retry. Rate-limit → flag so AliceBlue can fill this tick only."""
     for attempt in range(max_retries):
@@ -2199,7 +2208,9 @@ def render_broker_status_ribbon():
         a_col, a_lab = "#90A4AE", "IDLE"
     ab_sess = bool(st.session_state.get("_ab_session") or AB_SESSION)
     ab_err = str(st.session_state.get("_ab_err") or "")
-    if ab_sess and not ab_err:
+    if alice_rate_limited_now():
+        b_col, b_lab = "#FFB300", "RATE LIMIT"
+    elif ab_sess and not ab_err:
         b_col, b_lab = "#00E676", "ON"
     elif _alice_configured() and ab_err:
         b_col, b_lab = "#FF5252", "DOWN"
@@ -2497,6 +2508,8 @@ def alice_option_chain_atm_tokens(index_name, expiry_label, spot):
 
 
 def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
+    if alice_rate_limited_now():
+        return pd.DataFrame()
     headers, sid = _alice_auth_headers()
     if not sid or not token:
         return pd.DataFrame()
@@ -2520,8 +2533,16 @@ def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
     for url in urls:
         try:
             r = requests.post(url, headers=headers, json=body, timeout=18)
+            raw = (r.text or "")[:240].lower()
+            if r.status_code == 429 or "rate" in raw or "too many" in raw:
+                _mark_alice_rate_limit(f"AliceBlue HTTP {r.status_code} rate limit")
+                return pd.DataFrame()
             js = r.json() if r.content else {}
             rows = js.get("result") or js.get("data") or []
+            emsg = str(js.get("emsg") or js.get("message") or "").lower()
+            if "rate" in emsg or "too many" in emsg:
+                _mark_alice_rate_limit(emsg)
+                return pd.DataFrame()
             if str(js.get("stat") or "").lower() in ("not_ok", "notok") or not rows:
                 continue
             df = pd.DataFrame(rows)
@@ -4538,13 +4559,14 @@ def fetch_live_data(selected_interval_label="5 min", progress_container=None, fo
     except Exception:
         if p_bar: p_bar.empty()
         if p_status: p_status.empty()
-        st.warning("API Rate limit / sync notice: Retrying on next cycle...")
+        if not st.session_state.get("alice_only"):
+            st.warning("API Rate limit / sync notice: Retrying on next cycle...")
         return None
 
 # Full-chain fetch only in Default, and only on Fetch click.
 # Missing data_store is filled inside live_dashboard_fragment so we do not
 # double-call SmartAPI on every script run (that trips AB1004 / rate limits).
-if run_btn and view_is("default"):
+if run_btn and view_is("default") and not st.session_state.get("alice_only"):
     new_data = fetch_live_data(
         st.session_state["selected_timeframe"],
         progress_container=main_top_progress_holder,
