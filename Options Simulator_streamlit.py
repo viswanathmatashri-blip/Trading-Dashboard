@@ -2263,14 +2263,20 @@ def get_alice_session() -> str:
                 st.session_state["_ab_err"] = f"AliceBlue A3 session: {str(js)[:160]}"
         enc = ""
         last_txt = ""
+        bodies = [{"userId": user}, {"userId": str(AB_USER_ID or user).strip()}]
         for url in (
             f"{host}/api/customer/getEncryptionKey",
             f"{host}/api/customer/getAPIEncpkey",
         ):
-            r = requests.post(url, headers=headers, json={"userId": user}, timeout=15)
-            js, perr = _ab_parse_json(r)
-            last_txt = perr or f"HTTP {r.status_code}"
-            enc = str(js.get("encKey") or "")
+            for body in bodies:
+                r = requests.post(url, headers=headers, json=body, timeout=15)
+                js, perr = _ab_parse_json(r)
+                enc = str(js.get("encKey") or js.get("enckey") or js.get("encryptionKey") or "")
+                emsg = str(js.get("emsg") or js.get("message") or js.get("stat") or "")
+                snippet = (r.text or "")[:160].replace("\n", " ")
+                last_txt = perr or emsg or snippet or f"HTTP {r.status_code}"
+                if enc:
+                    break
             if enc:
                 break
         if not enc:
