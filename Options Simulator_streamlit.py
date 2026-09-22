@@ -3978,6 +3978,12 @@ st.session_state["app_view"] = st.sidebar.radio(
     key="app_view_radio",
 )
 st.session_state["multi_index_mode"] = st.session_state["app_view"] == "multi"
+st.session_state["alice_only"] = st.sidebar.checkbox(
+    "Disable Angel One (AliceBlue only)",
+    value=bool(st.session_state.get("alice_only")),
+    key="alice_only_cb",
+    help="Skip SmartAPI candles. Scalper Fetch uses AliceBlue session + option chain.",
+)
 
 with st.sidebar.expander("4. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
@@ -4157,12 +4163,6 @@ _ab_from_url = consume_alice_oauth_redirect()
 if _ab_from_url:
     st.sidebar.success("AliceBlue session from redirect")
 st.sidebar.text_input("AliceBlue authCode", key="ab_auth_code", help="After ANT login, copy authCode from the redirect URL")
-st.session_state["alice_only"] = st.sidebar.checkbox(
-    "Disable Angel One (AliceBlue only)",
-    value=bool(st.session_state.get("alice_only")),
-    key="alice_only_cb",
-    help="Test AliceBlue: skip SmartAPI candle calls",
-)
 if st.sidebar.button("Retry AliceBlue session", use_container_width=True, key="ab_retry_btn"):
     st.session_state["_ab_session"] = ""
     st.session_state["_ab_session_ts"] = 0
@@ -7122,6 +7122,7 @@ def bootstrap_alice_data_store(want_tf):
     opt_ex = "MCX" if Index_Name in ("GOLDM", "GOLD", "CRUDEOIL", "SILVERM", "SILVER") else Exchange
     return {
         "spot_price": spot,
+        "F": spot,
         "atm_strike": atm,
         "atm_ce_token": ce_t,
         "atm_pe_token": pe_t,
@@ -7312,7 +7313,7 @@ def live_dashboard_fragment():
     intel = bool(st.session_state.get("intel_refresh", False))
     have = st.session_state.get("data_store")
     now_s = datetime.datetime.now().timestamp()
-    if have is None or need_tf:
+    if (have is None or need_tf) and not st.session_state.get("alice_only"):
         refreshed_data = fetch_live_data(want_tf, for_view="default")
         if refreshed_data:
             refreshed_data["selected_expiry"] = selected_expiry_str
@@ -7325,7 +7326,7 @@ def live_dashboard_fragment():
         st.session_state["_tape_ts"] = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%H:%M:%S")
         gex_sec = int(st.session_state.get("gex_refresh_sel") or st.session_state.get("gex_refresh_min") or 5) * 60
         last_full = float(st.session_state.get("_full_fetch_ts") or 0)
-        if (now_s - last_full) >= gex_sec:
+        if (now_s - last_full) >= gex_sec and not st.session_state.get("alice_only"):
             refreshed_data = fetch_live_data(want_tf, for_view="default")
             if refreshed_data:
                 refreshed_data["selected_expiry"] = selected_expiry_str
@@ -7388,12 +7389,14 @@ def live_dashboard_fragment():
 
     # Core metrics only
     c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-    c1.metric("Spot (Fut)", f"{data['spot_price']:.0f} ({data['F']:.0f})")
-    c2.metric("Max Pain", f"{data['max_pain_strike']}")
+    _sp = float(data.get("spot_price") or 0)
+    _fu = float(data.get("F") or _sp or 0)
+    c1.metric("Spot (Fut)", f"{_sp:.0f} ({_fu:.0f})")
+    c2.metric("Max Pain", f"{data.get('max_pain_strike') or '–'}")
     c3.metric("Net GEX (OI)", fmt_compact_num(data.get("total_net_gex_oi")))
-    c4.metric("ATM IV Rank", f"{data['iv_percentile']:.0f}%")
-    c5.metric("PCR", f"{data['pcr']:.2f}")
-    c6.metric("C/P OI", f"{data['total_call_oi']//1000}k/{data['total_put_oi']//1000}k")
+    c4.metric("ATM IV Rank", f"{float(data.get('iv_percentile') or 0):.0f}%")
+    c5.metric("PCR", f"{float(data.get('pcr') or 0):.2f}")
+    c6.metric("C/P OI", f"{int(data.get('total_call_oi') or 0)//1000}k/{int(data.get('total_put_oi') or 0)//1000}k")
     c7.metric("Flip", f"{lvls.get('Zero_Gamma_Flip', '–')}")
     straddle_val = lvls.get("Straddle_Cost", 0)
     c8.metric("Straddle", f"₹{straddle_val:.0f}" if straddle_val else "–")
