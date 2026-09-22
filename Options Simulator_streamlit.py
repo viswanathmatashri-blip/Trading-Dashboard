@@ -2414,10 +2414,11 @@ def _alice_auth_headers():
 
 
 def alice_option_chain_atm_tokens(index_name, expiry_label, spot):
-    """Official A3 option chain → ATM CE/PE tokens."""
+    """A3 docs: getUnderlyingExp → getOptionChain → ATM CE/PE tokens."""
     headers, sid = _alice_auth_headers()
     if not sid:
         return "", ""
+    base = "https://a3.aliceblueonline.com"
     name = str(index_name or "").upper()
     if name in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
         exch = "nse_fo"
@@ -2427,37 +2428,68 @@ def alice_option_chain_atm_tokens(index_name, expiry_label, spot):
         exch = "mcx_fo"
         if name.startswith("CRUDE"):
             name = "CRUDEOIL"
-        if name in ("GOLDM", "GOLD"):
+        elif name in ("GOLDM", "GOLD"):
             name = "GOLD"
-    exp = str(expiry_label or "").replace("-", "").upper()
-    if len(exp) == 9 and exp[:2].isdigit():
-        exp = exp[0:2] + exp[2:5] + exp[7:9]
-    body = {"underlying": name, "expiry": exp, "interval": 10, "exch": exch}
+    want = str(expiry_label or "").replace("-", "").replace(" ", "").upper()
+    if len(want) >= 9 and want[:2].isdigit() and want[2:5].isalpha():
+        want = want[:5] + want[-2:]
     try:
-        r = requests.post(
-            "https://a3.aliceblueonline.com/obrest/optionChain/getOptionChain",
-            headers=headers, json=body, timeout=18,
+        r_exp = requests.post(
+            f"{base}/obrest/optionChain/getUnderlyingExp",
+            headers=headers,
+            json={"underlying": name, "exch": exch},
+            timeout=15,
         )
-        js, _ = _ab_parse_json(r)
-        rows = (((js.get("result") or [{}])[0]).get("data") or [])
+        js_exp, err_exp = _ab_parse_json(r_exp)
+        if str(js_exp.get("status") or js_exp.get("stat") or "").lower() not in ("ok", ""):
+            st.session_state["_ab_err"] = f"AliceBlue expiry: {js_exp.get('message') or js_exp.get('emsg') or err_exp}"
+        exp_list = []
+        for block in (js_exp.get("result") or []):
+            exp_list.extend(block.get("underlying_expiry") or [])
+        exp = want
+        if exp_list:
+            up = [str(x).upper() for x in exp_list]
+            exp = next((x for x in up if x == want or x[-5:] == want[-5:]), up[0])
+        rows = []
+        last_msg = ""
+        for interval in (10, 5, 25, 20, 15):
+            r = requests.post(
+                f"{base}/obrest/optionChain/getOptionChain",
+                headers=headers,
+                json={"underlying": name, "expiry": exp, "interval": interval, "exch": exch},
+                timeout=18,
+            )
+            js, perr = _ab_parse_json(r)
+            last_msg = str(js.get("message") or js.get("emsg") or perr or r.status_code)
+            if str(js.get("status") or "").lower() != "ok" and str(js.get("stat") or "").lower() != "ok":
+                continue
+            for block in (js.get("result") or []):
+                rows.extend(block.get("data") or [])
+            if rows:
+                break
+        if not rows:
+            st.session_state["_ab_err"] = f"AliceBlue chain empty ({name} {exp} {exch}): {last_msg}"
+            return "", ""
         best_ce, best_pe, best_d = "", "", 1e18
         sp = float(spot or 0)
         for row in rows:
             ce, pe = row.get("CE") or {}, row.get("PE") or {}
-            ts = str(ce.get("tradingsymbol") or pe.get("tradingsymbol") or "")
-            digits = "".join(ch for ch in ts if ch.isdigit())
             strike = 0.0
-            if len(digits) >= 5:
-                strike = float(digits[-5:]) if float(digits[-5:]) > 100 else float(digits[-4:])
-            try:
-                strike = float(str(ce.get("forInsName") or "").split()[-2])
-            except Exception:
-                pass
+            for blob in (ce.get("forInsName"), pe.get("forInsName"), ce.get("tradingsymbol"), pe.get("tradingsymbol")):
+                parts = str(blob or "").replace("CE", " ").replace("PE", " ").replace("C", " ").split()
+                for p in reversed(parts):
+                    p2 = p.replace(",", "")
+                    if p2.isdigit() and float(p2) > 20:
+                        strike = float(p2)
+                        break
+                if strike:
+                    break
             d = abs(strike - sp) if strike and sp else 1e9
             if d < best_d:
                 best_d = d
                 best_ce = str(ce.get("token") or "")
                 best_pe = str(pe.get("token") or "")
+        st.session_state["_ab_chain_ok"] = f"{name} {exp} CE={best_ce} PE={best_pe}"
         return best_ce, best_pe
     except Exception as e:
         st.session_state["_ab_err"] = f"AliceBlue chain: {e}"
@@ -2563,6 +2595,12 @@ def _tape_gap_window(cached, now_dt, index_name, api_interval):
 
 
 def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX", tail_minutes=None, cache_kind="spot"):
+    if st.session_state.get("alice_only"):
+        df = fetch_alice_candles(spot_token, exchange, api_interval, index_name)
+        if df is not None and not df.empty:
+            st.session_state["_last_broker"] = "aliceblue"
+            return df
+        return pd.DataFrame()
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
     live, today, _, _ = market_session_state(now_dt, index_name)
@@ -3666,6 +3704,12 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
 
     if not fut_token:
         return pd.DataFrame(), False, {}, "No active futures contract found"
+    if st.session_state.get("alice_only"):
+        df = fetch_alice_candles(fut_token, fut_exch, api_interval, index_name)
+        if df is not None and not df.empty:
+            st.session_state["_last_broker"] = "aliceblue"
+            return df, False, {"fut_token": str(fut_token), "fut_expiry": fut_expiry, "fut_exch": fut_exch}, ""
+        return pd.DataFrame(), False, {}, "AliceBlue only: no futures tape"
 
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
@@ -4092,6 +4136,12 @@ _ab_from_url = consume_alice_oauth_redirect()
 if _ab_from_url:
     st.sidebar.success("AliceBlue session from redirect")
 st.sidebar.text_input("AliceBlue authCode", key="ab_auth_code", help="After ANT login, copy authCode from the redirect URL")
+st.session_state["alice_only"] = st.sidebar.checkbox(
+    "Disable Angel One (AliceBlue only)",
+    value=bool(st.session_state.get("alice_only")),
+    key="alice_only_cb",
+    help="Test AliceBlue: skip SmartAPI candle calls",
+)
 if st.sidebar.button("Retry AliceBlue session", use_container_width=True, key="ab_retry_btn"):
     st.session_state["_ab_session"] = ""
     st.session_state["_ab_session_ts"] = 0
