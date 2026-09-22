@@ -7391,7 +7391,7 @@ def render_scalper_mode():
         _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560, hide_delta=True, accent="#69F0AE")
     miss = " · ".join(
         f"{s} {st.session_state.get(f'_scalp_miss_{s}') or ('tok '+str(t) if t else 'no token')}"
-        for s, t in (("PE", pe_tok), ("CE", ce_tok))
+        for s, t in (("PE", pe_a or ape), ("CE", ce_a or ace))
         if (s == "PE" and (pe_df is None or getattr(pe_df, "empty", True)))
         or (s == "CE" and (ce_df is None or getattr(ce_df, "empty", True)))
     )
