@@ -7107,6 +7107,33 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
     return pd.DataFrame(), want_tf
 
 
+def bootstrap_alice_data_store(want_tf):
+    """Minimal store from AliceBlue only: spot tape + ATM CE/PE tokens."""
+    spot_tok, spot_exch, fut_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
+    api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
+    spot_df = fetch_alice_candles(spot_tok, spot_exch or fut_exch, api_int, Index_Name)
+    spot = 0.0
+    if spot_df is not None and not spot_df.empty:
+        spot = float(pd.to_numeric(spot_df["close"], errors="coerce").iloc[-1] or 0)
+        st.session_state["_last_broker"] = "aliceblue"
+    ce_t, pe_t = alice_option_chain_atm_tokens(Index_Name, selected_expiry_str, spot)
+    step = 50 if Index_Name in ("NIFTY", "FINNIFTY") else 100
+    atm = int(round(spot / step) * step) if spot else 0
+    opt_ex = "MCX" if Index_Name in ("GOLDM", "GOLD", "CRUDEOIL", "SILVERM", "SILVER") else Exchange
+    return {
+        "spot_price": spot,
+        "atm_strike": atm,
+        "atm_ce_token": ce_t,
+        "atm_pe_token": pe_t,
+        "opt_exchange": opt_ex,
+        "selected_expiry": selected_expiry_str,
+        "spot_df": spot_df if spot_df is not None else pd.DataFrame(),
+        "basis_info": {"source": "aliceblue"},
+        "chain_results": [],
+        "bar_tf": want_tf,
+    }
+
+
 def render_scalper_mode():
     if st.session_state.get("app_view") != "scalper":
         return
@@ -7114,7 +7141,10 @@ def render_scalper_mode():
     st.session_state["atm_live_ok"] = True
     want_tf = st.session_state.get("selected_timeframe", "3 min")
     if "data_store" not in st.session_state or run_btn:
-        refreshed = fetch_live_data(want_tf, for_view="scalper")
+        if st.session_state.get("alice_only"):
+            refreshed = bootstrap_alice_data_store(want_tf)
+        else:
+            refreshed = fetch_live_data(want_tf, for_view="scalper")
         if refreshed:
             refreshed["selected_expiry"] = selected_expiry_str
             refreshed["bar_tf"] = want_tf
