@@ -4073,6 +4073,12 @@ st.session_state["app_view"] = st.sidebar.radio(
     key="app_view_radio",
 )
 st.session_state["multi_index_mode"] = st.session_state["app_view"] == "multi"
+_cur_view = st.session_state["app_view"]
+if st.session_state.get("_armed_view") != _cur_view:
+    st.session_state["enable_main_refresh"] = False
+    st.session_state["intel_refresh"] = False
+    st.session_state["atm_live_ok"] = False
+    st.session_state["_armed_view"] = _cur_view
 st.session_state["alice_only"] = st.sidebar.checkbox(
     "Disable Angel One (AliceBlue only)",
     value=bool(st.session_state.get("alice_only")),
