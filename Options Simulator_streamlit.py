@@ -2176,6 +2176,40 @@ def _alice_configured() -> bool:
     return bool(AB_APP_KEY) and bool(AB_USER_ID or AB_SESSION)
 
 
+def render_broker_status_ribbon():
+    angel_obj = st.session_state.get("_smart_api_obj") is not None
+    angel_err = str(st.session_state.get("_smart_api_err") or "")
+    angel_rl = angel_rate_limited_now()
+    if angel_obj and not angel_err:
+        a_col, a_lab = "#00E676", "ON"
+    elif angel_rl:
+        a_col, a_lab = "#FFB300", "RATE LIMIT"
+    elif angel_err:
+        a_col, a_lab = "#FF5252", "DOWN"
+    else:
+        a_col, a_lab = "#90A4AE", "IDLE"
+    ab_sess = bool(st.session_state.get("_ab_session") or AB_SESSION)
+    ab_err = str(st.session_state.get("_ab_err") or "")
+    if ab_sess and not ab_err:
+        b_col, b_lab = "#00E676", "ON"
+    elif _alice_configured() and ab_err:
+        b_col, b_lab = "#FF5252", "DOWN"
+    elif _alice_configured():
+        b_col, b_lab = "#FFB300", "STANDBY"
+    else:
+        b_col, b_lab = "#90A4AE", "OFF"
+    last = str(st.session_state.get("_last_broker") or "smartapi")
+    st.markdown(
+        f"<div style='display:flex;gap:14px;align-items:center;flex-wrap:wrap;"
+        f"font-size:12px;font-weight:700;letter-spacing:0.04em;margin:2px 0 8px 0;'>"
+        f"<span style='color:{a_col};'>● SmartAPI {a_lab}</span>"
+        f"<span style='color:{b_col};'>● AliceBlue {b_lab}</span>"
+        f"<span style='color:#90A4AE;font-weight:600;'>last tape {last}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def get_alice_session() -> str:
     """Session id for AliceBlue REST. Cached ~50 min."""
     cached = str(st.session_state.get("_ab_session") or AB_SESSION or "").strip()
@@ -6960,6 +6994,7 @@ def render_scalper_mode():
 def live_multi_fragment():
     if not view_is("multi"):
         return
+    render_broker_status_ribbon()
     render_multi_index_mode()
 
 
@@ -6967,6 +7002,7 @@ def live_multi_fragment():
 def live_scalper_fragment():
     if not view_is("scalper"):
         return
+    render_broker_status_ribbon()
     render_scalper_mode()
 
 
@@ -6974,6 +7010,7 @@ def live_scalper_fragment():
 def live_dashboard_fragment():
     if not view_is("default"):
         return
+    render_broker_status_ribbon()
     if "data_store" not in st.session_state:
         st.info("Please click '🚀 Fetch Chain & Greeks' in the sidebar to load data.")
         return
