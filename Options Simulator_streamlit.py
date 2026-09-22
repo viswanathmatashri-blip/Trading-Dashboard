@@ -154,6 +154,14 @@ AB_APP_SECRET = _secret_or_env("APP_SECRET_KEY", "ALICEBLUE_APP_SECRET", "ALICEB
 AB_USER_ID = _secret_or_env("ALICEBLUE_USER_ID", "AB_USER_ID", "ALICEBLUE_CLIENT_ID")
 AB_SESSION = _secret_or_env("ALICEBLUE_SESSION", "AB_SESSION", "ALICEBLUE_SESSION_ID")
 AB_AUTH_CODE = _secret_or_env("ALICEBLUE_AUTH_CODE", "AB_AUTH_CODE", "AUTH_CODE")
+try:
+    _qp = dict(st.query_params)
+    if _qp.get("authCode") or _qp.get("authcode"):
+        st.session_state["ab_auth_code"] = str(_qp.get("authCode") or _qp.get("authcode"))
+    if _qp.get("userId") or _qp.get("userid"):
+        st.session_state["ab_query_user"] = str(_qp.get("userId") or _qp.get("userid"))
+except Exception:
+    pass
 
 # Initialise Session State Variables
 if "basket_legs" not in st.session_state:
@@ -2232,7 +2240,7 @@ def get_alice_session() -> str:
     ts = float(st.session_state.get("_ab_session_ts") or 0)
     if cached and (time.time() - ts) < 3000:
         return cached
-    user = (AB_USER_ID or "").strip().upper()
+    user = (AB_USER_ID or str(st.session_state.get("ab_query_user") or "")).strip().upper()
     key = (AB_APP_KEY or "").strip()
     secret = (AB_APP_SECRET or "").strip()
     auth_code = (AB_AUTH_CODE or str(st.session_state.get("ab_auth_code") or "")).strip()
@@ -2261,6 +2269,15 @@ def get_alice_session() -> str:
                 return sid
             if js:
                 st.session_state["_ab_err"] = f"AliceBlue A3 session: {str(js)[:160]}"
+            elif not sid:
+                st.session_state["_ab_err"] = perr or "AliceBlue A3 empty reply"
+            return cached if not sid else sid
+        if not auth_code:
+            st.session_state["_ab_err"] = (
+                "Open ANT with your App Key, login, then paste authCode. "
+                "Old encKey API is not used."
+            )
+            return cached
         enc = ""
         last_txt = ""
         bodies = [{"userId": user}, {"userId": str(AB_USER_ID or user).strip()}]
@@ -3979,6 +3996,9 @@ else:
     st.session_state["gemini_enabled"] = False
 
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
+_ab_login = f"https://ant.aliceblueonline.com/?appcode={AB_APP_KEY}" if AB_APP_KEY else "https://ant.aliceblueonline.com/"
+st.sidebar.markdown(f"[Open AliceBlue ANT login]({_ab_login})")
+st.sidebar.text_input("AliceBlue authCode", key="ab_auth_code", help="After ANT login, copy authCode from the redirect URL")
 if st.sidebar.button("Retry AliceBlue session", use_container_width=True, key="ab_retry_btn"):
     st.session_state["_ab_session"] = ""
     st.session_state["_ab_session_ts"] = 0
