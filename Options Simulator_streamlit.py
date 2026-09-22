@@ -2219,13 +2219,18 @@ def render_broker_status_ribbon():
     else:
         b_col, b_lab = "#90A4AE", "OFF"
     last = str(st.session_state.get("_last_broker") or "smartapi")
+    srcs = " · ".join(
+        f"{lab} {st.session_state.get(key) or '–'}"
+        for lab, key in (("Spot", "_src_spot"), ("PE", "_src_opt_PE"), ("CE", "_src_opt_CE"))
+    )
     hint = (ab_err[:90] + "…") if ab_err and len(ab_err) > 90 else ab_err
     st.markdown(
         f"<div style='display:flex;gap:14px;align-items:center;flex-wrap:wrap;"
         f"font-size:12px;font-weight:700;letter-spacing:0.04em;margin:2px 0 8px 0;'>"
         f"<span style='color:{a_col};'>● SmartAPI {a_lab}</span>"
         f"<span style='color:{b_col};'>● AliceBlue {b_lab}</span>"
-        f"<span style='color:#90A4AE;font-weight:600;'>last tape {last}</span>"
+        f"<span style='color:#90A4AE;font-weight:600;'>last {last}</span>"
+        f"<span style='color:#90A4AE;font-weight:600;'>{srcs}</span>"
         f"{f'<span style=\"color:#78909C;font-weight:500;\">{hint}</span>' if hint else ''}"
         f"</div>",
         unsafe_allow_html=True,
@@ -2670,10 +2675,10 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
                 if live:
                     df_candles = merge_candle_frames(cached, df_candles)
                     save_session_cache(cache_kind or "spot", index_name, api_interval, df_candles, today)
+                st.session_state["_last_broker"] = "smartapi"
+                st.session_state[f"_src_{cache_kind or 'spot'}"] = "smartapi"
                 return compute_technical_indicators(df_candles), (offset > 0 and not live)
-    if live and not cached.empty:
-        return compute_technical_indicators(cached.copy()), False
-    if angel_rate_limited_now() and _alice_configured() and spot_token:
+    if _alice_configured() and spot_token:
         try:
             alt = fetch_alice_candles(spot_token, exchange, api_interval, index_name)
             if alt is not None and not alt.empty:
@@ -2682,9 +2687,12 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
                     alt = merge_candle_frames(cached, alt)
                     save_session_cache(cache_kind or "spot", index_name, api_interval, alt, today)
                 st.session_state["_last_broker"] = "aliceblue"
+                st.session_state[f"_src_{cache_kind or 'spot'}"] = "aliceblue"
                 return compute_technical_indicators(alt), False
         except Exception:
             pass
+    if live and not cached.empty:
+        return compute_technical_indicators(cached.copy()), False
     return pd.DataFrame(), False
 
 
@@ -7090,6 +7098,7 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
         if dfo is not None and not dfo.empty:
             st.session_state[cache_key] = dfo
             st.session_state[ts_key] = time.time()
+            st.session_state[f"_src_opt_{lab}"] = "smartapi" if not st.session_state.get("alice_only") else "aliceblue"
             return dfo, want_tf
     if _alice_configured() and tok:
         try:
@@ -7102,6 +7111,7 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
                     st.session_state[ts_key] = time.time()
                     st.session_state[f"_scalp_miss_{lab}"] = ""
                     st.session_state["_last_broker"] = "aliceblue"
+                    st.session_state[f"_src_opt_{lab}"] = "aliceblue"
                     return alt, want_tf
         except Exception:
             pass
