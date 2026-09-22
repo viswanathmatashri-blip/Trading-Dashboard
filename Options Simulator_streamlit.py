@@ -2230,9 +2230,7 @@ def get_alice_session() -> str:
         enc = ""
         last_txt = ""
         for url in (
-            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getAPIEncpkey",
-            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/customer/getAPIEncpkey",
-            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/customer/getEncryptionKey",
+                        "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/customer/getEncryptionKey",
         ):
             r = requests.post(url, headers=headers, json={"userId": user}, timeout=12)
             last_txt = (r.text or "")[:160]
