@@ -2329,6 +2329,39 @@ def get_alice_session() -> str:
     return cached
 
 
+def consume_alice_oauth_redirect():
+    """If ANT redirected here with authCode, mint session and strip the query."""
+    try:
+        qp = st.query_params
+        def _one(*names):
+            for name in names:
+                v = qp.get(name)
+                if isinstance(v, (list, tuple)):
+                    v = v[0] if v else ""
+                v = str(v or "").strip()
+                if v:
+                    return v
+            return ""
+        ac = _one("authCode", "authcode", "code")
+        uid = _one("userId", "userid", "userID")
+        if not ac:
+            return ""
+        st.session_state["ab_auth_code"] = ac
+        if uid:
+            st.session_state["ab_query_user"] = uid
+        st.session_state["_ab_session"] = ""
+        st.session_state["_ab_session_ts"] = 0
+        sid = get_alice_session()
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        return sid
+    except Exception as e:
+        st.session_state["_ab_err"] = f"AliceBlue redirect: {e}"
+        return ""
+
+
 def _alice_token_exchange(token, exchange, index_name=""):
     tok = str(token or "").strip()
     exch = str(exchange or "NSE").upper()
@@ -3998,6 +4031,9 @@ else:
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
 _ab_login = f"https://ant.aliceblueonline.com/?appcode={AB_APP_KEY}" if AB_APP_KEY else "https://ant.aliceblueonline.com/"
 st.sidebar.markdown(f"[Open AliceBlue ANT login]({_ab_login})")
+_ab_from_url = consume_alice_oauth_redirect()
+if _ab_from_url:
+    st.sidebar.success("AliceBlue session from redirect")
 st.sidebar.text_input("AliceBlue authCode", key="ab_auth_code", help="After ANT login, copy authCode from the redirect URL")
 if st.sidebar.button("Retry AliceBlue session", use_container_width=True, key="ab_retry_btn"):
     st.session_state["_ab_session"] = ""
