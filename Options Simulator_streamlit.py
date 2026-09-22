@@ -2199,12 +2199,14 @@ def render_broker_status_ribbon():
     else:
         b_col, b_lab = "#90A4AE", "OFF"
     last = str(st.session_state.get("_last_broker") or "smartapi")
+    hint = (ab_err[:90] + "…") if ab_err and len(ab_err) > 90 else ab_err
     st.markdown(
         f"<div style='display:flex;gap:14px;align-items:center;flex-wrap:wrap;"
         f"font-size:12px;font-weight:700;letter-spacing:0.04em;margin:2px 0 8px 0;'>"
         f"<span style='color:{a_col};'>● SmartAPI {a_lab}</span>"
         f"<span style='color:{b_col};'>● AliceBlue {b_lab}</span>"
         f"<span style='color:#90A4AE;font-weight:600;'>last tape {last}</span>"
+        f"{f'<span style=\"color:#78909C;font-weight:500;\">{hint}</span>' if hint else ''}"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -2225,35 +2227,52 @@ def get_alice_session() -> str:
         return cached
     try:
         headers = {"Content-Type": "application/json"}
-        r = requests.post(
-            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getAPIEncpkey",
-            headers=headers,
-            json={"userId": user},
-            timeout=12,
-        )
         enc = ""
-        try:
-            enc = str((r.json() or {}).get("encKey") or "")
-        except Exception:
-            enc = ""
+        last_txt = ""
+        for url in (
+            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getAPIEncpkey",
+            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/customer/getAPIEncpkey",
+        ):
+            r = requests.post(url, headers=headers, json={"userId": user}, timeout=12)
+            last_txt = (r.text or "")[:160]
+            try:
+                enc = str((r.json() or {}).get("encKey") or "")
+            except Exception:
+                enc = ""
+            if enc:
+                break
         if not enc:
-            st.session_state["_ab_err"] = f"AliceBlue encKey failed: {r.text[:160]}"
+            st.session_state["_ab_err"] = f"AliceBlue encKey failed: {last_txt}"
             return cached
-        user_data = hashlib.sha256(f"{user}{key}{enc}".encode()).hexdigest()
-        r2 = requests.post(
-            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getUserSID",
-            headers=headers,
-            json={"userId": user, "userData": user_data},
-            timeout=12,
-        )
-        js = r2.json() if r2.content else {}
-        sid = str(js.get("sessionID") or js.get("userSession") or js.get("sessionId") or "")
+        hashes = [
+            hashlib.sha256(f"{user}{key}{enc}".encode()).hexdigest(),
+        ]
+        if AB_APP_SECRET:
+            hashes.append(hashlib.sha256(f"{user}{AB_APP_SECRET}{enc}".encode()).hexdigest())
+        sid = ""
+        last_js = {}
+        for user_data in hashes:
+            for url in (
+                "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getUserSID",
+                "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/customer/getUserSID",
+            ):
+                r2 = requests.post(
+                    url, headers=headers,
+                    json={"userId": user, "userData": user_data},
+                    timeout=12,
+                )
+                last_js = r2.json() if r2.content else {}
+                sid = str(last_js.get("sessionID") or last_js.get("userSession") or last_js.get("sessionId") or "")
+                if sid:
+                    break
+            if sid:
+                break
         if sid:
             st.session_state["_ab_session"] = sid
             st.session_state["_ab_session_ts"] = time.time()
             st.session_state["_ab_err"] = ""
             return sid
-        st.session_state["_ab_err"] = f"AliceBlue session failed: {str(js)[:180]}"
+        st.session_state["_ab_err"] = f"AliceBlue session failed: {str(last_js)[:180]}"
     except Exception as e:
         st.session_state["_ab_err"] = f"AliceBlue session exception: {e}"
     return cached
@@ -3926,6 +3945,15 @@ else:
     st.session_state["gemini_enabled"] = False
 
 run_btn = st.sidebar.button("🚀 Fetch Chain & Greeks", use_container_width=True)
+if st.sidebar.button("Retry AliceBlue session", use_container_width=True, key="ab_retry_btn"):
+    st.session_state["_ab_session"] = ""
+    st.session_state["_ab_session_ts"] = 0
+    st.session_state["_ab_err"] = ""
+    sid = get_alice_session()
+    if sid:
+        st.sidebar.success("AliceBlue session OK")
+    else:
+        st.sidebar.error(str(st.session_state.get("_ab_err") or "AliceBlue session failed"))
 
 interval_mapping = {
     "1 min": ("ONE_MINUTE", 0),
