@@ -2173,6 +2173,80 @@ def download_master_scrip():
         return df_master
     return pd.DataFrame()
 
+
+@st.cache_data(ttl=3600)
+def download_alice_contract_master(exch="MCX"):
+    """Official AliceBlue contract master. Names like 'CRUDEOIL 15th OCT 7750 CE'."""
+    url = f"https://v2api.aliceblueonline.com/restpy/contract_master?exch={exch}"
+    try:
+        res = requests.get(url, timeout=45)
+        js = res.json() if res.content else {}
+        rows = js.get(exch) or js.get(exch.upper()) or []
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df["strike_num"] = pd.to_numeric(df.get("strike_price"), errors="coerce")
+        df["token"] = df["token"].astype(str)
+        df["symbol_u"] = df["symbol"].astype(str).str.upper()
+        df["opt"] = df.get("option_type", pd.Series("", index=df.index)).astype(str).str.upper()
+        df["fmt"] = df.get("formatted_ins_name", pd.Series("", index=df.index)).astype(str)
+        exp_ms = pd.to_numeric(df.get("expiry_date"), errors="coerce")
+        df["expiry_dt"] = pd.to_datetime(exp_ms, unit="ms", utc=True, errors="coerce").dt.tz_convert("Asia/Kolkata").dt.normalize()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def alice_master_atm_tokens(index_name, expiry_label, spot):
+    name = str(index_name or "").upper()
+    if name in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+        exch = "NFO"
+        aliases = [name]
+    elif name in ("SENSEX", "BANKEX"):
+        exch = "BFO"
+        aliases = [name]
+    else:
+        exch = "MCX"
+        aliases = MCX_NAME_ALIASES.get(name, [name])
+        if name.startswith("CRUDE"):
+            aliases = ["CRUDEOIL", "CRUDEOILM", "CRUDE"]
+    df = download_alice_contract_master(exch)
+    if df is None or df.empty:
+        return "", ""
+    hit = df[df["symbol_u"].isin([a.upper() for a in aliases])]
+    hit = hit[hit["opt"].isin(["CE", "PE"])]
+    if hit.empty:
+        return "", ""
+    want = str(expiry_label or "").replace("-", "").upper()
+    if not hit["expiry_dt"].isna().all():
+        try:
+            wd = pd.to_datetime(want, format="%d%b%Y", errors="coerce")
+            if pd.isna(wd):
+                wd = pd.to_datetime(want, format="%d%b%y", errors="coerce")
+            if not pd.isna(wd):
+                day = hit["expiry_dt"].dt.tz_localize(None) if getattr(hit["expiry_dt"].dt, "tz", None) else hit["expiry_dt"]
+                near = hit[day.dt.date == wd.date()]
+                if not near.empty:
+                    hit = near
+        except Exception:
+            pass
+    sp = float(spot or 0)
+    if not sp:
+        return "", ""
+    ce = hit[hit["opt"] == "CE"].copy()
+    pe = hit[hit["opt"] == "PE"].copy()
+    if ce.empty or pe.empty:
+        return "", ""
+    ce["_d"] = (ce["strike_num"] - sp).abs()
+    pe["_d"] = (pe["strike_num"] - sp).abs()
+    ce_tok = str(ce.sort_values("_d").iloc[0]["token"])
+    pe_tok = str(pe.sort_values("_d").iloc[0]["token"])
+    st.session_state["_ab_chain_ok"] = (
+        f"{ce.sort_values('_d').iloc[0].get('fmt')} | {pe.sort_values('_d').iloc[0].get('fmt')}"
+    )
+    return ce_tok, pe_tok
+
+
 def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
     try:
         exp_str = target_dt.strftime("%d%b%y").upper()
@@ -7023,13 +7097,14 @@ def _scalper_resolve_atm_token(data, lab):
     fut_tok = str(((data.get("basis_info") or {}).get("fut_token") or ""))
     if tok and str(tok) not in ("", "nan", "None") and str(tok) != fut_tok:
         return str(tok), (data.get("opt_exchange") or Exchange)
-    if get_alice_session():
-        ce_t, pe_t = alice_option_chain_atm_tokens(
-            Index_Name, selected_expiry, data.get("spot_price") or data.get("atm_strike")
-        )
+    if get_alice_session() or st.session_state.get("alice_only"):
+        spot_px = data.get("spot_price") or data.get("atm_strike")
+        ce_t, pe_t = alice_master_atm_tokens(Index_Name, selected_expiry_str, spot_px)
+        if not ce_t or not pe_t:
+            ce_t, pe_t = alice_option_chain_atm_tokens(Index_Name, selected_expiry_str, spot_px)
         pick = ce_t if lab == "CE" else pe_t
         if pick:
-            return str(pick), ("MCX" if Index_Name in MCX_INDEX_SET else Exchange)
+            return str(pick), ("MCX" if Index_Name in ("GOLDM", "GOLD", "CRUDEOIL", "SILVERM", "SILVER") else Exchange)
     strike = float(data.get("atm_strike") or data.get("spot_price") or 0)
     src = df_expiry if df_expiry is not None and not getattr(df_expiry, "empty", True) else df_options
     if src is None or getattr(src, "empty", True):
@@ -7151,7 +7226,9 @@ def bootstrap_alice_data_store(want_tf):
     if spot_df is not None and not spot_df.empty:
         spot = float(pd.to_numeric(spot_df["close"], errors="coerce").iloc[-1] or 0)
         st.session_state["_last_broker"] = "aliceblue"
-    ce_t, pe_t = alice_option_chain_atm_tokens(Index_Name, selected_expiry_str, spot)
+    ce_t, pe_t = alice_master_atm_tokens(Index_Name, selected_expiry_str, spot)
+    if not ce_t or not pe_t:
+        ce_t, pe_t = alice_option_chain_atm_tokens(Index_Name, selected_expiry_str, spot)
     step = 50 if Index_Name in ("NIFTY", "FINNIFTY") else 100
     atm = int(round(spot / step) * step) if spot else 0
     opt_ex = "MCX" if Index_Name in ("GOLDM", "GOLD", "CRUDEOIL", "SILVERM", "SILVER") else Exchange
