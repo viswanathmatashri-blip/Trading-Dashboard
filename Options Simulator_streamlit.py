@@ -2626,12 +2626,14 @@ def _tape_gap_window(cached, now_dt, index_name, api_interval):
 
 
 def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_interval, lookback_days=15, index_name="IDX", tail_minutes=None, cache_kind="spot"):
-    if st.session_state.get("alice_only"):
+    if st.session_state.get("alice_only") or angel_rate_limited_now():
         df = fetch_alice_candles(spot_token, exchange, api_interval, index_name)
         if df is not None and not df.empty:
             st.session_state["_last_broker"] = "aliceblue"
-            return df
-        return pd.DataFrame()
+            st.session_state[f"_src_{cache_kind or 'spot'}"] = "aliceblue"
+            return df, False
+        if st.session_state.get("alice_only"):
+            return pd.DataFrame(), False
     ist_tz = pytz.timezone("Asia/Kolkata")
     now_dt = datetime.datetime.now(ist_tz)
     live, today, _, _ = market_session_state(now_dt, index_name)
@@ -7075,6 +7077,18 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
         return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
     exch_opt = exch_opt or (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
     api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
+    if (st.session_state.get("alice_only") or angel_rate_limited_now()) and tok:
+        try:
+            alt = fetch_alice_candles(tok, exch_opt or "MCX", api_int, Index_Name)
+            if alt is not None and not alt.empty:
+                st.session_state[cache_key] = alt
+                st.session_state[ts_key] = time.time()
+                st.session_state[f"_src_opt_{lab}"] = "aliceblue"
+                st.session_state["_last_broker"] = "aliceblue"
+                st.session_state[f"_scalp_miss_{lab}"] = ""
+                return alt, want_tf
+        except Exception:
+            pass
     dfo = pd.DataFrame()
     tried = []
     for ex in [exch_opt] + [e for e in ("MCX", "NCO", "NFO") if e != exch_opt]:
