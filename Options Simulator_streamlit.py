@@ -2274,8 +2274,8 @@ def get_alice_session() -> str:
             return cached if not sid else sid
         if not auth_code:
             st.session_state["_ab_err"] = (
-                "Open ANT with your App Key, login, then paste authCode. "
-                "Old encKey API is not used."
+                "No authCode in the URL yet. Click Open AliceBlue ANT login, "
+                "finish OTP, and wait until you land back on this app with ?authCode="
             )
             return cached
         enc = ""
@@ -2402,10 +2402,71 @@ def _resample_ohlcv(df, api_interval):
     return o if not o.empty else df
 
 
-def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
+def _alice_auth_headers():
     sid = get_alice_session()
-    user = (AB_USER_ID or "").strip()
-    if not sid or not user:
+    user = (AB_USER_ID or str(st.session_state.get("ab_query_user") or "")).strip()
+    if not sid:
+        return {}, ""
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {sid}",
+    }, sid
+
+
+def alice_option_chain_atm_tokens(index_name, expiry_label, spot):
+    """Official A3 option chain → ATM CE/PE tokens."""
+    headers, sid = _alice_auth_headers()
+    if not sid:
+        return "", ""
+    name = str(index_name or "").upper()
+    if name in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+        exch = "nse_fo"
+    elif name in ("SENSEX", "BANKEX"):
+        exch = "bse_fo"
+    else:
+        exch = "mcx_fo"
+        if name.startswith("CRUDE"):
+            name = "CRUDEOIL"
+        if name in ("GOLDM", "GOLD"):
+            name = "GOLD"
+    exp = str(expiry_label or "").replace("-", "").upper()
+    if len(exp) == 9 and exp[:2].isdigit():
+        exp = exp[0:2] + exp[2:5] + exp[7:9]
+    body = {"underlying": name, "expiry": exp, "interval": 10, "exch": exch}
+    try:
+        r = requests.post(
+            "https://a3.aliceblueonline.com/obrest/optionChain/getOptionChain",
+            headers=headers, json=body, timeout=18,
+        )
+        js, _ = _ab_parse_json(r)
+        rows = (((js.get("result") or [{}])[0]).get("data") or [])
+        best_ce, best_pe, best_d = "", "", 1e18
+        sp = float(spot or 0)
+        for row in rows:
+            ce, pe = row.get("CE") or {}, row.get("PE") or {}
+            ts = str(ce.get("tradingsymbol") or pe.get("tradingsymbol") or "")
+            digits = "".join(ch for ch in ts if ch.isdigit())
+            strike = 0.0
+            if len(digits) >= 5:
+                strike = float(digits[-5:]) if float(digits[-5:]) > 100 else float(digits[-4:])
+            try:
+                strike = float(str(ce.get("forInsName") or "").split()[-2])
+            except Exception:
+                pass
+            d = abs(strike - sp) if strike and sp else 1e9
+            if d < best_d:
+                best_d = d
+                best_ce = str(ce.get("token") or "")
+                best_pe = str(pe.get("token") or "")
+        return best_ce, best_pe
+    except Exception as e:
+        st.session_state["_ab_err"] = f"AliceBlue chain: {e}"
+        return "", ""
+
+
+def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
+    headers, sid = _alice_auth_headers()
+    if not sid or not token:
         return pd.DataFrame()
     tok, exch = _alice_token_exchange(token, exchange, index_name)
     now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
@@ -2413,10 +2474,6 @@ def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
     start = now.replace(hour=int(sh[0]), minute=int(sh[1]), second=0, microsecond=0)
     frm = int(start.timestamp() * 1000)
     to = int(now.timestamp() * 1000)
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {user} {sid}",
-    }
     body = {
         "token": str(tok),
         "resolution": "1",
@@ -2425,8 +2482,8 @@ def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
         "exchange": exch,
     }
     urls = [
-        "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/chart/history",
         "https://a3.aliceblueonline.com/open-api/od/ChartAPIService/api/chart/history",
+        "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/chart/history",
     ]
     for url in urls:
         try:
@@ -6879,6 +6936,13 @@ def _scalper_resolve_atm_token(data, lab):
     fut_tok = str(((data.get("basis_info") or {}).get("fut_token") or ""))
     if tok and str(tok) not in ("", "nan", "None") and str(tok) != fut_tok:
         return str(tok), (data.get("opt_exchange") or Exchange)
+    if get_alice_session():
+        ce_t, pe_t = alice_option_chain_atm_tokens(
+            Index_Name, selected_expiry, data.get("spot_price") or data.get("atm_strike")
+        )
+        pick = ce_t if lab == "CE" else pe_t
+        if pick:
+            return str(pick), ("MCX" if Index_Name in MCX_INDEX_SET else Exchange)
     strike = float(data.get("atm_strike") or data.get("spot_price") or 0)
     src = df_expiry if df_expiry is not None and not getattr(df_expiry, "empty", True) else df_options
     if src is None or getattr(src, "empty", True):
