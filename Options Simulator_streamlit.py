@@ -3075,7 +3075,7 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
     return fig, evs
 
 
-def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", axis_times=None):
+def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", axis_times=None, hide_delta=False):
     if df_opt is None or df_opt.empty or len(df_opt) < 3:
         return None, "NO DATA"
     raw = df_opt.copy()
@@ -3133,38 +3133,51 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
     y0, y1 = y0 - pad, y1 + pad
     vp = compute_session_volume_profile(d, bin_step=max(0.5, (y1 - y0) / 40.0), prominence_factor=0.35)
     dp = compute_delta_profile(d, bin_step=max(0.5, (y1 - y0) / 40.0))
-    fig = make_subplots(
-        rows=4, cols=3,
-        column_widths=[0.13, 0.71, 0.16],
-        row_heights=[0.46, 0.16, 0.18, 0.20],
-        shared_xaxes=False,
-        horizontal_spacing=0.01,
-        vertical_spacing=0.02,
-        specs=[[{}, {}, {}], [None, {}, None], [None, {}, None], [None, {}, None]],
-    )
-    if dp.get("ok"):
-        fig.add_trace(plt_go.Bar(
-            x=list(dp["delta"]), y=list(dp["mids"]), orientation="h", showlegend=False, name="ΔP",
-            marker=dict(color=["#00E676" if v >= 0 else "#FF5252" for v in dp["delta"]]),
-            hovertemplate="Px %{y:.1f}<br>Δ %{x:.0f}<extra></extra>",
-        ), row=1, col=1)
+    if hide_delta:
+        fig = make_subplots(
+            rows=4, cols=2,
+            column_widths=[0.82, 0.18],
+            row_heights=[0.46, 0.16, 0.18, 0.20],
+            shared_xaxes=False,
+            horizontal_spacing=0.012,
+            vertical_spacing=0.02,
+            specs=[[{}, {}], [ {}, None], [ {}, None], [ {}, None]],
+        )
+        cndl, vpc = 1, 2
+    else:
+        fig = make_subplots(
+            rows=4, cols=3,
+            column_widths=[0.13, 0.71, 0.16],
+            row_heights=[0.46, 0.16, 0.18, 0.20],
+            shared_xaxes=False,
+            horizontal_spacing=0.01,
+            vertical_spacing=0.02,
+            specs=[[{}, {}, {}], [None, {}, None], [None, {}, None], [None, {}, None]],
+        )
+        cndl, vpc = 2, 3
+        if dp.get("ok"):
+            fig.add_trace(plt_go.Bar(
+                x=list(dp["delta"]), y=list(dp["mids"]), orientation="h", showlegend=False, name="ΔP",
+                marker=dict(color=["#00E676" if v >= 0 else "#FF5252" for v in dp["delta"]]),
+                hovertemplate="Px %{y:.1f}<br>Δ %{x:.0f}<extra></extra>",
+            ), row=1, col=1)
     fig.add_trace(plt_go.Candlestick(
         x=d["time_str"], open=d["open"], high=d["high"], low=d["low"], close=d["close"],
         name=label, increasing_line_color="#26A69A", decreasing_line_color="#EF5350",
         increasing_fillcolor="#26A69A", decreasing_fillcolor="#EF5350", showlegend=True,
-    ), row=1, col=2)
+    ), row=1, col=cndl)
     if d["vwap_u"].notna().any():
         fig.add_trace(plt_go.Scatter(
             x=d["time_str"], y=d["vwap_u"], mode="lines", showlegend=False, hoverinfo="skip",
             line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
-        ), row=1, col=2)
+        ), row=1, col=cndl)
         fig.add_trace(plt_go.Scatter(
             x=d["time_str"], y=d["vwap_l"], mode="lines", showlegend=False, hoverinfo="skip",
             line=dict(color="rgba(255,152,0,0.35)", width=1, dash="dot"),
             fill="tonexty", fillcolor="rgba(255,152,0,0.08)",
-        ), row=1, col=2)
+        ), row=1, col=cndl)
     fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["vwap"], name="VWAP",
-                                line=dict(color="#FF9800", width=1.6)), row=1, col=2)
+                                line=dict(color="#FF9800", width=1.6)), row=1, col=cndl)
     day_hi, day_lo = float(d["high"].max()), float(d["low"].min())
     opt_lvls = [
         {"price": day_hi, "name": "Day H", "color": "#FF8A80", "width": 1.1, "dash": "dot"},
@@ -3179,7 +3192,7 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
         yv = float(lv["price"])
         fig.add_hline(
             y=yv, line_dash=lv.get("dash", "dot"), line_color=lv["color"],
-            line_width=lv.get("width", 1.1), row=1, col=2,
+            line_width=lv.get("width", 1.1), row=1, col=cndl,
         )
         y_txt = yv
         if last_y is not None and abs(y_txt - last_y) < 2.0:
@@ -3189,7 +3202,7 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
             x=d["time_str"].iloc[-1], y=y_txt,
             text=f"{lv['name']} {yv:.0f}",
             showarrow=False, xanchor="right",
-            font=dict(size=8, color=lv["color"]), row=1, col=2,
+            font=dict(size=8, color=lv["color"]), row=1, col=cndl,
         )
     if st.session_state.get("pdec_labels_on"):
         try:
@@ -3207,7 +3220,7 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
                     text=short, showarrow=False, textangle=-90,
                     xanchor="center", yanchor="bottom",
                     font=dict(size=8, color="#CFD8DC"),
-                    row=1, col=2,
+                    row=1, col=cndl,
                 )
         except Exception:
             pass
@@ -3217,46 +3230,46 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
             x=list(vp["vol"]), y=list(vp["mids"]), orientation="h", showlegend=False, name="VP",
             marker=dict(color=cols),
             hovertemplate="Px %{y:.1f}<br>Vol %{x:.0f}<extra></extra>",
-        ), row=1, col=3)
+        ), row=1, col=vpc)
     vol = d["volume"].astype(float)
     up = d["close"] >= d["open"]
     fig.add_trace(plt_go.Bar(x=d["time_str"], y=np.where(up, vol, 0), showlegend=False,
-                             marker_color="rgba(0,230,118,0.7)"), row=2, col=2)
+                             marker_color="rgba(0,230,118,0.7)"), row=2, col=cndl)
     fig.add_trace(plt_go.Bar(x=d["time_str"], y=np.where(~up, -vol, 0), showlegend=False,
-                             marker_color="rgba(255,82,82,0.7)"), row=2, col=2)
+                             marker_color="rgba(255,82,82,0.7)"), row=2, col=cndl)
     efi_c = np.where(d["efi13"] >= 0, "#00E676", "#FF5252")
-    fig.add_trace(plt_go.Bar(x=d["time_str"], y=d["efi13"], marker_color=efi_c, showlegend=False), row=3, col=2)
+    fig.add_trace(plt_go.Bar(x=d["time_str"], y=d["efi13"], marker_color=efi_c, showlegend=False), row=3, col=cndl)
     fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["cvd"], line=dict(color="#B0BEC5", width=1.2),
-                                showlegend=False), row=4, col=2)
-    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=2)
-    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=3, col=2)
-    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=4, col=2)
+                                showlegend=False), row=4, col=cndl)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=cndl)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=3, col=cndl)
+    fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=4, col=cndl)
     fig.update_layout(template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                       height=560, margin=dict(l=40, r=6, t=8, b=18),
                       hovermode="x unified")
     fig.update_xaxes(rangeslider_visible=False)
-    fig.update_yaxes(range=[y0, y1], tickformat=".1f", row=1, col=1)
-    fig.update_yaxes(range=[y0, y1], title_text="LTP", row=1, col=2)
-    fig.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=3)
-    fig.update_xaxes(type="linear", showgrid=False, row=1, col=1)
-    fig.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=3)
+    if not hide_delta:
+        fig.update_yaxes(range=[y0, y1], tickformat=".1f", row=1, col=1)
+        fig.update_xaxes(type="linear", showgrid=False, row=1, col=1)
+    fig.update_yaxes(range=[y0, y1], title_text="LTP", row=1, col=cndl)
+    fig.update_yaxes(range=[y0, y1], showticklabels=False, row=1, col=vpc)
+    fig.update_xaxes(type="linear", showticklabels=False, showgrid=False, row=1, col=vpc)
     for r in (1, 2, 3):
         fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                         range=xr, showticklabels=False, row=r, col=2)
+                         range=xr, showticklabels=False, row=r, col=cndl)
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                     range=xr, nticks=8, row=4, col=2)
+                     range=xr, nticks=8, row=4, col=cndl)
     try:
         vm = float(max(abs(float(vol.max())), abs(float(vol.min())), 1.0))
-        fig.update_yaxes(range=[-vm * 1.2, vm * 1.2], title_text="Vol", row=2, col=2)
+        fig.update_yaxes(range=[-vm * 1.2, vm * 1.2], title_text="Vol", row=2, col=cndl)
         em = float(max(abs(float(d["efi13"].max())), abs(float(d["efi13"].min())), 1.0))
-        fig.update_yaxes(range=[-em * 1.2, em * 1.2], title_text="EFI", row=3, col=2)
-        cm = float(max(abs(float(d["cvd"].max())), abs(float(d["cvd"].min())), 1.0))
+        fig.update_yaxes(range=[-em * 1.2, em * 1.2], title_text="EFI", row=3, col=cndl)
         fig.update_yaxes(range=[min(0.0, float(d["cvd"].min()) * 1.1), max(0.0, float(d["cvd"].max()) * 1.1)],
-                         title_text="CVD", row=4, col=2)
+                         title_text="CVD", row=4, col=cndl)
     except Exception:
-        fig.update_yaxes(title_text="Vol", row=2, col=2)
-        fig.update_yaxes(title_text="EFI", row=3, col=2)
-        fig.update_yaxes(title_text="CVD", row=4, col=2)
+        fig.update_yaxes(title_text="Vol", row=2, col=cndl)
+        fig.update_yaxes(title_text="EFI", row=3, col=cndl)
+        fig.update_yaxes(title_text="CVD", row=4, col=cndl)
     act = "NO DATA"
     try:
         recs = pdec_session_history(d)
@@ -6715,7 +6728,17 @@ def _scalper_resolve_atm_token(data, lab):
     if tok and str(tok) not in ("", "nan", "None") and str(tok) != fut_tok:
         return str(tok), (data.get("opt_exchange") or Exchange)
     strike = float(data.get("atm_strike") or data.get("spot_price") or 0)
-    src = df_expiry if df_expiry is not None and not df_expiry.empty else df_options
+    src = df_expiry if df_expiry is not None and not getattr(df_expiry, "empty", True) else df_options
+    if src is None or getattr(src, "empty", True):
+        try:
+            aliases = [a.upper() for a in (MCX_NAME_ALIASES.get(Index_Name) or [Index_Name])]
+            src = df_master[
+                (df_master["exch_seg"].astype(str).str.upper().isin(["MCX", "NCO", "NFO", "BFO"]))
+                & (df_master["name"].astype(str).str.upper().isin(aliases + [str(Index_Name).upper()]))
+                & (df_master["instrumenttype"].astype(str).str.upper().str.contains("OPT", na=False))
+            ].copy()
+        except Exception:
+            src = pd.DataFrame()
     if src is None or getattr(src, "empty", True):
         return "", Exchange
     d = src.copy()
@@ -6746,7 +6769,8 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
     age = time.time() - float(st.session_state.get(ts_key) or 0)
     if isinstance(prev, pd.DataFrame) and not prev.empty and age < 4:
         return prev, want_tf
-    if not api or not tok:
+    if not tok:
+        st.session_state[f"_scalp_miss_{lab}"] = "no option token (check expiry / master)"
         return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
     exch_opt = exch_opt or (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
     api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
@@ -6774,6 +6798,20 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
             st.session_state[cache_key] = dfo
             st.session_state[ts_key] = time.time()
             return dfo, want_tf
+    if _alice_configured() and tok:
+        try:
+            alt = fetch_alice_candles(tok, exch_opt or "MCX", api_int, Index_Name)
+            if alt is not None and not alt.empty:
+                spot_px = float((st.session_state.get("data_store") or {}).get("spot_price") or 0)
+                med = float(pd.to_numeric(alt["close"], errors="coerce").median() or 0)
+                if not (spot_px and med > max(50.0, spot_px * 0.25)):
+                    st.session_state[cache_key] = alt
+                    st.session_state[ts_key] = time.time()
+                    st.session_state[f"_scalp_miss_{lab}"] = ""
+                    st.session_state["_last_broker"] = "aliceblue"
+                    return alt, want_tf
+        except Exception:
+            pass
     st.session_state[f"_scalp_miss_{lab}"] = f"tok={tok} exch tried {tried}"
     st.session_state[ts_key] = time.time()
     if isinstance(prev, pd.DataFrame) and not prev.empty:
@@ -6865,9 +6903,13 @@ def render_scalper_mode():
     cards = _parse_gemini_setups(st.session_state.get("gemini_regular") or "")
     axis = session_axis_labels(want_tf, Index_Name)
 
-    def _pane(title, dfp, tf_used, key, height=560):
-        st.markdown(f"<div class='chart-card'><div class='card-title'>{title} · {tf_used}</div>", unsafe_allow_html=True)
-        fig, act = _option_session_figure(dfp, title, Index_Name, tf_used, axis)
+    def _pane(title, dfp, tf_used, key, height=560, hide_delta=False, accent="#c8ccd4"):
+        st.markdown(
+            f"<div class='chart-card' style='border:1px solid {accent};'>"
+            f"<div class='card-title' style='color:{accent};'>{title} · {tf_used}</div>",
+            unsafe_allow_html=True,
+        )
+        fig, act = _option_session_figure(dfp, title, Index_Name, tf_used, axis, hide_delta=hide_delta)
         if act and "NO" not in str(act).upper() and "CHOP" not in str(act).upper():
             colr = "#FF5252" if "SHORT" in str(act).upper() else "#00E676"
             st.markdown(
@@ -6884,26 +6926,21 @@ def render_scalper_mode():
             st.caption("No tape this cycle.")
         st.markdown("</div>", unsafe_allow_html=True)
 
-    side_l, spot_mid, side_r = st.columns([0.17, 0.66, 0.17], gap="small")
-    with side_l:
+    spot_col, gem_col = st.columns([0.75, 0.25], gap="small")
+    with spot_col:
+        _pane("Spot", spot_df, want_tf, "scalp_sp", height=680, hide_delta=False, accent="#c8ccd4")
+    with gem_col:
         if cards:
             st.markdown(_setup_card_html(cards[0], 1), unsafe_allow_html=True)
+            if len(cards) > 1:
+                st.markdown(_setup_card_html(cards[1], 2), unsafe_allow_html=True)
         elif st.session_state.get("gemini_enabled"):
-            st.caption("Gemini setup 1…")
-    with spot_mid:
-        _pane("Spot", spot_df, want_tf, "scalp_sp", height=620)
-    with side_r:
-        if len(cards) > 1:
-            st.markdown(_setup_card_html(cards[1], 2), unsafe_allow_html=True)
-        elif cards and "NO TRADE" not in cards[0].upper():
-            st.caption("")
-        elif st.session_state.get("gemini_enabled") and not cards:
-            st.caption("Gemini setup 2…")
-    pe_col, ce_col = st.columns(2)
+            st.caption("Gemini setups…")
+    pe_col, ce_col = st.columns(2, gap="medium")
     with pe_col:
-        _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560)
+        _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560, hide_delta=True, accent="#FF8A80")
     with ce_col:
-        _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560)
+        _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560, hide_delta=True, accent="#69F0AE")
     miss = " · ".join(
         f"{s} {st.session_state.get(f'_scalp_miss_{s}') or ('tok '+str(t) if t else 'no token')}"
         for s, t in (("PE", pe_tok), ("CE", ce_tok))
@@ -8732,4 +8769,3 @@ try:
     clear_load_status()
 except Exception:
     pass
-
