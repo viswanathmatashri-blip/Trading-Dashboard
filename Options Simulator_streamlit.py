@@ -2210,7 +2210,7 @@ def render_broker_status_ribbon():
     ab_err = str(st.session_state.get("_ab_err") or "")
     if alice_rate_limited_now():
         b_col, b_lab = "#FFB300", "RATE LIMIT"
-    elif ab_sess and not ab_err:
+    elif ab_sess:
         b_col, b_lab = "#00E676", "ON"
     elif _alice_configured() and ab_err:
         b_col, b_lab = "#FF5252", "DOWN"
@@ -2537,8 +2537,12 @@ def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
             if r.status_code == 429 or "rate" in raw or "too many" in raw:
                 _mark_alice_rate_limit(f"AliceBlue HTTP {r.status_code} rate limit")
                 return pd.DataFrame()
-            js = r.json() if r.content else {}
+            js, perr = _ab_parse_json(r)
+            if perr and "empty" in perr.lower():
+                continue
             rows = js.get("result") or js.get("data") or []
+            if isinstance(rows, dict):
+                rows = rows.get("values") or rows.get("candles") or []
             emsg = str(js.get("emsg") or js.get("message") or "").lower()
             if "rate" in emsg or "too many" in emsg:
                 _mark_alice_rate_limit(emsg)
@@ -2571,7 +2575,8 @@ def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
             st.session_state["_last_broker"] = "aliceblue"
             return out
         except Exception as e:
-            st.session_state["_ab_err"] = f"AliceBlue candles: {e}"
+            if "Expecting value" not in str(e):
+                st.session_state["_ab_err"] = f"AliceBlue candles: {e}"
             continue
     return pd.DataFrame()
 
@@ -7110,6 +7115,12 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
 def bootstrap_alice_data_store(want_tf):
     """Minimal store from AliceBlue only: spot tape + ATM CE/PE tokens."""
     spot_tok, spot_exch, fut_exch = INDEX_TOKEN_MAP.get(Index_Name, ("99926000", "NSE", "NFO"))
+    if not spot_tok:
+        try:
+            spot_tok, _exp = get_near_month_futures_token(df_master, Index_Name, fut_exch or "MCX")
+            spot_exch = fut_exch or "MCX"
+        except Exception:
+            spot_tok = ""
     api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
     spot_df = fetch_alice_candles(spot_tok, spot_exch or fut_exch, api_int, Index_Name)
     spot = 0.0
