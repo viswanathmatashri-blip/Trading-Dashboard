@@ -7,6 +7,7 @@ import datetime
 import math
 import json
 import re
+import hashlib
 import random
 import numpy as np
 import pandas as pd
@@ -148,6 +149,10 @@ API_KEY = _secret_or_env("API_KEY", "SMARTAPI_KEY", "ANGEL_API_KEY")
 CLIENT_CODE = _secret_or_env("CLIENT_CODE", "CLIENTID", "CLIENT_ID")
 PIN = _secret_or_env("PIN", "MPIN", "PASSWORD")
 TOTP_SECRET = _secret_or_env("TOTP_SECRET", "TOTP", "TOKEN")
+AB_APP_KEY = _secret_or_env("APP_KEY", "ALICEBLUE_APP_KEY", "ALICEBLUE_API_KEY")
+AB_APP_SECRET = _secret_or_env("APP_SECRET_KEY", "ALICEBLUE_APP_SECRET", "ALICEBLUE_API_SECRET")
+AB_USER_ID = _secret_or_env("ALICEBLUE_USER_ID", "AB_USER_ID", "ALICEBLUE_CLIENT_ID")
+AB_SESSION = _secret_or_env("ALICEBLUE_SESSION", "AB_SESSION", "ALICEBLUE_SESSION_ID")
 
 # Initialise Session State Variables
 if "basket_legs" not in st.session_state:
@@ -287,23 +292,34 @@ INDEX_TOKEN_MAP = {
 INDIA_VIX_TOKEN = "99926017"
 
 # --- RATE LIMIT SAFEGUARD WRAPPER ---
-def safe_api_call(func, *args, max_retries=4, base_delay=0.6, **kwargs):
-    """Executes SmartAPI calls with dynamic retry logic and exponential backoff for rate limits."""
+def _mark_angel_rate_limit(msg=""):
+    st.session_state["_angel_rl_ts"] = time.time()
+    st.session_state["_angel_rl_msg"] = str(msg or "rate limit")
+
+
+def angel_rate_limited_now() -> bool:
+    return (time.time() - float(st.session_state.get("_angel_rl_ts") or 0)) < 12
+
+
+def safe_api_call(func, *args, max_retries=2, base_delay=0.35, **kwargs):
+    """SmartAPI with short retry. Rate-limit → flag so AliceBlue can fill this tick only."""
     for attempt in range(max_retries):
         try:
             res = func(*args, **kwargs)
             if isinstance(res, dict) and not res.get("status"):
-                msg = str(res.get("message", "")).lower()
-                if "access denied" in msg or "rate" in msg or "exceeding" in msg:
-                    raise Exception(f"Rate Limit Hit: {res.get('message')}")
+                msg = str(res.get("message", "") or res.get("errorcode", ""))
+                low = msg.lower()
+                if "access denied" in low or "rate" in low or "exceeding" in low or "ab1004" in low:
+                    _mark_angel_rate_limit(msg)
+                    raise Exception(f"Rate Limit Hit: {msg}")
             return res
         except Exception as e:
             err_str = str(e).lower()
-            if "access denied" in err_str or "rate" in err_str or "exceeding" in err_str:
+            if "access denied" in err_str or "rate" in err_str or "exceeding" in err_str or "ab1004" in err_str:
+                _mark_angel_rate_limit(str(e))
                 if attempt == max_retries - 1:
                     return None
-                sleep_time = base_delay * (2 ** attempt) + random.uniform(0.1, 0.4)
-                time.sleep(sleep_time)
+                time.sleep(base_delay * (2 ** attempt) + random.uniform(0.05, 0.2))
             else:
                 return None
     return None
@@ -2155,6 +2171,164 @@ def get_smartapi_token(df_exp, index_name, target_dt, strike, opt_type):
         pass
     return ""
 
+
+def _alice_configured() -> bool:
+    return bool(AB_APP_KEY) and bool(AB_USER_ID or AB_SESSION)
+
+
+def get_alice_session() -> str:
+    """Session id for AliceBlue REST. Cached ~50 min."""
+    cached = str(st.session_state.get("_ab_session") or AB_SESSION or "").strip()
+    ts = float(st.session_state.get("_ab_session_ts") or 0)
+    if cached and (time.time() - ts) < 3000:
+        return cached
+    user = (AB_USER_ID or "").strip()
+    key = (AB_APP_KEY or "").strip()
+    if not user or not key:
+        if cached:
+            return cached
+        st.session_state["_ab_err"] = "AliceBlue needs ALICEBLUE_USER_ID + APP_KEY in secrets"
+        return cached
+    try:
+        headers = {"Content-Type": "application/json"}
+        r = requests.post(
+            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getAPIEncpkey",
+            headers=headers,
+            json={"userId": user},
+            timeout=12,
+        )
+        enc = ""
+        try:
+            enc = str((r.json() or {}).get("encKey") or "")
+        except Exception:
+            enc = ""
+        if not enc:
+            st.session_state["_ab_err"] = f"AliceBlue encKey failed: {r.text[:160]}"
+            return cached
+        user_data = hashlib.sha256(f"{user}{key}{enc}".encode()).hexdigest()
+        r2 = requests.post(
+            "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getUserSID",
+            headers=headers,
+            json={"userId": user, "userData": user_data},
+            timeout=12,
+        )
+        js = r2.json() if r2.content else {}
+        sid = str(js.get("sessionID") or js.get("userSession") or js.get("sessionId") or "")
+        if sid:
+            st.session_state["_ab_session"] = sid
+            st.session_state["_ab_session_ts"] = time.time()
+            st.session_state["_ab_err"] = ""
+            return sid
+        st.session_state["_ab_err"] = f"AliceBlue session failed: {str(js)[:180]}"
+    except Exception as e:
+        st.session_state["_ab_err"] = f"AliceBlue session exception: {e}"
+    return cached
+
+
+def _alice_token_exchange(token, exchange, index_name=""):
+    tok = str(token or "").strip()
+    exch = str(exchange or "NSE").upper()
+    name = str(index_name or "").upper()
+    if tok.startswith("999"):
+        tok = tok[-5:].lstrip("0") or tok
+        return tok, "NSE::index"
+    if exch in ("NSE",) and name in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+        return tok, "NSE::index"
+    if exch in ("MCX", "NCO"):
+        return tok, "MCX"
+    if exch in ("BFO", "BSE"):
+        return tok, "BFO"
+    return tok, exch if exch else "NFO"
+
+
+def _resample_ohlcv(df, api_interval):
+    if df is None or df.empty or "time" not in df.columns:
+        return df
+    lab = str(api_interval or "")
+    if "ONE_MINUTE" in lab or lab in ("1", "1 min"):
+        return df
+    rule = "5min"
+    if "THREE" in lab:
+        rule = "3min"
+    elif "FIFTEEN" in lab or "15" in lab:
+        rule = "15min"
+    elif "TEN" in lab:
+        rule = "10min"
+    elif "FIVE" in lab:
+        rule = "5min"
+    g = df.copy()
+    g["time"] = pd.to_datetime(g["time"])
+    g = g.set_index("time").sort_index()
+    o = g.resample(rule, label="right", closed="right").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna(subset=["close"]).reset_index()
+    return o if not o.empty else df
+
+
+def fetch_alice_candles(token, exchange, api_interval, index_name="IDX"):
+    sid = get_alice_session()
+    user = (AB_USER_ID or "").strip()
+    if not sid or not user:
+        return pd.DataFrame()
+    tok, exch = _alice_token_exchange(token, exchange, index_name)
+    now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+    sh = session_hours(index_name)
+    start = now.replace(hour=int(sh[0]), minute=int(sh[1]), second=0, microsecond=0)
+    frm = int(start.timestamp() * 1000)
+    to = int(now.timestamp() * 1000)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {user} {sid}",
+    }
+    body = {
+        "token": str(tok),
+        "resolution": "1",
+        "from": str(frm),
+        "to": str(to),
+        "exchange": exch,
+    }
+    urls = [
+        "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/chart/history",
+        "https://a3.aliceblueonline.com/open-api/od/ChartAPIService/api/chart/history",
+    ]
+    for url in urls:
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=18)
+            js = r.json() if r.content else {}
+            rows = js.get("result") or js.get("data") or []
+            if str(js.get("stat") or "").lower() in ("not_ok", "notok") or not rows:
+                continue
+            df = pd.DataFrame(rows)
+            colmap = {c.lower(): c for c in df.columns}
+            def pick(*names):
+                for n in names:
+                    if n in df.columns:
+                        return n
+                    if n.lower() in colmap:
+                        return colmap[n.lower()]
+                return None
+            tcol = pick("time", "datetime", "timestamp")
+            if not tcol:
+                continue
+            out = pd.DataFrame({
+                "time": pd.to_datetime(df[tcol]),
+                "open": pd.to_numeric(df[pick("open", "o")], errors="coerce"),
+                "high": pd.to_numeric(df[pick("high", "h")], errors="coerce"),
+                "low": pd.to_numeric(df[pick("low", "l")], errors="coerce"),
+                "close": pd.to_numeric(df[pick("close", "c")], errors="coerce"),
+                "volume": pd.to_numeric(df[pick("volume", "vol", "v")], errors="coerce").fillna(0),
+            }).dropna(subset=["close"])
+            if out.empty:
+                continue
+            out = _resample_ohlcv(out, api_interval)
+            st.session_state["_last_broker"] = "aliceblue"
+            return out
+        except Exception as e:
+            st.session_state["_ab_err"] = f"AliceBlue candles: {e}"
+            continue
+    return pd.DataFrame()
+
+
 # --- HOLIDAY / WEEKEND FALLBACK ENGINE FOR CANDLE CHARTS ---
 
 def _tape_gap_window(cached, now_dt, index_name, api_interval):
@@ -2241,6 +2415,18 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
                 return compute_technical_indicators(df_candles), (offset > 0 and not live)
     if live and not cached.empty:
         return compute_technical_indicators(cached.copy()), False
+    if angel_rate_limited_now() and _alice_configured() and spot_token:
+        try:
+            alt = fetch_alice_candles(spot_token, exchange, api_interval, index_name)
+            if alt is not None and not alt.empty:
+                alt["time"] = series_to_ist(alt["time"])
+                if live:
+                    alt = merge_candle_frames(cached, alt)
+                    save_session_cache(cache_kind or "spot", index_name, api_interval, alt, today)
+                st.session_state["_last_broker"] = "aliceblue"
+                return compute_technical_indicators(alt), False
+        except Exception:
+            pass
     return pd.DataFrame(), False
 
 
@@ -3335,6 +3521,16 @@ def fetch_futures_candles_with_vwap(smart_api, index_name, df_scrip_master, api_
     if best_df.empty and not cached.empty and not currently_closed:
         best_df = compute_technical_indicators(cached.copy())
         best_offset = 0
+    if best_df.empty and angel_rate_limited_now() and _alice_configured() and fut_token:
+        try:
+            alt = fetch_alice_candles(fut_token, fut_exch, api_interval, index_name)
+            if alt is not None and not alt.empty:
+                alt["time"] = series_to_ist(alt["time"])
+                best_df = compute_technical_indicators(alt)
+                best_offset = 0
+                st.session_state["_last_broker"] = "aliceblue"
+        except Exception:
+            pass
     if best_df.empty:
         return pd.DataFrame(), False, {}, "Could not fetch futures candles"
 
@@ -8536,3 +8732,4 @@ try:
     clear_load_status()
 except Exception:
     pass
+
