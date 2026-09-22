@@ -153,6 +153,7 @@ AB_APP_KEY = _secret_or_env("APP_KEY", "ALICEBLUE_APP_KEY", "ALICEBLUE_API_KEY")
 AB_APP_SECRET = _secret_or_env("APP_SECRET_KEY", "ALICEBLUE_APP_SECRET", "ALICEBLUE_API_SECRET")
 AB_USER_ID = _secret_or_env("ALICEBLUE_USER_ID", "AB_USER_ID", "ALICEBLUE_CLIENT_ID")
 AB_SESSION = _secret_or_env("ALICEBLUE_SESSION", "AB_SESSION", "ALICEBLUE_SESSION_ID")
+AB_AUTH_CODE = _secret_or_env("ALICEBLUE_AUTH_CODE", "AB_AUTH_CODE", "AUTH_CODE")
 
 # Initialise Session State Variables
 if "basket_legs" not in st.session_state:
@@ -2212,55 +2213,83 @@ def render_broker_status_ribbon():
     )
 
 
+def _ab_parse_json(resp):
+    raw = (resp.text or "").strip()
+    if not raw:
+        return {}, f"HTTP {resp.status_code} empty body"
+    if raw[:1] in "<":
+        return {}, f"HTTP {resp.status_code} HTML not JSON"
+    try:
+        js = resp.json()
+        return (js if isinstance(js, dict) else {}), ""
+    except Exception as e:
+        return {}, f"HTTP {resp.status_code} not JSON ({e})"
+
+
 def get_alice_session() -> str:
     """Session id for AliceBlue REST. Cached ~50 min."""
     cached = str(st.session_state.get("_ab_session") or AB_SESSION or "").strip()
     ts = float(st.session_state.get("_ab_session_ts") or 0)
     if cached and (time.time() - ts) < 3000:
         return cached
-    user = (AB_USER_ID or "").strip()
+    user = (AB_USER_ID or "").strip().upper()
     key = (AB_APP_KEY or "").strip()
+    secret = (AB_APP_SECRET or "").strip()
+    auth_code = (AB_AUTH_CODE or str(st.session_state.get("ab_auth_code") or "")).strip()
     if not user or not key:
         if cached:
             return cached
         st.session_state["_ab_err"] = "AliceBlue needs ALICEBLUE_USER_ID + APP_KEY in secrets"
         return cached
+    headers = {"Content-Type": "application/json"}
+    host = "https://ant.aliceblueonline.com/rest/AliceBlueAPIService"
     try:
-        headers = {"Content-Type": "application/json"}
+        if auth_code and secret:
+            chk = hashlib.sha256(f"{user}{auth_code}{secret}".encode()).hexdigest()
+            r = requests.post(
+                "https://a3.aliceblueonline.com/open-api/od/v1/vendor/getUserDetails",
+                headers=headers,
+                json={"checkSum": chk},
+                timeout=15,
+            )
+            js, perr = _ab_parse_json(r)
+            sid = str(js.get("userSession") or js.get("sessionID") or "")
+            if sid:
+                st.session_state["_ab_session"] = sid
+                st.session_state["_ab_session_ts"] = time.time()
+                st.session_state["_ab_err"] = ""
+                return sid
+            if js:
+                st.session_state["_ab_err"] = f"AliceBlue A3 session: {str(js)[:160]}"
         enc = ""
         last_txt = ""
         for url in (
-                        "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/customer/getEncryptionKey",
+            f"{host}/api/customer/getEncryptionKey",
+            f"{host}/api/customer/getAPIEncpkey",
         ):
-            r = requests.post(url, headers=headers, json={"userId": user}, timeout=12)
-            last_txt = (r.text or "")[:160]
-            try:
-                enc = str((r.json() or {}).get("encKey") or "")
-            except Exception:
-                enc = ""
+            r = requests.post(url, headers=headers, json={"userId": user}, timeout=15)
+            js, perr = _ab_parse_json(r)
+            last_txt = perr or f"HTTP {r.status_code}"
+            enc = str(js.get("encKey") or "")
             if enc:
                 break
         if not enc:
             st.session_state["_ab_err"] = f"AliceBlue encKey failed: {last_txt}"
             return cached
-        hashes = [
-            hashlib.sha256(f"{user}{key}{enc}".encode()).hexdigest(),
-        ]
-        if AB_APP_SECRET:
-            hashes.append(hashlib.sha256(f"{user}{AB_APP_SECRET}{enc}".encode()).hexdigest())
+        hashes = [hashlib.sha256(f"{user}{key}{enc}".encode()).hexdigest()]
+        if secret:
+            hashes.append(hashlib.sha256(f"{user}{secret}{enc}".encode()).hexdigest())
         sid = ""
         last_js = {}
+        last_txt = ""
         for user_data in hashes:
-            for url in (
-                "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/api/customer/getUserSID",
-                "https://ant.aliceblueonline.com/rest/AliceBlueAPIService/customer/getUserSID",
-            ):
+            for path in ("/api/customer/getUserSID", "/sso/getUserDetails"):
                 r2 = requests.post(
-                    url, headers=headers,
+                    host + path, headers=headers,
                     json={"userId": user, "userData": user_data},
-                    timeout=12,
+                    timeout=15,
                 )
-                last_js = r2.json() if r2.content else {}
+                last_js, last_txt = _ab_parse_json(r2)
                 sid = str(last_js.get("sessionID") or last_js.get("userSession") or last_js.get("sessionId") or "")
                 if sid:
                     break
@@ -2271,7 +2300,7 @@ def get_alice_session() -> str:
             st.session_state["_ab_session_ts"] = time.time()
             st.session_state["_ab_err"] = ""
             return sid
-        st.session_state["_ab_err"] = f"AliceBlue session failed: {str(last_js)[:180]}"
+        st.session_state["_ab_err"] = f"AliceBlue session failed: {last_txt or str(last_js)[:180]}"
     except Exception as e:
         st.session_state["_ab_err"] = f"AliceBlue session exception: {e}"
     return cached
