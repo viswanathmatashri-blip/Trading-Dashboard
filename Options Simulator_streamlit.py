@@ -2223,13 +2223,19 @@ def alice_master_atm_tokens(index_name, expiry_label, spot):
             wd = pd.to_datetime(want, format="%d%b%Y", errors="coerce")
             if pd.isna(wd):
                 wd = pd.to_datetime(want, format="%d%b%y", errors="coerce")
-            if not pd.isna(wd):
-                day = hit["expiry_dt"].dt.tz_localize(None) if getattr(hit["expiry_dt"].dt, "tz", None) else hit["expiry_dt"]
-                near = hit[day.dt.date == wd.date()]
-                if not near.empty:
-                    hit = near
+            if pd.isna(wd):
+                return "", ""
+            day = hit["expiry_dt"].dt.tz_localize(None) if str(getattr(hit["expiry_dt"].dtype, "tz", None)) != "None" else hit["expiry_dt"]
+            try:
+                near = hit[pd.to_datetime(day).dt.date == wd.date()]
+            except Exception:
+                near = hit[hit["fmt"].astype(str).str.upper().str.contains(wd.strftime("%b").upper(), na=False)]
+                near = near[near["fmt"].astype(str).str.contains(str(wd.day), na=False)]
+            if near.empty:
+                return "", ""
+            hit = near
         except Exception:
-            pass
+            return "", ""
     sp = float(spot or 0)
     if not sp:
         return "", ""
@@ -7139,22 +7145,25 @@ def _scalper_resolve_atm_token(data, lab):
     return str(row.get("token") or ""), exch
 
 
-def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
-    """One getCandleData per side. Reuse cache for 4s so Auto-Refresh does not stampede."""
+def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
+    """Angel token → SmartAPI. Alice token → AliceBlue. Never mix tokens across brokers."""
     cache_key = f"_scalp_df_{Index_Name}_{lab}_{want_tf}"
     ts_key = cache_key + "_ts"
     prev = st.session_state.get(cache_key)
     age = time.time() - float(st.session_state.get(ts_key) or 0)
     if isinstance(prev, pd.DataFrame) and not prev.empty and age < 4:
         return prev, want_tf
-    if not tok:
+    tok = angel_tok or alice_tok
+    if not tok and not alice_tok:
         st.session_state[f"_scalp_miss_{lab}"] = "no option token (check expiry / master)"
+        st.session_state[f"_src_opt_{lab}"] = "–"
         return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
     exch_opt = exch_opt or (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
     api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
-    if (st.session_state.get("alice_only") or angel_rate_limited_now()) and tok:
+    use_alice_first = st.session_state.get("alice_only") or angel_rate_limited_now()
+    if use_alice_first and alice_tok:
         try:
-            alt = fetch_alice_candles(tok, exch_opt or "MCX", api_int, Index_Name)
+            alt = fetch_alice_candles(alice_tok, exch_opt or "MCX", api_int, Index_Name)
             if alt is not None and not alt.empty:
                 st.session_state[cache_key] = alt
                 st.session_state[ts_key] = time.time()
@@ -7166,12 +7175,13 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
             pass
     dfo = pd.DataFrame()
     tried = []
-    for ex in [exch_opt] + [e for e in ("MCX", "NCO", "NFO") if e != exch_opt]:
+    if angel_tok and api and not st.session_state.get("alice_only"):
+      for ex in [exch_opt] + [e for e in ("MCX", "NCO", "NFO") if e != exch_opt]:
         tried.append(ex)
         try:
             dfo, _ = fetch_candles_with_holiday_fallback(
-                api, str(tok), ex, api_int, 0, Index_Name,
-                cache_kind=f"opt_{lab}_{tok}",
+                api, str(angel_tok), ex, api_int, 0, Index_Name,
+                cache_kind=f"opt_{lab}_{angel_tok}",
             )
         except Exception:
             dfo = pd.DataFrame()
@@ -7189,9 +7199,9 @@ def _scalper_fetch_opt(api, tok, lab, want_tf, exch_opt=None):
             st.session_state[ts_key] = time.time()
             st.session_state[f"_src_opt_{lab}"] = "smartapi" if not st.session_state.get("alice_only") else "aliceblue"
             return dfo, want_tf
-    if _alice_configured() and tok:
+    if _alice_configured() and alice_tok:
         try:
-            alt = fetch_alice_candles(tok, exch_opt or "MCX", api_int, Index_Name)
+            alt = fetch_alice_candles(alice_tok, exch_opt or "MCX", api_int, Index_Name)
             if alt is not None and not alt.empty:
                 spot_px = float((st.session_state.get("data_store") or {}).get("spot_price") or 0)
                 med = float(pd.to_numeric(alt["close"], errors="coerce").median() or 0)
@@ -7323,10 +7333,11 @@ def render_scalper_mode():
         )
         st.session_state["_scalp_tape_ts"] = time.time()
         data = st.session_state["data_store"]
-    ce_tok, ce_ex = _scalper_resolve_atm_token(data, "CE")
-    pe_tok, pe_ex = _scalper_resolve_atm_token(data, "PE")
-    ce_df, ce_tf = _scalper_fetch_opt(api, ce_tok, "CE", want_tf, ce_ex)
-    pe_df, pe_tf = _scalper_fetch_opt(api, pe_tok, "PE", want_tf, pe_ex)
+    ce_a, ce_ex = _scalper_resolve_atm_token(data, "CE")
+    pe_a, pe_ex = _scalper_resolve_atm_token(data, "PE")
+    ace, ape = alice_master_atm_tokens(Index_Name, selected_expiry_str, data.get("spot_price") or data.get("atm_strike"))
+    ce_df, ce_tf = _scalper_fetch_opt(api, ce_a, ace, "CE", want_tf, ce_ex)
+    pe_df, pe_tf = _scalper_fetch_opt(api, pe_a, ape, "PE", want_tf, pe_ex)
 
     st.session_state["_scalp_spot_df"] = spot_df
     st.session_state["_scalp_pe_df"] = pe_df
