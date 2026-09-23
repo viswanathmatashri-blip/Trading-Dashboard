@@ -7598,18 +7598,32 @@ def render_scalper_mode():
         spot_df = spot_src if spot_src is not None else pd.DataFrame()
 
     api = get_smart_api_client()
+    last_ok = float(st.session_state.get("_scalp_complete_ts") or 0)
+    reuse = (
+        time.time() - last_ok < 10
+        and isinstance(st.session_state.get("_scalp_ce_df"), pd.DataFrame)
+        and not st.session_state["_scalp_ce_df"].empty
+        and isinstance(st.session_state.get("_scalp_pe_df"), pd.DataFrame)
+        and not st.session_state["_scalp_pe_df"].empty
+    )
     last_tape = float(st.session_state.get("_scalp_tape_ts") or 0)
-    if auto and live_now and (time.time() - last_tape) >= 8:
+    if auto and live_now and (time.time() - last_tape) >= 10 and not reuse:
         st.session_state["data_store"] = refresh_index_tapes(
             st.session_state.get("data_store") or data, want_tf, for_view="scalper"
         )
         st.session_state["_scalp_tape_ts"] = time.time()
         data = st.session_state["data_store"]
-    ce_a, ce_ex = _scalper_resolve_atm_token(data, "CE")
-    pe_a, pe_ex = _scalper_resolve_atm_token(data, "PE")
-    ace, ape = alice_master_atm_tokens(Index_Name, selected_expiry_str, data.get("spot_price") or data.get("atm_strike"))
-    ce_df, ce_tf = _scalper_fetch_opt(api, ce_a, ace, "CE", want_tf, ce_ex)
-    pe_df, pe_tf = _scalper_fetch_opt(api, pe_a, ape, "PE", want_tf, pe_ex)
+    ce_a = pe_a = ace = ape = ""
+    if reuse:
+        ce_df = st.session_state["_scalp_ce_df"]
+        pe_df = st.session_state["_scalp_pe_df"]
+        ce_tf = pe_tf = want_tf
+    else:
+        ce_a, ce_ex = _scalper_resolve_atm_token(data, "CE")
+        pe_a, pe_ex = _scalper_resolve_atm_token(data, "PE")
+        ace, ape = alice_master_atm_tokens(Index_Name, selected_expiry_str, data.get("spot_price") or data.get("atm_strike"))
+        ce_df, ce_tf = _scalper_fetch_opt(api, ce_a, ace, "CE", want_tf, ce_ex)
+        pe_df, pe_tf = _scalper_fetch_opt(api, pe_a, ape, "PE", want_tf, pe_ex)
 
     st.session_state["_scalp_spot_df"] = spot_df
     st.session_state["_scalp_pe_df"] = pe_df
@@ -7661,6 +7675,7 @@ def render_scalper_mode():
         _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560, hide_delta=True, accent="#FF8A80")
     with ce_col:
         _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560, hide_delta=True, accent="#69F0AE")
+    st.session_state["_scalp_complete_ts"] = time.time()
     miss = " · ".join(
         f"{s} {st.session_state.get(f'_scalp_miss_{s}') or ('tok '+str(t) if t else 'no token')}"
         for s, t in (("PE", pe_a or ape), ("CE", ce_a or ace))
@@ -7687,7 +7702,7 @@ def live_multi_fragment():
         st.exception(e)
 
 
-@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("scalper")) else None)
+@st.fragment(run_every=8 if (st.session_state.get("enable_main_refresh") and view_is("scalper")) else None)
 def live_scalper_fragment():
     if not view_is("scalper"):
         return
