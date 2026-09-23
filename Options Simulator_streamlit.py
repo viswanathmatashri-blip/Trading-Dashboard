@@ -3180,6 +3180,113 @@ def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: 
     return out
 
 
+def _tf_minutes(tf_label):
+    s = str(tf_label or "5 min").lower()
+    if "15" in s:
+        return 15
+    if "3" in s:
+        return 3
+    if "1" in s and "15" not in s:
+        return 1
+    return 5
+
+
+def pack_ltf_buy_sell(df_tf, df_1m=None):
+    """1m close>open = buy vol inside each TF bar (TV request.security_lower_tf proxy)."""
+    d = df_tf.reset_index(drop=True).copy()
+    d["time"] = pd.to_datetime(d["time"], errors="coerce")
+    vol = pd.to_numeric(d.get("volume", 0), errors="coerce").fillna(0.0)
+    cl = pd.to_numeric(d["close"], errors="coerce")
+    op = pd.to_numeric(d["open"], errors="coerce")
+    d["buy_vol"] = np.where(cl > op, vol, np.where(cl < op, 0.0, vol * 0.5))
+    d["sell_vol"] = np.where(cl < op, vol, np.where(cl > op, 0.0, vol * 0.5))
+    if df_1m is None or getattr(df_1m, "empty", True) or "time" not in df_1m.columns:
+        return d
+    m = df_1m.copy()
+    m["time"] = pd.to_datetime(m["time"], errors="coerce")
+    m = m.dropna(subset=["time"]).sort_values("time")
+    mv = pd.to_numeric(m.get("volume", 0), errors="coerce").fillna(0.0)
+    mc = pd.to_numeric(m["close"], errors="coerce")
+    mo = pd.to_numeric(m["open"], errors="coerce")
+    m["b"] = np.where(mc > mo, mv, np.where(mc < mo, 0.0, mv * 0.5))
+    m["s"] = np.where(mc < mo, mv, np.where(mc > mo, 0.0, mv * 0.5))
+    buys, sells = [], []
+    times = d["time"].tolist()
+    for i, t0 in enumerate(times):
+        t1 = times[i + 1] if i + 1 < len(times) else t0 + pd.Timedelta(minutes=5)
+        sl = m[(m["time"] >= t0) & (m["time"] < t1)]
+        if sl.empty:
+            buys.append(float(d["buy_vol"].iloc[i]))
+            sells.append(float(d["sell_vol"].iloc[i]))
+        else:
+            buys.append(float(sl["b"].sum()))
+            sells.append(float(sl["s"].sum()))
+    d["buy_vol"] = buys
+    d["sell_vol"] = sells
+    return d
+
+
+def orderflow_flags(d, vol_mult=1.5, imb_mult=3.0, imb_vol_mult=2.5, missed_mult=1.0):
+    if d is None or getattr(d, "empty", True) or len(d) < 8:
+        return d
+    out = d.reset_index(drop=True).copy()
+    tot = pd.to_numeric(out["buy_vol"], errors="coerce").fillna(0) + pd.to_numeric(out["sell_vol"], errors="coerce").fillna(0)
+    out["of_tot"] = tot
+    avg = tot.rolling(20, min_periods=8).mean()
+    hi, lo = pd.to_numeric(out["high"], errors="coerce"), pd.to_numeric(out["low"], errors="coerce")
+    cl, op = pd.to_numeric(out["close"], errors="coerce"), pd.to_numeric(out["open"], errors="coerce")
+    buy, sell = pd.to_numeric(out["buy_vol"], errors="coerce").fillna(0), pd.to_numeric(out["sell_vol"], errors="coerce").fillna(0)
+    bull_w = ((cl - lo) > (hi - cl)) & (cl >= op)
+    bear_w = ((hi - cl) > (cl - lo)) & (cl <= op)
+    hi_vol = tot > (avg * vol_mult)
+    ext_vol = tot > (avg * imb_vol_mult)
+    miss_vol = tot > (avg * missed_mult)
+    out["buy_abs"] = hi_vol & (sell > buy) & bull_w
+    out["sell_abs"] = hi_vol & (buy > sell) & bear_w
+    out["buy_abs_pct"] = np.where(out["buy_abs"] & (tot > 0), sell / tot * 100.0, 0.0)
+    out["sell_abs_pct"] = np.where(out["sell_abs"] & (tot > 0), buy / tot * 100.0, 0.0)
+    tick = (hi - lo).replace(0, np.nan).median()
+    tick = float(tick) if pd.notna(tick) else 0.05
+    tick = max(tick * 0.02, 0.05)
+    out["miss_buy"] = ((hi - cl) <= tick) & (buy > 0) & (sell > 0) & miss_vol
+    out["miss_sell"] = ((cl - lo) <= tick) & (buy > 0) & (sell > 0) & miss_vol
+    safe_s = sell.replace(0, 1.0)
+    safe_b = buy.replace(0, 1.0)
+    out["buy_imb"] = ext_vol & (cl > op) & ((buy / safe_s) >= imb_mult)
+    out["sell_imb"] = ext_vol & (cl < op) & ((sell / safe_b) >= imb_mult)
+    return out
+
+
+def add_orderflow_marks(fig, d, row, col, xcol="time_str"):
+    if d is None or getattr(d, "empty", True):
+        return fig
+    xs = d[xcol] if xcol in d.columns else d["time"]
+    try:
+        for i in range(len(d)):
+            x = str(xs.iloc[i])
+            if bool(d["buy_abs"].iloc[i]):
+                fig.add_annotation(
+                    x=x, y=float(d["low"].iloc[i]),
+                    text=f"{float(d['buy_abs_pct'].iloc[i]):.0f}%",
+                    showarrow=False, yanchor="top",
+                    font=dict(size=8, color="#C4B918"),
+                    bgcolor="rgba(8,211,113,0.55)",
+                    row=row, col=col,
+                )
+            if bool(d["sell_abs"].iloc[i]):
+                fig.add_annotation(
+                    x=x, y=float(d["high"].iloc[i]),
+                    text=f"{float(d['sell_abs_pct'].iloc[i]):.0f}%",
+                    showarrow=False, yanchor="bottom",
+                    font=dict(size=8, color="#FFFFFF"),
+                    bgcolor="rgba(198,40,40,0.55)",
+                    row=row, col=col,
+                )
+    except Exception:
+        pass
+    return fig
+
+
 def add_tv_cvd_traces(fig, d, row=None, col=None):
     """CVD candles + TV-style Bull/Bear. row/col optional for a lone Figure."""
     if d is None or getattr(d, "empty", True):
@@ -3594,7 +3701,7 @@ def build_delta_footprint_figure(dfi: pd.DataFrame, axis_times=None, bin_pts=2.0
     return fig, evs
 
 
-def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", axis_times=None, hide_delta=False):
+def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", axis_times=None, hide_delta=False, df_ltf=None):
     if df_opt is None or df_opt.empty or len(df_opt) < 3:
         return None, "NO DATA"
     raw = df_opt.copy()
@@ -3697,6 +3804,11 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
         ), row=1, col=cndl)
     fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["vwap"], name="VWAP",
                                 line=dict(color="#FF9800", width=1.6)), row=1, col=cndl)
+    try:
+        of = orderflow_flags(pack_ltf_buy_sell(d, df_ltf))
+        add_orderflow_marks(fig, of, 1, cndl)
+    except Exception:
+        pass
     day_hi, day_lo = float(d["high"].max()), float(d["low"].min())
     opt_lvls = [
         {"price": day_hi, "name": "Day H", "color": "#FF8A80", "width": 1.1, "dash": "dot"},
@@ -7674,6 +7786,14 @@ def render_scalper_mode():
         ace, ape = alice_master_atm_tokens(Index_Name, selected_expiry_str, data.get("spot_price") or data.get("atm_strike"))
         ce_df, ce_tf = _scalper_fetch_opt(api, ce_a, ace, "CE", want_tf, ce_ex)
         pe_df, pe_tf = _scalper_fetch_opt(api, pe_a, ape, "PE", want_tf, pe_ex)
+        if want_tf != "1 min":
+            try:
+                pe_1m, _ = _scalper_fetch_opt(api, pe_a, ape, "PE", "1 min", pe_ex)
+                ce_1m, _ = _scalper_fetch_opt(api, ce_a, ace, "CE", "1 min", ce_ex)
+                st.session_state["_scalp_pe_1m"] = pe_1m
+                st.session_state["_scalp_ce_1m"] = ce_1m
+            except Exception:
+                pass
 
     st.session_state["_scalp_spot_df"] = spot_df
     st.session_state["_scalp_pe_df"] = pe_df
@@ -7682,13 +7802,13 @@ def render_scalper_mode():
     cards = _parse_gemini_setups(st.session_state.get("gemini_regular") or "")
     axis = session_axis_labels(want_tf, Index_Name)
 
-    def _pane(title, dfp, tf_used, key, height=560, hide_delta=False, accent="#c8ccd4"):
+    def _pane(title, dfp, tf_used, key, height=560, hide_delta=False, accent="#c8ccd4", df_ltf=None):
         st.markdown(
             f"<div class='chart-card' style='border:1px solid {accent};'>"
             f"<div class='card-title' style='color:{accent};'>{title} · {tf_used}</div>",
             unsafe_allow_html=True,
         )
-        fig, act = _option_session_figure(dfp, title, Index_Name, tf_used, axis, hide_delta=hide_delta)
+        fig, act = _option_session_figure(dfp, title, Index_Name, tf_used, axis, hide_delta=hide_delta, df_ltf=df_ltf)
         if act and "NO" not in str(act).upper() and "CHOP" not in str(act).upper():
             colr = "#FF5252" if "SHORT" in str(act).upper() else "#00E676"
             st.markdown(
@@ -7723,9 +7843,11 @@ def render_scalper_mode():
             st.caption("Gemini setups…")
     pe_col, ce_col = st.columns(2, gap="medium")
     with pe_col:
-        _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560, hide_delta=True, accent="#FF8A80")
+        _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560, hide_delta=True, accent="#FF8A80",
+              df_ltf=st.session_state.get("_scalp_pe_1m"))
     with ce_col:
-        _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560, hide_delta=True, accent="#69F0AE")
+        _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560, hide_delta=True, accent="#69F0AE",
+              df_ltf=st.session_state.get("_scalp_ce_1m"))
     st.session_state["_scalp_complete_ts"] = time.time()
     miss = " · ".join(
         f"{s} {st.session_state.get(f'_scalp_miss_{s}') or ('tok '+str(t) if t else 'no token')}"
