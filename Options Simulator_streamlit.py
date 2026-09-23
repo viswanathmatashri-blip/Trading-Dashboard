@@ -3717,15 +3717,18 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
                 if j < 0 or j >= len(d):
                     continue
                 colr = "#00E676" if kind == "BULL" else "#FF5252"
-                fig.add_annotation(
-                    x=str(d["time_str"].iloc[j]), y=float(cvd_s.iloc[j] or 0),
-                    text=" Bull " if kind == "BULL" else " Bear ",
-                    showarrow=False,
-                    font=dict(size=10, color="#FFFFFF", family="Inter"),
-                    bgcolor=colr, borderpad=3,
-                    yanchor="bottom" if kind == "BULL" else "top",
-                    row=4, col=cndl,
-                )
+                xj = str(d["time_str"].iloc[j])
+                yj = float(cvd_s.iloc[j] or 0)
+                fig.add_trace(plt_go.Scatter(
+                    x=[xj], y=[yj], mode="markers+text",
+                    marker=dict(size=11, color=colr, symbol="diamond",
+                                line=dict(width=1.2, color="#FFFFFF")),
+                    text=["Bull" if kind == "BULL" else "Bear"],
+                    textposition="top center" if kind == "BULL" else "bottom center",
+                    textfont=dict(size=10, color=colr, family="Inter"),
+                    showlegend=False,
+                    hovertemplate=f"{kind} @ {xj}<extra></extra>",
+                ), row=4, col=cndl)
         i = int(tvdiv.get("at") or -1)
         if tvdiv.get("label") and 0 <= i < len(d):
             colr = "#00E676" if tvdiv.get("bull") else "#FF5252"
@@ -7532,7 +7535,10 @@ def live_scalper_fragment():
     if not view_is("scalper"):
         return
     render_broker_status_ribbon()
-    render_scalper_mode()
+    try:
+        render_scalper_mode()
+    except Exception as e:
+        st.exception(e)
 
 
 @st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("default")) else None)
