@@ -3071,54 +3071,63 @@ def save_flow_tape(index_name: str, day, tape):
 
 
 def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: int = 5, range_hi: int = 60) -> dict:
-    """TradingView 'CVD + Div' regular pivots on bar delta (close-open)×vol — not cumsum, not Spearman."""
-    out = {"ok": False, "bull": False, "bear": False, "label": "", "at": None, "note": ""}
+    """Exact TV 'CVD + Div' regular pivots on lastVolume = session CVD close."""
+    out = {
+        "ok": False, "bull": False, "bear": False, "label": "", "at": None, "note": "",
+        "marks": [], "bull_pairs": [], "bear_pairs": [],
+    }
     if df is None or getattr(df, "empty", True) or len(df) < left + right + range_lo + 2:
         return out
     d = df.reset_index(drop=True)
-    delta = _signed_delta(d).astype(float)
+    if "cvd" in d.columns and d["cvd"].notna().any():
+        last_vol = pd.to_numeric(d["cvd"], errors="coerce")
+    else:
+        last_vol = _signed_delta(d).astype(float).cumsum()
     low = pd.to_numeric(d["low"] if "low" in d.columns else d["close"], errors="coerce")
     high = pd.to_numeric(d["high"] if "high" in d.columns else d["close"], errors="coerce")
     n = len(d)
     pl, ph = [], []
     for i in range(left, n - right):
-        w = delta.iloc[i - left:i + right + 1]
-        if not len(w) or pd.isna(delta.iloc[i]):
+        w = last_vol.iloc[i - left:i + right + 1]
+        if not len(w) or pd.isna(last_vol.iloc[i]):
             continue
-        if float(delta.iloc[i]) == float(w.min()) and (w == delta.iloc[i]).sum() == 1:
+        v = float(last_vol.iloc[i])
+        if v == float(w.min()) and (w == last_vol.iloc[i]).sum() == 1:
             pl.append(i)
-        if float(delta.iloc[i]) == float(w.max()) and (w == delta.iloc[i]).sum() == 1:
+        if v == float(w.max()) and (w == last_vol.iloc[i]).sum() == 1:
             ph.append(i)
-    def _pair(idxs, bull=True):
-        hits = []
-        for k in range(1, len(idxs)):
-            a, b = idxs[k - 1], idxs[k]
-            gap = b - a
-            if gap < range_lo or gap > range_hi:
-                continue
-            if bull:
-                if float(low.iloc[b]) < float(low.iloc[a]) and float(delta.iloc[b]) > float(delta.iloc[a]):
-                    hits.append(b)
-            else:
-                if float(high.iloc[b]) > float(high.iloc[a]) and float(delta.iloc[b]) < float(delta.iloc[a]):
-                    hits.append(b)
-        return hits
-    bulls, bears = _pair(pl, True), _pair(ph, False)
+    bull_pairs, bear_pairs, bulls, bears = [], [], [], []
+    for k in range(1, len(pl)):
+        a, b = pl[k - 1], pl[k]
+        if not (range_lo <= (b - a) <= range_hi):
+            continue
+        if float(low.iloc[b]) < float(low.iloc[a]) and float(last_vol.iloc[b]) > float(last_vol.iloc[a]):
+            bulls.append(b)
+            bull_pairs.append((a, b))
+    for k in range(1, len(ph)):
+        a, b = ph[k - 1], ph[k]
+        if not (range_lo <= (b - a) <= range_hi):
+            continue
+        if float(high.iloc[b]) > float(high.iloc[a]) and float(last_vol.iloc[b]) < float(last_vol.iloc[a]):
+            bears.append(b)
+            bear_pairs.append((a, b))
     out["ok"] = True
+    out["bull_pairs"] = bull_pairs
+    out["bear_pairs"] = bear_pairs
+    out["marks"] = [("BULL", i) for i in bulls] + [("BEAR", i) for i in bears]
     last_b = max(bulls) if bulls else -1
     last_s = max(bears) if bears else -1
     fresh = max(0, n - right - 8)
-    out["marks"] = [("BULL", i) for i in bulls] + [("BEAR", i) for i in bears]
     if last_b > last_s and last_b >= fresh:
         out["bull"] = True
         out["label"] = "CVD BULL DIV"
         out["at"] = last_b
-        out["note"] = "Price LL + delta HL (TV pivot)"
+        out["note"] = "Price LL + CVD HL"
     elif last_s > last_b and last_s >= fresh:
         out["bear"] = True
         out["label"] = "CVD BEAR DIV"
         out["at"] = last_s
-        out["note"] = "Price HH + delta LH (TV pivot)"
+        out["note"] = "Price HH + CVD LH"
     return out
 
 
@@ -3639,8 +3648,15 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
                              marker_color="rgba(255,82,82,0.7)"), row=2, col=cndl)
     efi_c = np.where(d["efi13"] >= 0, "#00E676", "#FF5252")
     fig.add_trace(plt_go.Bar(x=d["time_str"], y=d["efi13"], marker_color=efi_c, showlegend=False), row=3, col=cndl)
-    fig.add_trace(plt_go.Scatter(x=d["time_str"], y=d["cvd"], line=dict(color="#B0BEC5", width=1.2),
-                                showlegend=False), row=4, col=cndl)
+    cvd_close = pd.to_numeric(d["cvd"], errors="coerce")
+    cvd_open = cvd_close.shift(1).fillna(0.0)
+    cvd_hi = pd.concat([cvd_open, cvd_close], axis=1).max(axis=1)
+    cvd_lo = pd.concat([cvd_open, cvd_close], axis=1).min(axis=1)
+    fig.add_trace(plt_go.Candlestick(
+        x=d["time_str"], open=cvd_open, high=cvd_hi, low=cvd_lo, close=cvd_close,
+        name="CVD", increasing_line_color="#00897B", decreasing_line_color="#E53935",
+        increasing_fillcolor="#00897B", decreasing_fillcolor="#E53935", showlegend=False,
+    ), row=4, col=cndl)
     fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=2, col=cndl)
     fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=3, col=cndl)
     fig.add_hline(y=0, line_dash="dot", line_color="#FFF", row=4, col=cndl)
@@ -3679,34 +3695,49 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
         pass
     try:
         tvdiv = tv_style_cvd_div(d)
+        cvd_s = pd.to_numeric(d["cvd"], errors="coerce") if "cvd" in d.columns else None
         if tvdiv.get("label"):
             act = f"{tvdiv['label']} · {act}"
-            i = int(tvdiv.get("at") or -1)
-            if 0 <= i < len(d):
-                colr = "#00E676" if tvdiv.get("bull") else "#FF5252"
+        if cvd_s is not None:
+            for a, b in (tvdiv.get("bull_pairs") or []):
+                fig.add_trace(plt_go.Scatter(
+                    x=[str(d["time_str"].iloc[a]), str(d["time_str"].iloc[b])],
+                    y=[float(cvd_s.iloc[a]), float(cvd_s.iloc[b])],
+                    mode="lines", line=dict(color="#00E676", width=2),
+                    showlegend=False, hoverinfo="skip",
+                ), row=4, col=cndl)
+            for a, b in (tvdiv.get("bear_pairs") or []):
+                fig.add_trace(plt_go.Scatter(
+                    x=[str(d["time_str"].iloc[a]), str(d["time_str"].iloc[b])],
+                    y=[float(cvd_s.iloc[a]), float(cvd_s.iloc[b])],
+                    mode="lines", line=dict(color="#FF5252", width=2),
+                    showlegend=False, hoverinfo="skip",
+                ), row=4, col=cndl)
+            for kind, j in (tvdiv.get("marks") or []):
+                if j < 0 or j >= len(d):
+                    continue
+                colr = "#00E676" if kind == "BULL" else "#FF5252"
                 fig.add_annotation(
-                    x=str(d["time_str"].iloc[i]),
-                    y=float(d["high"].iloc[i]) if tvdiv.get("bear") else float(d["low"].iloc[i]),
-                    text="BEAR" if tvdiv.get("bear") else "BULL",
-                    showarrow=True, arrowhead=2, arrowcolor=colr,
-                    font=dict(size=10, color=colr, family="Inter"),
-                    ay=-28 if tvdiv.get("bear") else 28,
-                    row=1, col=cndl,
+                    x=str(d["time_str"].iloc[j]), y=float(cvd_s.iloc[j] or 0),
+                    text=" Bull " if kind == "BULL" else " Bear ",
+                    showarrow=False,
+                    font=dict(size=10, color="#FFFFFF", family="Inter"),
+                    bgcolor=colr, borderpad=3,
+                    yanchor="bottom" if kind == "BULL" else "top",
+                    row=4, col=cndl,
                 )
-            if "cvd" in d.columns:
-                for kind, j in (tvdiv.get("marks") or []):
-                    if j < 0 or j >= len(d):
-                        continue
-                    colr = "#00E676" if kind == "BULL" else "#FF5252"
-                    fig.add_annotation(
-                        x=str(d["time_str"].iloc[j]),
-                        y=float(pd.to_numeric(d["cvd"], errors="coerce").iloc[j] or 0),
-                        text=kind,
-                        showarrow=True, arrowhead=2, arrowcolor=colr,
-                        font=dict(size=9, color=colr, family="Inter"),
-                        ay=-16 if kind == "BEAR" else 16,
-                        row=4, col=cndl,
-                    )
+        i = int(tvdiv.get("at") or -1)
+        if tvdiv.get("label") and 0 <= i < len(d):
+            colr = "#00E676" if tvdiv.get("bull") else "#FF5252"
+            fig.add_annotation(
+                x=str(d["time_str"].iloc[i]),
+                y=float(d["high"].iloc[i]) if tvdiv.get("bear") else float(d["low"].iloc[i]),
+                text="BEAR" if tvdiv.get("bear") else "BULL",
+                showarrow=True, arrowhead=2, arrowcolor=colr,
+                font=dict(size=10, color=colr, family="Inter"),
+                ay=-28 if tvdiv.get("bear") else 28,
+                row=1, col=cndl,
+            )
     except Exception:
         pass
     return fig, act
