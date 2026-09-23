@@ -3146,6 +3146,66 @@ def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: 
     return out
 
 
+def add_tv_cvd_traces(fig, d, row=None, col=None):
+    """CVD candles + TV-style Bull/Bear. row/col optional for a lone Figure."""
+    if d is None or getattr(d, "empty", True):
+        return fig
+    dd = d.reset_index(drop=True).copy()
+    if "cvd" not in dd.columns or not dd["cvd"].notna().any():
+        dd = attach_bar_flow(dd, rebuild=True)
+    if "cvd" not in dd.columns:
+        return fig
+    xs = dd["time_str"] if "time_str" in dd.columns else pd.to_datetime(dd["time"]).dt.strftime("%H:%M")
+    cvd_close = pd.to_numeric(dd["cvd"], errors="coerce")
+    cvd_open = cvd_close.shift(1).fillna(0.0)
+    cvd_hi = pd.concat([cvd_open, cvd_close], axis=1).max(axis=1)
+    cvd_lo = pd.concat([cvd_open, cvd_close], axis=1).min(axis=1)
+    loc = {} if row is None else {"row": row, "col": col}
+    fig.add_trace(plt_go.Candlestick(
+        x=xs, open=cvd_open, high=cvd_hi, low=cvd_lo, close=cvd_close,
+        name="CVD", increasing_line_color="#00897B", decreasing_line_color="#E53935",
+        increasing_fillcolor="#00897B", decreasing_fillcolor="#E53935", showlegend=False,
+    ), **loc)
+    try:
+        fig.add_hline(y=0, line_dash="dot", line_color="#FFF", **loc)
+    except Exception:
+        fig.add_hline(y=0, line_dash="dot", line_color="#FFF")
+    try:
+        tvdiv = tv_style_cvd_div(dd)
+        cvd_s = cvd_close
+        for a, b in (tvdiv.get("bull_pairs") or []):
+            fig.add_trace(plt_go.Scatter(
+                x=[str(xs.iloc[a]), str(xs.iloc[b])],
+                y=[float(cvd_s.iloc[a]), float(cvd_s.iloc[b])],
+                mode="lines", line=dict(color="#00E676", width=2),
+                showlegend=False, hoverinfo="skip",
+            ), **loc)
+        for a, b in (tvdiv.get("bear_pairs") or []):
+            fig.add_trace(plt_go.Scatter(
+                x=[str(xs.iloc[a]), str(xs.iloc[b])],
+                y=[float(cvd_s.iloc[a]), float(cvd_s.iloc[b])],
+                mode="lines", line=dict(color="#FF5252", width=2),
+                showlegend=False, hoverinfo="skip",
+            ), **loc)
+        for kind, j in (tvdiv.get("marks") or []):
+            if j < 0 or j >= len(dd):
+                continue
+            colr = "#00E676" if kind == "BULL" else "#FF5252"
+            fig.add_trace(plt_go.Scatter(
+                x=[str(xs.iloc[j])], y=[float(cvd_s.iloc[j] or 0)],
+                mode="markers+text",
+                marker=dict(size=10, color=colr, symbol="diamond", line=dict(width=1, color="#FFF")),
+                text=["Bull" if kind == "BULL" else "Bear"],
+                textposition="top center" if kind == "BULL" else "bottom center",
+                textfont=dict(size=9, color=colr),
+                showlegend=False,
+                hovertemplate=f"{kind}<extra></extra>",
+            ), **loc)
+    except Exception:
+        pass
+    return fig
+
+
 def cvd_price_stats(df: pd.DataFrame, window: int = 20) -> dict:
     """OLS slopes + p-values on this TF only. Divergence only if both slopes significant.
 
@@ -5861,14 +5921,7 @@ def render_futures_cvd_chart(data: dict):
     )
 
     fig = plt_go.Figure()
-    fig.add_trace(plt_go.Scatter(
-        x=df["time_str"], y=df["cvd"],
-        mode="lines", name="CVD",
-        line=dict(color=colour, width=2),
-        fill="tozeroy",
-        fillcolor="rgba(0,230,118,0.08)" if latest_cvd >= 0 else "rgba(255,82,82,0.08)",
-    ))
-    fig.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot")
+    add_tv_cvd_traces(fig, df)
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
         height=280, margin=dict(l=10, r=10, t=30, b=10),
@@ -6853,9 +6906,10 @@ def build_multi_index_figure(index_name, dfi, vp):
     if not axis_times:
         axis_times = list(dfi["time_str"])
     fig = make_subplots(
-        rows=1, cols=2, column_widths=[0.82, 0.18],
-        shared_yaxes=True, horizontal_spacing=0.012,
-        specs=[[{}, {}]],
+        rows=2, cols=2, column_widths=[0.82, 0.18],
+        row_heights=[0.70, 0.30],
+        shared_yaxes=False, horizontal_spacing=0.012, vertical_spacing=0.06,
+        specs=[[{}, {}], [{}, None]],
     )
     idx_o = dfi["spot_px"].astype(float) + (dfi["open"].astype(float) - dfi["close"].astype(float))
     idx_h = dfi["spot_px"].astype(float) + (dfi["high"].astype(float) - dfi["close"].astype(float))
@@ -6967,16 +7021,23 @@ def build_multi_index_figure(index_name, dfi, vp):
                 xr = [max(0, i - 80), min(len(axis_times) - 1, i + 2)]
     except Exception:
         xr = None
+    try:
+        add_tv_cvd_traces(fig, dfi, 2, 1)
+    except Exception:
+        pass
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-        height=400, margin=dict(l=36, r=6, t=52, b=22),
+        height=520, margin=dict(l=36, r=6, t=52, b=22),
         xaxis_rangeslider_visible=False, showlegend=False, hovermode="x unified",
     )
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
-                     range=xr, nticks=7, row=1, col=1)
+                     range=xr, nticks=7, showticklabels=False, row=1, col=1)
     fig.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=axis_times,
+                     range=xr, nticks=7, row=2, col=1)
     fig.update_yaxes(range=[y0, y1], tickfont=dict(size=8), row=1, col=1)
     fig.update_yaxes(range=[y0, y1], showticklabels=False, showgrid=False, row=1, col=2)
+    fig.update_yaxes(title_text="CVD", tickfont=dict(size=8), row=2, col=1)
     return fig
 
 
@@ -8822,24 +8883,7 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     x=dfi["time_str"], y=dfi["efi13"], marker_color=efi_col, showlegend=False, name="EFI",
                 ), row=3, col=2)
                 fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=3, col=2)
-                cvd_last = float(dfi["cvd"].iloc[-1])
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["cvd"].clip(lower=0),
-                    mode="lines", showlegend=False, name="CVD+",
-                    line=dict(color="#00E676", width=1.6),
-                    fill="tozeroy", fillcolor="rgba(0,230,118,0.22)",
-                ), row=4, col=2)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["cvd"].clip(upper=0),
-                    mode="lines", showlegend=False, name="CVD-",
-                    line=dict(color="#FF5252", width=1.6),
-                    fill="tozeroy", fillcolor="rgba(255,82,82,0.22)",
-                ), row=4, col=2)
-                fig_stack.add_trace(plt_go.Scatter(
-                    x=dfi["time_str"], y=dfi["cvd"], mode="lines", showlegend=False, name="CVD",
-                    line=dict(color="#B0BEC5", width=1.2),
-                ), row=4, col=2)
-                fig_stack.add_hline(y=0, line_width=1, line_color="#FFFFFF", line_dash="dot", row=4, col=2)
+                add_tv_cvd_traces(fig_stack, dfi, 4, 2)
                 tf_min_w = {"3 min": 10, "5 min": 8, "15 min": 6}.get(st.session_state.get("selected_timeframe", "5 min"), 8)
                 cvd_st = cvd_price_stats(dfi, window=tf_min_w)
                 if cvd_st.get("ok"):
