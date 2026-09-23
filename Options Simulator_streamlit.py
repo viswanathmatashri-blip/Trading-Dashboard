@@ -7358,8 +7358,16 @@ def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
             return int(t.hour) if pd.notna(t) else -1
         except Exception:
             return -1
-    if isinstance(prev, pd.DataFrame) and not prev.empty and age < 4:
-        if not (Index_Name in ("CRUDEOIL", "GOLDM", "GOLD", "SILVERM") and now_h >= 16 and _bar_hour(prev) < 16):
+    if isinstance(prev, pd.DataFrame) and not prev.empty and age < 2:
+        stale_hrs = Index_Name in ("CRUDEOIL", "GOLDM", "GOLD", "SILVERM") and now_h >= 16 and _bar_hour(prev) < 16
+        last_t = pd.to_datetime(prev["time"], errors="coerce").max() if "time" in prev.columns else pd.NaT
+        lag = 9999
+        if pd.notna(last_t):
+            now_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+            if getattr(last_t, "tzinfo", None) is None:
+                last_t = pytz.timezone("Asia/Kolkata").localize(last_t)
+            lag = (now_ist - last_t).total_seconds()
+        if (not stale_hrs) and lag < 240:
             return prev, want_tf
     tok = angel_tok or alice_tok
     if not tok and not alice_tok:
@@ -7627,7 +7635,13 @@ def render_scalper_mode():
             st.caption(f"VA · {act or '—'}")
         if fig is not None:
             fig.update_layout(height=height, margin=dict(l=28, r=4, t=6, b=14))
-            st.plotly_chart(fig, use_container_width=True, key=key)
+            uid = key
+            try:
+                if dfp is not None and not getattr(dfp, "empty", True):
+                    uid = f"{key}_{len(dfp)}_{pd.to_datetime(dfp['time']).iloc[-1]}"
+            except Exception:
+                uid = key
+            st.plotly_chart(fig, use_container_width=True, key=str(uid))
         else:
             st.caption("No tape this cycle.")
         st.markdown("</div>", unsafe_allow_html=True)
