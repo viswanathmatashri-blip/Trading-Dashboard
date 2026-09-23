@@ -7290,8 +7290,16 @@ def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
     ts_key = cache_key + "_ts"
     prev = st.session_state.get(cache_key)
     age = time.time() - float(st.session_state.get(ts_key) or 0)
+    now_h = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).hour
+    def _bar_hour(df):
+        try:
+            t = pd.to_datetime(df["time"], errors="coerce").max()
+            return int(t.hour) if pd.notna(t) else -1
+        except Exception:
+            return -1
     if isinstance(prev, pd.DataFrame) and not prev.empty and age < 4:
-        return prev, want_tf
+        if not (Index_Name in ("CRUDEOIL", "GOLDM", "GOLD", "SILVERM") and now_h >= 16 and _bar_hour(prev) < 16):
+            return prev, want_tf
     tok = angel_tok or alice_tok
     if not tok and not alice_tok:
         st.session_state[f"_scalp_miss_{lab}"] = "no option token (check expiry / master)"
@@ -7332,6 +7340,36 @@ def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
     dfo = pd.DataFrame()
     tried = []
     if angel_tok and api and not st.session_state.get("alice_only"):
+        try:
+            now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+            for ex0 in [exch_opt or "MCX", "MCX", "NCO"]:
+                param = {
+                    "exchange": ex0,
+                    "symboltoken": str(angel_tok),
+                    "interval": api_int,
+                    "fromdate": now.strftime("%Y-%m-%d 09:00"),
+                    "todate": now.strftime("%Y-%m-%d %H:%M"),
+                }
+                res = safe_api_call(api.getCandleData, param)
+                if res and res.get("status") and res.get("data"):
+                    dfo = pd.DataFrame(res["data"], columns=["time", "open", "high", "low", "close", "volume"])
+                    dfo[["open", "high", "low", "close", "volume"]] = dfo[["open", "high", "low", "close", "volume"]].astype(float)
+                    dfo["time"] = series_to_ist(dfo["time"])
+                    break
+        except Exception:
+            dfo = pd.DataFrame()
+    if dfo is not None and not getattr(dfo, "empty", True):
+        if alice_df is not None and not alice_df.empty:
+            try:
+                dfo = merge_candle_frames(alice_df, dfo)
+            except Exception:
+                pass
+        st.session_state[cache_key] = dfo
+        st.session_state[ts_key] = time.time()
+        st.session_state[f"_src_opt_{lab}"] = "smartapi"
+        st.session_state["_last_broker"] = "smartapi"
+        return dfo, want_tf
+    if angel_tok and api and not st.session_state.get("alice_only") and (dfo is None or getattr(dfo, "empty", True)):
       for ex in [exch_opt] + [e for e in ("MCX", "NCO", "NFO") if e != exch_opt]:
         tried.append(ex)
         try:
