@@ -3070,6 +3070,58 @@ def save_flow_tape(index_name: str, day, tape):
 
 
 
+def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: int = 5, range_hi: int = 60) -> dict:
+    """TradingView 'CVD + Div' regular pivots on bar delta (close-open)×vol — not cumsum, not Spearman."""
+    out = {"ok": False, "bull": False, "bear": False, "label": "", "at": None, "note": ""}
+    if df is None or getattr(df, "empty", True) or len(df) < left + right + range_lo + 2:
+        return out
+    d = df.reset_index(drop=True)
+    delta = _signed_delta(d).astype(float)
+    low = pd.to_numeric(d["low"] if "low" in d.columns else d["close"], errors="coerce")
+    high = pd.to_numeric(d["high"] if "high" in d.columns else d["close"], errors="coerce")
+    n = len(d)
+    pl, ph = [], []
+    for i in range(left, n - right):
+        w = delta.iloc[i - left:i + right + 1]
+        if not len(w) or pd.isna(delta.iloc[i]):
+            continue
+        if float(delta.iloc[i]) == float(w.min()) and (w == delta.iloc[i]).sum() == 1:
+            pl.append(i)
+        if float(delta.iloc[i]) == float(w.max()) and (w == delta.iloc[i]).sum() == 1:
+            ph.append(i)
+    def _pair(idxs, bull=True):
+        hits = []
+        for k in range(1, len(idxs)):
+            a, b = idxs[k - 1], idxs[k]
+            gap = b - a
+            if gap < range_lo or gap > range_hi:
+                continue
+            if bull:
+                if float(low.iloc[b]) < float(low.iloc[a]) and float(delta.iloc[b]) > float(delta.iloc[a]):
+                    hits.append(b)
+            else:
+                if float(high.iloc[b]) > float(high.iloc[a]) and float(delta.iloc[b]) < float(delta.iloc[a]):
+                    hits.append(b)
+        return hits
+    bulls, bears = _pair(pl, True), _pair(ph, False)
+    out["ok"] = True
+    last_b = max(bulls) if bulls else -1
+    last_s = max(bears) if bears else -1
+    fresh = max(0, n - right - 8)
+    out["marks"] = [("BULL", i) for i in bulls] + [("BEAR", i) for i in bears]
+    if last_b > last_s and last_b >= fresh:
+        out["bull"] = True
+        out["label"] = "CVD BULL DIV"
+        out["at"] = last_b
+        out["note"] = "Price LL + delta HL (TV pivot)"
+    elif last_s > last_b and last_s >= fresh:
+        out["bear"] = True
+        out["label"] = "CVD BEAR DIV"
+        out["at"] = last_s
+        out["note"] = "Price HH + delta LH (TV pivot)"
+    return out
+
+
 def cvd_price_stats(df: pd.DataFrame, window: int = 20) -> dict:
     """OLS slopes + p-values on this TF only. Divergence only if both slopes significant.
 
@@ -3623,6 +3675,38 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
         recs = pdec_session_history(d)
         if recs:
             act = recs[-1].get("action") or "—"
+    except Exception:
+        pass
+    try:
+        tvdiv = tv_style_cvd_div(d)
+        if tvdiv.get("label"):
+            act = f"{tvdiv['label']} · {act}"
+            i = int(tvdiv.get("at") or -1)
+            if 0 <= i < len(d):
+                colr = "#00E676" if tvdiv.get("bull") else "#FF5252"
+                fig.add_annotation(
+                    x=str(d["time_str"].iloc[i]),
+                    y=float(d["high"].iloc[i]) if tvdiv.get("bear") else float(d["low"].iloc[i]),
+                    text="BEAR" if tvdiv.get("bear") else "BULL",
+                    showarrow=True, arrowhead=2, arrowcolor=colr,
+                    font=dict(size=10, color=colr, family="Inter"),
+                    ay=-28 if tvdiv.get("bear") else 28,
+                    row=1, col=cndl,
+                )
+            if "cvd" in d.columns:
+                for kind, j in (tvdiv.get("marks") or []):
+                    if j < 0 or j >= len(d):
+                        continue
+                    colr = "#00E676" if kind == "BULL" else "#FF5252"
+                    fig.add_annotation(
+                        x=str(d["time_str"].iloc[j]),
+                        y=float(pd.to_numeric(d["cvd"], errors="coerce").iloc[j] or 0),
+                        text=kind,
+                        showarrow=True, arrowhead=2, arrowcolor=colr,
+                        font=dict(size=9, color=colr, family="Inter"),
+                        ay=-16 if kind == "BEAR" else 16,
+                        row=4, col=cndl,
+                    )
     except Exception:
         pass
     return fig, act
