@@ -3125,9 +3125,11 @@ def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: 
                 bear_pairs.append((a, b))
                 break
     out["ok"] = True
-    out["bull_pairs"] = bull_pairs
-    out["bear_pairs"] = bear_pairs
-    out["marks"] = [("BULL", i) for i in bulls] + [("BEAR", i) for i in bears]
+    out["bull_pairs"] = bull_pairs[-4:]
+    out["bear_pairs"] = bear_pairs[-4:]
+    marks = [("BULL", i) for i in bulls] + [("BEAR", i) for i in bears]
+    marks = sorted(marks, key=lambda x: x[1])[-6:]
+    out["marks"] = marks
     last_b = max(bulls) if bulls else -1
     last_s = max(bears) if bears else -1
     fresh = max(0, n - right - 8)
@@ -7315,10 +7317,11 @@ def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
       for ex in [exch_opt] + [e for e in ("MCX", "NCO", "NFO") if e != exch_opt]:
         tried.append(ex)
         try:
-            dfo, _ = fetch_candles_with_holiday_fallback(
+            got = fetch_candles_with_holiday_fallback(
                 api, str(angel_tok), ex, api_int, 0, Index_Name,
                 cache_kind=f"opt_{lab}_{angel_tok}",
             )
+            dfo = got[0] if isinstance(got, tuple) else got
         except Exception:
             dfo = pd.DataFrame()
         if dfo is not None and not dfo.empty:
@@ -7539,7 +7542,10 @@ def live_multi_fragment():
     if not view_is("multi"):
         return
     render_broker_status_ribbon()
-    render_multi_index_mode()
+    try:
+        render_multi_index_mode()
+    except Exception as e:
+        st.exception(e)
 
 
 @st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("scalper")) else None)
@@ -9338,12 +9344,16 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
 
 
 _view_now = active_view()
-if _view_now == "multi":
-    live_multi_fragment()
-elif _view_now == "scalper":
-    live_scalper_fragment()
-else:
-    live_dashboard_fragment()
+try:
+    if _view_now == "multi":
+        live_multi_fragment()
+    elif _view_now == "scalper":
+        live_scalper_fragment()
+    else:
+        live_dashboard_fragment()
+except Exception as _boot_err:
+    st.error("View refresh failed — last tape kept. Reload if this stays.")
+    st.exception(_boot_err)
 
 # --- Raw Z-Score details ---
 if st.session_state.get("app_view", "default") == "default":
