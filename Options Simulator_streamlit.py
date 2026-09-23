@@ -3143,6 +3143,40 @@ def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: 
         out["label"] = "CVD BEAR DIV"
         out["at"] = last_s
         out["note"] = "Price HH + CVD LH"
+    # Live: last bar vs last CONFIRMED price swing (no 5-bar wait on now).
+    p_hi, p_lo = [], []
+    for i in range(left, n - right):
+        hw = high.iloc[i - left:i + right + 1]
+        lw = low.iloc[i - left:i + right + 1]
+        if pd.isna(high.iloc[i]) or pd.isna(low.iloc[i]):
+            continue
+        if float(high.iloc[i]) == float(hw.max()) and (hw == high.iloc[i]).sum() == 1:
+            p_hi.append(i)
+        if float(low.iloc[i]) == float(lw.min()) and (lw == low.iloc[i]).sum() == 1:
+            p_lo.append(i)
+    live = n - 1
+    watch = None
+    if p_hi and live > p_hi[-1]:
+        h = p_hi[-1]
+        if float(high.iloc[live]) > float(high.iloc[h]) and float(last_vol.iloc[live]) < float(last_vol.iloc[h]):
+            watch = "BEAR"
+            out["bear_pairs"] = (out["bear_pairs"] + [(h, live)])[-4:]
+    if p_lo and live > p_lo[-1] and watch is None:
+        lo = p_lo[-1]
+        if float(low.iloc[live]) < float(low.iloc[lo]) and float(last_vol.iloc[live]) > float(last_vol.iloc[lo]):
+            watch = "BULL"
+            out["bull_pairs"] = (out["bull_pairs"] + [(lo, live)])[-4:]
+    if watch:
+        out["watch"] = watch
+        out["marks"] = (out["marks"] + [(f"WATCH {watch}", live)])[-8:]
+        if not out.get("label"):
+            out["label"] = f"CVD WATCH {watch}"
+            out["at"] = live
+            out["note"] = "Live vs last swing (unconfirmed)"
+            if watch == "BULL":
+                out["bull"] = True
+            else:
+                out["bear"] = True
     return out
 
 
@@ -3190,13 +3224,14 @@ def add_tv_cvd_traces(fig, d, row=None, col=None):
         for kind, j in (tvdiv.get("marks") or []):
             if j < 0 or j >= len(dd):
                 continue
-            colr = "#00E676" if kind == "BULL" else "#FF5252"
+            colr = "#00E676" if "BULL" in str(kind) else "#FF5252"
             fig.add_trace(plt_go.Scatter(
                 x=[str(xs.iloc[j])], y=[float(cvd_s.iloc[j] or 0)],
                 mode="markers+text",
                 marker=dict(size=10, color=colr, symbol="diamond", line=dict(width=1, color="#FFF")),
-                text=["Bull" if kind == "BULL" else "Bear"],
-                textposition="top center" if kind == "BULL" else "bottom center",
+                text=["Watch Bull" if "WATCH" in str(kind) and "BULL" in str(kind) else (
+                    "Watch Bear" if "WATCH" in str(kind) else ("Bull" if "BULL" in str(kind) else "Bear"))],
+                textposition="top center" if "BULL" in str(kind) else "bottom center",
                 textfont=dict(size=9, color=colr),
                 showlegend=False,
                 hovertemplate=f"{kind}<extra></extra>",
@@ -7601,11 +7636,18 @@ def render_scalper_mode():
     last_ok = float(st.session_state.get("_scalp_complete_ts") or 0)
     reuse = (
         time.time() - last_ok < 10
+        and st.session_state.get("_scalp_tf") == want_tf
         and isinstance(st.session_state.get("_scalp_ce_df"), pd.DataFrame)
         and not st.session_state["_scalp_ce_df"].empty
         and isinstance(st.session_state.get("_scalp_pe_df"), pd.DataFrame)
         and not st.session_state["_scalp_pe_df"].empty
     )
+    if st.session_state.get("_scalp_tf") != want_tf:
+        for k in list(st.session_state.keys()):
+            if str(k).startswith("_scalp_df_"):
+                st.session_state.pop(k, None)
+        st.session_state["_scalp_complete_ts"] = 0
+        reuse = False
     last_tape = float(st.session_state.get("_scalp_tape_ts") or 0)
     if auto and live_now and (time.time() - last_tape) >= 10 and not reuse:
         st.session_state["data_store"] = refresh_index_tapes(
@@ -7628,6 +7670,7 @@ def render_scalper_mode():
     st.session_state["_scalp_spot_df"] = spot_df
     st.session_state["_scalp_pe_df"] = pe_df
     st.session_state["_scalp_ce_df"] = ce_df
+    st.session_state["_scalp_tf"] = want_tf
     cards = _parse_gemini_setups(st.session_state.get("gemini_regular") or "")
     axis = session_axis_labels(want_tf, Index_Name)
 
