@@ -7299,18 +7299,36 @@ def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
         return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
     exch_opt = exch_opt or (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
     api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
+    alice_df = pd.DataFrame()
     if alice_tok:
         try:
-            alt = fetch_alice_candles(alice_tok, exch_opt or "MCX", api_int, Index_Name)
-            if alt is not None and not alt.empty:
-                st.session_state[cache_key] = alt
-                st.session_state[ts_key] = time.time()
-                st.session_state[f"_src_opt_{lab}"] = "aliceblue"
-                st.session_state["_last_broker"] = "aliceblue"
-                st.session_state[f"_scalp_miss_{lab}"] = ""
-                return alt, want_tf
+            alice_df = fetch_alice_candles(alice_tok, exch_opt or "MCX", api_int, Index_Name)
         except Exception:
-            pass
+            alice_df = pd.DataFrame()
+    def _mcx_tape_short(df):
+        if df is None or getattr(df, "empty", True) or "time" not in getattr(df, "columns", []):
+            return True
+        last = pd.to_datetime(df["time"], errors="coerce").max()
+        if pd.isna(last):
+            return True
+        now = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
+        if getattr(last, "tzinfo", None) is None:
+            last = pytz.timezone("Asia/Kolkata").localize(last)
+        else:
+            last = last.tz_convert("Asia/Kolkata")
+        live, _, _, _ = market_session_state(now, Index_Name)
+        if live and last.hour < 16 and now.hour >= 16:
+            return True
+        if live and (now - last).total_seconds() > 25 * 60:
+            return True
+        return False
+    if alice_df is not None and not alice_df.empty and not _mcx_tape_short(alice_df):
+        st.session_state[cache_key] = alice_df
+        st.session_state[ts_key] = time.time()
+        st.session_state[f"_src_opt_{lab}"] = "aliceblue"
+        st.session_state["_last_broker"] = "aliceblue"
+        st.session_state[f"_scalp_miss_{lab}"] = ""
+        return alice_df, want_tf
     dfo = pd.DataFrame()
     tried = []
     if angel_tok and api and not st.session_state.get("alice_only"):
@@ -7334,9 +7352,14 @@ def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
             except Exception:
                 pass
         if dfo is not None and not dfo.empty:
+            if alice_df is not None and not alice_df.empty:
+                try:
+                    dfo = merge_candle_frames(alice_df, dfo)
+                except Exception:
+                    pass
             st.session_state[cache_key] = dfo
             st.session_state[ts_key] = time.time()
-            st.session_state[f"_src_opt_{lab}"] = "smartapi" if not st.session_state.get("alice_only") else "aliceblue"
+            st.session_state[f"_src_opt_{lab}"] = "smartapi+alice" if (alice_df is not None and not alice_df.empty) else "smartapi"
             return dfo, want_tf
     if _alice_configured() and alice_tok:
         try:
@@ -7355,6 +7378,9 @@ def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
             pass
     st.session_state[f"_scalp_miss_{lab}"] = f"tok={tok} exch tried {tried}"
     st.session_state[ts_key] = time.time()
+    if alice_df is not None and not alice_df.empty:
+        st.session_state[cache_key] = alice_df
+        return alice_df, want_tf
     if isinstance(prev, pd.DataFrame) and not prev.empty:
         return prev, want_tf
     return pd.DataFrame(), want_tf
