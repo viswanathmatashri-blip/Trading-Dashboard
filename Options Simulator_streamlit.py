@@ -3125,11 +3125,10 @@ def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: 
                 bear_pairs.append((a, b))
                 break
     out["ok"] = True
-    out["bull_pairs"] = bull_pairs[-4:]
-    out["bear_pairs"] = bear_pairs[-4:]
+    out["bull_pairs"] = bull_pairs
+    out["bear_pairs"] = bear_pairs
     marks = [("BULL", i) for i in bulls] + [("BEAR", i) for i in bears]
-    marks = sorted(marks, key=lambda x: x[1])[-6:]
-    out["marks"] = marks
+    out["marks"] = sorted(marks, key=lambda x: x[1])
     last_b = max(bulls) if bulls else -1
     last_s = max(bears) if bears else -1
     fresh = max(0, n - right - 8)
@@ -3160,15 +3159,15 @@ def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: 
         h = p_hi[-1]
         if float(high.iloc[live]) > float(high.iloc[h]) and float(last_vol.iloc[live]) < float(last_vol.iloc[h]):
             watch = "BEAR"
-            out["bear_pairs"] = (out["bear_pairs"] + [(h, live)])[-4:]
+            out["bear_pairs"] = out["bear_pairs"] + [(h, live)]
     if p_lo and live > p_lo[-1] and watch is None:
         lo = p_lo[-1]
         if float(low.iloc[live]) < float(low.iloc[lo]) and float(last_vol.iloc[live]) > float(last_vol.iloc[lo]):
             watch = "BULL"
-            out["bull_pairs"] = (out["bull_pairs"] + [(lo, live)])[-4:]
+            out["bull_pairs"] = out["bull_pairs"] + [(lo, live)]
     if watch:
         out["watch"] = watch
-        out["marks"] = (out["marks"] + [(f"WATCH {watch}", live)])[-8:]
+        out["marks"] = out["marks"] + [(f"WATCH {watch}", live)]
         if not out.get("label"):
             out["label"] = f"CVD WATCH {watch}"
             out["at"] = live
