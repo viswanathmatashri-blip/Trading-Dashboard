@@ -3826,26 +3826,34 @@ def _option_session_figure(df_opt, label, index_name="NIFTY", tf_label="5 min", 
             for kind, j in (tvdiv.get("marks") or []):
                 if j < 0 or j >= len(d):
                     continue
-                colr = "#00E676" if kind == "BULL" else "#FF5252"
+                ks = str(kind).upper()
+                is_bull = "BULL" in ks
+                is_watch = "WATCH" in ks
+                colr = "#00E676" if is_bull else "#FF5252"
+                lab = ("Watch Bull" if is_watch and is_bull else
+                       "Watch Bear" if is_watch else
+                       "Bull" if is_bull else "Bear")
                 xj = str(d["time_str"].iloc[j])
                 yj = float(cvd_s.iloc[j] or 0)
                 fig.add_trace(plt_go.Scatter(
                     x=[xj], y=[yj], mode="markers+text",
                     marker=dict(size=11, color=colr, symbol="diamond",
                                 line=dict(width=1.2, color="#FFFFFF")),
-                    text=["Bull" if kind == "BULL" else "Bear"],
-                    textposition="top center" if kind == "BULL" else "bottom center",
+                    text=[lab],
+                    textposition="top center" if is_bull else "bottom center",
                     textfont=dict(size=10, color=colr, family="Inter"),
                     showlegend=False,
-                    hovertemplate=f"{kind} @ {xj}<extra></extra>",
+                    hovertemplate=f"{ks} @ {xj}<extra></extra>",
                 ), row=4, col=cndl)
         i = int(tvdiv.get("at") or -1)
         if tvdiv.get("label") and 0 <= i < len(d):
-            colr = "#00E676" if tvdiv.get("bull") else "#FF5252"
+            lab_u = str(tvdiv.get("label") or "").upper()
+            is_bull = "BULL" in lab_u
+            colr = "#00E676" if is_bull else "#FF5252"
             fig.add_annotation(
                 x=str(d["time_str"].iloc[i]),
-                y=float(d["high"].iloc[i]) if tvdiv.get("bear") else float(d["low"].iloc[i]),
-                text="BEAR" if tvdiv.get("bear") else "BULL",
+                y=float(d["high"].iloc[i]) if not is_bull else float(d["low"].iloc[i]),
+                text=str(tvdiv.get("label") or "").replace("CVD ", ""),
                 showarrow=True, arrowhead=2, arrowcolor=colr,
                 font=dict(size=10, color=colr, family="Inter"),
                 ay=-28 if tvdiv.get("bear") else 28,
