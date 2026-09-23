@@ -3097,20 +3097,33 @@ def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: 
         if v == float(w.max()) and (w == last_vol.iloc[i]).sum() == 1:
             ph.append(i)
     bull_pairs, bear_pairs, bulls, bears = [], [], [], []
+    span_hi = max(int(range_hi), int(range_hi) * 3)
     for k in range(1, len(pl)):
-        a, b = pl[k - 1], pl[k]
-        if not (range_lo <= (b - a) <= range_hi):
-            continue
-        if float(low.iloc[b]) < float(low.iloc[a]) and float(last_vol.iloc[b]) > float(last_vol.iloc[a]):
-            bulls.append(b)
-            bull_pairs.append((a, b))
+        b = pl[k]
+        for back in (1, 2, 3):
+            if k < back:
+                continue
+            a = pl[k - back]
+            gap = b - a
+            if gap < range_lo or gap > span_hi:
+                continue
+            if float(low.iloc[b]) < float(low.iloc[a]) and float(last_vol.iloc[b]) > float(last_vol.iloc[a]):
+                bulls.append(b)
+                bull_pairs.append((a, b))
+                break
     for k in range(1, len(ph)):
-        a, b = ph[k - 1], ph[k]
-        if not (range_lo <= (b - a) <= range_hi):
-            continue
-        if float(high.iloc[b]) > float(high.iloc[a]) and float(last_vol.iloc[b]) < float(last_vol.iloc[a]):
-            bears.append(b)
-            bear_pairs.append((a, b))
+        b = ph[k]
+        for back in (1, 2, 3):
+            if k < back:
+                continue
+            a = ph[k - back]
+            gap = b - a
+            if gap < range_lo or gap > span_hi:
+                continue
+            if float(high.iloc[b]) > float(high.iloc[a]) and float(last_vol.iloc[b]) < float(last_vol.iloc[a]):
+                bears.append(b)
+                bear_pairs.append((a, b))
+                break
     out["ok"] = True
     out["bull_pairs"] = bull_pairs
     out["bear_pairs"] = bear_pairs
