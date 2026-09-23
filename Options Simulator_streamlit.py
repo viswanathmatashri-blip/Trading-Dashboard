@@ -7284,8 +7284,7 @@ def _scalper_fetch_opt(api, angel_tok, alice_tok, lab, want_tf, exch_opt=None):
         return (prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()), want_tf
     exch_opt = exch_opt or (st.session_state.get("data_store") or {}).get("opt_exchange") or Exchange
     api_int, _ = interval_mapping.get(want_tf, ("THREE_MINUTE", 10))
-    use_alice_first = st.session_state.get("alice_only") or angel_rate_limited_now()
-    if use_alice_first and alice_tok:
+    if alice_tok:
         try:
             alt = fetch_alice_candles(alice_tok, exch_opt or "MCX", api_int, Index_Name)
             if alt is not None and not alt.empty:
