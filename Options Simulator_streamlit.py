@@ -940,6 +940,26 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
     vah = vp.get("vah") if isinstance(vp, dict) else None
     val = vp.get("val") if isinstance(vp, dict) else None
     dens = _value_density(d, val, vah)
+    try:
+        hh = _series_num(d.get("high", d["close"]))
+        ll = _series_num(d.get("low", d["close"]))
+        cc = _series_num(d.get("close", px))
+        prev = cc.shift(1)
+        tr = pd.concat([(hh - ll).abs(), (hh - prev).abs(), (ll - prev).abs()], axis=1).max(axis=1)
+        a5 = float(tr.tail(5).mean()) if len(tr) >= 5 else float(tr.mean() or 0)
+        a20 = float(tr.tail(20).mean()) if len(tr) >= 8 else max(a5, 1e-9)
+        atr_ratio = a5 / max(a20, 1e-9)
+    except Exception:
+        atr_ratio = 1.0
+    two_out = False
+    try:
+        if vah is not None and val is not None and len(px) >= 2:
+            two_out = bool(
+                (float(px.iloc[-1]) > float(vah) and float(px.iloc[-2]) > float(vah))
+                or (float(px.iloc[-1]) < float(val) and float(px.iloc[-2]) < float(val))
+            )
+    except Exception:
+        two_out = False
     vw = None
     if "vwap_idx" in d.columns:
         vw = float(_series_num(d["vwap_idx"]).iloc[-1])
@@ -968,19 +988,23 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
     s_range += 0.7 if abs(vz) < 1.10 else -0.3
     s_range += 0.6 if gex_sign > 0 else (-0.2 if gex_sign < 0 else 0.1)
     s_range += 0.4 if realized_vs_atr < 1.15 else -0.3
+    s_range += 0.6 if atr_ratio <= 1.00 else (-0.3 if atr_ratio >= 1.25 else 0.1)
+    s_range += 0.5 if (vah and val and val <= last <= vah and not two_out) else 0.0
 
     s_trend += 1.2 if eff >= 0.38 else (0.4 if eff >= 0.28 else -0.5)
     s_trend += 1.0 if dens <= 0.48 else (0.2 if dens <= 0.58 else -0.6)
     s_trend += 0.7 if abs(vz) >= 1.15 else -0.2
     s_trend += 0.6 if gex_sign < 0 else (-0.15 if gex_sign > 0 else 0.05)
     s_trend += 0.5 if realized_vs_atr >= 1.25 else -0.2
+    s_trend += 0.7 if atr_ratio >= 1.25 else (-0.2 if atr_ratio <= 1.00 else 0.1)
+    s_trend += 0.8 if two_out else 0.0
 
     if s_range >= 1.4 and s_range >= s_trend + 0.35:
         regime = "RANGE"
     elif s_trend >= 1.4 and s_trend >= s_range + 0.35:
         regime = "TREND"
     else:
-        regime = "CHOP"
+        regime = "WAIT"
     out.update({
         "regime": regime, "score_range": round(s_range, 2), "score_trend": round(s_trend, 2),
         "eff": round(eff, 3), "atr_pct": round(atrp * 100.0, 3), "density": round(dens, 3),
@@ -988,7 +1012,9 @@ def classify_market_regime(dfi: pd.DataFrame, data: dict = None) -> dict:
         "vah": float(vah) if vah else None, "val": float(val) if val else None,
         "poc": float(vp.get("poc")) if isinstance(vp, dict) and vp.get("poc") else None,
         "vp": vp if isinstance(vp, dict) else {},
-        "note": f"{regime} dens={dens:.2f} eff={eff:.2f} zVWAP={vz:+.2f} GEX={'+' if gex_sign>0 else ('-' if gex_sign<0 else '0')}",
+        "atr_ratio": round(float(atr_ratio), 2),
+        "two_out": bool(two_out),
+        "note": f"{regime} ER={eff:.2f} ATR5/20={atr_ratio:.2f} dens={dens:.2f} VA={'OUT×2' if two_out else 'in/edge'}",
     })
     return out
 
@@ -8039,193 +8065,37 @@ def live_dashboard_fragment():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ========== SUPERHUMAN DECISION ENGINE ==========
+    # ========== REGIME + VA (Superhuman trigger tree removed) ==========
     _sc_src = data.get("df_futures") if data.get("df_futures") is not None and not getattr(data.get("df_futures"), "empty", True) else data.get("df_candles", pd.DataFrame())
-    _sc_sig = (
-        st.session_state.get("_gex_ts"),
-        float(data.get("spot_price") or 0),
-        int(len(_sc_src)) if _sc_src is not None and hasattr(_sc_src, "__len__") else 0,
-    )
-    if st.session_state.get("_scores_sig") == _sc_sig and isinstance(st.session_state.get("_scores_cache"), dict):
-        scores = st.session_state["_scores_cache"]
-    else:
-        scores = compute_superhuman_scores(data, _sc_src if _sc_src is not None else pd.DataFrame())
-        st.session_state["_scores_cache"] = scores
-        st.session_state["_scores_sig"] = _sc_sig
+    scores = None
 
-    if "error" not in scores:
-        # ----- Decision Log (persist bias changes during the day) -----
-        decision_log = _load_decision_log(Index_Name)
-        now_ist = datetime.datetime.now(pytz.timezone("Asia/Kolkata"))
-        should_log = False
-        if not decision_log:
-            should_log = True
+    try:
+        _src = _sc_src if _sc_src is not None else pd.DataFrame()
+        if "spot_px" not in getattr(_src, "columns", []):
+            _reg_df = _src.copy()
         else:
-            last = decision_log[-1]
-            if last["bias"] != scores["bias"] or (now_ist - last["ts"]).total_seconds() >= 900:
-                should_log = True
-        if should_log:
-            decision_log.append({
-                "ts": now_ist,
-                "bias": scores["bias"],
-                "composite": scores["composite"],
-                "clarity": scores.get("clarity", ""),
-            })
-            day_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-            decision_log = [e for e in decision_log if e["ts"] >= day_start]
-            _save_decision_log(decision_log, Index_Name)
-
-        trig = scores.get("dir_trigger") or {}
-        st.markdown(
-            f"<div style='background:#1A1F2B;border:1px solid #2A2F3A;border-radius:8px;"
-            f"padding:6px 12px;margin:6px 0 8px 0;display:flex;flex-wrap:wrap;align-items:center;gap:14px;'>"
-            f"<span style='font-weight:700;color:#00E676;font-size:13px;'>🧠 Superhuman</span>"
-            f"<span style='font-weight:800;color:{scores['colour']};font-size:14px;'>"
-            f"{scores['bias']} ({scores['composite']:+.0f})</span>"
-            f"<span style='color:#AAA;font-size:12px;'>{scores.get('clarity','')}</span>"
-            f"<span style='font-weight:800;color:{trig.get('colour','#FF9800')};font-size:13px;'>"
-            f"⚡ {trig.get('trigger','NO TRIGGER')}</span>"
-            f"<span style='color:#CCC;font-size:12px;'>{trig.get('summary','')}</span>"
-            f"<span style='color:#888;font-size:11px;margin-left:auto;'>"
-            f"L {trig.get('long_hits',0)}/5 · S {trig.get('short_hits',0)}/5</span>"
-            f"</div>",
-            unsafe_allow_html=True
-        )
-        with st.expander("▼ Trigger · Decision tree · Intraday log", expanded=False):
-            trig = scores.get("dir_trigger") or {}
-            st.caption(
-                "LONG TRIGGER = ≥3 of GEX/VWAP/OBV/CVD bullish AND EFI>0. "
-                "SHORT TRIGGER = ≥3 bearish AND EFI<0. "
-                "BIAS (no fire) = 3/4 setup aligned but EFI has not confirmed. "
-                "LEAN (no fire) = fewer than 3/4 setup checks; EFI does not matter yet. "
-                "NO DIRECTIONAL TRIGGER = setup split."
-            )
-            t1, t2, t3 = st.columns([1.35, 0.90, 0.75])
-            with t1:
-                rules = {
-                    "Location (GEX)": ("Above put wall / LVN", "Below call wall"),
-                    "Trend (VWAP)": ("Price > VWAP", "Price < VWAP"),
-                    "Macro Flow (OBV)": ("OBV > MA20", "OBV < MA20"),
-                    "Order Delta (CVD)": ("CVD HH", "CVD LL"),
-                    "Execution (EFI 13)": ("EFI > 0", "EFI < 0"),
-                }
-                lines = ["| Metric | L | S | Now |", "|---|---|---|---|"]
-                for ch in trig.get("checks") or []:
-                    side = "L" if ch.get("long") and not ch.get("short") else ("S" if ch.get("short") and not ch.get("long") else "—")
-                    lr, sr = rules.get(ch["name"], ("", ""))
-                    lines.append(f"| {ch['name']} | {lr} | {sr} | **{side}** {ch.get('note','')} |")
-                st.markdown("\n".join(lines))
-            with t2:
-                st.markdown(
-                    f"**{scores['bias']} ({scores['composite']:+.0f})**  \n"
-                    f"- Quiet + long γ → PIN  \n"
-                    f"- Big range + long γ → REVERSION  \n"
-                    f"- Short γ / wall break → TREND  \n"
-                    f"- |C|≤15 → NO EDGE  \n"
-                    f"- else → MILD DIR"
-                )
-            with t3:
-                st.markdown("**Log**")
-                if not decision_log:
-                    st.caption("No log yet.")
-                else:
-                    for e in decision_log[-8:]:
-                        st.caption(f"{e['ts'].strftime('%H:%M')} {e['bias']} ({e['composite']:+.0f})")
-
-        with st.expander("▼ VA Playbook (range fade vs trend acceptance)", expanded=False):
-            rows = ["| Code | Setup · Action |", "|---|---|"]
-            for k, v in VA_PLAYBOOK.items():
-                rows.append(f"| `{k}` | {v[0]} — **{v[1]}** |")
-            st.markdown("\n".join(rows))
-            st.markdown(
-                """
-**Regime (RANGE vs TREND vs CHOP)** — scored, not a single switch:
-- Value density = session volume sitting between VAL and VAH (high → range / pin).
-- Efficiency ratio = |net move| / Σ|bar moves| over 20 bars (high → trend).
-- VWAP z-score stretch, session range vs ATR√t, net GEX sign (long-γ leans range, short-γ leans trend).
-- RANGE if range-score ≥ 1.4 and beats trend-score by ≥ 0.35; TREND is the mirror; else CHOP.
-
-**Location is statistical, not a tick print:**
-- Buffer = max(0.35 × session VWAP-σ, 0.35 × ATR, 1 pt).
-- `ABOVE_VAH` only if last ≥ VAH + buffer; `z = (px − VAH) / σ`.
-- Persistence: ≥2 of last 3 closes on that side of the level.
-
-**ΔV absorption:** last-12 OLS slope of price vs last-5 signed volume. Probe + non-confirming ΔV = absorb.
-**EFI:** last-12 OLS slope. Fade needs EFI *not* expanding with price; acceptance needs EFI expanding *with* ΔV.
-                """
-            )
-            try:
-                dfi_now = st.session_state.get("_last_dfi")
-                if dfi_now is not None:
-                    rec = classify_va_setup(dfi_now, st.session_state.get("data_store"))
-                    st.caption(
-                        f"Now: {rec.get('regime')} · {rec.get('model')} · {rec.get('action')} · {rec.get('efi_note')}"
-                    )
-            except Exception:
-                pass
-
-        with st.expander("▼ Δ Footprint absorption (proxy setups)", expanded=False):
-            st.code(
-"""detect_fp_absorptions — last CLOSED bar only, lookback 20 bars, no lookahead
-Not bid/ask tape. Shelf = signed close-location volume in 2-pt bins.
-
-z_sweep_dn = (mean(low[-20:-1]) - this.low) / std(low[-20:-1])
-z_sweep_up = (this.high - mean(high[-20:-1])) / std(high[-20:-1])
-typ, sig   = mean/std of |bin volume| on all prior bins
-sell_low   = sum of negative bins in lower 33% of this bar
-buy_high   = sum of positive bins in upper 33% of this bar
-z_sell     = (sell_low - typ) / sig
-z_buy      = (buy_high - typ) / sig
-loc        = (close - low) / (high - low)
-
-SETUP 1 BID ABS (long / spring)  — green ▲
-  z_sweep_dn >= 1.6
-  loc >= 0.72 and close >= open
-  z_sell >= 1.4
-  Entry: close of that bar
-  Stop:  this.low - 2 pts
-  Target: next resistance / top-5 ask cluster (discretionary)
-
-SETUP 2 OFFER ABS (short / upthrust) — red ▼
-  z_sweep_up >= 1.6
-  loc <= 0.28 and close < open
-  z_buy >= 1.4
-  Entry: close of that bar
-  Stop:  this.high + 2 pts
-  Target: next support / top-5 bid cluster (discretionary)
-
-If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n.
-""",
-                language="text",
-            )
-            evs = st.session_state.get("_fp_abs_evs") or []
-            st.caption(
-                f"Session marks: {sum(1 for e in evs if e.get('side')>0)} bid · "
-                f"{sum(1 for e in evs if e.get('side')<0)} offer"
-            )
-
-        # Score Breakdown
-        with st.expander("▼ Score Breakdown & Details", expanded=False):
-            or_txt = f"{scores['or_low']:.0f}-{scores['or_high']:.0f}" if scores.get("or_low") is not None else "N/A"
-            s1, s2, s3 = st.columns(3)
-            with s1:
-                st.markdown(f"**Gamma** {scores['gamma_regime_score']:+.0f}")
-                st.caption(f"OI GEX Rs {scores['total_delta_gex_cr']:.0f} Cr · DTE {scores.get('dte','-')}")
-                st.markdown(f"**Exp vs Real** {scores['move_score']:+.0f}")
-                st.caption(f"{scores['expected_move_pct']:.2f}% vs {scores['realised_range_pct']:.2f}%")
-            with s2:
-                st.markdown(f"**Vanna/Charm** {scores['flow_score']:+.0f}")
-                st.caption("tanh(VEX+CEX) · pin vs accel")
-                st.markdown(f"**OR vs Walls** {scores['or_score']:+.0f}")
-                st.caption(f"OR {or_txt} · tod {scores.get('tod_factor',1):.2f}")
-            with s3:
-                st.markdown(f"**Flip dist** {scores.get('flip_score',0):+.0f}")
-                st.caption(f"{scores.get('dist_to_flip_pct',0):.3f}% from flip")
-                st.markdown(f"**Composite** {scores['composite']:+.0f} → {scores['bias']}")
-                st.caption("0.38g + 0.22 move + 0.15 flow + 0.15 OR + 0.10 flip")
-
-    else:
-        st.warning("Could not compute Superhuman scores – insufficient data.")
+            _reg_df = _src
+        if _reg_df is None or getattr(_reg_df, "empty", True):
+            _reg_df = st.session_state.get("_last_dfi")
+        reg = classify_market_regime(_reg_df, data) if _reg_df is not None else {"regime": "WAIT", "note": ""}
+    except Exception:
+        reg = {"regime": "WAIT", "note": ""}
+    _rc = {"RANGE": "#FFD54F", "TREND": "#69F0AE", "WAIT": "#90A4AE"}.get(reg.get("regime"), "#90A4AE")
+    st.markdown(
+        f"<div style='background:#1A1F2B;border:1px solid #2A2F3A;border-radius:8px;"
+        f"padding:8px 12px;margin:6px 0 8px 0;display:flex;flex-wrap:wrap;gap:14px;align-items:center;'>"
+        f"<span style='font-weight:800;color:{_rc};font-size:15px;'>REGIME · {reg.get('regime','WAIT')}</span>"
+        f"<span style='color:#B0BEC5;font-size:12px;'>{reg.get('note','')}</span>"
+        f"<span style='color:#888;font-size:11px;margin-left:auto;'>R {reg.get('score_range',0):+.1f} · T {reg.get('score_trend',0):+.1f}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("▼ VA Playbook (range fade vs trend acceptance)", expanded=False):
+        rows = ["| Code | Setup · Action |", "|---|---|"]
+        for k, v in VA_PLAYBOOK.items():
+            rows.append(f"| `{k}` | {v[0]} — **{v[1]}** |")
+        st.markdown("\n".join(rows))
+        st.caption("VA arrows on the session chart are the live trigger. Regime is scored (ER, ATR5/20, value density, 2-bar VA, VWAP z, GEX). WAIT = mixed, do not force a label.")
 
     # ========== UNDERLYING TECHNICALS – SPOT + FUTURES VWAP ==========
     df_full = data.get("df_candles", pd.DataFrame())
