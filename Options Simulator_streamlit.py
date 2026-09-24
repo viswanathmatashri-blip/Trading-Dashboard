@@ -9520,6 +9520,10 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                         st.caption("DEX / premium empty until Auto-Refresh stores snaps in market hours. No strike fallback.")
                     st.plotly_chart(fig_dex, use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
+                try:
+                    cvd_last = float(pd.to_numeric(dfi["cvd"], errors="coerce").iloc[-1])
+                except Exception:
+                    cvd_last = 0.0
                 cap = (f"{st.session_state.get('selected_timeframe','?')} · "
                        f"{len(dfi)} bars · Fut {latest_fut:,.1f} · VWAP {latest_vwap:,.1f} · CVD {cvd_last:,.0f}")
                 if cvd_st.get("ok"):
