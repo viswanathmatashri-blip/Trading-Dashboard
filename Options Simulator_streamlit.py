@@ -1130,6 +1130,14 @@ def classify_va_setup(dfi: pd.DataFrame, data: dict = None) -> dict:
         else:
             code = "CHOP"
 
+    regime_now = str(reg.get("regime") or "WAIT")
+    if regime_now == "RANGE" and not str(code).startswith("M1"):
+        code = "CHOP"
+    elif regime_now == "TREND" and not str(code).startswith("M2"):
+        code = "CHOP"
+    elif regime_now not in ("RANGE", "TREND"):
+        code = "CHOP"
+
     micro, action = VA_PLAYBOOK.get(code, VA_PLAYBOOK["CHOP"])
     glyphs = " ".join(LEVEL_GLYPH.get(k, "→") for k in (p_arr, d_arr, e_arr, c_arr))
     note = (
@@ -1194,6 +1202,15 @@ def pdec_session_history(dfi: pd.DataFrame, min_bars: int = 16) -> list:
             "y": float(hi) if pd.notna(hi) else None,
             "model": rec.get("model"),
         })
+    try:
+        live_reg = str((classify_market_regime(dfi, data) or {}).get("regime") or "WAIT")
+        allow = "M1" if live_reg == "RANGE" else ("M2" if live_reg == "TREND" else None)
+        if allow:
+            out = [r for r in out if str(r.get("model") or "").startswith(allow)]
+        else:
+            out = [r for r in out if not str(r.get("model") or "").startswith(("M1", "M2"))]
+    except Exception:
+        pass
     st.session_state["_va_hist"] = out
     st.session_state["_va_hist_sig"] = sig
     return out
