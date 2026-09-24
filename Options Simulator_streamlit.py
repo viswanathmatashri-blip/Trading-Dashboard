@@ -3076,7 +3076,13 @@ def tv_style_cvd_div(df: pd.DataFrame, left: int = 5, right: int = 5, range_lo: 
         "ok": False, "bull": False, "bear": False, "label": "", "at": None, "note": "",
         "marks": [], "bull_pairs": [], "bear_pairs": [],
     }
-    if df is None or getattr(df, "empty", True) or len(df) < left + right + range_lo + 2:
+    if df is None or getattr(df, "empty", True):
+        return out
+    if len(df) < 40:
+        left = min(left, 3)
+        right = min(right, 3)
+        range_lo = min(range_lo, 3)
+    if len(df) < left + right + range_lo + 2:
         return out
     d = df.reset_index(drop=True)
     if "cvd" in d.columns and d["cvd"].notna().any():
@@ -4426,12 +4432,43 @@ if st.session_state.get("_armed_view") != _cur_view:
     st.session_state["intel_refresh"] = False
     st.session_state["atm_live_ok"] = False
     st.session_state["_armed_view"] = _cur_view
+def reset_local_runtime():
+    """Drop this browser session's clients, tapes, and disk candle cache. Cannot close other tabs."""
+    st.session_state["enable_main_refresh"] = False
+    st.session_state["intel_refresh"] = False
+    st.session_state["atm_live_ok"] = False
+    drop = [
+        "_smart_api_obj", "_smart_api_ts", "_smart_api_err",
+        "data_store", "alice_session", "alice_userSession",
+        "_alice_sid", "_ab_err", "_scalp_complete_ts", "_scalp_tape_ts",
+    ]
+    for k in list(st.session_state.keys()):
+        ks = str(k)
+        if ks in drop or ks.startswith("_scalp_") or ks.startswith("sess_cache_") or ks.startswith("_src_"):
+            try:
+                del st.session_state[k]
+            except Exception:
+                st.session_state[k] = None
+    try:
+        import shutil
+        if SESSION_CACHE_DIR.exists():
+            for p in SESSION_CACHE_DIR.glob("*.pkl"):
+                p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 st.session_state["alice_only"] = st.sidebar.checkbox(
     "Disable Angel One (AliceBlue only)",
     value=bool(st.session_state.get("alice_only")),
     key="alice_only_cb",
     help="Skip SmartAPI candles. Scalper Fetch uses AliceBlue session + option chain.",
 )
+if st.sidebar.button("Kill session + caches", help="Stops Auto-Refresh in THIS tab, drops SmartAPI/Alice clients and candle pickle cache. Other open browsers are not closed — reboot the Cloud app for that."):
+    reset_local_runtime()
+    st.sidebar.success("This tab reset. Close other tabs or Reboot the Cloud app.")
+    st.rerun()
+st.sidebar.caption("Other tabs keep calling APIs until you close them or reboot Streamlit Cloud (Manage app → Reboot).")
 
 with st.sidebar.expander("4. Market Parameters", expanded=True):
     c1, c2 = st.columns(2)
@@ -7841,11 +7878,16 @@ def render_scalper_mode():
         elif st.session_state.get("gemini_enabled"):
             st.caption("Gemini setups…")
     pe_col, ce_col = st.columns(2, gap="medium")
+    try:
+        _atm_k = float(data.get("atm_strike") or 0)
+        _atm_lbl = f"{_atm_k:.0f}" if _atm_k else ""
+    except Exception:
+        _atm_lbl = str(data.get("atm_strike") or "")
     with pe_col:
-        _pane("ATM PE", pe_df, pe_tf, "scalp_pe", height=560, hide_delta=True, accent="#FF8A80",
+        _pane(f"ATM PE {_atm_lbl}".strip(), pe_df, pe_tf, "scalp_pe", height=560, hide_delta=True, accent="#FF8A80",
               df_ltf=st.session_state.get("_scalp_pe_1m"))
     with ce_col:
-        _pane("ATM CE", ce_df, ce_tf, "scalp_ce", height=560, hide_delta=True, accent="#69F0AE",
+        _pane(f"ATM CE {_atm_lbl}".strip(), ce_df, ce_tf, "scalp_ce", height=560, hide_delta=True, accent="#69F0AE",
               df_ltf=st.session_state.get("_scalp_ce_1m"))
     st.session_state["_scalp_complete_ts"] = time.time()
     miss = " · ".join(
@@ -9380,11 +9422,15 @@ If any gate fails → no mark. Caption on the tab shows BID ABS n · OFFER ABS n
                     except Exception as e:
                         st.caption(f"ATM {lab} unavailable.")
                 if str(flow_choice).startswith("4"):
-                    st.markdown("<div class='chart-card'><div class='card-title'>ATM CE</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div class='chart-card'><div class='card-title'>ATM CE {float(data.get('atm_strike') or 0):.0f}</div>",
+                        unsafe_allow_html=True)
                     _render_atm_tab(data.get("atm_ce_token"), "CE")
                     st.markdown("</div>", unsafe_allow_html=True)
                 if str(flow_choice).startswith("5"):
-                    st.markdown("<div class='chart-card'><div class='card-title'>ATM PE</div>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div class='chart-card'><div class='card-title'>ATM PE {float(data.get('atm_strike') or 0):.0f}</div>",
+                        unsafe_allow_html=True)
                     _render_atm_tab(data.get("atm_pe_token"), "PE")
                     st.markdown("</div>", unsafe_allow_html=True)
                 if str(flow_choice).startswith("2"):
