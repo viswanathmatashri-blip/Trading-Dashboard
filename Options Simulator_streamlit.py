@@ -4651,6 +4651,14 @@ elif st.session_state.get("app_view") == "miscalper":
             en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, True)), key=f"mis_en_{_idx}")
         st.session_state["mis_enabled"] = en
         st.session_state["mis_max_loss"] = st.number_input("Max loss (INR)", min_value=500, value=int(st.session_state.get("mis_max_loss") or 5000), step=500)
+        _mis_auto = st.checkbox(
+            "Auto-Refresh 5s",
+            value=bool(st.session_state.get("enable_main_refresh")),
+            key="cb_mis_refresh",
+            help="Quotes only the live 1-min bar. Seed first. Other modes stay off.",
+        )
+        if _mis_auto != bool(st.session_state.get("enable_main_refresh")):
+            st.session_state["enable_main_refresh"] = _mis_auto
         if st.button("Seed / refresh 1-min tapes"):
             st.session_state["mis_need_seed"] = True
 elif st.session_state.get("app_view") == "scalper":
@@ -8002,7 +8010,6 @@ def _mis_quotes(pairs):
 def live_mis_fragment():
     if not view_is("miscalper"):
         return
-    render_broker_status_ribbon()
     try:
         from multi_index_scalper import render_multi_index_scalper
         render_multi_index_scalper(
