@@ -699,19 +699,27 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             if row:
                 setups.append(row)
 
+    n_watch = max(len(summary), 1)
+    watch_h = min(38 * (n_watch + 1) + 20, 320)
+    setup_h = 38 * 8 + 20
     st.markdown(
-        """
+        f"""
 <style>
-  section.main .block-container { padding-top: 0.6rem; }
-  .mis-pin {
+  html, body, [data-testid="stAppViewContainer"],
+  [data-testid="stAppViewContainer"] > .main,
+  .main .block-container {{
+    overflow: visible !important;
+  }}
+  .main .block-container {{ padding-top: 0.4rem; max-width: 100%; }}
+  .mis-pin {{
     position: sticky;
     top: 0;
-    z-index: 80;
+    z-index: 200;
     background: #0E1117;
     border-bottom: 1px solid #2a2d33;
-    padding: 4px 0 8px 0;
-  }
-  .mis-pin [data-testid="stDataFrame"] { background: #0E1117; }
+    padding: 2px 0 8px 0;
+    box-shadow: 0 10px 18px rgba(0,0,0,0.5);
+  }}
 </style>
 <div class="mis-pin">
 """,
@@ -719,15 +727,25 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     )
     st.caption("WATCH LOG")
     if summary:
-        st.dataframe(style_watch(pd.DataFrame(summary)), use_container_width=True, height=196)
+        st.dataframe(
+            style_watch(pd.DataFrame(summary)),
+            use_container_width=True,
+            height=watch_h,
+            hide_index=True,
+        )
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    st.caption("SETUPS")
+    st.caption("SETUPS · 7 rows, rest scroll inside")
     if setups:
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
             sdf = sdf.sort_values("Bar", ascending=False)
-        st.dataframe(style_setups(sdf), use_container_width=True, height=220)
+        st.dataframe(
+            style_setups(sdf),
+            use_container_width=True,
+            height=setup_h,
+            hide_index=True,
+        )
     else:
         st.write("No CONFIRMED LONG/SHORT on FUT / CE / PE in the loaded sessions.")
     st.markdown("</div>", unsafe_allow_html=True)
