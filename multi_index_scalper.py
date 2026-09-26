@@ -77,6 +77,122 @@ def rows_from_df(df: pd.DataFrame) -> list:
     return out
 
 
+def _ist_minute():
+    try:
+        from zoneinfo import ZoneInfo
+        now = dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(second=0, microsecond=0)
+    except Exception:
+        now = dt.datetime.now().replace(second=0, microsecond=0)
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _rebuild_last_from_prev(rows, t, o, h, l, c, v):
+    """Rewrite or append only the forming minute. Prior bars stay as cached."""
+    prev_cvd = float(rows[-1]["CVD"]) if rows and str(rows[-1].get("time")) != str(t) else (
+        float(rows[-2]["CVD"]) if len(rows) >= 2 else 0.0
+    )
+    if rows and str(rows[-1].get("time")) == str(t):
+        # CVD of previous closed bar
+        prev_cvd = float(rows[-2]["CVD"]) if len(rows) >= 2 else 0.0
+    sf = loc_flow(o, h, l, c, v)
+    if sf == 0 and v:
+        sf = signed_delta(o, c, v)
+    cvd = prev_cvd + sf
+    row = {
+        "time": t, "price": round(c, 2), "open": round(o, 2),
+        "high": round(h, 2), "low": round(l, 2), "volume": int(max(v, 0)),
+        "CVD": round(cvd, 2), "VWAP": rows[-1].get("VWAP", c) if rows else round(c, 2),
+        "source": "LIVE_1m",
+    }
+    if rows and str(rows[-1].get("time")) == str(t):
+        # keep session VWAP from last closed if present
+        if len(rows) >= 2:
+            row["VWAP"] = rows[-2].get("VWAP", row["VWAP"])
+        rows[-1] = row
+    else:
+        if rows:
+            row["VWAP"] = rows[-1].get("VWAP", row["VWAP"])
+        rows.append(row)
+    if len(rows) > 1600:
+        del rows[:-1500]
+    return rows
+
+
+def apply_live_tape(book, side, price, day_vol=None, ltq=None):
+    """Colab Tape.apply_live — only the current IST minute changes."""
+    if price is None:
+        return book
+    try:
+        px = float(price)
+    except Exception:
+        return book
+    key_rows = {"idx": "idx_rows", "ce": "ce_rows", "pe": "pe_rows"}[side]
+    key_sw = {"idx": "idx_sw", "ce": "ce_sw", "pe": "pe_sw"}[side]
+    key_form = f"form_{side}"
+    key_dv = f"dayvol_{side}"
+    rows = list(book.get(key_rows) or [])
+    t = _ist_minute()
+    dv = 0.0
+    last_dv = book.get(key_dv)
+    try:
+        if day_vol is not None:
+            d = float(day_vol)
+            if last_dv is not None and d >= last_dv:
+                dv = d - last_dv
+            elif ltq:
+                dv = float(ltq)
+            book[key_dv] = d
+        elif ltq:
+            dv = float(ltq)
+    except Exception:
+        dv = float(ltq or 0) if ltq else 0.0
+    form = book.get(key_form)
+    if form is None or form.get("t") != t:
+        if form is not None:
+            rows = _rebuild_last_from_prev(
+                rows, form["t"], form["o"], form["h"], form["l"], form["c"], form["v"]
+            )
+        form = {"t": t, "o": px, "h": px, "l": px, "c": px, "v": max(dv, 0.0)}
+    else:
+        form["h"] = max(form["h"], px)
+        form["l"] = min(form["l"], px)
+        form["c"] = px
+        form["v"] += max(dv, 0.0)
+    rows = _rebuild_last_from_prev(rows, form["t"], form["o"], form["h"], form["l"], form["c"], form["v"])
+    book[key_form] = form
+    book[key_rows] = rows
+    book[key_sw] = rebuild_swings(rows)
+    if side == "idx":
+        book["fut"] = px
+        book["spot"] = book.get("spot") or px
+    return book
+
+
+def live_apply_quotes(books, enabled, quotes: dict):
+    """quotes: token -> {ltp, volume, ltq}"""
+    if not quotes:
+        return books
+    for name, book in list(books.items()):
+        if not enabled.get(name):
+            continue
+        try:
+            tok = str(book.get("idx_tok") or "")
+            if tok and tok in quotes:
+                q = quotes[tok]
+                apply_live_tape(book, "idx", q.get("ltp"), q.get("volume"), q.get("ltq"))
+            ctok = str(book.get("ce_tok") or "")
+            if ctok and ctok in quotes:
+                q = quotes[ctok]
+                apply_live_tape(book, "ce", q.get("ltp"), q.get("volume"), q.get("ltq"))
+            ptok = str(book.get("pe_tok") or "")
+            if ptok and ptok in quotes:
+                q = quotes[ptok]
+                apply_live_tape(book, "pe", q.get("ltp"), q.get("volume"), q.get("ltq"))
+        except Exception:
+            continue
+    return books
+
+
 def rebuild_swings(rows: list) -> list:
     swings, seen = [], set()
     n = len(rows)
@@ -437,14 +553,28 @@ def seed_book(name, fetch_fn, df_master, token_map, fut_fn=None):
         book["pe_rows"] = rows_from_df(dpe)
         book["ce_sw"] = rebuild_swings(book["ce_rows"])
         book["pe_sw"] = rebuild_swings(book["pe_rows"])
+    for side, rk in (("idx", "idx_rows"), ("ce", "ce_rows"), ("pe", "pe_rows")):
+        rs = book.get(rk) or []
+        if rs:
+            last = rs[-1]
+            book[f"form_{side}"] = {
+                "t": last["time"][:19] if len(str(last.get("time") or "")) >= 16 else last.get("time"),
+                "o": last["open"], "h": last["high"], "l": last["low"],
+                "c": last["price"], "v": last.get("volume") or 0,
+            }
     books = st.session_state.get("_mis_books") or {}
     books[name] = book
     st.session_state["_mis_books"] = books
     return book
 
 
-def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None):
+def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None, quote_fn=None):
     st.markdown("### Multi Index Scalper")
+    _live = st.session_state.get("_mis_live_ts")
+    if _live:
+        st.caption(f"Live tape {_live} · cached history kept · only current 1-min bar updates")
+    if st.session_state.get("_mis_live_err"):
+        st.caption(f"Quote tick: {st.session_state.get('_mis_live_err')}")
     enabled = dict(st.session_state.get("mis_enabled") or {n: True for n in ORDER})
     max_loss = float(st.session_state.get("mis_max_loss") or 5000)
     books = st.session_state.get("_mis_books") or {}
@@ -462,29 +592,22 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.session_state["mis_need_seed"] = False
         books = st.session_state.get("_mis_books") or {}
 
-    # live refresh: refetch last session 1m for enabled (same as last-bar update, cheaper than 21 quote paths)
-    if st.session_state.get("enable_main_refresh") and books:
-        for n, book in list(books.items()):
-            if not enabled.get(n) or not book.get("idx_tok"):
-                continue
-            try:
-                df, _ = fetch_fn(book["idx_tok"], book["idx_exch"], "ONE_MINUTE", n, "mis_idx")
-                if df is not None and not getattr(df, "empty", True):
-                    book["idx_rows"] = rows_from_df(df)
-                    book["idx_sw"] = rebuild_swings(book["idx_rows"])
-                    if book["idx_rows"]:
-                        book["fut"] = book["idx_rows"][-1]["price"]
-                if book.get("ce_tok"):
-                    dce, _ = fetch_fn(book["ce_tok"], book["idx_exch"], "ONE_MINUTE", n, "mis_ce")
-                    book["ce_rows"] = rows_from_df(dce)
-                    book["ce_sw"] = rebuild_swings(book["ce_rows"])
-                if book.get("pe_tok"):
-                    dpe, _ = fetch_fn(book["pe_tok"], book["idx_exch"], "ONE_MINUTE", n, "mis_pe")
-                    book["pe_rows"] = rows_from_df(dpe)
-                    book["pe_sw"] = rebuild_swings(book["pe_rows"])
-            except Exception:
-                pass
-        st.session_state["_mis_books"] = books
+    if st.session_state.get("enable_main_refresh") and books and quote_fn:
+        try:
+            toks = []
+            for n, book in books.items():
+                if not enabled.get(n):
+                    continue
+                for k, exch_k in (("idx_tok", "idx_exch"), ("ce_tok", "idx_exch"), ("pe_tok", "idx_exch")):
+                    tok = book.get(k)
+                    if tok:
+                        toks.append((str(book.get(exch_k) or "NFO"), str(tok)))
+            quotes = quote_fn(toks) or {}
+            books = live_apply_quotes(books, enabled, quotes)
+            st.session_state["_mis_books"] = books
+            st.session_state["_mis_live_ts"] = dt.datetime.now().strftime("%H:%M:%S")
+        except Exception as e:
+            st.session_state["_mis_live_err"] = str(e)[:180]
 
     with st.expander("Status and flow legend", expanded=False):
         L, R = st.columns(2)
