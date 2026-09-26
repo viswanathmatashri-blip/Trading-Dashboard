@@ -1,0 +1,592 @@
+"""Multi Index Scalper — Colab Index CVD Desk logic (WATCH / CONFIRMED / setups)."""
+from __future__ import annotations
+
+import datetime as dt
+import math
+
+import pandas as pd
+import streamlit as st
+
+ORDER = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]
+LOT_SIZES = {
+    "NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120,
+    "SENSEX": 20, "GOLDM": 100, "CRUDEOIL": 100,
+}
+STEP = {
+    "NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25,
+    "SENSEX": 100, "GOLDM": 100, "CRUDEOIL": 50,
+}
+MIN_SL_PCT = -3.0
+RR_BLUE = 1.0
+PIVOT_L, PIVOT_R = 5, 5
+FILL = {
+    "CONFIRMED SHORT": "background-color:#c62828;color:#fff",
+    "CONFIRMED LONG": "background-color:#2e7d32;color:#fff",
+    "WATCH SHORT": "background-color:#ffcdd2;color:#b71c1c",
+    "WATCH LONG": "background-color:#c8e6c9;color:#1b5e20",
+    "TREND LONG DENIED": "background-color:#ffcdd2;color:#b71c1c",
+    "TREND SHORT DENIED": "background-color:#c8e6c9;color:#1b5e20",
+}
+PRIO = list(FILL.keys())
+
+
+def loc_flow(o, h, l, c, v):
+    rng = float(h) - float(l)
+    if rng <= 0 or not v:
+        return 0.0
+    return float(v) * max(-1.0, min(1.0, 2.0 * ((float(c) - float(l)) / rng) - 1.0))
+
+
+def signed_delta(o, c, v):
+    if not v:
+        return 0.0
+    return float(v) if c > o else (-float(v) if c < o else 0.0)
+
+
+def rows_from_df(df: pd.DataFrame) -> list:
+    if df is None or getattr(df, "empty", True):
+        return []
+    d = df.copy()
+    d["time"] = pd.to_datetime(d["time"], errors="coerce")
+    d = d.dropna(subset=["time"]).sort_values("time")
+    out, cvd, pv, vv, p2 = [], 0.0, 0.0, 0.0, 0.0
+    for _, r in d.iterrows():
+        o = float(r.get("open", r["close"]))
+        h = float(r.get("high", r["close"]))
+        l = float(r.get("low", r["close"]))
+        c = float(r["close"])
+        v = float(r.get("volume", 0) or 0)
+        sf = loc_flow(o, h, l, c, v)
+        if sf == 0 and v:
+            sf = signed_delta(o, c, v)
+        cvd += sf
+        pv += c * v
+        vv += v
+        p2 += c * c * v
+        vwap = pv / vv if vv else c
+        sig = math.sqrt(max(p2 / vv - vwap * vwap, 0)) if vv else 0.0
+        ts = pd.Timestamp(r["time"]).strftime("%Y-%m-%d %H:%M:%S")
+        out.append({
+            "time": ts, "price": round(c, 2), "open": round(o, 2),
+            "high": round(h, 2), "low": round(l, 2), "volume": int(v),
+            "CVD": round(cvd, 2), "VWAP": round(vwap, 2),
+            "VWAP_1.5σ_up": round(vwap + 1.5 * sig, 2),
+            "VWAP_1.5σ_dn": round(vwap - 1.5 * sig, 2),
+            "source": "HIST_1m",
+        })
+    return out
+
+
+def rebuild_swings(rows: list) -> list:
+    swings, seen = [], set()
+    n = len(rows)
+    if n < 9:
+        return swings
+    L = PIVOT_L if n >= 40 else 3
+    R = PIVOT_R if n >= 40 else 3
+    px = [r["price"] for r in rows]
+
+    def last(side):
+        for s in reversed(swings):
+            if s["side"] == side:
+                return s
+        return None
+
+    def add(i, side):
+        if (i, side) in seen:
+            return
+        seen.add((i, side))
+        prev = last(side)
+        rec = {
+            "i": i, "timestamp": rows[i]["time"], "session": rows[i]["time"][:10],
+            "side": side, "price": rows[i]["price"], "CVD": rows[i]["CVD"],
+            "label": "", "cvd_label": "", "div": "",
+        }
+        if prev:
+            if side == "SH":
+                rec["label"] = "HH" if rec["price"] > prev["price"] else ("LH" if rec["price"] < prev["price"] else "EH")
+                rec["cvd_label"] = "HH" if rec["CVD"] > prev["CVD"] else ("LH" if rec["CVD"] < prev["CVD"] else "EH")
+                if rec["label"] == "HH" and rec["cvd_label"] == "LH":
+                    rec["div"] = "Bearish"
+            else:
+                rec["label"] = "LL" if rec["price"] < prev["price"] else ("HL" if rec["price"] > prev["price"] else "EL")
+                rec["cvd_label"] = "LL" if rec["CVD"] < prev["CVD"] else ("HL" if rec["CVD"] > prev["CVD"] else "EL")
+                if rec["label"] == "LL" and rec["cvd_label"] == "HL":
+                    rec["div"] = "Bullish"
+        swings.append(rec)
+
+    for i in range(L, n - R):
+        w = px[i - L:i + R + 1]
+        mid = px[i]
+        if mid == max(w) and w.count(mid) == 1:
+            add(i, "SH")
+        if mid == min(w) and w.count(mid) == 1:
+            add(i, "SL")
+    return swings
+
+
+def rdi_of(r):
+    h, l, c = r.get("high"), r.get("low"), r.get("price")
+    if None in (h, l, c):
+        return None
+    rng = h - l
+    return 0.0 if rng <= 0 else max(-1.0, min(1.0, 2.0 * ((c - l) / rng) - 1.0))
+
+
+def disp_of(r):
+    o, h, l, c = r.get("open"), r.get("high"), r.get("low"), r.get("price")
+    if None in (o, h, l, c):
+        return None
+    rng = h - l
+    return 0.0 if rng <= 0 else abs(c - o) / rng
+
+
+def flow_tag(rdi, disp, status):
+    if rdi is None or disp is None:
+        return "—"
+    ar = abs(rdi)
+    at = any(x in (status or "") for x in ("WATCH", "SWING", "CONFIRMED"))
+    if ar >= 0.40 and disp <= 0.20:
+        return "ABSORPTION"
+    if ar <= 0.10 and at:
+        return "EXHAUSTION"
+    if ar >= 0.35 and disp >= 0.85:
+        return "ACCEL"
+    return "—"
+
+
+def annotate_bars(rows, swings):
+    by_ts = {}
+    for s in swings:
+        by_ts.setdefault(str(s.get("timestamp")), []).append(s)
+    last_sh = last_sl = None
+    out = []
+    for r in rows:
+        ts = str(r.get("time"))
+        px, cvd = r.get("price"), r.get("CVD")
+        tags, reason = [], ""
+        here = by_ts.get(ts) or []
+        for s in here:
+            if s.get("side") == "SH" and s.get("div") == "Bearish":
+                tags.append("CONFIRMED SHORT")
+            elif s.get("side") == "SL" and s.get("div") == "Bullish":
+                tags.append("CONFIRMED LONG")
+            elif s.get("side") == "SH":
+                tags.append("SWING HIGH")
+            elif s.get("side") == "SL":
+                tags.append("SWING LOW")
+        if last_sh and px is not None and cvd is not None:
+            if px >= last_sh["price"] and cvd < last_sh["CVD"]:
+                tags.append("WATCH SHORT")
+                reason = f"px {px} >= SH {last_sh['price']} @ {last_sh['timestamp']} CVD {cvd} < {last_sh['CVD']}"
+            elif px >= last_sh["price"] and cvd >= last_sh["CVD"]:
+                tags.append("TREND SHORT DENIED")
+        if last_sl and px is not None and cvd is not None:
+            if px <= last_sl["price"] and cvd > last_sl["CVD"]:
+                tags.append("WATCH LONG")
+                reason = (reason + " | " if reason else "") + (
+                    f"px {px} <= SL {last_sl['price']} @ {last_sl['timestamp']} CVD {cvd} > {last_sl['CVD']}"
+                )
+            elif px <= last_sl["price"] and cvd <= last_sl["CVD"]:
+                tags.append("TREND LONG DENIED")
+        status = " | ".join(tags) if tags else "—"
+        rdi, disp = rdi_of(r), disp_of(r)
+        row = dict(r)
+        row["status"] = status
+        row["watch_reason"] = reason
+        row["RDI"] = None if rdi is None else round(rdi, 3)
+        row["Disp"] = None if disp is None else round(disp, 3)
+        row["flow"] = flow_tag(rdi, disp, status)
+        out.append(row)
+        for s in here:
+            if s.get("side") == "SH":
+                last_sh = s
+            elif s.get("side") == "SL":
+                last_sl = s
+    return out
+
+
+def last_pack(rows, swings, ltp=None, symbol=""):
+    ann = annotate_bars(rows or [], swings or [])
+    last = ann[-1] if ann else {}
+    return {
+        "WATCH": last.get("status") or "—",
+        "Flow": last.get("flow") or "—",
+        "RDI": last.get("RDI") if last.get("RDI") is not None else "—",
+        "Reason": last.get("watch_reason") or "",
+        "Bar": last.get("time") or "",
+        "LTP": ltp if ltp is not None else (last.get("price") if last else "—"),
+        "ann": ann,
+        "swings": swings or [],
+        "symbol": symbol or "",
+    }
+
+
+def last_confirmed(ann):
+    for r in reversed(ann or []):
+        stt = r.get("status") or ""
+        if "CONFIRMED LONG" in stt:
+            return "CONFIRMED LONG", r
+        if "CONFIRMED SHORT" in stt:
+            return "CONFIRMED SHORT", r
+    return None, None
+
+
+def price_at(pack, ts):
+    rows = pack.get("ann") or []
+    for r in rows:
+        if str(r.get("time")) == str(ts):
+            return r.get("price")
+    before = [r for r in rows if str(r.get("time")) <= str(ts)]
+    return before[-1].get("price") if before else None
+
+
+def nearest_sh_above(swings, ltp):
+    above = [s for s in (swings or []) if s.get("side") == "SH" and s.get("price") is not None and s["price"] > ltp]
+    return min(above, key=lambda s: s["price"]) if above else None
+
+
+def sl_below_ltp(pack, ts, ltp):
+    rows = pack.get("ann") or []
+    if not rows:
+        return None
+    i = None
+    for k, r in enumerate(rows):
+        if str(r.get("time")) == str(ts):
+            i = k
+            break
+    if i is None:
+        before = [k for k, r in enumerate(rows) if str(r.get("time")) <= str(ts)]
+        i = before[-1] if before else len(rows) - 1
+    for r in reversed(rows[: i + 1]):
+        lo = r.get("low")
+        if lo is None:
+            continue
+        try:
+            lo = float(lo)
+        except Exception:
+            continue
+        if lo < ltp:
+            return lo
+    return None
+
+
+def apply_min_sl(ltp, slpx):
+    floor = ltp * (1.0 + MIN_SL_PCT / 100.0)
+    if slpx is None:
+        return round(floor, 2)
+    return round(min(float(slpx), floor), 2)
+
+
+def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, trigger_ts, max_loss):
+    ltp = price_at(buy_pack, trigger_ts)
+    if ltp is None:
+        ltp = buy_pack.get("LTP")
+    try:
+        ltp = float(ltp)
+    except Exception:
+        return None
+    tgt = nearest_sh_above(buy_pack.get("swings"), ltp)
+    slpx = apply_min_sl(ltp, sl_below_ltp(buy_pack, trigger_ts, ltp))
+    target = tgt["price"] if tgt else None
+    tgt_pct = round((target - ltp) / ltp * 100, 2) if target and ltp else None
+    sl_pct = round((slpx - ltp) / ltp * 100, 2) if slpx and ltp else None
+    risk = (ltp - slpx) if slpx is not None else None
+    reward = (target - ltp) if target is not None else None
+    if risk is None or risk <= 0 or lot <= 0:
+        lots, rr, risk_lot = 0, None, None
+    else:
+        risk_lot = risk * lot
+        lots = int(max_loss // risk_lot) if risk_lot > 0 else 0
+        rr = round(reward / risk, 2) if reward and reward > 0 else None
+    return {
+        "Index": index, "Trigger": source, "Confirmed": confirmed,
+        "Buy": f"{strike} {buy_side}" if strike else buy_side,
+        "Opt exp": oexp or "—", "LTP": round(ltp, 2),
+        "Target": target if target is not None else "—",
+        "Target %": tgt_pct if tgt_pct is not None else "—",
+        "SL": slpx if slpx is not None else "—",
+        "SL %": sl_pct if sl_pct is not None else "—",
+        "Lot Qty": lot, "Entry lots": lots, "Qty": lots * lot,
+        "Risk/lot": round(risk_lot, 2) if risk_lot else "—",
+        "R:R": rr if rr is not None else "—", "Bar": trigger_ts or "",
+    }
+
+
+def watch_css(val):
+    text = "" if val is None else str(val)
+    for k in PRIO:
+        if k in text:
+            return FILL[k]
+    return ""
+
+
+def style_watch(df):
+    use = [c for c in df.columns if "WATCH" in str(c).upper()]
+    sty = df.style
+    if use:
+        sty = sty.map(watch_css, subset=use)
+    return sty.hide(axis="index")
+
+
+def style_setups(df):
+    def row_style(row):
+        css = [""] * len(row)
+        try:
+            rr = float(row["R:R"])
+        except Exception:
+            rr = 0
+        if rr <= RR_BLUE:
+            return css
+        buy = str(row.get("Buy") or "")
+        if "Buy" in row.index:
+            if buy.endswith("PE") or " PE" in buy:
+                css[row.index.get_loc("Buy")] = "background-color:#c62828;color:#fff"
+            elif buy.endswith("CE") or " CE" in buy:
+                css[row.index.get_loc("Buy")] = "background-color:#2e7d32;color:#fff"
+        for col in ("Target %", "SL %", "Entry lots"):
+            if col in row.index:
+                css[row.index.get_loc(col)] = "background-color:#1565c0;color:#fff"
+        return css
+    return df.style.apply(row_style, axis=1).hide(axis="index")
+
+
+def _atm_from_master(df_master, name, spot, fo):
+    if df_master is None or getattr(df_master, "empty", True) or not spot:
+        return None
+    today = dt.datetime.now().date()
+    step = STEP.get(name, 50)
+    atm = int(round(float(spot) / step) * step)
+    names = ["GOLDM", "GOLD"] if name == "GOLDM" else [name]
+    d = df_master.copy()
+    d["name_u"] = d["name"].astype(str).str.upper()
+    d = d[d["name_u"].isin([x.upper() for x in names])]
+    if "exch_seg" in d.columns:
+        d = d[d["exch_seg"].astype(str) == str(fo)]
+    if "instrumenttype" in d.columns:
+        d = d[d["instrumenttype"].astype(str).isin(["OPTIDX", "OPTSTK", "OPTFUT", "OPTCOM"])]
+    ce = pe = exp = None
+    rows = []
+    for _, r in d.iterrows():
+        try:
+            raw = str(r.get("expiry") or "")
+            e = None
+            for fmt in ("%d%b%Y", "%d%b%y", "%Y-%m-%d"):
+                try:
+                    e = dt.datetime.strptime(raw, fmt).date()
+                    break
+                except Exception:
+                    pass
+            if not e or e < today:
+                continue
+            k = float(r.get("strike") or 0)
+            if k > 10000:
+                k = k / 100.0
+            if abs(k - atm) > 0.01:
+                continue
+            sym = str(r.get("symbol") or "")
+            side = "CE" if sym.endswith("CE") else ("PE" if sym.endswith("PE") else None)
+            if not side:
+                continue
+            rows.append((e, side, str(r.get("token")), sym, fo))
+        except Exception:
+            continue
+    by = {}
+    for e, side, tok, sym, ex in rows:
+        by.setdefault(e, {})[side] = (tok, sym, ex)
+    for e in sorted(by):
+        if "CE" in by[e] and "PE" in by[e]:
+            return atm, str(e), by[e]["CE"], by[e]["PE"]
+    return None
+
+
+def seed_book(name, fetch_fn, df_master, token_map, fut_fn=None):
+    idx_tok, cash, fo = token_map.get(name, ("", "NSE", "NFO"))
+    book = st.session_state.setdefault("_mis_books", {}).get(name) or {
+        "name": name, "idx_rows": [], "idx_sw": [], "ce_rows": [], "ce_sw": [],
+        "pe_rows": [], "pe_sw": [], "spot": None, "fut": None, "atm": None, "exp": None,
+        "ce_tok": None, "pe_tok": None, "ce_sym": "", "pe_sym": "",
+        "idx_tok": None, "idx_exch": fo, "err": "",
+    }
+    tok = None
+    if fut_fn:
+        try:
+            tok, _ = fut_fn(df_master, name, fo)
+        except Exception:
+            tok = None
+    token = tok or idx_tok
+    exch = fo if tok else cash
+    book["idx_tok"] = token
+    book["idx_exch"] = exch
+    df, _ = fetch_fn(token, exch, "ONE_MINUTE", name, "mis_idx")
+    rows = rows_from_df(df)
+    book["idx_rows"] = rows
+    book["idx_sw"] = rebuild_swings(rows)
+    if rows:
+        book["fut"] = rows[-1]["price"]
+        book["spot"] = rows[-1]["price"]
+    atm = _atm_from_master(df_master, name, book.get("spot"), fo)
+    if atm:
+        strike, exp, ce, pe = atm
+        book["atm"], book["exp"] = strike, exp
+        book["ce_tok"], book["ce_sym"] = ce[0], ce[1]
+        book["pe_tok"], book["pe_sym"] = pe[0], pe[1]
+        dce, _ = fetch_fn(ce[0], ce[2], "ONE_MINUTE", name, "mis_ce")
+        dpe, _ = fetch_fn(pe[0], pe[2], "ONE_MINUTE", name, "mis_pe")
+        book["ce_rows"] = rows_from_df(dce)
+        book["pe_rows"] = rows_from_df(dpe)
+        book["ce_sw"] = rebuild_swings(book["ce_rows"])
+        book["pe_sw"] = rebuild_swings(book["pe_rows"])
+    books = st.session_state.get("_mis_books") or {}
+    books[name] = book
+    st.session_state["_mis_books"] = books
+    return book
+
+
+def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None):
+    st.markdown("### Multi Index Scalper")
+    enabled = dict(st.session_state.get("mis_enabled") or {n: True for n in ORDER})
+    max_loss = float(st.session_state.get("mis_max_loss") or 5000)
+    books = st.session_state.get("_mis_books") or {}
+    if st.session_state.get("mis_need_seed"):
+        names = [n for n in ORDER if enabled.get(n)]
+        bar = st.progress(0.0, text="Seeding 1-min tapes…")
+        for i, n in enumerate(names):
+            try:
+                seed_book(n, fetch_fn, df_master, token_map, fut_fn=fut_fn)
+            except Exception as e:
+                books = st.session_state.get("_mis_books") or {}
+                books[n] = {"name": n, "err": str(e), "idx_rows": []}
+                st.session_state["_mis_books"] = books
+            bar.progress((i + 1) / max(len(names), 1), text=f"Seeded {n}")
+        st.session_state["mis_need_seed"] = False
+        books = st.session_state.get("_mis_books") or {}
+
+    # live refresh: refetch last session 1m for enabled (same as last-bar update, cheaper than 21 quote paths)
+    if st.session_state.get("enable_main_refresh") and books:
+        for n, book in list(books.items()):
+            if not enabled.get(n) or not book.get("idx_tok"):
+                continue
+            try:
+                df, _ = fetch_fn(book["idx_tok"], book["idx_exch"], "ONE_MINUTE", n, "mis_idx")
+                if df is not None and not getattr(df, "empty", True):
+                    book["idx_rows"] = rows_from_df(df)
+                    book["idx_sw"] = rebuild_swings(book["idx_rows"])
+                    if book["idx_rows"]:
+                        book["fut"] = book["idx_rows"][-1]["price"]
+                if book.get("ce_tok"):
+                    dce, _ = fetch_fn(book["ce_tok"], book["idx_exch"], "ONE_MINUTE", n, "mis_ce")
+                    book["ce_rows"] = rows_from_df(dce)
+                    book["ce_sw"] = rebuild_swings(book["ce_rows"])
+                if book.get("pe_tok"):
+                    dpe, _ = fetch_fn(book["pe_tok"], book["idx_exch"], "ONE_MINUTE", n, "mis_pe")
+                    book["pe_rows"] = rows_from_df(dpe)
+                    book["pe_sw"] = rebuild_swings(book["pe_rows"])
+            except Exception:
+                pass
+        st.session_state["_mis_books"] = books
+
+    with st.expander("Status and flow legend", expanded=False):
+        L, R = st.columns(2)
+        with L:
+            st.markdown(
+                "**Status**\n\n"
+                "| Tag | Meaning |\n|---|---|\n"
+                "| `WATCH SHORT` / `WATCH LONG` | Price vs last swing, CVD disagrees |\n"
+                "| `CONFIRMED SHORT` / `LONG` | Pivot + CVD divergence |\n"
+                "| `TREND DENIED` | Break supported by CVD |"
+            )
+        with R:
+            st.markdown(
+                "**Flow**\n\n"
+                "| Tag | Rule |\n|---|---|\n"
+                "| `ABSORPTION` | |RDI| ≥ 0.40 and Disp ≤ 0.20 |\n"
+                "| `EXHAUSTION` | |RDI| ≤ 0.10 and WATCH/SWING |\n"
+                "| `ACCEL` | |RDI| ≥ 0.35 and Disp ≥ 0.85 |"
+            )
+
+    summary, setups = [], []
+    packs = {}
+    for name in ORDER:
+        if not enabled.get(name):
+            continue
+        book = books.get(name)
+        if not book:
+            continue
+        idx = last_pack(book.get("idx_rows"), book.get("idx_sw"), book.get("fut"))
+        ce = last_pack(book.get("ce_rows"), book.get("ce_sw"), None, book.get("ce_sym"))
+        pe = last_pack(book.get("pe_rows"), book.get("pe_sw"), None, book.get("pe_sym"))
+        packs[name] = (book, idx, ce, pe)
+        strike = book.get("atm") or "—"
+        oexp = book.get("exp") or "—"
+        summary.append({
+            "Index": name,
+            "Spot": book.get("spot") if book.get("spot") is not None else "—",
+            "Fut LTP": book.get("fut") if book.get("fut") is not None else "—",
+            "ATM": strike, "Opt exp": oexp,
+            "Idx WATCH": idx["WATCH"], "Idx Flow": idx["Flow"], "Idx Reason": idx["Reason"],
+            "CE WATCH": ce["WATCH"], "CE Flow": ce["Flow"], "CE Reason": ce["Reason"], "CE LTP": ce["LTP"],
+            "PE WATCH": pe["WATCH"], "PE Flow": pe["Flow"], "PE Reason": pe["Reason"], "PE LTP": pe["LTP"],
+            "Bar": idx["Bar"],
+        })
+        lot = LOT_SIZES.get(name, 1)
+        for source, pack, rule in (
+            ("FUT", idx, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
+            ("CE", ce, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
+            ("PE", pe, {"CONFIRMED LONG": "PE", "CONFIRMED SHORT": "CE"}),
+        ):
+            kind, bar = last_confirmed(pack.get("ann"))
+            if not kind:
+                continue
+            buy = rule[kind]
+            buy_pack = ce if buy == "CE" else pe
+            ts = bar.get("time") if bar else ""
+            row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
+            if row:
+                setups.append(row)
+
+    st.subheader("WATCH LOG")
+    if summary:
+        st.dataframe(style_watch(pd.DataFrame(summary)), use_container_width=True)
+    else:
+        st.info("Click Fetch in the sidebar to seed 1-min tapes for enabled indices.")
+
+    st.subheader("SETUPS")
+    if setups:
+        sdf = pd.DataFrame(setups)
+        if "Bar" in sdf.columns:
+            sdf = sdf.sort_values("Bar", ascending=False)
+        st.dataframe(style_setups(sdf), use_container_width=True)
+    else:
+        st.write("No CONFIRMED LONG/SHORT on FUT / CE / PE in the loaded sessions.")
+
+    def draw_tape(title, pack):
+        st.markdown(f"**{title}**")
+        if pack["ann"]:
+            df = pd.DataFrame(pack["ann"][::-1])
+            cols = [c for c in ["time", "status", "flow", "watch_reason", "price", "CVD", "RDI", "Disp", "volume", "VWAP"] if c in df.columns]
+            st.dataframe(df[cols], use_container_width=True, hide_index=True, height=260)
+        else:
+            st.write("No bars.")
+
+    for name in ORDER:
+        if name not in packs:
+            continue
+        book, idx, ce, pe = packs[name]
+        strike = book.get("atm") or "—"
+        oexp = book.get("exp") or "—"
+        st.subheader(f"{name}  ·  1 min")
+        if book.get("err"):
+            st.caption(book["err"])
+        a, b, c, d = st.columns(4)
+        a.metric("Spot", book.get("spot") or "—")
+        b.metric("Fut", book.get("fut") or "—")
+        c.metric("ATM", f"{strike}  {oexp}")
+        d.metric("CE / PE", f"{ce['LTP']} / {pe['LTP']}")
+        draw_tape("Index / Fut", idx)
+        c1, c2 = st.columns(2)
+        with c1:
+            draw_tape(book.get("ce_sym") or f"{strike} CE", ce)
+        with c2:
+            draw_tape(book.get("pe_sym") or f"{strike} PE", pe)
+        st.divider()
