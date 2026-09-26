@@ -699,20 +699,38 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             if row:
                 setups.append(row)
 
-    st.subheader("WATCH LOG")
+    st.markdown(
+        """
+<style>
+  section.main .block-container { padding-top: 0.6rem; }
+  .mis-pin {
+    position: sticky;
+    top: 0;
+    z-index: 80;
+    background: #0E1117;
+    border-bottom: 1px solid #2a2d33;
+    padding: 4px 0 8px 0;
+  }
+  .mis-pin [data-testid="stDataFrame"] { background: #0E1117; }
+</style>
+<div class="mis-pin">
+""",
+        unsafe_allow_html=True,
+    )
+    st.caption("WATCH LOG")
     if summary:
-        st.dataframe(style_watch(pd.DataFrame(summary)), use_container_width=True)
+        st.dataframe(style_watch(pd.DataFrame(summary)), use_container_width=True, height=196)
     else:
-        st.info("Click Fetch in the sidebar to seed 1-min tapes for enabled indices.")
-
-    st.subheader("SETUPS")
+        st.info("Seed 1-min tapes in the sidebar.")
+    st.caption("SETUPS")
     if setups:
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
             sdf = sdf.sort_values("Bar", ascending=False)
-        st.dataframe(style_setups(sdf), use_container_width=True)
+        st.dataframe(style_setups(sdf), use_container_width=True, height=220)
     else:
         st.write("No CONFIRMED LONG/SHORT on FUT / CE / PE in the loaded sessions.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
     def draw_tape(title, pack):
         st.markdown(f"**{title}**")
