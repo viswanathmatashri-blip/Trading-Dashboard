@@ -7969,7 +7969,36 @@ def _mis_fetch(token, exchange, interval, index_name, kind):
     )
 
 
-@st.fragment(run_every=8 if (st.session_state.get("enable_main_refresh") and view_is("miscalper")) else None)
+def _mis_quotes(pairs):
+    """Batch FULL quotes. pairs = [(exchange, token), ...]. Returns {token: {ltp, volume, ltq}}."""
+    out = {}
+    api = get_smart_api_client()
+    if not api or not pairs:
+        return out
+    by = {}
+    for exch, tok in pairs:
+        by.setdefault(str(exch), []).append(str(tok))
+    for exch, toks in by.items():
+        uniq = list(dict.fromkeys(toks))
+        for i in range(0, len(uniq), 40):
+            chunk = uniq[i:i + 40]
+            try:
+                res = safe_api_call(api.getMarketData, "FULL", {exch: chunk})
+            except Exception:
+                res = None
+            fetched = (((res or {}).get("data") or {}) or {}).get("fetched") or []
+            for it in fetched:
+                tok = str(it.get("symbolToken") or it.get("token") or "")
+                ltp = it.get("ltp") or it.get("lastTradedPrice")
+                if not tok or ltp is None:
+                    continue
+                vol = it.get("tradeVolume") or it.get("opnInterest") or it.get("volume")
+                ltq = it.get("lastTradeQty") or it.get("lastTradedQty") or it.get("ltq")
+                out[tok] = {"ltp": float(ltp), "volume": vol, "ltq": ltq}
+    return out
+
+
+@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("miscalper")) else None)
 def live_mis_fragment():
     if not view_is("miscalper"):
         return
@@ -7979,6 +8008,7 @@ def live_mis_fragment():
         render_multi_index_scalper(
             _mis_fetch, df_master, INDEX_TOKEN_MAP, get_smart_api_client,
             fut_fn=get_near_month_futures_token,
+            quote_fn=_mis_quotes,
         )
     except Exception as e:
         st.exception(e)
