@@ -569,7 +569,37 @@ def seed_book(name, fetch_fn, df_master, token_map, fut_fn=None):
 
 
 def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None, quote_fn=None):
-    st.markdown("### Multi Index Scalper")
+    a_lab = "ON" if st.session_state.get("_smart_api_obj") and not st.session_state.get("_smart_api_err") else (
+        "RATE LIMIT" if st.session_state.get("_angel_rl_ts") else ("DOWN" if st.session_state.get("_smart_api_err") else "IDLE")
+    )
+    a_col = {"ON": "#00E676", "RATE LIMIT": "#FFB300", "DOWN": "#FF5252"}.get(a_lab, "#90A4AE")
+    if st.session_state.get("_ab_session"):
+        b_lab, b_col = "ON", "#00E676"
+    elif st.session_state.get("_ab_err"):
+        b_lab, b_col = "DOWN", "#FF5252"
+    else:
+        b_lab, b_col = "STANDBY", "#FFB300"
+    last = st.session_state.get("_last_broker") or "—"
+    h1, h2 = st.columns([2.2, 1.1])
+    with h1:
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap;'>"
+            f"<span style='font-size:1.15rem;font-weight:700;color:#69F0AE;'>Multi Index Scalper</span>"
+            f"<span style='color:{a_col};font-size:12px;font-weight:700;'>● SmartAPI {a_lab}</span>"
+            f"<span style='color:{b_col};font-size:12px;font-weight:700;'>● AliceBlue {b_lab}</span>"
+            f"<span style='color:#90A4AE;font-size:11px;'>last {last}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with h2:
+        _mis_auto = st.checkbox(
+            "Auto-Refresh 5s",
+            value=bool(st.session_state.get("enable_main_refresh")),
+            key="cb_mis_refresh_main",
+        )
+    if _mis_auto != bool(st.session_state.get("enable_main_refresh")):
+        st.session_state["enable_main_refresh"] = _mis_auto
+        st.rerun()
     _live = st.session_state.get("_mis_live_ts")
     if _live:
         st.caption(f"Live tape {_live} · cached history kept · only current 1-min bar updates")
@@ -589,6 +619,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 books[n] = {"name": n, "err": str(e), "idx_rows": []}
                 st.session_state["_mis_books"] = books
             bar.progress((i + 1) / max(len(names), 1), text=f"Seeded {n}")
+        bar.empty()
         st.session_state["mis_need_seed"] = False
         books = st.session_state.get("_mis_books") or {}
 
@@ -698,14 +729,18 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         book, idx, ce, pe = packs[name]
         strike = book.get("atm") or "—"
         oexp = book.get("exp") or "—"
-        st.subheader(f"{name}  ·  1 min")
         if book.get("err"):
             st.caption(book["err"])
-        a, b, c, d = st.columns(4)
-        a.metric("Spot", book.get("spot") or "—")
-        b.metric("Fut", book.get("fut") or "—")
-        c.metric("ATM", f"{strike}  {oexp}")
-        d.metric("CE / PE", f"{ce['LTP']} / {pe['LTP']}")
+        st.markdown(
+            f"<div style='display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
+            f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · 1 min</span>"
+            f"<span style='color:#B0BEC5;font-size:13px;'>Spot <b style='color:#EEE;'>{book.get('spot') or '—'}</b></span>"
+            f"<span style='color:#B0BEC5;font-size:13px;'>Fut <b style='color:#EEE;'>{book.get('fut') or '—'}</b></span>"
+            f"<span style='color:#B0BEC5;font-size:13px;'>ATM <b style='color:#EEE;'>{strike}</b> {oexp}</span>"
+            f"<span style='color:#B0BEC5;font-size:13px;'>CE/PE <b style='color:#69F0AE;'>{ce['LTP']}</b> / <b style='color:#FF8A80;'>{pe['LTP']}</b></span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
         draw_tape("Index / Fut", idx)
         c1, c2 = st.columns(2)
         with c1:
