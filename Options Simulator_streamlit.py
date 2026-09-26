@@ -229,7 +229,7 @@ if "app_view" not in st.session_state:
 
 def active_view() -> str:
     v = str(st.session_state.get("app_view") or "default")
-    if v not in ("default", "multi", "scalper"):
+    if v not in ("default", "multi", "scalper", "miscalper"):
         v = "default"
     st.session_state["multi_index_mode"] = v == "multi"
     return v
@@ -4461,10 +4461,11 @@ _view_labels = {
     "default": "1. Default mode",
     "multi": "2. Multi Index mode",
     "scalper": "3. Scalper mode",
+    "miscalper": "4. Multi Index Scalper",
 }
 st.session_state["app_view"] = st.sidebar.radio(
     "View mode",
-    ["default", "multi", "scalper"],
+    ["default", "multi", "scalper", "miscalper"],
     format_func=lambda x: _view_labels.get(x, x),
     key="app_view_radio",
 )
@@ -4642,6 +4643,16 @@ if st.session_state.get("app_view") == "multi":
         st.session_state["multi_enabled"] = en
         n_on = sum(1 for v in en.values() if v)
         st.caption(f"{n_on} live · tapes 5s · Net GEX 5 min")
+elif st.session_state.get("app_view") == "miscalper":
+    with st.sidebar.expander("Multi Index Scalper", expanded=True):
+        st.caption("1-min CVD desk. Other modes do not fetch while this is selected.")
+        en = dict(st.session_state.get("mis_enabled") or {n: True for n in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]})
+        for _idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]:
+            en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, True)), key=f"mis_en_{_idx}")
+        st.session_state["mis_enabled"] = en
+        st.session_state["mis_max_loss"] = st.number_input("Max loss (INR)", min_value=500, value=int(st.session_state.get("mis_max_loss") or 5000), step=500)
+        if st.button("Seed / refresh 1-min tapes"):
+            st.session_state["mis_need_seed"] = True
 elif st.session_state.get("app_view") == "scalper":
     st.sidebar.caption("Scalper uses the index + expiry from Market Parameters. ATM PE | Spot | ATM CE.")
     with st.sidebar.expander("6. Gemini analysis", expanded=True):
@@ -7948,6 +7959,31 @@ def render_scalper_mode():
             pass
 
 
+def _mis_fetch(token, exchange, interval, index_name, kind):
+    api = get_smart_api_client()
+    if not token:
+        return pd.DataFrame(), False
+    return fetch_candles_with_holiday_fallback(
+        api, token, exchange, interval, lookback_days=5,
+        index_name=index_name, cache_kind=kind,
+    )
+
+
+@st.fragment(run_every=8 if (st.session_state.get("enable_main_refresh") and view_is("miscalper")) else None)
+def live_mis_fragment():
+    if not view_is("miscalper"):
+        return
+    render_broker_status_ribbon()
+    try:
+        from multi_index_scalper import render_multi_index_scalper
+        render_multi_index_scalper(
+            _mis_fetch, df_master, INDEX_TOKEN_MAP, get_smart_api_client,
+            fut_fn=get_near_month_futures_token,
+        )
+    except Exception as e:
+        st.exception(e)
+
+
 @st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("multi")) else None)
 def live_multi_fragment():
     if not view_is("multi"):
@@ -9595,6 +9631,8 @@ try:
         live_multi_fragment()
     elif _view_now == "scalper":
         live_scalper_fragment()
+    elif _view_now == "miscalper":
+        live_mis_fragment()
     else:
         live_dashboard_fragment()
 except Exception as _boot_err:
