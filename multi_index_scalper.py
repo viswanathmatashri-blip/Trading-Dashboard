@@ -510,6 +510,26 @@ def last_confirmed(ann):
     return None, None
 
 
+def all_confirmed(ann):
+    out = []
+    seen = set()
+    for r in reversed(ann or []):
+        stt = str(r.get("status") or "")
+        kind = None
+        if "CONFIRMED LONG" in stt:
+            kind = "CONFIRMED LONG"
+        elif "CONFIRMED SHORT" in stt:
+            kind = "CONFIRMED SHORT"
+        if not kind:
+            continue
+        key = (kind, str(r.get("time") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((kind, r))
+    return out
+
+
 def price_at(pack, ts):
     rows = pack.get("ann") or []
     for r in rows:
@@ -1104,50 +1124,39 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Bar": bar_ts,
         })
         lot = LOT_SIZES.get(name, 1)
-        tu, fu = str(t_lab).upper(), str(f_lab).upper()
-        conflict = (
-            tu.startswith("CONFLICT")
-            or fu.startswith("CONFLICT")
-            or (tu.startswith("LONG") and fu.startswith("SHORT"))
-            or (tu.startswith("SHORT") and fu.startswith("LONG"))
-        )
-        if conflict:
-            continue
         for source, pack, rule in (
             ("FUT", idx, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
             ("CE", ce, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
             ("PE", pe, {"CONFIRMED LONG": "PE", "CONFIRMED SHORT": "CE"}),
         ):
-            kind, bar = last_confirmed(pack.get("ann"))
-            if not kind:
-                continue
-            buy = rule[kind]
-            buy_pack = ce if buy == "CE" else pe
-            fine = book.get("ce_1m_rows") if buy == "CE" else book.get("pe_1m_rows")
-            if fine:
-                buy_pack = dict(buy_pack)
-                buy_pack["ann"] = [
-                    {"time": r.get("time"), "high": r.get("high"), "low": r.get("low"), "price": r.get("price")}
-                    for r in fine
-                ]
-            ts = bar.get("time") if bar else ""
-            hit = _row_at(idx.get("ann") or [], ts)
-            t_at = str((hit or {}).get("Trend") or "—")
-            f_at = str((hit or {}).get("Flow x/3") or "—")
-            tu2, fu2 = t_at.upper(), f_at.upper()
-            if (
-                tu2 in ("", "—", "NONE")
-                or tu2.startswith("CONFLICT")
-                or fu2.startswith("CONFLICT")
-                or (tu2.startswith("LONG") and fu2.startswith("SHORT"))
-                or (tu2.startswith("SHORT") and fu2.startswith("LONG"))
-            ):
-                continue
-            row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
-            if row:
-                row["Trend"] = t_at
-                row["Flow"] = f_at
-                setups.append(row)
+            for kind, bar in all_confirmed(pack.get("ann")):
+                buy = rule[kind]
+                buy_pack = ce if buy == "CE" else pe
+                fine = book.get("ce_1m_rows") if buy == "CE" else book.get("pe_1m_rows")
+                if fine:
+                    buy_pack = dict(buy_pack)
+                    buy_pack["ann"] = [
+                        {"time": r.get("time"), "high": r.get("high"), "low": r.get("low"), "price": r.get("price")}
+                        for r in fine
+                    ]
+                ts = bar.get("time") if bar else ""
+                hit = _row_at(idx.get("ann") or [], ts)
+                t_at = str((hit or {}).get("Trend") or t_lab or "—")
+                f_at = str((hit or {}).get("Flow x/3") or f_lab or "—")
+                if t_at in ("", "—"):
+                    t_at = "LONG CONFLUENCE 1/3" if "LONG" in kind else "SHORT CONFLUENCE 1/3"
+                tu2, fu2 = t_at.upper(), f_at.upper()
+                if tu2.startswith("CONFLICT") or fu2.startswith("CONFLICT"):
+                    continue
+                if tu2.startswith("LONG") and fu2.startswith("SHORT"):
+                    continue
+                if tu2.startswith("SHORT") and fu2.startswith("LONG"):
+                    continue
+                row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
+                if row:
+                    row["Trend"] = t_at
+                    row["Flow"] = f_at
+                    setups.append(row)
 
     _send_mis_telegram(setups)
 
