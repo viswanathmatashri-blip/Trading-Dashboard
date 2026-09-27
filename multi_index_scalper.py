@@ -340,6 +340,108 @@ def annotate_bars(rows, swings):
     return out
 
 
+MCX_NAMES = {"GOLDM", "CRUDEOIL"}
+LONG_BITS = ("WATCH LONG", "TREND SHORT DENIED", "CONFIRMED LONG")
+SHORT_BITS = ("WATCH SHORT", "TREND LONG DENIED", "CONFIRMED SHORT")
+
+
+def _ist_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo("Asia/Kolkata"))
+    except Exception:
+        return dt.datetime.now()
+
+
+def session_open(name: str) -> bool:
+    now = _ist_now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    if name in MCX_NAMES:
+        return dt.time(9, 0) <= t <= dt.time(23, 30)
+    return dt.time(9, 15) <= t <= dt.time(15, 30)
+
+
+def _parse_bar(ts):
+    if not ts:
+        return None
+    s = str(ts).replace("T", " ")[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return dt.datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def last_session_bar(name, rows, fallback):
+    """Outside hours: last print at/before 15:30 (15:15 ok) / MCX 23:30 (23:00 ok)."""
+    close_h, close_m = (23, 30) if name in MCX_NAMES else (15, 30)
+    alt_h, alt_m = (23, 0) if name in MCX_NAMES else (15, 15)
+    best = None
+    for r in reversed(rows or []):
+        ts = _parse_bar(r.get("time"))
+        if ts is None:
+            continue
+        hm = (ts.hour, ts.minute)
+        if hm <= (close_h, close_m):
+            best = r.get("time")
+            if hm in ((close_h, close_m), (alt_h, alt_m)):
+                return str(best)[:19]
+            break
+    if best:
+        return str(best)[:19]
+    fb = _parse_bar(fallback)
+    if fb and (fb.hour, fb.minute) <= (close_h, close_m):
+        return str(fallback)[:19]
+    return str(fallback or "")[:19]
+
+
+def _vote_status(text, invert=False):
+    t = str(text or "").upper()
+    lg = any(b in t for b in LONG_BITS)
+    sh = any(b in t for b in SHORT_BITS)
+    if invert:
+        lg, sh = sh, lg
+    if lg and not sh:
+        return "LONG"
+    if sh and not lg:
+        return "SHORT"
+    return None
+
+
+def _vote_flow(pack, invert=False):
+    fl = str(pack.get("Flow") or "").upper()
+    if fl in ("", "—", "NONE"):
+        return None
+    rdi = pack.get("RDI")
+    try:
+        rdi = float(rdi)
+    except Exception:
+        rdi = 0.0
+    side = "LONG" if rdi > 0 else ("SHORT" if rdi < 0 else None)
+    if fl == "ABSORPTION" and side:
+        side = "SHORT" if side == "LONG" else "LONG"
+    if invert and side:
+        side = "SHORT" if side == "LONG" else "LONG"
+    return side
+
+
+def confluence_label(votes, kind="TREND"):
+    longs = sum(1 for v in votes if v == "LONG")
+    shorts = sum(1 for v in votes if v == "SHORT")
+    prefix = "LONG CONFLUENCE" if kind == "TREND" else "LONG FLOW"
+    prefix_s = "SHORT CONFLUENCE" if kind == "TREND" else "SHORT FLOW"
+    if longs and shorts:
+        return f"CONFLICTING {longs}L/{shorts}S"
+    if longs:
+        return f"{prefix} {longs}/3"
+    if shorts:
+        return f"{prefix_s} {shorts}/3"
+    return "—"
+
+
 def last_pack(rows, swings, ltp=None, symbol=""):
     ann = annotate_bars(rows or [], swings or [])
     last = ann[-1] if ann else {}
@@ -455,11 +557,25 @@ def watch_css(val):
     return ""
 
 
+def confluence_css(val):
+    text = str(val or "").upper()
+    if text.startswith("LONG"):
+        return "background-color:#2e7d32;color:#fff"
+    if text.startswith("SHORT"):
+        return "background-color:#c62828;color:#fff"
+    if text.startswith("CONFLICT"):
+        return "background-color:#00838f;color:#fff"
+    return ""
+
+
 def style_watch(df):
-    use = [c for c in df.columns if "WATCH" in str(c).upper()]
     sty = df.style
+    use = [c for c in df.columns if "WATCH" in str(c).upper()]
     if use:
         sty = sty.map(watch_css, subset=use)
+    extra = [c for c in ("Trend", "Flow x/3") if c in df.columns]
+    if extra:
+        sty = sty.map(confluence_css, subset=extra)
     return sty.hide(axis="index")
 
 
@@ -655,7 +771,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.session_state["mis_need_seed"] = False
         books = st.session_state.get("_mis_books") or {}
 
-    if st.session_state.get("enable_main_refresh") and books and quote_fn:
+    live_ok = any(session_open(n) for n in ORDER if enabled.get(n))
+    if st.session_state.get("enable_main_refresh") and books and quote_fn and live_ok:
         try:
             toks = []
             for n, book in books.items():
@@ -705,6 +822,19 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         packs[name] = (book, idx, ce, pe)
         strike = book.get("atm") or "—"
         oexp = book.get("exp") or "—"
+        t_votes = [
+            _vote_status(idx["WATCH"], invert=False),
+            _vote_status(ce["WATCH"], invert=False),
+            _vote_status(pe["WATCH"], invert=True),
+        ]
+        f_votes = [
+            _vote_flow(idx, invert=False),
+            _vote_flow(ce, invert=False),
+            _vote_flow(pe, invert=True),
+        ]
+        bar_ts = idx["Bar"]
+        if not session_open(name):
+            bar_ts = last_session_bar(name, book.get("idx_rows") or [], bar_ts)
         summary.append({
             "Index": name,
             "Spot": book.get("spot") if book.get("spot") is not None else "—",
@@ -713,7 +843,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Idx WATCH": idx["WATCH"], "Idx Flow": idx["Flow"], "Idx Reason": idx["Reason"],
             "CE WATCH": ce["WATCH"], "CE Flow": ce["Flow"], "CE Reason": ce["Reason"], "CE LTP": ce["LTP"],
             "PE WATCH": pe["WATCH"], "PE Flow": pe["Flow"], "PE Reason": pe["Reason"], "PE LTP": pe["LTP"],
-            "Bar": idx["Bar"],
+            "Trend": confluence_label(t_votes, "TREND"),
+            "Flow x/3": confluence_label(f_votes, "FLOW"),
+            "Bar": bar_ts,
         })
         lot = LOT_SIZES.get(name, 1)
         for source, pack, rule in (
