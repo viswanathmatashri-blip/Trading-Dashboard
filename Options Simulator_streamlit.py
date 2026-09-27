@@ -229,7 +229,7 @@ if "app_view" not in st.session_state:
 
 def active_view() -> str:
     v = str(st.session_state.get("app_view") or "default")
-    if v not in ("default", "multi", "scalper", "miscalper"):
+    if v not in ("default", "multi", "scalper", "miscalper", "crypto"):
         v = "default"
     st.session_state["multi_index_mode"] = v == "multi"
     return v
@@ -4463,10 +4463,11 @@ _view_labels = {
     "multi": "2. Multi Index mode",
     "scalper": "3. Scalper mode",
     "miscalper": "4. Multi Index Scalper",
+    "crypto": "5. Multi Index Crypto Scalper",
 }
 st.session_state["app_view"] = st.sidebar.radio(
     "View mode",
-    ["default", "multi", "scalper", "miscalper"],
+    ["default", "multi", "scalper", "miscalper", "crypto"],
     format_func=lambda x: _view_labels.get(x, x),
     key="app_view_radio",
 )
@@ -4654,6 +4655,16 @@ elif st.session_state.get("app_view") == "miscalper":
         st.session_state["mis_max_loss"] = st.number_input("Max loss (INR)", min_value=500, value=int(st.session_state.get("mis_max_loss") or 2000), step=500)
         if st.button("Seed / refresh tapes"):
             st.session_state["mis_need_seed"] = True
+elif st.session_state.get("app_view") == "crypto":
+    with st.sidebar.expander("Multi Index Crypto Scalper", expanded=True):
+        st.caption("Public Binance futures + Deribit options. No broker login.")
+        en = dict(st.session_state.get("cry_enabled") or {n: True for n in ["BTC", "ETH", "SOL", "BNB", "XRP"]})
+        for _idx in ["BTC", "ETH", "SOL", "BNB", "XRP"]:
+            en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, True)), key=f"cry_en_{_idx}")
+        st.session_state["cry_enabled"] = en
+        st.session_state["cry_max_loss"] = st.number_input("Max loss (USD)", min_value=50, value=int(st.session_state.get("cry_max_loss") or 2000), step=50)
+        if st.button("Seed / refresh crypto tapes"):
+            st.session_state["cry_need_seed"] = True
 elif st.session_state.get("app_view") == "scalper":
     st.sidebar.caption("Scalper uses the index + expiry from Market Parameters. ATM PE | Spot | ATM CE.")
     with st.sidebar.expander("6. Gemini analysis", expanded=True):
@@ -8014,6 +8025,17 @@ def live_mis_fragment():
         st.exception(e)
 
 
+@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("crypto")) else None)
+def live_crypto_fragment():
+    if not view_is("crypto"):
+        return
+    try:
+        from Crypto import render_crypto_scalper
+        render_crypto_scalper()
+    except Exception as e:
+        st.exception(e)
+
+
 @st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("multi")) else None)
 def live_multi_fragment():
     if not view_is("multi"):
@@ -9663,6 +9685,8 @@ try:
         live_scalper_fragment()
     elif _view_now == "miscalper":
         live_mis_fragment()
+    elif _view_now == "crypto":
+        live_crypto_fragment()
     else:
         live_dashboard_fragment()
 except Exception as _boot_err:
