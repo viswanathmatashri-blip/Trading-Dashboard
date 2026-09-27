@@ -6,6 +6,7 @@ import math
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 ORDER = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]
 LOT_SIZES = {
@@ -940,27 +941,56 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
 """,
         unsafe_allow_html=True,
     )
-    st.caption("WATCH LOG")
+    def _take_index_click(ev, df):
+        try:
+            rows = list((ev.selection or {}).get("rows") or ev.selection.rows)
+        except Exception:
+            try:
+                rows = list(ev.selection.rows)
+            except Exception:
+                rows = []
+        if rows and df is not None and "Index" in df.columns:
+            try:
+                st.session_state["mis_jump"] = str(df.iloc[int(rows[0])]["Index"])
+            except Exception:
+                pass
+
+    st.caption("WATCH LOG · click an index to jump")
     if summary:
-        st.dataframe(
-            style_watch(pd.DataFrame(summary)),
-            use_container_width=True,
-            height=watch_h,
-            hide_index=True,
-        )
+        wdf = pd.DataFrame(summary)
+        try:
+            evw = st.dataframe(
+                style_watch(wdf),
+                use_container_width=True,
+                height=watch_h,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="mis_watch_pick",
+            )
+            _take_index_click(evw, wdf)
+        except TypeError:
+            st.dataframe(style_watch(wdf), use_container_width=True, height=watch_h, hide_index=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    st.caption("SETUPS · 7 rows, rest scroll inside")
+    st.caption("SETUPS · 7 rows · click an index to jump")
     if setups:
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
-            sdf = sdf.sort_values("Bar", ascending=False)
-        st.dataframe(
-            style_setups(sdf),
-            use_container_width=True,
-            height=setup_h,
-            hide_index=True,
-        )
+            sdf = sdf.sort_values("Bar", ascending=False).reset_index(drop=True)
+        try:
+            evs = st.dataframe(
+                style_setups(sdf),
+                use_container_width=True,
+                height=setup_h,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="mis_setup_pick",
+            )
+            _take_index_click(evs, sdf)
+        except TypeError:
+            st.dataframe(style_setups(sdf), use_container_width=True, height=setup_h, hide_index=True)
     else:
         st.write("No CONFIRMED LONG/SHORT on FUT / CE / PE in the loaded sessions.")
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1000,7 +1030,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             )
 
         st.markdown(
-            f"<div style='display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
+            f"<div id='mis-sec-{name}' style='display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
             f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · {st.session_state.get('mis_tf') or '1 min'}</span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>Spot <b style='color:#EEE;'>{book.get('spot') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>Fut <b style='color:#EEE;'>{book.get('fut') or '—'}</b></span>"
@@ -1016,3 +1046,29 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         with c2:
             draw_tape(book.get("pe_sym") or f"{strike} PE", pe)
         st.divider()
+
+    jump = str(st.session_state.get("mis_jump") or "")
+    if jump:
+        components.html(
+            f"""
+<script>
+const id = "mis-sec-{jump}";
+const doc = window.parent.document;
+const el = doc.getElementById(id);
+if (el) {{
+  el.scrollIntoView({{behavior: "smooth", block: "start"}});
+  let p = el.parentElement;
+  while (p) {{
+    const oy = window.parent.getComputedStyle(p).overflowY;
+    if (oy === "auto" || oy === "scroll") {{
+      const top = el.getBoundingClientRect().top - p.getBoundingClientRect().top + p.scrollTop - 8;
+      p.scrollTo({{top: top, behavior: "smooth"}});
+      break;
+    }}
+    p = p.parentElement;
+  }}
+}}
+</script>
+""",
+            height=0,
+        )
