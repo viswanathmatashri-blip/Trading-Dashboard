@@ -810,6 +810,11 @@ def style_setups(df):
                 css[row.index.get_loc("Accuracy")] = "background-color:#2e7d32;color:#fff"
             elif acc.startswith("SL Hit"):
                 css[row.index.get_loc("Accuracy")] = "background-color:#c62828;color:#fff"
+        for col in ("Trend", "Flow"):
+            if col in row.index:
+                fill = confluence_css(row.get(col))
+                if fill:
+                    css[row.index.get_loc(col)] = fill
         try:
             rr = float(row["R:R"])
         except Exception:
@@ -1128,6 +1133,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             ts = bar.get("time") if bar else ""
             row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
             if row:
+                row["Trend"] = t_lab
+                row["Flow"] = f_lab
                 setups.append(row)
 
     _send_mis_telegram(setups)
@@ -1184,6 +1191,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
             sdf = sdf.sort_values("Bar", ascending=False).reset_index(drop=True)
+        front = [c for c in ("Index", "Trigger", "Confirmed", "Trend", "Flow") if c in sdf.columns]
+        rest = [c for c in sdf.columns if c not in front]
+        sdf = sdf[front + rest]
         try:
             evs = st.dataframe(
                 style_setups(sdf),
