@@ -167,69 +167,118 @@ def binance_option_info():
     return st.session_state["_bn_opt_info"]
 
 
-def pick_atm_binance(name, spot):
-    info = binance_option_info()
-    syms = info.get("optionSymbols") or info.get("symbols") or []
-    if not syms or not spot:
+def _parse_bn_opt_symbol(sym):
+    # BTC-260928-85000-C
+    parts = str(sym).split("-")
+    if len(parts) < 4:
         return None
-    und = BINANCE_FUT.get(name, f"{name}USDT")
+    und, ymd, strike, side = parts[0], parts[1], parts[2], parts[-1]
+    try:
+        exp = dt.datetime.strptime(ymd, "%y%m%d").date()
+        k = float(strike)
+    except Exception:
+        return None
+    side = "C" if side.upper().startswith("C") else ("P" if side.upper().startswith("P") else "")
+    if not side:
+        return None
+    return und, exp, k, side, str(sym)
+
+
+def pick_atm_binance(name, spot):
+    if not spot:
+        return None
+    und = name.upper()
     today = dt.datetime.utcnow().date()
     step = STEP.get(name, 50)
     atm = float(int(round(float(spot) / step) * step))
-    by_exp = {}
-    for it in syms:
+    parsed = []
+
+    info = binance_option_info()
+    if info and not info.get("_err"):
+        for it in info.get("optionSymbols") or info.get("symbols") or []:
+            rec = _parse_bn_opt_symbol(it.get("symbol"))
+            if rec:
+                parsed.append(rec)
+            else:
+                try:
+                    u = str(it.get("underlying") or "")
+                    if not u.upper().startswith(und):
+                        continue
+                    raw_exp = it.get("expiryDate") or 0
+                    exp = dt.datetime.utcfromtimestamp(int(raw_exp) / 1000).date()
+                    k = float(it.get("strikePrice") or 0)
+                    side = str(it.get("side") or "")
+                    side = "C" if "CALL" in side.upper() or side == "C" else ("P" if "PUT" in side.upper() or side == "P" else "")
+                    if side:
+                        parsed.append((und, exp, k, side, str(it.get("symbol"))))
+                except Exception:
+                    continue
+
+    if not parsed:
         try:
-            u = str(it.get("underlying") or it.get("underlyingName") or "")
-            if u not in (und, name, f"{name}USDT"):
-                continue
-            raw_exp = it.get("expiryDate") or it.get("expirationDate")
-            if raw_exp is None:
-                continue
-            if isinstance(raw_exp, (int, float)):
-                exp = dt.datetime.utcfromtimestamp(int(raw_exp) / 1000).date()
-            else:
-                exp = dt.datetime.strptime(str(raw_exp)[:10], "%Y-%m-%d").date()
-            if exp < today:
-                continue
-            k = float(it.get("strikePrice") or it.get("strike") or 0)
-            if abs(k - atm) > step * 0.51:
-                continue
-            side = str(it.get("side") or it.get("optionType") or "").upper()
-            if side in ("CALL", "C"):
-                side = "C"
-            elif side in ("PUT", "P"):
-                side = "P"
-            else:
-                s = str(it.get("symbol") or "")
-                side = "C" if s.endswith("-C") else ("P" if s.endswith("-P") else "")
-            if side not in ("C", "P"):
-                continue
-            by_exp.setdefault(exp, {})[side] = str(it.get("symbol"))
+            tick = _get_json("https://eapi.binance.com/eapi/v1/ticker")
+            for it in tick if isinstance(tick, list) else []:
+                rec = _parse_bn_opt_symbol(it.get("symbol"))
+                if rec and rec[0].upper() == und:
+                    parsed.append(rec)
         except Exception:
+            pass
+
+    by_exp = {}
+    for u, exp, k, side, sym in parsed:
+        if u.upper() != und and not str(u).upper().startswith(und):
             continue
+        if exp < today:
+            continue
+        if abs(k - float(spot)) > max(step * 2, float(spot) * 0.02):
+            continue
+        by_exp.setdefault(exp, []).append((abs(k - float(spot)), k, side, sym))
+
     for exp in sorted(by_exp):
-        if "C" in by_exp[exp] and "P" in by_exp[exp]:
-            return int(atm), str(exp), by_exp[exp]["C"], by_exp[exp]["P"]
+        legs = by_exp[exp]
+        legs.sort()
+        ce = next((s for _, k, side, s in legs if side == "C"), None)
+        pe = next((s for _, k, side, s in legs if side == "P"), None)
+        if ce and pe:
+            k_use = next((k for _, k, side, s in legs if s == ce), atm)
+            return int(k_use), str(exp), ce, pe
     return None
 
 
 def fetch_binance_opt_klines(symbol, interval, limit=500):
-    js = _get_json(
+    last_err = None
+    for url in (
         "https://eapi.binance.com/eapi/v1/klines",
-        {"symbol": symbol, "interval": interval, "limit": int(limit)},
-    )
-    return _klines_from_binance_list(js)
+        "https://eapi.binance.com/eapi/v1/klines",
+    ):
+        try:
+            js = _get_json(url, {"symbol": symbol, "interval": interval, "limit": int(limit)})
+            df = _klines_from_binance_list(js)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    return pd.DataFrame()
 
 
 def fetch_binance_opt_last(symbol):
-    js = _get_json("https://eapi.binance.com/eapi/v1/ticker", {"symbol": symbol})
-    if isinstance(js, list):
-        js = js[0] if js else {}
-    for k in ("lastPrice", "markPrice", "bidPrice", "askPrice"):
+    for url, params in (
+        ("https://eapi.binance.com/eapi/v1/ticker", {"symbol": symbol}),
+        ("https://eapi.binance.com/eapi/v1/mark", {"symbol": symbol}),
+    ):
         try:
-            v = float(js.get(k) or 0)
-            if v > 0:
-                return v
+            js = _get_json(url, params)
+            if isinstance(js, list):
+                js = js[0] if js else {}
+            for k in ("lastPrice", "markPrice", "bidPrice", "askPrice"):
+                try:
+                    v = float(js.get(k) or 0)
+                    if v > 0:
+                        return v
+                except Exception:
+                    continue
         except Exception:
             continue
     return 0.0
@@ -380,13 +429,24 @@ def seed_crypto(name):
                 book["atm"], book["exp"] = strike, exp
                 book["ce_sym"], book["pe_sym"] = ce_n, pe_n
                 book["ce_tok"], book["pe_tok"] = ce_n, pe_n
-                dce = fetch_binance_opt_klines(ce_n, b_int)
-                dpe = fetch_binance_opt_klines(pe_n, b_int)
                 ce_last = fetch_binance_opt_last(ce_n)
                 pe_last = fetch_binance_opt_last(pe_n)
-                if ce_last and dce is not None and not dce.empty:
+                try:
+                    dce = fetch_binance_opt_klines(ce_n, b_int)
+                except Exception:
+                    dce = pd.DataFrame()
+                try:
+                    dpe = fetch_binance_opt_klines(pe_n, b_int)
+                except Exception:
+                    dpe = pd.DataFrame()
+                now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                if (dce is None or dce.empty) and ce_last:
+                    dce = pd.DataFrame([{"time": now, "open": ce_last, "high": ce_last, "low": ce_last, "close": ce_last, "volume": 0}])
+                elif ce_last and dce is not None and not dce.empty:
                     dce.iloc[-1, dce.columns.get_loc("close")] = ce_last
-                if pe_last and dpe is not None and not dpe.empty:
+                if (dpe is None or dpe.empty) and pe_last:
+                    dpe = pd.DataFrame([{"time": now, "open": pe_last, "high": pe_last, "low": pe_last, "close": pe_last, "volume": 0}])
+                elif pe_last and dpe is not None and not dpe.empty:
                     dpe.iloc[-1, dpe.columns.get_loc("close")] = pe_last
                 book["ce_rows"] = rows_from_df(dce)
                 book["pe_rows"] = rows_from_df(dpe)
