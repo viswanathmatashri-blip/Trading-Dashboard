@@ -634,6 +634,54 @@ def style_watch(df):
     return sty.hide(axis="index")
 
 
+def _cell_css(col, val):
+    if col in ("Trend", "Flow x/3"):
+        return confluence_css(val)
+    if "WATCH" in str(col).upper():
+        return watch_css(val)
+    return ""
+
+
+def watch_log_html(df: pd.DataFrame) -> str:
+    gold = {"Idx WATCH", "CE WATCH", "PE WATCH"}
+    rows = []
+    rows.append("<thead><tr>")
+    for c in df.columns:
+        if c in gold:
+            rows.append(
+                f'<th style="background:#C9A227;color:#111;font-weight:800;padding:6px 8px;'
+                f'white-space:nowrap;position:sticky;top:0;z-index:2;border-bottom:1px solid #333;">{c}</th>'
+            )
+        else:
+            rows.append(
+                f'<th style="background:#16181d;color:#c8ccd4;font-weight:700;padding:6px 8px;'
+                f'white-space:nowrap;position:sticky;top:0;z-index:2;border-bottom:1px solid #333;">{c}</th>'
+            )
+    rows.append("</tr></thead><tbody>")
+    for _, r in df.iterrows():
+        rows.append("<tr>")
+        for c in df.columns:
+            v = r[c]
+            extra = _cell_css(c, v)
+            if c == "Index":
+                rows.append(
+                    f'<td style="padding:5px 8px;white-space:nowrap;">{v}</td>'
+                )
+            else:
+                rows.append(
+                    f'<td style="padding:5px 8px;white-space:nowrap;{extra}">{"" if v is None else v}</td>'
+                )
+        rows.append("</tr>")
+    rows.append("</tbody>")
+    return (
+        '<div style="overflow:auto;width:100%;border:1px solid #2a2d33;border-radius:6px;">'
+        '<table style="width:100%;border-collapse:collapse;font-size:12px;font-family:ui-sans-serif,system-ui;'
+        'color:#e0e0e0;background:#0E1117;">'
+        + "".join(rows)
+        + "</table></div>"
+    )
+
+
 def style_setups(df):
     def row_style(row):
         css = [""] * len(row)
@@ -973,19 +1021,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     st.caption(f"WATCH LOG    last updated {_upd}")
     if summary:
         wdf = pd.DataFrame(summary)
-        try:
-            evw = st.dataframe(
-                style_watch(wdf),
-                use_container_width=True,
-                height=watch_h,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="mis_watch_pick",
-            )
-            _take_index_click(evw, wdf)
-        except TypeError:
-            st.dataframe(style_watch(wdf), use_container_width=True, height=watch_h, hide_index=True)
+        st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
     st.caption(f"SETUPS    last updated {_upd}")
