@@ -955,7 +955,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             except Exception:
                 pass
 
-    _upd = _ist_now().strftime("%d-%m-%Y %I:%M %p")
+    _upd = _ist_now().strftime("%d-%m-%Y %H:%M:%S")
     st.caption(f"WATCH LOG    last updated {_upd}")
     if summary:
         wdf = pd.DataFrame(summary)
