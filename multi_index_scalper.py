@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import os
 
 import pandas as pd
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -656,6 +658,57 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
     }
 
 
+def _send_mis_telegram(setups):
+    def _sec(k, alt=""):
+        try:
+            if k in st.secrets:
+                return str(st.secrets[k]).strip()
+        except Exception:
+            pass
+        return (os.getenv(k) or os.getenv(alt) or "").strip()
+
+    tok = _sec("TELE_BOTTOKEN", "TELEGRAM_BOT_TOKEN")
+    chat = _sec("TELE_CHATID", "TELEGRAM_CHAT_ID")
+    if not tok or not chat or not setups:
+        return
+    sent = st.session_state.setdefault("_mis_tg_sent", set())
+    if not isinstance(sent, set):
+        sent = set(sent)
+        st.session_state["_mis_tg_sent"] = sent
+    for row in setups:
+        conf = str(row.get("Confirmed") or "")
+        if "CONFIRMED LONG" not in conf and "CONFIRMED SHORT" not in conf:
+            continue
+        key = f"{row.get('Index')}|{row.get('Trigger')}|{row.get('Bar')}|{row.get('Buy')}"
+        if key in sent:
+            continue
+        tgt = row.get("Target")
+        tgt_pct = row.get("Target %")
+        sl = row.get("SL")
+        sl_pct = row.get("SL %")
+        msg = (
+            f"{row.get('Index')}\n"
+            f"{row.get('Trigger')}\n"
+            f"{row.get('Buy')}\n"
+            f"Buy : {row.get('LTP')}\n"
+            f"Target : {tgt} ({tgt_pct}%)\n"
+            f"SL -{sl} ({sl_pct}%)\n"
+            f"Entry Lot Qty = {row.get('Qty')}\n"
+            f"R:R = {row.get('R:R')}"
+        )
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{tok}/sendMessage",
+                json={"chat_id": chat, "text": msg, "disable_web_page_preview": True},
+                timeout=8,
+            )
+            if r.ok:
+                sent.add(key)
+        except Exception:
+            continue
+    st.session_state["_mis_tg_sent"] = sent
+
+
 def watch_css(val):
     text = "" if val is None else str(val)
     for k in PRIO:
@@ -1067,6 +1120,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
             if row:
                 setups.append(row)
+
+    _send_mis_telegram(setups)
 
     n_watch = max(len(summary), 1)
     watch_h = min(38 * (n_watch + 1) + 20, 320)
