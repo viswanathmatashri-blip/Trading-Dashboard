@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import hmac
+import os
 import time
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
@@ -59,8 +63,39 @@ TF_DERIBIT = {
 _HDR = {"User-Agent": "Mozilla/5.0 GammaDesk/1.0", "Accept": "application/json"}
 
 
-def _get_json(url, params=None, timeout=12):
-    r = requests.get(url, params=params or {}, timeout=timeout, headers=_HDR)
+def _bn_keys():
+    def g(*names):
+        for n in names:
+            try:
+                if n in st.secrets and str(st.secrets[n]).strip():
+                    return str(st.secrets[n]).strip()
+            except Exception:
+                pass
+            v = (os.getenv(n) or "").strip()
+            if v:
+                return v
+        return ""
+    return g("BINANCE_API_KEY", "BINANCE_KEY"), g("BINANCE_SECRET_KEY", "BINANCE_SECRET", "BINANCE_API_SECRET")
+
+
+def _bn_headers():
+    h = dict(_HDR)
+    key, _ = _bn_keys()
+    if key:
+        h["X-MBX-APIKEY"] = key
+    return h
+
+
+def _get_json(url, params=None, timeout=12, signed=False):
+    params = dict(params or {})
+    headers = _bn_headers()
+    key, secret = _bn_keys()
+    if signed and secret:
+        params["timestamp"] = int(time.time() * 1000)
+        params["recvWindow"] = 10000
+        qs = urlencode(params)
+        params["signature"] = hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    r = requests.get(url, params=params, timeout=timeout, headers=headers)
     r.raise_for_status()
     return r.json()
 
@@ -79,73 +114,125 @@ def _klines_from_binance_list(js):
 def fetch_binance_klines(symbol, interval, limit=500):
     """fapi is 451 in many regions (IN). Fall back to Vision spot, Bybit, Deribit perp."""
     errors = []
-    for url, params in (
-        ("https://data-api.binance.vision/api/v3/klines",
-         {"symbol": symbol, "interval": interval, "limit": int(limit)}),
-        ("https://api.binance.com/api/v3/klines",
-         {"symbol": symbol, "interval": interval, "limit": int(limit)}),
-        ("https://fapi.binance.com/fapi/v1/klines",
-         {"symbol": symbol, "interval": interval, "limit": int(limit)}),
+    for url in (
+        "https://api.binance.com/api/v3/klines",
+        "https://api1.binance.com/api/v3/klines",
+        "https://api2.binance.com/api/v3/klines",
+        "https://api3.binance.com/api/v3/klines",
+        "https://data-api.binance.vision/api/v3/klines",
+        "https://fapi.binance.com/fapi/v1/klines",
     ):
         try:
-            js = _get_json(url, params)
+            js = _get_json(url, {"symbol": symbol, "interval": interval, "limit": int(limit)})
             df = _klines_from_binance_list(js)
             if not df.empty:
                 return df
         except Exception as e:
             errors.append(f"{url.split('/')[2]}:{e}")
-    by_int = {"1m": "1", "3m": "3", "5m": "5", "15m": "15"}.get(interval, "1")
-    try:
-        js = _get_json(
-            "https://api.bybit.com/v5/market/kline",
-            {"category": "linear", "symbol": symbol, "interval": by_int, "limit": min(int(limit), 200)},
-        )
-        lst = (((js or {}).get("result") or {}).get("list") or [])
-        rows = []
-        for k in reversed(lst):
-            rows.append({
-                "time": dt.datetime.utcfromtimestamp(int(k[0]) / 1000).strftime("%Y-%m-%d %H:%M:%S"),
-                "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
-                "close": float(k[4]), "volume": float(k[5]),
-            })
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            return df
-    except Exception as e:
-        errors.append(f"bybit:{e}")
-    ccy = symbol.replace("USDT", "")
-    if ccy in ("BTC", "ETH"):
-        try:
-            res = {"1m": "1", "3m": "3", "5m": "5", "15m": "15"}.get(interval, "1")
-            df = deribit_chart(f"{ccy}-PERPETUAL", res)
-            if df is not None and not df.empty:
-                return df
-        except Exception as e:
-            errors.append(f"deribit:{e}")
-    raise RuntimeError(" / ".join(errors[:3]) or "no kline source")
+    raise RuntimeError(" / ".join(errors[:3]) or "no Binance kline source")
 
 
 def fetch_binance_ticker(symbol):
-    for url, params, path in (
-        ("https://data-api.binance.vision/api/v3/ticker/price", {"symbol": symbol}, "price"),
-        ("https://api.binance.com/api/v3/ticker/price", {"symbol": symbol}, "price"),
-        ("https://fapi.binance.com/fapi/v1/ticker/price", {"symbol": symbol}, "price"),
-        ("https://api.bybit.com/v5/market/tickers", {"category": "linear", "symbol": symbol}, "bybit"),
+    errors = []
+    for url in (
+        "https://api.binance.com/api/v3/ticker/price",
+        "https://api1.binance.com/api/v3/ticker/price",
+        "https://fapi.binance.com/fapi/v1/ticker/price",
+        "https://data-api.binance.vision/api/v3/ticker/price",
     ):
         try:
-            js = _get_json(url, params)
-            if path == "bybit":
-                lst = (((js or {}).get("result") or {}).get("list") or [])
-                if lst:
-                    return float(lst[0].get("lastPrice"))
+            js = _get_json(url, {"symbol": symbol})
+            return float(js.get("price") or 0)
+        except Exception as e:
+            errors.append(str(e)[:80])
+    raise RuntimeError(f"no Binance ticker for {symbol}: {errors[:1]}")
+
+
+def binance_option_info():
+    cached = st.session_state.get("_bn_opt_info")
+    if cached is not None:
+        return cached
+    last_err = None
+    for url in (
+        "https://eapi.binance.com/eapi/v1/exchangeInfo",
+        "https://eapi.binance.com/eapi/v1/exchangeInfo",
+    ):
+        try:
+            js = _get_json(url)
+            st.session_state["_bn_opt_info"] = js
+            return js
+        except Exception as e:
+            last_err = e
+    st.session_state["_bn_opt_info"] = {"_err": str(last_err)}
+    return st.session_state["_bn_opt_info"]
+
+
+def pick_atm_binance(name, spot):
+    info = binance_option_info()
+    syms = info.get("optionSymbols") or info.get("symbols") or []
+    if not syms or not spot:
+        return None
+    und = BINANCE_FUT.get(name, f"{name}USDT")
+    today = dt.datetime.utcnow().date()
+    step = STEP.get(name, 50)
+    atm = float(int(round(float(spot) / step) * step))
+    by_exp = {}
+    for it in syms:
+        try:
+            u = str(it.get("underlying") or it.get("underlyingName") or "")
+            if u not in (und, name, f"{name}USDT"):
+                continue
+            raw_exp = it.get("expiryDate") or it.get("expirationDate")
+            if raw_exp is None:
+                continue
+            if isinstance(raw_exp, (int, float)):
+                exp = dt.datetime.utcfromtimestamp(int(raw_exp) / 1000).date()
             else:
-                return float(js.get("price") or 0)
+                exp = dt.datetime.strptime(str(raw_exp)[:10], "%Y-%m-%d").date()
+            if exp < today:
+                continue
+            k = float(it.get("strikePrice") or it.get("strike") or 0)
+            if abs(k - atm) > step * 0.51:
+                continue
+            side = str(it.get("side") or it.get("optionType") or "").upper()
+            if side in ("CALL", "C"):
+                side = "C"
+            elif side in ("PUT", "P"):
+                side = "P"
+            else:
+                s = str(it.get("symbol") or "")
+                side = "C" if s.endswith("-C") else ("P" if s.endswith("-P") else "")
+            if side not in ("C", "P"):
+                continue
+            by_exp.setdefault(exp, {})[side] = str(it.get("symbol"))
         except Exception:
             continue
-    ccy = symbol.replace("USDT", "")
-    if ccy in ("BTC", "ETH"):
-        return deribit_index(ccy)
-    raise RuntimeError(f"no ticker for {symbol}")
+    for exp in sorted(by_exp):
+        if "C" in by_exp[exp] and "P" in by_exp[exp]:
+            return int(atm), str(exp), by_exp[exp]["C"], by_exp[exp]["P"]
+    return None
+
+
+def fetch_binance_opt_klines(symbol, interval, limit=500):
+    js = _get_json(
+        "https://eapi.binance.com/eapi/v1/klines",
+        {"symbol": symbol, "interval": interval, "limit": int(limit)},
+    )
+    return _klines_from_binance_list(js)
+
+
+def fetch_binance_opt_last(symbol):
+    js = _get_json("https://eapi.binance.com/eapi/v1/ticker", {"symbol": symbol})
+    if isinstance(js, list):
+        js = js[0] if js else {}
+    for k in ("lastPrice", "markPrice", "bidPrice", "askPrice"):
+        try:
+            v = float(js.get(k) or 0)
+            if v > 0:
+                return v
+        except Exception:
+            continue
+    return 0.0
 
 
 def deribit_index(ccy):
@@ -192,6 +279,45 @@ def deribit_chart(name, resolution="1", hours=36):
         except Exception:
             continue
     return pd.DataFrame(rows)
+
+
+def deribit_ticker(name):
+    js = _get_json(
+        "https://www.deribit.com/api/v2/public/ticker",
+        {"instrument_name": name},
+    )
+    return (js or {}).get("result") or {}
+
+
+def option_usd_df(df, index_px, last_usd=None):
+    """Deribit option OHLC is in coin. Convert to USD."""
+    try:
+        px = float(index_px or 0)
+    except Exception:
+        px = 0.0
+    if df is None or getattr(df, "empty", True):
+        if last_usd and last_usd > 0:
+            now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            return pd.DataFrame([{
+                "time": now, "open": last_usd, "high": last_usd,
+                "low": last_usd, "close": last_usd, "volume": 0,
+            }])
+        return pd.DataFrame()
+    out = df.copy()
+    if px > 0:
+        for c in ("open", "high", "low", "close"):
+            if c in out.columns:
+                out[c] = out[c].astype(float) * px
+    if last_usd and last_usd > 0:
+        if out.empty:
+            now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            out = pd.DataFrame([{
+                "time": now, "open": last_usd, "high": last_usd,
+                "low": last_usd, "close": last_usd, "volume": 0,
+            }])
+        else:
+            out.iloc[-1, out.columns.get_loc("close")] = last_usd
+    return out
 
 
 def pick_atm_deribit(ccy, spot):
@@ -245,31 +371,38 @@ def seed_crypto(name):
             book["spot"] = fetch_binance_ticker(BINANCE_FUT[name])
         except Exception:
             pass
-        ccy = DERIBIT_CCY.get(name)
-        if ccy:
-            try:
-                dspot = deribit_index(ccy) or book["spot"]
-                book["spot"] = dspot or book["spot"]
-                atm = pick_atm_deribit(ccy, book["spot"])
-                if atm:
-                    strike, exp, ce_n, pe_n = atm
-                    book["atm"], book["exp"] = strike, exp
-                    book["ce_sym"], book["pe_sym"] = ce_n, pe_n
-                    book["ce_tok"], book["pe_tok"] = ce_n, pe_n
-                    dce = deribit_chart(ce_n, d_res)
-                    dpe = deribit_chart(pe_n, d_res)
-                    book["ce_rows"] = rows_from_df(dce)
-                    book["pe_rows"] = rows_from_df(dpe)
-                    book["ce_sw"] = rebuild_swings(book["ce_rows"])
-                    book["pe_sw"] = rebuild_swings(book["pe_rows"])
-                    if d_res == "1":
-                        book["ce_1m_rows"] = book["ce_rows"]
-                        book["pe_1m_rows"] = book["pe_rows"]
-                    else:
-                        book["ce_1m_rows"] = rows_from_df(deribit_chart(ce_n, "1"))
-                        book["pe_1m_rows"] = rows_from_df(deribit_chart(pe_n, "1"))
-            except Exception as e:
-                book["err"] = f"options:{e}"
+        loaded_opt = False
+        try:
+            atm = pick_atm_binance(name, book.get("spot"))
+            if atm:
+                strike, exp, ce_n, pe_n = atm
+                book["opt_src"] = "binance"
+                book["atm"], book["exp"] = strike, exp
+                book["ce_sym"], book["pe_sym"] = ce_n, pe_n
+                book["ce_tok"], book["pe_tok"] = ce_n, pe_n
+                dce = fetch_binance_opt_klines(ce_n, b_int)
+                dpe = fetch_binance_opt_klines(pe_n, b_int)
+                ce_last = fetch_binance_opt_last(ce_n)
+                pe_last = fetch_binance_opt_last(pe_n)
+                if ce_last and dce is not None and not dce.empty:
+                    dce.iloc[-1, dce.columns.get_loc("close")] = ce_last
+                if pe_last and dpe is not None and not dpe.empty:
+                    dpe.iloc[-1, dpe.columns.get_loc("close")] = pe_last
+                book["ce_rows"] = rows_from_df(dce)
+                book["pe_rows"] = rows_from_df(dpe)
+                book["ce_sw"] = rebuild_swings(book["ce_rows"])
+                book["pe_sw"] = rebuild_swings(book["pe_rows"])
+                if b_int == "1m":
+                    book["ce_1m_rows"] = book["ce_rows"]
+                    book["pe_1m_rows"] = book["pe_rows"]
+                else:
+                    book["ce_1m_rows"] = rows_from_df(fetch_binance_opt_klines(ce_n, "1m"))
+                    book["pe_1m_rows"] = rows_from_df(fetch_binance_opt_klines(pe_n, "1m"))
+                loaded_opt = True
+        except Exception as e:
+            book["err"] = f"binance-opt:{e}"
+        if not loaded_opt and not book.get("err"):
+            book["err"] = "Binance options ATM not found for this symbol"
     except Exception as e:
         book["err"] = str(e)
     books = st.session_state.get("_cry_books") or {}
@@ -291,6 +424,22 @@ def live_crypto_quotes(books, enabled):
             book["spot"] = px
         except Exception:
             pass
+        for side, key in (("ce", "ce_tok"), ("pe", "pe_tok")):
+            iname = book.get(key)
+            if not iname:
+                continue
+            try:
+                if book.get("opt_src") == "binance":
+                    usd = fetch_binance_opt_last(iname)
+                else:
+                    tk = deribit_ticker(iname)
+                    last = tk.get("last_price") or tk.get("mark_price")
+                    idx_px = float(book.get("spot") or 0)
+                    usd = float(last) * idx_px if last and idx_px else None
+                if usd and usd > 0:
+                    apply_live_tape(book, side, usd, None, None)
+            except Exception:
+                pass
     return books
 
 
@@ -301,7 +450,7 @@ def render_crypto_scalper():
         st.markdown(
             "<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;'>"
             "<span style='font-size:1.12rem;font-weight:700;color:#69F0AE;'>Multi Index Crypto Scalper</span>"
-            "<span style='color:#90A4AE;font-size:11px;'>Binance + Deribit public</span>"
+            f"<span style='color:#90A4AE;font-size:11px;'>Binance only · key {'ON' if _bn_keys()[0] else 'MISSING'}</span>"
             "</div>",
             unsafe_allow_html=True,
         )
