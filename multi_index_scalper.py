@@ -955,7 +955,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             except Exception:
                 pass
 
-    st.caption("WATCH LOG · click an index to jump")
+    _upd = _ist_now().strftime("%d-%m-%Y %I:%M %p")
+    st.caption(f"WATCH LOG    last updated {_upd}")
     if summary:
         wdf = pd.DataFrame(summary)
         try:
@@ -973,7 +974,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             st.dataframe(style_watch(wdf), use_container_width=True, height=watch_h, hide_index=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    st.caption("SETUPS · 7 rows · click an index to jump")
+    st.caption(f"SETUPS    last updated {_upd}")
     if setups:
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
@@ -996,7 +997,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     st.markdown("</div>", unsafe_allow_html=True)
 
     def draw_tape(title, pack, extra_cols=None):
-        st.markdown(f"**{title}**")
+        st.markdown(f"**{title}**  ·  last updated {_upd}")
         if pack["ann"]:
             df = pd.DataFrame(pack["ann"][::-1])
             cols = [c for c in ["time", "status", "flow", "Trend", "Flow x/3", "watch_reason", "price", "CVD", "RDI", "Disp", "volume", "VWAP"] if c in df.columns]
@@ -1032,6 +1033,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(
             f"<div id='mis-sec-{name}' style='display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
             f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · {st.session_state.get('mis_tf') or '1 min'}</span>"
+            f"<span style='color:#78909C;font-size:11px;'>last updated {_upd}</span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>Spot <b style='color:#EEE;'>{book.get('spot') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>Fut <b style='color:#EEE;'>{book.get('fut') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>ATM <b style='color:#EEE;'>{strike}</b> {oexp}</span>"
