@@ -1259,7 +1259,8 @@ def send_telegram_alert(text: str) -> bool:
 
 
 def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st, index_name=None):
-    """Edge-triggered alerts. No token in logs. Skip when market closed."""
+    """Old Default-mode alerts off. Multi Index Scalper sends CONFIRMED setups."""
+    return
     idx = index_name or st.session_state.get("_last_index") or "INDEX"
     live, _, _, _ = market_session_state(index_name=idx)
     if not live:
