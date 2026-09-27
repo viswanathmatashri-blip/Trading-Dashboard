@@ -428,6 +428,37 @@ def _vote_flow(pack, invert=False):
     return side
 
 
+def _row_at(ann, ts):
+    if not ann:
+        return {}
+    ts = str(ts or "")
+    for r in reversed(ann):
+        if str(r.get("time") or "") == ts:
+            return r
+    before = [r for r in ann if str(r.get("time") or "") <= ts]
+    return before[-1] if before else {}
+
+
+def attach_bar_confluence(idx_ann, ce_ann, pe_ann):
+    out = []
+    for r in idx_ann or []:
+        nr = dict(r)
+        ce = _row_at(ce_ann, r.get("time"))
+        pe = _row_at(pe_ann, r.get("time"))
+        nr["Trend"] = confluence_label([
+            _vote_status(r.get("status")),
+            _vote_status(ce.get("status")),
+            _vote_status(pe.get("status"), invert=True),
+        ], "TREND")
+        nr["Flow x/3"] = confluence_label([
+            _vote_flow({"Flow": r.get("flow"), "RDI": r.get("RDI")}),
+            _vote_flow({"Flow": ce.get("flow"), "RDI": ce.get("RDI")}),
+            _vote_flow({"Flow": pe.get("flow"), "RDI": pe.get("RDI")}, invert=True),
+        ], "FLOW")
+        out.append(nr)
+    return out
+
+
 def confluence_label(votes, kind="TREND"):
     longs = sum(1 for v in votes if v == "LONG")
     shorts = sum(1 for v in votes if v == "SHORT")
@@ -715,15 +746,22 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     else:
         b_lab, b_col = "STANDBY", "#FFB300"
     last = st.session_state.get("_last_broker") or "—"
-    h1, h2, h3 = st.columns([2.4, 0.9, 0.7])
+    h1, hL, h2, hTf, h3 = st.columns([1.7, 2.0, 0.85, 0.22, 0.55])
     with h1:
         st.markdown(
-            f"<div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap;'>"
-            f"<span style='font-size:1.15rem;font-weight:700;color:#69F0AE;'>Multi Index Scalper</span>"
-            f"<span style='color:{a_col};font-size:12px;font-weight:700;'>● SmartAPI {a_lab}</span>"
-            f"<span style='color:{b_col};font-size:12px;font-weight:700;'>● AliceBlue {b_lab}</span>"
-            f"<span style='color:#90A4AE;font-size:11px;'>last {last}</span>"
+            f"<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;'>"
+            f"<span style='font-size:1.12rem;font-weight:700;color:#69F0AE;'>Multi Index Scalper</span>"
+            f"<span style='color:{a_col};font-size:11px;font-weight:700;'>● SmartAPI {a_lab}</span>"
+            f"<span style='color:{b_col};font-size:11px;font-weight:700;'>● AliceBlue {b_lab}</span>"
             f"</div>",
+            unsafe_allow_html=True,
+        )
+    with hL:
+        st.markdown(
+            "<div style='font-size:11px;color:#90A4AE;line-height:1.25;'>"
+            "<b style='color:#B0BEC5;'>Status</b> WATCH · CONFIRMED · TREND DENIED &nbsp;|&nbsp; "
+            "<b style='color:#B0BEC5;'>Flow</b> ABSORB |RDI|≥0.40 Disp≤0.20 · EXH |RDI|≤0.10 · ACCEL |RDI|≥0.35 Disp≥0.85"
+            "</div>",
             unsafe_allow_html=True,
         )
     with h2:
@@ -732,12 +770,14 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             value=bool(st.session_state.get("enable_main_refresh")),
             key="cb_mis_refresh_main",
         )
+    with hTf:
+        st.markdown("<div style='padding-top:8px;font-size:12px;color:#B0BEC5;font-weight:700;'>TF</div>", unsafe_allow_html=True)
     with h3:
         _tfs = ["1 min", "2 min", "3 min", "5 min", "15 min"]
         _cur = st.session_state.get("mis_tf") or "1 min"
         if _cur not in _tfs:
             _cur = "1 min"
-        _tf = st.selectbox("TF", _tfs, index=_tfs.index(_cur), key="mis_tf_sel")
+        _tf = st.selectbox("TF", _tfs, index=_tfs.index(_cur), key="mis_tf_sel", label_visibility="collapsed")
         if _tf != st.session_state.get("mis_tf"):
             st.session_state["mis_tf"] = _tf
             st.session_state["mis_need_seed"] = True
@@ -789,25 +829,6 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         except Exception as e:
             st.session_state["_mis_live_err"] = str(e)[:180]
 
-    with st.expander("Status and flow legend", expanded=False):
-        L, R = st.columns(2)
-        with L:
-            st.markdown(
-                "**Status**\n\n"
-                "| Tag | Meaning |\n|---|---|\n"
-                "| `WATCH SHORT` / `WATCH LONG` | Price vs last swing, CVD disagrees |\n"
-                "| `CONFIRMED SHORT` / `LONG` | Pivot + CVD divergence |\n"
-                "| `TREND DENIED` | Break supported by CVD |"
-            )
-        with R:
-            st.markdown(
-                "**Flow**\n\n"
-                "| Tag | Rule |\n|---|---|\n"
-                "| `ABSORPTION` | |RDI| ≥ 0.40 and Disp ≤ 0.20 |\n"
-                "| `EXHAUSTION` | |RDI| ≤ 0.10 and WATCH/SWING |\n"
-                "| `ACCEL` | |RDI| ≥ 0.35 and Disp ≥ 0.85 |"
-            )
-
     summary, setups = [], []
     packs = {}
     for name in ORDER:
@@ -819,6 +840,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         idx = last_pack(book.get("idx_rows"), book.get("idx_sw"), book.get("fut"))
         ce = last_pack(book.get("ce_rows"), book.get("ce_sw"), None, book.get("ce_sym"))
         pe = last_pack(book.get("pe_rows"), book.get("pe_sw"), None, book.get("pe_sym"))
+        idx["ann"] = attach_bar_confluence(idx.get("ann"), ce.get("ann"), pe.get("ann"))
         t_lab = confluence_label([
             _vote_status(idx["WATCH"], invert=False),
             _vote_status(ce["WATCH"], invert=False),
@@ -924,16 +946,24 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.write("No CONFIRMED LONG/SHORT on FUT / CE / PE in the loaded sessions.")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    def draw_tape(title, pack):
+    def draw_tape(title, pack, extra_cols=None):
         st.markdown(f"**{title}**")
         if pack["ann"]:
             df = pd.DataFrame(pack["ann"][::-1])
-            cols = [c for c in ["time", "status", "flow", "watch_reason", "price", "CVD", "RDI", "Disp", "volume", "VWAP"] if c in df.columns]
-            st.dataframe(df[cols], use_container_width=True, hide_index=True, height=260)
+            cols = [c for c in ["time", "status", "flow", "Trend", "Flow x/3", "watch_reason", "price", "CVD", "RDI", "Disp", "volume", "VWAP"] if c in df.columns]
+            if extra_cols:
+                cols = extra_cols + [c for c in cols if c not in extra_cols]
+            sty = df[cols].style
+            extra = [c for c in ("Trend", "Flow x/3") if c in df.columns]
+            if extra:
+                sty = sty.map(confluence_css, subset=extra)
+            st.dataframe(sty.hide(axis="index"), use_container_width=True, height=260)
         else:
             st.write("No bars.")
 
-    for name in ORDER:
+    tape_box = st.container(height=640)
+    with tape_box:
+      for name in ORDER:
         if name not in packs:
             continue
         book, idx, ce, pe, t_lab, f_lab = packs[name]
@@ -953,7 +983,6 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(
             f"<div style='display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
             f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · {st.session_state.get('mis_tf') or '1 min'}</span>"
-            f"{_pill(t_lab)} {_pill(f_lab)}"
             f"<span style='color:#B0BEC5;font-size:13px;'>Spot <b style='color:#EEE;'>{book.get('spot') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>Fut <b style='color:#EEE;'>{book.get('fut') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>ATM <b style='color:#EEE;'>{strike}</b> {oexp}</span>"
