@@ -1131,10 +1131,22 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                     for r in fine
                 ]
             ts = bar.get("time") if bar else ""
+            hit = _row_at(idx.get("ann") or [], ts)
+            t_at = str((hit or {}).get("Trend") or "—")
+            f_at = str((hit or {}).get("Flow x/3") or "—")
+            tu2, fu2 = t_at.upper(), f_at.upper()
+            if (
+                tu2 in ("", "—", "NONE")
+                or tu2.startswith("CONFLICT")
+                or fu2.startswith("CONFLICT")
+                or (tu2.startswith("LONG") and fu2.startswith("SHORT"))
+                or (tu2.startswith("SHORT") and fu2.startswith("LONG"))
+            ):
+                continue
             row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
             if row:
-                row["Trend"] = t_lab
-                row["Flow"] = f_lab
+                row["Trend"] = t_at
+                row["Flow"] = f_at
                 setups.append(row)
 
     _send_mis_telegram(setups)
