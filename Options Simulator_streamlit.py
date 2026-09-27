@@ -4650,7 +4650,7 @@ elif st.session_state.get("app_view") == "miscalper":
         for _idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]:
             en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, True)), key=f"mis_en_{_idx}")
         st.session_state["mis_enabled"] = en
-        st.session_state["mis_max_loss"] = st.number_input("Max loss (INR)", min_value=500, value=int(st.session_state.get("mis_max_loss") or 5000), step=500)
+        st.session_state["mis_max_loss"] = st.number_input("Max loss (INR)", min_value=500, value=int(st.session_state.get("mis_max_loss") or 2000), step=500)
         if st.button("Seed / refresh tapes"):
             st.session_state["mis_need_seed"] = True
 elif st.session_state.get("app_view") == "scalper":
