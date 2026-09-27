@@ -194,10 +194,18 @@ def live_apply_quotes(books, enabled, quotes: dict):
         if not enabled.get(name):
             continue
         try:
+            cash = str(book.get("cash_tok") or "")
+            if cash and cash in quotes:
+                try:
+                    book["spot"] = float(quotes[cash].get("ltp"))
+                except Exception:
+                    pass
             tok = str(book.get("idx_tok") or "")
             if tok and tok in quotes:
                 q = quotes[tok]
                 apply_live_tape(book, "idx", q.get("ltp"), q.get("volume"), q.get("ltq"))
+                if not cash:
+                    book["spot"] = book.get("fut") or book.get("spot")
             ctok = str(book.get("ce_tok") or "")
             if ctok and ctok in quotes:
                 q = quotes[ctok]
@@ -539,7 +547,8 @@ def sl_below_ltp(pack, ts, ltp):
 
 
 def apply_min_sl(ltp, slpx):
-    floor = ltp * (1.0 + MIN_SL_PCT / 100.0)
+    pct = -5.0 if float(ltp or 0) < 100 else MIN_SL_PCT
+    floor = ltp * (1.0 + pct / 100.0)
     if slpx is None:
         return round(floor, 2)
     return round(min(float(slpx), floor), 2)
@@ -707,6 +716,16 @@ def seed_book(name, fetch_fn, df_master, token_map, fut_fn=None):
     if rows:
         book["fut"] = rows[-1]["price"]
         book["spot"] = rows[-1]["price"]
+    book["cash_tok"] = str(idx_tok) if idx_tok else ""
+    book["cash_exch"] = cash
+    if idx_tok:
+        try:
+            dspot, _ = fetch_fn(str(idx_tok), cash, interval, name, "mis_spot")
+            srows = rows_from_df(dspot)
+            if srows:
+                book["spot"] = srows[-1]["price"]
+        except Exception:
+            pass
     atm = _atm_from_master(df_master, name, book.get("spot"), fo)
     if atm:
         strike, exp, ce, pe = atm
@@ -818,7 +837,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             for n, book in books.items():
                 if not enabled.get(n):
                     continue
-                for k, exch_k in (("idx_tok", "idx_exch"), ("ce_tok", "idx_exch"), ("pe_tok", "idx_exch")):
+                for k, exch_k in (("idx_tok", "idx_exch"), ("cash_tok", "cash_exch"), ("ce_tok", "idx_exch"), ("pe_tok", "idx_exch")):
                     tok = book.get(k)
                     if tok:
                         toks.append((str(book.get(exch_k) or "NFO"), str(tok)))
