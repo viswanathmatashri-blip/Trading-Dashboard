@@ -653,6 +653,8 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
     slpx = apply_min_sl(ltp, sl_below_ltp(buy_pack, trigger_ts, ltp))
     target = tgt["price"] if tgt else None
     tgt_pct = round((target - ltp) / ltp * 100, 2) if target and ltp else None
+    if tgt_pct is None or tgt_pct < 3.0:
+        return None
     sl_pct = round((slpx - ltp) / ltp * 100, 2) if slpx and ltp else None
     risk = (ltp - slpx) if slpx is not None else None
     reward = (target - ltp) if target is not None else None
