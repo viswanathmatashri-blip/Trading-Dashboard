@@ -819,7 +819,17 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         idx = last_pack(book.get("idx_rows"), book.get("idx_sw"), book.get("fut"))
         ce = last_pack(book.get("ce_rows"), book.get("ce_sw"), None, book.get("ce_sym"))
         pe = last_pack(book.get("pe_rows"), book.get("pe_sw"), None, book.get("pe_sym"))
-        packs[name] = (book, idx, ce, pe)
+        t_lab = confluence_label([
+            _vote_status(idx["WATCH"], invert=False),
+            _vote_status(ce["WATCH"], invert=False),
+            _vote_status(pe["WATCH"], invert=True),
+        ], "TREND")
+        f_lab = confluence_label([
+            _vote_flow(idx, invert=False),
+            _vote_flow(ce, invert=False),
+            _vote_flow(pe, invert=True),
+        ], "FLOW")
+        packs[name] = (book, idx, ce, pe, t_lab, f_lab)
         strike = book.get("atm") or "—"
         oexp = book.get("exp") or "—"
         t_votes = [
@@ -926,14 +936,24 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     for name in ORDER:
         if name not in packs:
             continue
-        book, idx, ce, pe = packs[name]
+        book, idx, ce, pe, t_lab, f_lab = packs[name]
         strike = book.get("atm") or "—"
         oexp = book.get("exp") or "—"
         if book.get("err"):
             st.caption(book["err"])
+
+        def _pill(txt):
+            u = str(txt or "").upper()
+            bg = "#2e7d32" if u.startswith("LONG") else ("#c62828" if u.startswith("SHORT") else ("#00838f" if u.startswith("CONFLICT") else "#37474f"))
+            return (
+                f"<span style='background:{bg};color:#fff;font-size:11px;font-weight:700;"
+                f"padding:2px 8px;border-radius:10px;letter-spacing:0.02em;'>{txt}</span>"
+            )
+
         st.markdown(
-            f"<div style='display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
+            f"<div style='display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
             f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · {st.session_state.get('mis_tf') or '1 min'}</span>"
+            f"{_pill(t_lab)} {_pill(f_lab)}"
             f"<span style='color:#B0BEC5;font-size:13px;'>Spot <b style='color:#EEE;'>{book.get('spot') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>Fut <b style='color:#EEE;'>{book.get('fut') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>ATM <b style='color:#EEE;'>{strike}</b> {oexp}</span>"
