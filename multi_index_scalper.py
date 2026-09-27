@@ -599,7 +599,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     else:
         b_lab, b_col = "STANDBY", "#FFB300"
     last = st.session_state.get("_last_broker") or "—"
-    h1, h2 = st.columns([2.2, 1.1])
+    h1, h2, h3 = st.columns([2.4, 0.9, 0.7])
     with h1:
         st.markdown(
             f"<div style='display:flex;align-items:center;gap:14px;flex-wrap:wrap;'>"
@@ -611,25 +611,23 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             unsafe_allow_html=True,
         )
     with h2:
-        c_auto, c_tf = st.columns([1.05, 1])
-        with c_auto:
-            _mis_auto = st.checkbox(
-                "Auto-Refresh 5s",
-                value=bool(st.session_state.get("enable_main_refresh")),
-                key="cb_mis_refresh_main",
-            )
-        with c_tf:
-            _tfs = ["1 min", "2 min", "3 min", "5 min", "15 min"]
-            _cur = st.session_state.get("mis_tf") or "1 min"
-            if _cur not in _tfs:
-                _cur = "1 min"
-            _tf = st.selectbox("TF", _tfs, index=_tfs.index(_cur), key="mis_tf_sel", label_visibility="collapsed")
-            if _tf != st.session_state.get("mis_tf"):
-                st.session_state["mis_tf"] = _tf
-                st.session_state["mis_need_seed"] = True
-                st.session_state["_mis_books"] = {}
-                st.rerun()
+        _mis_auto = st.checkbox(
+            "Auto-Refresh 5s",
+            value=bool(st.session_state.get("enable_main_refresh")),
+            key="cb_mis_refresh_main",
+        )
+    with h3:
+        _tfs = ["1 min", "2 min", "3 min", "5 min", "15 min"]
+        _cur = st.session_state.get("mis_tf") or "1 min"
+        if _cur not in _tfs:
+            _cur = "1 min"
+        _tf = st.selectbox("TF", _tfs, index=_tfs.index(_cur), key="mis_tf_sel")
+        if _tf != st.session_state.get("mis_tf"):
             st.session_state["mis_tf"] = _tf
+            st.session_state["mis_need_seed"] = True
+            st.session_state["_mis_books"] = {}
+            st.rerun()
+        st.session_state["mis_tf"] = _tf
     if _mis_auto != bool(st.session_state.get("enable_main_refresh")):
         st.session_state["enable_main_refresh"] = _mis_auto
         st.rerun()
@@ -639,7 +637,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     if st.session_state.get("_mis_live_err"):
         st.caption(f"Quote tick: {st.session_state.get('_mis_live_err')}")
     enabled = dict(st.session_state.get("mis_enabled") or {n: True for n in ORDER})
-    max_loss = float(st.session_state.get("mis_max_loss") or 5000)
+    max_loss = float(st.session_state.get("mis_max_loss") or 2000)
     books = st.session_state.get("_mis_books") or {}
     if st.session_state.get("mis_need_seed"):
         names = [n for n in ORDER if enabled.get(n)]
