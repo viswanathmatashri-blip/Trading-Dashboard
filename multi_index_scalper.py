@@ -582,12 +582,17 @@ def setup_accuracy(buy_pack, trigger_ts, slpx, target):
             continue
         hit_sl = slpx is not None and lo <= slpx
         hit_tgt = target is not None and hi >= target
-        if hit_sl and hit_tgt:
-            return "SL Hit"
+        if not hit_sl and not hit_tgt:
+            continue
+        t0 = _parse_bar(trigger_ts)
+        t1 = _parse_bar(ts)
+        elapsed = ""
+        if t0 and t1:
+            sec = max(int((t1 - t0).total_seconds()), 0)
+            elapsed = f" +{sec // 60:02d}:{sec % 60:02d}"
         if hit_sl:
-            return "SL Hit"
-        if hit_tgt:
-            return "Target Hit"
+            return f"SL Hit{elapsed}"
+        return f"Target Hit{elapsed}"
     return "OPEN"
 
 
@@ -725,9 +730,9 @@ def style_setups(df):
         css = [""] * len(row)
         acc = str(row.get("Accuracy") or "")
         if "Accuracy" in row.index:
-            if acc == "Target Hit":
+            if acc.startswith("Target Hit"):
                 css[row.index.get_loc("Accuracy")] = "background-color:#2e7d32;color:#fff"
-            elif acc == "SL Hit":
+            elif acc.startswith("SL Hit"):
                 css[row.index.get_loc("Accuracy")] = "background-color:#c62828;color:#fff"
         try:
             rr = float(row["R:R"])
