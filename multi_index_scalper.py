@@ -19,6 +19,13 @@ STEP = {
 MIN_SL_PCT = -3.0
 RR_BLUE = 1.0
 PIVOT_L, PIVOT_R = 5, 5
+TF_API = {
+    "1 min": "ONE_MINUTE",
+    "2 min": "TWO_MINUTE",
+    "3 min": "THREE_MINUTE",
+    "5 min": "FIVE_MINUTE",
+    "15 min": "FIFTEEN_MINUTE",
+}
 FILL = {
     "CONFIRMED SHORT": "background-color:#c62828;color:#fff",
     "CONFIRMED LONG": "background-color:#2e7d32;color:#fff",
@@ -77,12 +84,23 @@ def rows_from_df(df: pd.DataFrame) -> list:
     return out
 
 
+def _tf_minutes():
+    lab = str(st.session_state.get("mis_tf") or "1 min")
+    for n in (15, 5, 3, 2, 1):
+        if str(n) in lab:
+            return n
+    return 1
+
+
 def _ist_minute():
+    step = _tf_minutes()
     try:
         from zoneinfo import ZoneInfo
         now = dt.datetime.now(ZoneInfo("Asia/Kolkata")).replace(second=0, microsecond=0)
     except Exception:
         now = dt.datetime.now().replace(second=0, microsecond=0)
+    minute = (now.minute // step) * step
+    now = now.replace(minute=minute)
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -534,7 +552,8 @@ def seed_book(name, fetch_fn, df_master, token_map, fut_fn=None):
     exch = fo if tok else cash
     book["idx_tok"] = token
     book["idx_exch"] = exch
-    df, _ = fetch_fn(token, exch, "ONE_MINUTE", name, "mis_idx")
+    interval = TF_API.get(st.session_state.get("mis_tf") or "1 min", "ONE_MINUTE")
+    df, _ = fetch_fn(token, exch, interval, name, "mis_idx")
     rows = rows_from_df(df)
     book["idx_rows"] = rows
     book["idx_sw"] = rebuild_swings(rows)
@@ -547,8 +566,8 @@ def seed_book(name, fetch_fn, df_master, token_map, fut_fn=None):
         book["atm"], book["exp"] = strike, exp
         book["ce_tok"], book["ce_sym"] = ce[0], ce[1]
         book["pe_tok"], book["pe_sym"] = pe[0], pe[1]
-        dce, _ = fetch_fn(ce[0], ce[2], "ONE_MINUTE", name, "mis_ce")
-        dpe, _ = fetch_fn(pe[0], pe[2], "ONE_MINUTE", name, "mis_pe")
+        dce, _ = fetch_fn(ce[0], ce[2], interval, name, "mis_ce")
+        dpe, _ = fetch_fn(pe[0], pe[2], interval, name, "mis_pe")
         book["ce_rows"] = rows_from_df(dce)
         book["pe_rows"] = rows_from_df(dpe)
         book["ce_sw"] = rebuild_swings(book["ce_rows"])
@@ -592,11 +611,25 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             unsafe_allow_html=True,
         )
     with h2:
-        _mis_auto = st.checkbox(
-            "Auto-Refresh 5s",
-            value=bool(st.session_state.get("enable_main_refresh")),
-            key="cb_mis_refresh_main",
-        )
+        c_auto, c_tf = st.columns([1.05, 1])
+        with c_auto:
+            _mis_auto = st.checkbox(
+                "Auto-Refresh 5s",
+                value=bool(st.session_state.get("enable_main_refresh")),
+                key="cb_mis_refresh_main",
+            )
+        with c_tf:
+            _tfs = ["1 min", "2 min", "3 min", "5 min", "15 min"]
+            _cur = st.session_state.get("mis_tf") or "1 min"
+            if _cur not in _tfs:
+                _cur = "1 min"
+            _tf = st.selectbox("TF", _tfs, index=_tfs.index(_cur), key="mis_tf_sel", label_visibility="collapsed")
+            if _tf != st.session_state.get("mis_tf"):
+                st.session_state["mis_tf"] = _tf
+                st.session_state["mis_need_seed"] = True
+                st.session_state["_mis_books"] = {}
+                st.rerun()
+            st.session_state["mis_tf"] = _tf
     if _mis_auto != bool(st.session_state.get("enable_main_refresh")):
         st.session_state["enable_main_refresh"] = _mis_auto
         st.rerun()
@@ -610,7 +643,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     books = st.session_state.get("_mis_books") or {}
     if st.session_state.get("mis_need_seed"):
         names = [n for n in ORDER if enabled.get(n)]
-        bar = st.progress(0.0, text="Seeding 1-min tapes…")
+        _tf_lab = st.session_state.get("mis_tf") or "1 min"
+        bar = st.progress(0.0, text=f"Seeding {_tf_lab} tapes…")
         for i, n in enumerate(names):
             try:
                 seed_book(n, fetch_fn, df_master, token_map, fut_fn=fut_fn)
@@ -769,7 +803,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             st.caption(book["err"])
         st.markdown(
             f"<div style='display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
-            f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · 1 min</span>"
+            f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · {st.session_state.get('mis_tf') or '1 min'}</span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>Spot <b style='color:#EEE;'>{book.get('spot') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>Fut <b style='color:#EEE;'>{book.get('fut') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>ATM <b style='color:#EEE;'>{strike}</b> {oexp}</span>"
