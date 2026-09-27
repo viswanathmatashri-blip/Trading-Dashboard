@@ -555,6 +555,42 @@ def apply_min_sl(ltp, slpx):
     return round(min(float(slpx), floor), 2)
 
 
+def setup_accuracy(buy_pack, trigger_ts, slpx, target):
+    """After trigger, which level prints first on the option tape."""
+    if slpx is None and target is None:
+        return "—"
+    try:
+        slpx = None if slpx is None else float(slpx)
+        target = None if target is None else float(target)
+    except Exception:
+        return "—"
+    ann = list(buy_pack.get("ann") or [])
+    started = False
+    for r in ann:
+        ts = str(r.get("time") or "")
+        if not started:
+            if ts >= str(trigger_ts or ""):
+                started = True
+            else:
+                continue
+        if ts == str(trigger_ts or ""):
+            continue
+        try:
+            hi = float(r.get("high") if r.get("high") is not None else r.get("price"))
+            lo = float(r.get("low") if r.get("low") is not None else r.get("price"))
+        except Exception:
+            continue
+        hit_sl = slpx is not None and lo <= slpx
+        hit_tgt = target is not None and hi >= target
+        if hit_sl and hit_tgt:
+            return "SL Hit"
+        if hit_sl:
+            return "SL Hit"
+        if hit_tgt:
+            return "Target Hit"
+    return "OPEN"
+
+
 def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, trigger_ts, max_loss):
     ltp = price_at(buy_pack, trigger_ts)
     if ltp is None:
@@ -586,7 +622,9 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
         "SL %": sl_pct if sl_pct is not None else "—",
         "Lot Qty": lot, "Entry lots": lots, "Qty": lots * lot,
         "Risk/lot": round(risk_lot, 2) if risk_lot else "—",
-        "R:R": rr if rr is not None else "—", "Bar": trigger_ts or "",
+        "R:R": rr if rr is not None else "—",
+        "Accuracy": setup_accuracy(buy_pack, trigger_ts, slpx, target),
+        "Bar": trigger_ts or "",
     }
 
 
@@ -685,6 +723,12 @@ def watch_log_html(df: pd.DataFrame) -> str:
 def style_setups(df):
     def row_style(row):
         css = [""] * len(row)
+        acc = str(row.get("Accuracy") or "")
+        if "Accuracy" in row.index:
+            if acc == "Target Hit":
+                css[row.index.get_loc("Accuracy")] = "background-color:#2e7d32;color:#fff"
+            elif acc == "SL Hit":
+                css[row.index.get_loc("Accuracy")] = "background-color:#c62828;color:#fff"
         try:
             rr = float(row["R:R"])
         except Exception:
