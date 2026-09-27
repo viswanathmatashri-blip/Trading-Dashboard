@@ -78,6 +78,24 @@ def _bn_keys():
     return g("BINANCE_API_KEY", "BINANCE_KEY"), g("BINANCE_SECRET_KEY", "BINANCE_SECRET", "BINANCE_API_SECRET")
 
 
+def _bn_proxies():
+    def g(*names):
+        for n in names:
+            try:
+                if n in st.secrets and str(st.secrets[n]).strip():
+                    return str(st.secrets[n]).strip()
+            except Exception:
+                pass
+            v = (os.getenv(n) or "").strip()
+            if v:
+                return v
+        return ""
+    url = g("BINANCE_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY")
+    if not url:
+        return None
+    return {"http": url, "https": url}
+
+
 def _bn_headers():
     h = dict(_HDR)
     key, _ = _bn_keys()
@@ -95,7 +113,13 @@ def _get_json(url, params=None, timeout=12, signed=False):
         params["recvWindow"] = 10000
         qs = urlencode(params)
         params["signature"] = hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    r = requests.get(url, params=params, timeout=timeout, headers=headers)
+    r = requests.get(
+        url,
+        params=params,
+        timeout=timeout,
+        headers=headers,
+        proxies=_bn_proxies(),
+    )
     r.raise_for_status()
     return r.json()
 
@@ -159,12 +183,14 @@ def binance_option_info():
     ):
         try:
             js = _get_json(url)
+            if isinstance(js, dict) and not (js.get("optionSymbols") or js.get("symbols")):
+                last_err = js.get("msg") or js.get("code") or "no optionSymbols"
+                continue
             st.session_state["_bn_opt_info"] = js
             return js
         except Exception as e:
             last_err = e
-    st.session_state["_bn_opt_info"] = {"_err": str(last_err)}
-    return st.session_state["_bn_opt_info"]
+    return {"_err": str(last_err or "eapi unavailable")}
 
 
 def _parse_bn_opt_symbol(sym):
@@ -184,9 +210,63 @@ def _parse_bn_opt_symbol(sym):
     return und, exp, k, side, str(sym)
 
 
+def _candidate_strikes(spot, step):
+    base = int(round(float(spot) / step) * step)
+    out = []
+    for stg in (step, max(step // 2, 1), step * 2):
+        b = int(round(float(spot) / stg) * stg)
+        for k in (b, b - stg, b + stg, base):
+            if k > 0 and k not in out:
+                out.append(int(k))
+    return out[:10]
+
+
+def _candidate_expiries():
+    today = dt.datetime.utcnow().date()
+    days = []
+    for i in range(0, 14):
+        days.append(today + dt.timedelta(days=i))
+    for i in range(0, 28):
+        d = today + dt.timedelta(days=i)
+        if d.weekday() == 4:
+            days.append(d)
+    seen, out = set(), []
+    for d in days:
+        if d >= today and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def pick_atm_by_probe(name, spot):
+    """Build BTC-YYMMDD-STRIKE-C and see which ticker lives."""
+    und = name.upper()
+    step = STEP.get(name, 50)
+    for exp in _candidate_expiries():
+        for k in _candidate_strikes(spot, step):
+            ce = f"{und}-{exp:%y%m%d}-{k}-C"
+            pe = f"{und}-{exp:%y%m%d}-{k}-P"
+            try:
+                last_c = fetch_binance_opt_last(ce)
+            except Exception:
+                last_c = 0
+            if not last_c:
+                continue
+            try:
+                last_p = fetch_binance_opt_last(pe)
+            except Exception:
+                last_p = 0
+            if last_p:
+                return int(k), str(exp), ce, pe
+    return None
+
+
 def pick_atm_binance(name, spot):
     if not spot:
         return None
+    probed = pick_atm_by_probe(name, spot)
+    if probed:
+        return probed
     und = name.upper()
     today = dt.datetime.utcnow().date()
     step = STEP.get(name, 50)
@@ -384,7 +464,7 @@ def pick_atm_deribit(ccy, spot):
             if exp < today:
                 continue
             k = float(it.get("strike") or 0)
-            if abs(k - atm) > step * 0.51:
+            if abs(k - float(spot)) > max(step * 2, float(spot) * 0.03):
                 continue
             side = str(it.get("option_type") or "").lower()
             if side not in ("call", "put"):
@@ -461,8 +541,44 @@ def seed_crypto(name):
                 loaded_opt = True
         except Exception as e:
             book["err"] = f"binance-opt:{e}"
+        if not loaded_opt and name in DERIBIT_CCY:
+            try:
+                ccy = DERIBIT_CCY[name]
+                dspot = deribit_index(ccy) or book.get("spot")
+                book["spot"] = dspot or book.get("spot")
+                atm = pick_atm_deribit(ccy, book.get("spot"))
+                if not atm:
+                    book["err"] = (book.get("err") or "") + " | Deribit ATM not found"
+                else:
+                    strike, exp, ce_n, pe_n = atm
+                    book["opt_src"] = "deribit"
+                    book["atm"], book["exp"] = strike, exp
+                    book["ce_sym"], book["pe_sym"] = ce_n, pe_n
+                    book["ce_tok"], book["pe_tok"] = ce_n, pe_n
+                    idx_px = float(book.get("spot") or 0)
+                    def _usd_last(iname):
+                        tk = deribit_ticker(iname)
+                        last = tk.get("last_price") or tk.get("mark_price") or 0
+                        try:
+                            last = float(last)
+                        except Exception:
+                            last = 0.0
+                        return (last * idx_px) if last and idx_px else 0.0
+                    ce_usd, pe_usd = _usd_last(ce_n), _usd_last(pe_n)
+                    dce = option_usd_df(deribit_chart(ce_n, d_res), idx_px, ce_usd)
+                    dpe = option_usd_df(deribit_chart(pe_n, d_res), idx_px, pe_usd)
+                    book["ce_rows"] = rows_from_df(dce)
+                    book["pe_rows"] = rows_from_df(dpe)
+                    book["ce_sw"] = rebuild_swings(book["ce_rows"])
+                    book["pe_sw"] = rebuild_swings(book["pe_rows"])
+                    book["ce_1m_rows"] = book["ce_rows"] if d_res == "1" else rows_from_df(option_usd_df(deribit_chart(ce_n, "1"), idx_px, ce_usd))
+                    book["pe_1m_rows"] = book["pe_rows"] if d_res == "1" else rows_from_df(option_usd_df(deribit_chart(pe_n, "1"), idx_px, pe_usd))
+                    book["err"] = ""
+                    loaded_opt = True
+            except Exception as e:
+                book["err"] = (book.get("err") or "") + f" | deribit:{e}"
         if not loaded_opt and not book.get("err"):
-            book["err"] = "Binance options ATM not found for this symbol"
+            book["err"] = "No option source (Binance eapi blocked; Deribit only BTC/ETH)"
     except Exception as e:
         book["err"] = str(e)
     books = st.session_state.get("_cry_books") or {}
@@ -510,7 +626,7 @@ def render_crypto_scalper():
         st.markdown(
             "<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;'>"
             "<span style='font-size:1.12rem;font-weight:700;color:#69F0AE;'>Multi Index Crypto Scalper</span>"
-            f"<span style='color:#90A4AE;font-size:11px;'>Binance only · key {'ON' if _bn_keys()[0] else 'MISSING'}</span>"
+            f"<span style='color:#90A4AE;font-size:11px;'>Binance spot/fut · Deribit opts fallback · key {'ON' if _bn_keys()[0] else 'OFF'}</span>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -551,6 +667,8 @@ def render_crypto_scalper():
     books = st.session_state.get("_cry_books") or {}
     if st.session_state.get("cry_need_seed"):
         names = [n for n in ORDER if enabled.get(n)]
+        st.session_state["_cry_books"] = {}
+        st.session_state.pop("_bn_opt_info", None)
         bar = st.progress(0.0, text="Seeding crypto tapes…")
         for i, n in enumerate(names):
             try:
