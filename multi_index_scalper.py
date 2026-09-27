@@ -548,7 +548,13 @@ def sl_below_ltp(pack, ts, ltp):
 
 
 def apply_min_sl(ltp, slpx):
-    pct = -5.0 if float(ltp or 0) < 100 else MIN_SL_PCT
+    px = float(ltp or 0)
+    if px < 70:
+        pct = -10.0
+    elif px < 100:
+        pct = -7.0
+    else:
+        pct = -5.0
     floor = ltp * (1.0 + pct / 100.0)
     if slpx is None:
         return round(floor, 2)
