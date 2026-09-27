@@ -555,7 +555,7 @@ def apply_min_sl(ltp, slpx):
     return round(min(float(slpx), floor), 2)
 
 
-def setup_accuracy(buy_pack, trigger_ts, slpx, target):
+def setup_accuracy(buy_pack, trigger_ts, slpx, target, now_ltp=None):
     """After trigger, which level prints first on the option tape."""
     if slpx is None and target is None:
         return "—"
@@ -593,6 +593,23 @@ def setup_accuracy(buy_pack, trigger_ts, slpx, target):
         if hit_sl:
             return f"SL Hit{elapsed}"
         return f"Target Hit{elapsed}"
+    try:
+        live = float(now_ltp) if now_ltp is not None else float(buy_pack.get("LTP"))
+    except Exception:
+        live = None
+    t0 = _parse_bar(trigger_ts)
+    now = _ist_now()
+    try:
+        now_n = now.replace(tzinfo=None)
+    except Exception:
+        now_n = now
+    if live is not None and t0 is not None and t0.date() == now_n.date():
+        sec = max(int((now_n - t0).total_seconds()), 0)
+        elapsed = f" +{sec // 60:02d}:{sec % 60:02d}"
+        if slpx is not None and live <= slpx:
+            return f"SL Hit{elapsed}"
+        if target is not None and live >= target:
+            return f"Target Hit{elapsed}"
     return "OPEN"
 
 
@@ -628,7 +645,7 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
         "Lot Qty": lot, "Entry lots": lots, "Qty": lots * lot,
         "Risk/lot": round(risk_lot, 2) if risk_lot else "—",
         "R:R": rr if rr is not None else "—",
-        "Accuracy": setup_accuracy(buy_pack, trigger_ts, slpx, target),
+        "Accuracy": setup_accuracy(buy_pack, trigger_ts, slpx, target, now_ltp=buy_pack.get("LTP")),
         "Bar": trigger_ts or "",
     }
 
@@ -850,6 +867,18 @@ def seed_book(name, fetch_fn, df_master, token_map, fut_fn=None):
         book["pe_rows"] = rows_from_df(dpe)
         book["ce_sw"] = rebuild_swings(book["ce_rows"])
         book["pe_sw"] = rebuild_swings(book["pe_rows"])
+        if interval == "ONE_MINUTE":
+            book["ce_1m_rows"] = book["ce_rows"]
+            book["pe_1m_rows"] = book["pe_rows"]
+        else:
+            try:
+                dce1, _ = fetch_fn(ce[0], ce[2], "ONE_MINUTE", name, "mis_ce1m")
+                dpe1, _ = fetch_fn(pe[0], pe[2], "ONE_MINUTE", name, "mis_pe1m")
+                book["ce_1m_rows"] = rows_from_df(dce1)
+                book["pe_1m_rows"] = rows_from_df(dpe1)
+            except Exception:
+                book["ce_1m_rows"] = book["ce_rows"]
+                book["pe_1m_rows"] = book["pe_rows"]
     for side, rk in (("idx", "idx_rows"), ("ce", "ce_rows"), ("pe", "pe_rows")):
         rs = book.get(rk) or []
         if rs:
@@ -1021,6 +1050,13 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 continue
             buy = rule[kind]
             buy_pack = ce if buy == "CE" else pe
+            fine = book.get("ce_1m_rows") if buy == "CE" else book.get("pe_1m_rows")
+            if fine:
+                buy_pack = dict(buy_pack)
+                buy_pack["ann"] = [
+                    {"time": r.get("time"), "high": r.get("high"), "low": r.get("low"), "price": r.get("price")}
+                    for r in fine
+                ]
             ts = bar.get("time") if bar else ""
             row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
             if row:
