@@ -1099,6 +1099,15 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Bar": bar_ts,
         })
         lot = LOT_SIZES.get(name, 1)
+        tu, fu = str(t_lab).upper(), str(f_lab).upper()
+        conflict = (
+            tu.startswith("CONFLICT")
+            or fu.startswith("CONFLICT")
+            or (tu.startswith("LONG") and fu.startswith("SHORT"))
+            or (tu.startswith("SHORT") and fu.startswith("LONG"))
+        )
+        if conflict:
+            continue
         for source, pack, rule in (
             ("FUT", idx, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
             ("CE", ce, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
