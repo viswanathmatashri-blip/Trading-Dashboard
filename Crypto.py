@@ -124,11 +124,20 @@ def _get_json(url, params=None, timeout=12, signed=False):
     return r.json()
 
 
+def _ist_fmt(ts_sec):
+    try:
+        from zoneinfo import ZoneInfo
+        t = dt.datetime.fromtimestamp(float(ts_sec), ZoneInfo("Asia/Kolkata"))
+    except Exception:
+        t = dt.datetime.utcfromtimestamp(float(ts_sec)) + dt.timedelta(hours=5, minutes=30)
+    return t.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _klines_from_binance_list(js):
     rows = []
     for k in js or []:
         rows.append({
-            "time": dt.datetime.utcfromtimestamp(int(k[0]) / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+            "time": _ist_fmt(int(k[0]) / 1000),
             "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
             "close": float(k[4]), "volume": float(k[5]),
         })
@@ -398,7 +407,7 @@ def deribit_chart(name, resolution="1", hours=36):
     for i, t in enumerate(ticks):
         try:
             rows.append({
-                "time": dt.datetime.utcfromtimestamp(int(t) / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                "time": _ist_fmt(int(t) / 1000),
                 "open": float(res["open"][i]),
                 "high": float(res["high"][i]),
                 "low": float(res["low"][i]),
@@ -426,7 +435,7 @@ def option_usd_df(df, index_px, last_usd=None):
         px = 0.0
     if df is None or getattr(df, "empty", True):
         if last_usd and last_usd > 0:
-            now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            now = _ist_now().strftime("%Y-%m-%d %H:%M:%S")
             return pd.DataFrame([{
                 "time": now, "open": last_usd, "high": last_usd,
                 "low": last_usd, "close": last_usd, "volume": 0,
@@ -439,7 +448,7 @@ def option_usd_df(df, index_px, last_usd=None):
                 out[c] = out[c].astype(float) * px
     if last_usd and last_usd > 0:
         if out.empty:
-            now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            now = _ist_now().strftime("%Y-%m-%d %H:%M:%S")
             out = pd.DataFrame([{
                 "time": now, "open": last_usd, "high": last_usd,
                 "low": last_usd, "close": last_usd, "volume": 0,
@@ -519,7 +528,7 @@ def seed_crypto(name):
                     dpe = fetch_binance_opt_klines(pe_n, b_int)
                 except Exception:
                     dpe = pd.DataFrame()
-                now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                now = _ist_now().strftime("%Y-%m-%d %H:%M:%S")
                 if (dce is None or dce.empty) and ce_last:
                     dce = pd.DataFrame([{"time": now, "open": ce_last, "high": ce_last, "low": ce_last, "close": ce_last, "volume": 0}])
                 elif ce_last and dce is not None and not dce.empty:
