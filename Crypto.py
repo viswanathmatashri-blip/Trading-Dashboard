@@ -56,17 +56,16 @@ TF_DERIBIT = {
 }
 
 
+_HDR = {"User-Agent": "Mozilla/5.0 GammaDesk/1.0", "Accept": "application/json"}
+
+
 def _get_json(url, params=None, timeout=12):
-    r = requests.get(url, params=params or {}, timeout=timeout)
+    r = requests.get(url, params=params or {}, timeout=timeout, headers=_HDR)
     r.raise_for_status()
     return r.json()
 
 
-def fetch_binance_klines(symbol, interval, limit=500):
-    js = _get_json(
-        "https://fapi.binance.com/fapi/v1/klines",
-        {"symbol": symbol, "interval": interval, "limit": int(limit)},
-    )
+def _klines_from_binance_list(js):
     rows = []
     for k in js or []:
         rows.append({
@@ -77,9 +76,76 @@ def fetch_binance_klines(symbol, interval, limit=500):
     return pd.DataFrame(rows)
 
 
+def fetch_binance_klines(symbol, interval, limit=500):
+    """fapi is 451 in many regions (IN). Fall back to Vision spot, Bybit, Deribit perp."""
+    errors = []
+    for url, params in (
+        ("https://data-api.binance.vision/api/v3/klines",
+         {"symbol": symbol, "interval": interval, "limit": int(limit)}),
+        ("https://api.binance.com/api/v3/klines",
+         {"symbol": symbol, "interval": interval, "limit": int(limit)}),
+        ("https://fapi.binance.com/fapi/v1/klines",
+         {"symbol": symbol, "interval": interval, "limit": int(limit)}),
+    ):
+        try:
+            js = _get_json(url, params)
+            df = _klines_from_binance_list(js)
+            if not df.empty:
+                return df
+        except Exception as e:
+            errors.append(f"{url.split('/')[2]}:{e}")
+    by_int = {"1m": "1", "3m": "3", "5m": "5", "15m": "15"}.get(interval, "1")
+    try:
+        js = _get_json(
+            "https://api.bybit.com/v5/market/kline",
+            {"category": "linear", "symbol": symbol, "interval": by_int, "limit": min(int(limit), 200)},
+        )
+        lst = (((js or {}).get("result") or {}).get("list") or [])
+        rows = []
+        for k in reversed(lst):
+            rows.append({
+                "time": dt.datetime.utcfromtimestamp(int(k[0]) / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                "open": float(k[1]), "high": float(k[2]), "low": float(k[3]),
+                "close": float(k[4]), "volume": float(k[5]),
+            })
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            return df
+    except Exception as e:
+        errors.append(f"bybit:{e}")
+    ccy = symbol.replace("USDT", "")
+    if ccy in ("BTC", "ETH"):
+        try:
+            res = {"1m": "1", "3m": "3", "5m": "5", "15m": "15"}.get(interval, "1")
+            df = deribit_chart(f"{ccy}-PERPETUAL", res)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            errors.append(f"deribit:{e}")
+    raise RuntimeError(" / ".join(errors[:3]) or "no kline source")
+
+
 def fetch_binance_ticker(symbol):
-    js = _get_json("https://fapi.binance.com/fapi/v1/ticker/price", {"symbol": symbol})
-    return float(js.get("price") or 0)
+    for url, params, path in (
+        ("https://data-api.binance.vision/api/v3/ticker/price", {"symbol": symbol}, "price"),
+        ("https://api.binance.com/api/v3/ticker/price", {"symbol": symbol}, "price"),
+        ("https://fapi.binance.com/fapi/v1/ticker/price", {"symbol": symbol}, "price"),
+        ("https://api.bybit.com/v5/market/tickers", {"category": "linear", "symbol": symbol}, "bybit"),
+    ):
+        try:
+            js = _get_json(url, params)
+            if path == "bybit":
+                lst = (((js or {}).get("result") or {}).get("list") or [])
+                if lst:
+                    return float(lst[0].get("lastPrice"))
+            else:
+                return float(js.get("price") or 0)
+        except Exception:
+            continue
+    ccy = symbol.replace("USDT", "")
+    if ccy in ("BTC", "ETH"):
+        return deribit_index(ccy)
+    raise RuntimeError(f"no ticker for {symbol}")
 
 
 def deribit_index(ccy):
