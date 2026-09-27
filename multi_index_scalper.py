@@ -642,7 +642,9 @@ def setup_accuracy(buy_pack, trigger_ts, slpx, target, now_ltp=None):
 
 
 def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, trigger_ts, max_loss):
-    ltp = price_at(buy_pack, trigger_ts)
+    ltp = buy_pack.get("_entry_px")
+    if ltp is None:
+        ltp = price_at(buy_pack, trigger_ts)
     if ltp is None:
         ltp = buy_pack.get("LTP")
     try:
@@ -675,7 +677,10 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
         "Lot Qty": lot, "Entry lots": lots, "Qty": lots * lot,
         "Risk/lot": round(risk_lot, 2) if risk_lot else "—",
         "R:R": rr if rr is not None else "—",
-        "Accuracy": setup_accuracy(buy_pack, trigger_ts, slpx, target, now_ltp=buy_pack.get("LTP")),
+        "Accuracy": setup_accuracy(
+            dict(buy_pack, ann=buy_pack.get("_acc_ann") or buy_pack.get("ann")),
+            trigger_ts, slpx, target, now_ltp=buy_pack.get("LTP"),
+        ),
         "Bar": trigger_ts or "",
     }
 
@@ -1134,14 +1139,17 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             for kind, bar in all_confirmed(pack.get("ann")):
                 buy = rule[kind]
                 buy_pack = ce if buy == "CE" else pe
+                ts = bar.get("time") if bar else ""
+                if source in ("CE", "PE") and bar.get("price") is not None:
+                    buy_pack = dict(buy_pack)
+                    buy_pack["_entry_px"] = bar.get("price")
                 fine = book.get("ce_1m_rows") if buy == "CE" else book.get("pe_1m_rows")
                 if fine:
                     buy_pack = dict(buy_pack)
-                    buy_pack["ann"] = [
+                    buy_pack["_acc_ann"] = [
                         {"time": r.get("time"), "high": r.get("high"), "low": r.get("low"), "price": r.get("price")}
                         for r in fine
                     ]
-                ts = bar.get("time") if bar else ""
                 hit = _row_at(idx.get("ann") or [], ts)
                 t_at = str((hit or {}).get("Trend") or t_lab or "—")
                 f_at = str((hit or {}).get("Flow x/3") or f_lab or "—")
@@ -1156,6 +1164,13 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                     continue
                 row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
                 if row:
+                    live_pack = ce if buy == "CE" else pe
+                    try:
+                        live_px = float(live_pack.get("LTP"))
+                        if live_px > 0:
+                            row["LTP"] = round(live_px, 2)
+                    except Exception:
+                        pass
                     row["Trend"] = t_at
                     row["Flow"] = f_at
                     setups.append(row)
