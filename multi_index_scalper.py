@@ -617,6 +617,20 @@ def style_watch(df):
     extra = [c for c in ("Trend", "Flow x/3") if c in df.columns]
     if extra:
         sty = sty.map(confluence_css, subset=extra)
+    gold = [c for c in ("Idx WATCH", "CE WATCH", "PE WATCH") if c in df.columns]
+    head_css = []
+    for i, c in enumerate(df.columns):
+        if c in gold:
+            head_css.append({
+                "selector": f"th.col_heading.level0.col{i}",
+                "props": [
+                    ("background-color", "#C9A227"),
+                    ("color", "#111111"),
+                    ("font-weight", "800"),
+                ],
+            })
+    if head_css:
+        sty = sty.set_table_styles(head_css, overwrite=False)
     return sty.hide(axis="index")
 
 
