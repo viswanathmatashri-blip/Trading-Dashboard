@@ -605,16 +605,28 @@ def causal_watch_events(rows):
     out = []
     if len(rows) < 8:
         return out
-    for i in range(7, len(rows)):
-        prefix = rows[: i + 1]
-        ann = annotate_bars(prefix, rebuild_swings(prefix))
-        if not ann:
-            continue
-        last = ann[-1]
-        stt = str(last.get("status") or "")
+    try:
+        ann = annotate_bars(rows, rebuild_swings(rows))
+    except Exception:
+        return out
+    lag = dt.timedelta(minutes=max(PIVOT_R * _tf_minutes(), 1))
+    for r in ann:
+        stt = str(r.get("status") or "")
         kind = "WATCH LONG" if "WATCH LONG" in stt else ("WATCH SHORT" if "WATCH SHORT" in stt else None)
-        if kind:
-            out.append((kind, last))
+        if not kind:
+            continue
+        reason = str(r.get("watch_reason") or "")
+        swing_ts = None
+        if " @ " in reason:
+            swing_ts = _parse_bar(reason.split(" @ ", 1)[1][:19])
+        bar_ts = _parse_bar(r.get("time"))
+        if swing_ts and bar_ts:
+            try:
+                if bar_ts.replace(tzinfo=None) < swing_ts.replace(tzinfo=None) + lag:
+                    continue
+            except Exception:
+                pass
+        out.append((kind, r))
     return out
 
 
@@ -1258,6 +1270,10 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             books[_n] = clip_book_session(_b)
     st.session_state["_mis_books"] = books
 
+    if not books:
+        st.info("Click Seed / refresh tapes in the sidebar.")
+        return
+
     summary, live_alerts = [], []
     journal = st.session_state.setdefault("_mis_live_setups", [])
     packs = {}
@@ -1353,8 +1369,10 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                         continue
                     row["Trend"] = t_at
                     row["Flow"] = f_at
-                    row["_jk"] = f"{name}|{str(ts)[:16]}|{buy}"
-                    have_i = next((i for i, r in enumerate(journal) if str(r.get("_jk")) == row["_jk"]), None)
+                    row["_jk"] = f"{name}|{str(ts)[:16]}|{str(row.get('Buy') or buy).strip()}"
+                    def _dk(r):
+                        return f"{r.get('Index')}|{str(r.get('Bar') or r.get('Pivot') or '')[:16]}|{str(r.get('Buy') or '').strip()}"
+                    have_i = next((i for i, r in enumerate(journal) if _dk(r) == row["_jk"]), None)
                     if have_i is None:
                         journal.append(row)
                         if session_open(name):
@@ -1369,7 +1387,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
 
     compact, seen = [], {}
     for r in journal:
-        k = r.get("_jk") or f"{r.get('Index')}|{str(r.get('Bar') or '')[:16]}|{r.get('Buy')}"
+        k = f"{r.get('Index')}|{str(r.get('Bar') or r.get('Pivot') or '')[:16]}|{str(r.get('Buy') or '').strip()}"
         trig = str(r.get("Trigger") or "")
         if k not in seen:
             seen[k] = len(compact)
