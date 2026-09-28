@@ -56,6 +56,42 @@ def signed_delta(o, c, v):
     return float(v) if c > o else (-float(v) if c < o else 0.0)
 
 
+EFI_WIN = 5
+
+
+def attach_efi(rows):
+    """EFI = vol * (close - prev close). EFI sl = OLS slope over last EFI_WIN bars."""
+    prev_c = None
+    efi_hist = []
+    for r in rows or []:
+        try:
+            c = float(r.get("price"))
+            v = float(r.get("volume") or 0)
+        except Exception:
+            c, v = None, 0.0
+        if prev_c is None or c is None:
+            efi = 0.0
+        else:
+            efi = v * (c - prev_c)
+        r["EFI"] = round(efi, 2)
+        efi_hist.append(efi)
+        win = efi_hist[-EFI_WIN:]
+        n = len(win)
+        sl = 0.0
+        if n >= 3:
+            sx = n * (n - 1) / 2.0
+            sx2 = (n - 1) * n * (2 * n - 1) / 6.0
+            sy = sum(win)
+            sxy = sum(i * y for i, y in enumerate(win))
+            den = n * sx2 - sx * sx
+            sl = (n * sxy - sx * sy) / den if den else 0.0
+        r["EFI sl"] = round(sl, 4)
+        r["EFI tag"] = "EFI+" if sl > 0 else ("EFI-" if sl < 0 else "EFI flat")
+        if c is not None:
+            prev_c = c
+    return rows
+
+
 def rows_from_df(df: pd.DataFrame) -> list:
     if df is None or getattr(df, "empty", True):
         return []
@@ -87,7 +123,7 @@ def rows_from_df(df: pd.DataFrame) -> list:
             "VWAP_1.5σ_dn": round(vwap - 1.5 * sig, 2),
             "source": "HIST_1m",
         })
-    return out
+    return attach_efi(out)
 
 
 def _tf_minutes():
@@ -186,6 +222,7 @@ def apply_live_tape(book, side, price, day_vol=None, ltq=None):
         form["c"] = px
         form["v"] += max(dv, 0.0)
     rows = _rebuild_last_from_prev(rows, form["t"], form["o"], form["h"], form["l"], form["c"], form["v"])
+    attach_efi(rows)
     book[key_form] = form
     book[key_rows] = rows
     book[key_sw] = rebuild_swings(rows)
@@ -349,7 +386,14 @@ def annotate_bars(rows, swings):
         row["watch_reason"] = reason
         row["RDI"] = None if rdi is None else round(rdi, 3)
         row["Disp"] = None if disp is None else round(disp, 3)
+        row["EFI"] = r.get("EFI")
+        row["EFI sl"] = r.get("EFI sl")
+        row["EFI tag"] = r.get("EFI tag") or "—"
         row["flow"] = flow_tag(rdi, disp, status)
+        if row.get("EFI tag") and row["EFI tag"] != "—":
+            if reason:
+                reason = f"{reason} | {row['EFI tag']} sl={row.get('EFI sl')}"
+            row["watch_reason"] = reason or row.get("watch_reason") or ""
         out.append(row)
         for s in here:
             if s.get("side") == "SH":
@@ -1481,7 +1525,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(f"**{title}**  ·  last updated {_upd}")
         if pack["ann"]:
             df = pd.DataFrame(pack["ann"][::-1])
-            cols = [c for c in ["time", "status", "flow", "Trend", "Flow x/3", "watch_reason", "price", "CVD", "RDI", "Disp", "volume", "VWAP"] if c in df.columns]
+            cols = [c for c in ["time", "status", "flow", "Trend", "Flow x/3", "watch_reason", "price", "CVD", "EFI", "EFI sl", "EFI tag", "RDI", "Disp", "volume", "VWAP"] if c in df.columns]
             if extra_cols:
                 cols = extra_cols + [c for c in cols if c not in extra_cols]
             sty = df[cols].style
