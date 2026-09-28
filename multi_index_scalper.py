@@ -599,6 +599,25 @@ def all_watch(ann):
     return out
 
 
+def causal_watch_events(rows):
+    """WATCH printable at each close using only bars up to that close (no future)."""
+    rows = list(rows or [])
+    out = []
+    if len(rows) < 8:
+        return out
+    for i in range(7, len(rows)):
+        prefix = rows[: i + 1]
+        ann = annotate_bars(prefix, rebuild_swings(prefix))
+        if not ann:
+            continue
+        last = ann[-1]
+        stt = str(last.get("status") or "")
+        kind = "WATCH LONG" if "WATCH LONG" in stt else ("WATCH SHORT" if "WATCH SHORT" in stt else None)
+        if kind:
+            out.append((kind, last))
+    return out
+
+
 def last_watch(ann):
     """Live signal: WATCH on the latest bar only (no 5-bar wait)."""
     if not ann:
@@ -1302,14 +1321,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 "CONFIRMED LONG": rule["CONFIRMED LONG"],
                 "CONFIRMED SHORT": rule["CONFIRMED SHORT"],
             }
+            raw = book.get("idx_rows") if source == "FUT" else (book.get("ce_rows") if source == "CE" else book.get("pe_rows"))
+            events = [(k, b) for k, b in causal_watch_events(raw) if in_session_ts(name, (b or {}).get("time"))]
             live_kind, live_bar = last_watch(pack.get("ann"))
-            events = []
-            if live_kind and live_bar and "WATCH" in str(live_kind):
-                ts_w = live_bar.get("time")
-                if in_session_ts(name, ts_w):
-                    close_ts = last_session_bar(name, pack.get("ann") or [], ts_w)
-                    if session_open(name) or str(ts_w)[:16] == str(close_ts)[:16]:
-                        events.append((live_kind, live_bar))
             for kind, bar in events:
                 buy = rule_w[kind]
                 buy_pack = ce if buy == "CE" else pe
@@ -1332,14 +1346,6 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 if t_at in ("", "—"):
                     t_at = "LONG CONFLUENCE 1/3" if "LONG" in kind else "SHORT CONFLUENCE 1/3"
                 tu2, fu2 = t_at.upper(), f_at.upper()
-                if tu2.startswith("CONFLICT") or fu2.startswith("CONFLICT"):
-                    continue
-                if tu2.startswith("LONG") and fu2.startswith("SHORT"):
-                    continue
-                if tu2.startswith("SHORT") and fu2.startswith("LONG"):
-                    continue
-                if not rdi_agrees(kind, bar):
-                    continue
                 row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
                 if row:
                     chk = row.get("Pivot") or row.get("Bar") or ts
@@ -1412,7 +1418,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    st.caption(f"SETUPS · live WATCH journal only (no CONFIRMED backpaint)    last updated {_upd}")
+    st.caption(f"SETUPS · causal WATCH at each bar close (no future bars)    last updated {_upd}")
     if setups:
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
