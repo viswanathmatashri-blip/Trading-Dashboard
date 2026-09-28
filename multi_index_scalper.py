@@ -346,6 +346,7 @@ def flow_tag(rdi, disp, status):
 
 
 def annotate_bars(rows, swings):
+    rows = attach_efi(list(rows or []))
     by_ts = {}
     for s in swings:
         by_ts.setdefault(str(s.get("timestamp")), []).append(s)
@@ -460,7 +461,7 @@ def clip_book_session(book):
     if not name:
         return book
     for k in ("idx_rows", "ce_rows", "pe_rows", "ce_1m_rows", "pe_1m_rows"):
-        book[k] = clip_session_rows(name, book.get(k))
+        book[k] = attach_efi(clip_session_rows(name, book.get(k)))
     for side in ("idx", "ce", "pe"):
         form = book.get(f"form_{side}")
         if form and not in_session_ts(name, form.get("t")):
