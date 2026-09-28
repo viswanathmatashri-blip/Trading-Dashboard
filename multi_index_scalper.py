@@ -1302,12 +1302,14 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 "CONFIRMED LONG": rule["CONFIRMED LONG"],
                 "CONFIRMED SHORT": rule["CONFIRMED SHORT"],
             }
-            if not session_open(name):
-                continue
             live_kind, live_bar = last_watch(pack.get("ann"))
             events = []
-            if live_kind and live_bar and "WATCH" in live_kind:
-                events.append((live_kind, live_bar))
+            if live_kind and live_bar and "WATCH" in str(live_kind):
+                ts_w = live_bar.get("time")
+                if in_session_ts(name, ts_w):
+                    close_ts = last_session_bar(name, pack.get("ann") or [], ts_w)
+                    if session_open(name) or str(ts_w)[:16] == str(close_ts)[:16]:
+                        events.append((live_kind, live_bar))
             for kind, bar in events:
                 buy = rule_w[kind]
                 buy_pack = ce if buy == "CE" else pe
@@ -1349,7 +1351,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                     have = {str(r.get("_jk")) for r in journal}
                     if row["_jk"] not in have:
                         journal.append(row)
-                        live_alerts.append(row)
+                        if session_open(name):
+                            live_alerts.append(row)
                     else:
                         for r in journal:
                             if r.get("_jk") == row["_jk"]:
@@ -1431,7 +1434,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         except TypeError:
             st.dataframe(style_setups(sdf), use_container_width=True, height=setup_h, hide_index=True)
     else:
-        st.write("No CONFIRMED LONG/SHORT on FUT / CE / PE in the loaded sessions.")
+        st.write("No live WATCH journal yet — Auto-Refresh during session, or last-bar WATCH at the close.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     def draw_tape(title, pack, extra_cols=None):
