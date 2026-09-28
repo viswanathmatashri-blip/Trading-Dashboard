@@ -143,8 +143,11 @@ def _rebuild_last_from_prev(rows, t, o, h, l, c, v):
 
 
 def apply_live_tape(book, side, price, day_vol=None, ltq=None):
-    """Colab Tape.apply_live — only the current IST minute changes."""
+    """Only the current IST minute of THIS product. Closed sessions are not stamped."""
     if price is None:
+        return book
+    nm = book.get("name") or ""
+    if nm and not session_open(nm):
         return book
     try:
         px = float(price)
@@ -529,6 +532,41 @@ def is_live_confirm(pivot_ts, last_tape_ts):
         pass
     window = dt.timedelta(minutes=_tf_minutes() * 2)
     return due <= last + dt.timedelta(seconds=30) and due >= last - window
+
+
+def rdi_agrees(kind, bar) -> bool:
+    """Reject WATCH/CONFIRMED if bar RDI fights the side."""
+    try:
+        rdi = bar.get("RDI")
+        if rdi is None:
+            return True
+        rdi = float(rdi)
+    except Exception:
+        return True
+    if "LONG" in str(kind):
+        return rdi >= -0.10
+    if "SHORT" in str(kind):
+        return rdi <= 0.10
+    return True
+
+
+def all_watch(ann):
+    out, seen = [], set()
+    for r in ann or []:
+        stt = str(r.get("status") or "")
+        kind = None
+        if "WATCH LONG" in stt:
+            kind = "WATCH LONG"
+        elif "WATCH SHORT" in stt:
+            kind = "WATCH SHORT"
+        if not kind:
+            continue
+        key = (kind, str(r.get("time") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((kind, r))
+    return out
 
 
 def last_watch(ann):
@@ -1164,7 +1202,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         except Exception as e:
             st.session_state["_mis_live_err"] = str(e)[:180]
 
-    summary, setups = [], []
+    summary, setups, live_alerts = [], [], []
     packs = {}
     for name in ORDER:
         if not enabled.get(name):
@@ -1215,8 +1253,6 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Bar": bar_ts,
         })
         lot = LOT_SIZES.get(name, 1)
-        if not session_open(name):
-            continue
         for source, pack, rule in (
             ("FUT", idx, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
             ("CE", ce, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
@@ -1228,10 +1264,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 "CONFIRMED LONG": rule["CONFIRMED LONG"],
                 "CONFIRMED SHORT": rule["CONFIRMED SHORT"],
             }
-            events = []
-            wkind, wbar = last_watch(pack.get("ann"))
-            if wkind:
-                events.append((wkind, wbar))
+            events = all_watch(pack.get("ann")) + all_confirmed(pack.get("ann"))
+            live_kind, live_bar = last_watch(pack.get("ann"))
             for kind, bar in events:
                 buy = rule_w[kind]
                 buy_pack = ce if buy == "CE" else pe
@@ -1258,20 +1292,22 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                     continue
                 if tu2.startswith("SHORT") and fu2.startswith("LONG"):
                     continue
+                if not rdi_agrees(kind, bar):
+                    continue
                 row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
                 if row:
-                    live_pack = ce if buy == "CE" else pe
-                    try:
-                        live_px = float(live_pack.get("LTP"))
-                        if live_px > 0:
-                            row["LTP"] = round(live_px, 2)
-                    except Exception:
-                        pass
                     row["Trend"] = t_at
                     row["Flow"] = f_at
                     setups.append(row)
+                    if (
+                        session_open(name)
+                        and live_kind == kind
+                        and live_bar
+                        and str(live_bar.get("time") or "") == str(ts)
+                    ):
+                        live_alerts.append(row)
 
-    _send_mis_telegram(setups)
+    _send_mis_telegram(live_alerts)
 
     n_watch = max(len(summary), 1)
     watch_h = min(38 * (n_watch + 1) + 20, 320)
@@ -1320,7 +1356,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    st.caption(f"SETUPS · LIVE WATCH on last bar    last updated {_upd}")
+    st.caption(f"SETUPS · WATCH/CONFIRMED + Trend confluence + RDI agrees    last updated {_upd}")
     if setups:
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
