@@ -1353,18 +1353,34 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                         continue
                     row["Trend"] = t_at
                     row["Flow"] = f_at
-                    row["_jk"] = f"{name}|{source}|{kind}|{ts}|{buy}"
-                    have = {str(r.get("_jk")) for r in journal}
-                    if row["_jk"] not in have:
+                    row["_jk"] = f"{name}|{str(ts)[:16]}|{buy}"
+                    have_i = next((i for i, r in enumerate(journal) if str(r.get("_jk")) == row["_jk"]), None)
+                    if have_i is None:
                         journal.append(row)
                         if session_open(name):
                             live_alerts.append(row)
                     else:
-                        for r in journal:
-                            if r.get("_jk") == row["_jk"]:
-                                r["Accuracy"] = row.get("Accuracy")
-                                break
+                        old = journal[have_i]
+                        old_src = str(old.get("Trigger") or "")
+                        if source in ("CE", "PE") and old_src.startswith("FUT"):
+                            journal[have_i] = row
+                        else:
+                            old["Accuracy"] = row.get("Accuracy")
 
+    compact, seen = [], {}
+    for r in journal:
+        k = r.get("_jk") or f"{r.get('Index')}|{str(r.get('Bar') or '')[:16]}|{r.get('Buy')}"
+        trig = str(r.get("Trigger") or "")
+        if k not in seen:
+            seen[k] = len(compact)
+            r["_jk"] = k
+            compact.append(r)
+        else:
+            prev = compact[seen[k]]
+            if trig.startswith(("CE", "PE")) and str(prev.get("Trigger") or "").startswith("FUT"):
+                r["_jk"] = k
+                compact[seen[k]] = r
+    journal = compact
     st.session_state["_mis_live_setups"] = journal
     setups = [dict(r) for r in journal]
     for r in setups:
