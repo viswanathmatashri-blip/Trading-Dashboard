@@ -544,6 +544,23 @@ def nearest_sh_above(swings, ltp):
     return min(above, key=lambda s: s["price"]) if above else None
 
 
+def target_for_long(pack, ts, ltp):
+    sh = nearest_sh_above(pack.get("swings"), ltp)
+    if sh and float(sh["price"]) > float(ltp):
+        return float(sh["price"])
+    highs = []
+    for r in pack.get("ann") or []:
+        if str(r.get("time") or "") < str(ts or ""):
+            continue
+        try:
+            h = float(r.get("high") if r.get("high") is not None else r.get("price"))
+        except Exception:
+            continue
+        if h > float(ltp):
+            highs.append(h)
+    return min(highs) if highs else None
+
+
 def sl_below_ltp(pack, ts, ltp):
     rows = pack.get("ann") or []
     if not rows:
@@ -642,6 +659,18 @@ def setup_accuracy(buy_pack, trigger_ts, slpx, target, now_ltp=None):
 
 
 def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, trigger_ts, max_loss):
+    freeze = st.session_state.setdefault("_mis_setup_freeze", {})
+    fk = f"{index}|{source}|{confirmed}|{trigger_ts}|{buy_side}|{strike}"
+    if fk in freeze:
+        prev = dict(freeze[fk])
+        prev["Accuracy"] = setup_accuracy(
+            dict(buy_pack, ann=buy_pack.get("_acc_ann") or buy_pack.get("ann")),
+            trigger_ts, prev.get("SL") if prev.get("SL") != "—" else None,
+            prev.get("Target") if prev.get("Target") != "—" else None,
+            now_ltp=buy_pack.get("LTP"),
+        )
+        return prev
+
     ltp = buy_pack.get("_entry_px")
     if ltp is None:
         ltp = price_at(buy_pack, trigger_ts)
@@ -651,11 +680,12 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
         ltp = float(ltp)
     except Exception:
         return None
-    tgt = nearest_sh_above(buy_pack.get("swings"), ltp)
     slpx = apply_min_sl(ltp, sl_below_ltp(buy_pack, trigger_ts, ltp))
-    target = tgt["price"] if tgt else None
-    tgt_pct = round((target - ltp) / ltp * 100, 2) if target and ltp else None
-    if tgt_pct is None or tgt_pct < 3.0:
+    target = target_for_long(buy_pack, trigger_ts, ltp)
+    if target is None or float(target) <= ltp:
+        return None
+    tgt_pct = round((target - ltp) / ltp * 100, 2)
+    if tgt_pct < 3.0:
         return None
     sl_pct = round((slpx - ltp) / ltp * 100, 2) if slpx and ltp else None
     risk = (ltp - slpx) if slpx is not None else None
@@ -681,8 +711,11 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
             dict(buy_pack, ann=buy_pack.get("_acc_ann") or buy_pack.get("ann")),
             trigger_ts, slpx, target, now_ltp=buy_pack.get("LTP"),
         ),
-        "Bar": trigger_ts or "",
+        "Bar": _ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Pivot": trigger_ts or "",
     }
+    freeze[fk] = {k: v for k, v in row.items() if k != "Accuracy"}
+    return row
 
 
 def _send_mis_telegram(setups):
