@@ -394,6 +394,36 @@ def _parse_bar(ts):
     return None
 
 
+def session_close_hm(name):
+    return (23, 30) if name in MCX_NAMES else (15, 30)
+
+
+def in_session_ts(name, ts) -> bool:
+    t = _parse_bar(ts)
+    if t is None:
+        return False
+    start = dt.time(9, 0) if name in MCX_NAMES else dt.time(9, 15)
+    ch, cm = session_close_hm(name)
+    return start <= t.time() <= dt.time(ch, cm)
+
+
+def clip_session_rows(name, rows):
+    return [r for r in (rows or []) if in_session_ts(name, r.get("time"))]
+
+
+def clip_book_session(book):
+    name = book.get("name") or ""
+    if not name:
+        return book
+    for k in ("idx_rows", "ce_rows", "pe_rows", "ce_1m_rows", "pe_1m_rows"):
+        book[k] = clip_session_rows(name, book.get(k))
+    for side in ("idx", "ce", "pe"):
+        form = book.get(f"form_{side}")
+        if form and not in_session_ts(name, form.get("t")):
+            book[f"form_{side}"] = None
+    return book
+
+
 def last_session_bar(name, rows, fallback):
     """Outside hours: last print at/before 15:30 (15:15 ok) / MCX 23:30 (23:00 ok)."""
     close_h, close_m = (23, 30) if name in MCX_NAMES else (15, 30)
@@ -752,6 +782,8 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
     fk = f"{index}|{source}|{confirmed}|{trigger_ts}|{buy_side}|{strike}"
     if fk in freeze:
         prev = dict(freeze[fk])
+        if not in_session_ts(index, prev.get("Bar")):
+            prev["Bar"] = trigger_ts or prev.get("Pivot") or prev.get("Bar")
         prev["Accuracy"] = setup_accuracy(
             dict(buy_pack, ann=buy_pack.get("_acc_ann") or buy_pack.get("ann")),
             trigger_ts, prev.get("SL") if prev.get("SL") != "—" else None,
@@ -800,7 +832,7 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
             dict(buy_pack, ann=buy_pack.get("_acc_ann") or buy_pack.get("ann")),
             trigger_ts, slpx, target, now_ltp=buy_pack.get("LTP"),
         ),
-        "Bar": _ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Bar": trigger_ts or "",
         "Pivot": trigger_ts or "",
     }
     freeze[fk] = {k: v for k, v in row.items() if k != "Accuracy"}
@@ -1202,6 +1234,11 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         except Exception as e:
             st.session_state["_mis_live_err"] = str(e)[:180]
 
+    for _n, _b in list(books.items()):
+        if isinstance(_b, dict):
+            books[_n] = clip_book_session(_b)
+    st.session_state["_mis_books"] = books
+
     summary, setups, live_alerts = [], [], []
     packs = {}
     for name in ORDER:
@@ -1270,6 +1307,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 buy = rule_w[kind]
                 buy_pack = ce if buy == "CE" else pe
                 ts = bar.get("time") if bar else ""
+                if not in_session_ts(name, ts):
+                    continue
                 if source in ("CE", "PE") and bar.get("price") is not None:
                     buy_pack = dict(buy_pack)
                     buy_pack["_entry_px"] = bar.get("price")
@@ -1296,6 +1335,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                     continue
                 row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
                 if row:
+                    chk = row.get("Pivot") or row.get("Bar") or ts
+                    if not in_session_ts(name, chk):
+                        continue
                     row["Trend"] = t_at
                     row["Flow"] = f_at
                     setups.append(row)
