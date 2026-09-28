@@ -199,6 +199,8 @@ def live_apply_quotes(books, enabled, quotes: dict):
     for name, book in list(books.items()):
         if not enabled.get(name):
             continue
+        if not session_open(name):
+            continue
         try:
             cash = str(book.get("cash_tok") or "")
             if cash and cash in quotes:
@@ -1149,7 +1151,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         try:
             toks = []
             for n, book in books.items():
-                if not enabled.get(n):
+                if not enabled.get(n) or not session_open(n):
                     continue
                 for k, exch_k in (("idx_tok", "idx_exch"), ("cash_tok", "cash_exch"), ("ce_tok", "idx_exch"), ("pe_tok", "idx_exch")):
                     tok = book.get(k)
@@ -1213,6 +1215,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Bar": bar_ts,
         })
         lot = LOT_SIZES.get(name, 1)
+        if not session_open(name):
+            continue
         for source, pack, rule in (
             ("FUT", idx, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
             ("CE", ce, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
