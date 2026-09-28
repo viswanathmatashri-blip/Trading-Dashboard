@@ -1239,7 +1239,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             books[_n] = clip_book_session(_b)
     st.session_state["_mis_books"] = books
 
-    summary, setups, live_alerts = [], [], []
+    summary, live_alerts = [], []
+    journal = st.session_state.setdefault("_mis_live_setups", [])
     packs = {}
     for name in ORDER:
         if not enabled.get(name):
@@ -1301,8 +1302,12 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 "CONFIRMED LONG": rule["CONFIRMED LONG"],
                 "CONFIRMED SHORT": rule["CONFIRMED SHORT"],
             }
-            events = all_watch(pack.get("ann")) + all_confirmed(pack.get("ann"))
+            if not session_open(name):
+                continue
             live_kind, live_bar = last_watch(pack.get("ann"))
+            events = []
+            if live_kind and live_bar and "WATCH" in live_kind:
+                events.append((live_kind, live_bar))
             for kind, bar in events:
                 buy = rule_w[kind]
                 buy_pack = ce if buy == "CE" else pe
@@ -1340,15 +1345,21 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                         continue
                     row["Trend"] = t_at
                     row["Flow"] = f_at
-                    setups.append(row)
-                    if (
-                        session_open(name)
-                        and live_kind == kind
-                        and live_bar
-                        and str(live_bar.get("time") or "") == str(ts)
-                    ):
+                    row["_jk"] = f"{name}|{source}|{kind}|{ts}|{buy}"
+                    have = {str(r.get("_jk")) for r in journal}
+                    if row["_jk"] not in have:
+                        journal.append(row)
                         live_alerts.append(row)
+                    else:
+                        for r in journal:
+                            if r.get("_jk") == row["_jk"]:
+                                r["Accuracy"] = row.get("Accuracy")
+                                break
 
+    st.session_state["_mis_live_setups"] = journal
+    setups = [dict(r) for r in journal]
+    for r in setups:
+        r.pop("_jk", None)
     _send_mis_telegram(live_alerts)
 
     n_watch = max(len(summary), 1)
@@ -1398,7 +1409,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    st.caption(f"SETUPS · WATCH/CONFIRMED + Trend confluence + RDI agrees    last updated {_upd}")
+    st.caption(f"SETUPS · live WATCH journal only (no CONFIRMED backpaint)    last updated {_upd}")
     if setups:
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
