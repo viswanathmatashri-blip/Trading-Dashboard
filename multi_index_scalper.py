@@ -571,6 +571,30 @@ def confluence_label(votes, kind="TREND"):
     return "—"
 
 
+def efi_confluence_at(idx, ce, pe, ts):
+    def side(pack, inv=False):
+        rr = _row_at((pack or {}).get("ann") or [], ts)
+        if not rr and (pack or {}).get("ann"):
+            rr = pack["ann"][-1]
+        if not rr:
+            return None
+        try:
+            sl = float(rr.get("EFI sl") or 0)
+        except Exception:
+            sl = 0.0
+        tag = str(rr.get("EFI tag") or "")
+        long = sl > 0 or "EFI+" in tag
+        short = sl < 0 or "EFI-" in tag
+        if inv:
+            long, short = short, long
+        if long and not short:
+            return "LONG"
+        if short and not long:
+            return "SHORT"
+        return None
+    return confluence_label([side(idx, False), side(ce, False), side(pe, True)], "EFI")
+
+
 def last_pack(rows, swings, ltp=None, symbol=""):
     ann = annotate_bars(rows or [], swings or [])
     last = ann[-1] if ann else {}
@@ -1459,6 +1483,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                             journal[have_i] = row
                         else:
                             old["Accuracy"] = row.get("Accuracy")
+                            old["EFI"] = row.get("EFI") or old.get("EFI")
+                            old["Trend"] = row.get("Trend") or old.get("Trend")
+                            old["Flow"] = row.get("Flow") or old.get("Flow")
 
     compact, seen = [], {}
     for r in journal:
@@ -1478,6 +1505,12 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     setups = [dict(r) for r in journal]
     for r in setups:
         r.pop("_jk", None)
+        r.setdefault("EFI", "—")
+        if not r.get("EFI") or r.get("EFI") == "—":
+            pk = packs.get(r.get("Index"))
+            if pk:
+                _book, idx, ce, pe, _t, _f = pk
+                r["EFI"] = efi_confluence_at(idx, ce, pe, r.get("Pivot") or r.get("Bar"))
     _send_mis_telegram(live_alerts)
 
     n_watch = max(len(summary), 1)
