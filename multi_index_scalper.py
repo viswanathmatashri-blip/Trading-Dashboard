@@ -779,7 +779,7 @@ def setup_accuracy(buy_pack, trigger_ts, slpx, target, now_ltp=None):
 
 def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, trigger_ts, max_loss):
     freeze = st.session_state.setdefault("_mis_setup_freeze", {})
-    fk = f"{index}|{source}|{confirmed}|{trigger_ts}|{buy_side}|{strike}"
+    fk = f"{index}|{source}|{confirmed}|{trigger_ts}|{buy_side}|{strike}|pxv2"
     if fk in freeze:
         prev = dict(freeze[fk])
         if not in_session_ts(index, prev.get("Bar")):
@@ -1309,7 +1309,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 ts = bar.get("time") if bar else ""
                 if not in_session_ts(name, ts):
                     continue
-                if source in ("CE", "PE") and bar.get("price") is not None:
+                if source == buy and bar.get("price") is not None:
                     buy_pack = dict(buy_pack)
                     buy_pack["_entry_px"] = bar.get("price")
                 fine = book.get("ce_1m_rows") if buy == "CE" else book.get("pe_1m_rows")
