@@ -22,6 +22,9 @@ STEP = {
 MIN_SL_PCT = -3.0
 RR_BLUE = 1.0
 PIVOT_L, PIVOT_R = 5, 5
+TF_MIN = {
+    "1 min": 1, "2 min": 2, "3 min": 3, "5 min": 5, "15 min": 15,
+}
 TF_API = {
     "1 min": "ONE_MINUTE",
     "2 min": "TWO_MINUTE",
@@ -500,6 +503,52 @@ def last_pack(rows, swings, ltp=None, symbol=""):
     }
 
 
+def _tf_minutes():
+    return int(TF_MIN.get(st.session_state.get("mis_tf") or "1 min", 1))
+
+
+def confirm_ready_ts(pivot_ts):
+    t = _parse_bar(pivot_ts)
+    if not t:
+        return None
+    return t + dt.timedelta(minutes=PIVOT_R * _tf_minutes())
+
+
+def is_live_confirm(pivot_ts, last_tape_ts):
+    """True only if the 5-bar confirmation just completed (last 2 closed bars)."""
+    due = confirm_ready_ts(pivot_ts)
+    last = _parse_bar(last_tape_ts) or _ist_now().replace(tzinfo=None)
+    if due is None or last is None:
+        return False
+    try:
+        last = last.replace(tzinfo=None)
+        due = due.replace(tzinfo=None)
+    except Exception:
+        pass
+    window = dt.timedelta(minutes=_tf_minutes() * 2)
+    return due <= last + dt.timedelta(seconds=30) and due >= last - window
+
+
+def last_watch(ann):
+    """Live signal: WATCH on the latest bar only (no 5-bar wait)."""
+    if not ann:
+        return None, None
+    r = ann[-1]
+    stt = str(r.get("status") or "")
+    if "WATCH LONG" in stt:
+        return "WATCH LONG", r
+    if "WATCH SHORT" in stt:
+        return "WATCH SHORT", r
+    if len(ann) >= 2:
+        r2 = ann[-2]
+        stt2 = str(r2.get("status") or "")
+        if "WATCH LONG" in stt2:
+            return "WATCH LONG", r2
+        if "WATCH SHORT" in stt2:
+            return "WATCH SHORT", r2
+    return None, None
+
+
 def last_confirmed(ann):
     for r in reversed(ann or []):
         stt = r.get("status") or ""
@@ -737,7 +786,7 @@ def _send_mis_telegram(setups):
         st.session_state["_mis_tg_sent"] = sent
     for row in setups:
         conf = str(row.get("Confirmed") or "")
-        if "CONFIRMED LONG" not in conf and "CONFIRMED SHORT" not in conf:
+        if not any(x in conf for x in ("CONFIRMED LONG", "CONFIRMED SHORT", "WATCH LONG", "WATCH SHORT")):
             continue
         key = f"{row.get('Index')}|{row.get('Trigger')}|{row.get('Bar')}|{row.get('Buy')}"
         if key in sent:
@@ -1169,8 +1218,18 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             ("CE", ce, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
             ("PE", pe, {"CONFIRMED LONG": "PE", "CONFIRMED SHORT": "CE"}),
         ):
-            for kind, bar in all_confirmed(pack.get("ann")):
-                buy = rule[kind]
+            rule_w = {
+                "WATCH LONG": rule["CONFIRMED LONG"],
+                "WATCH SHORT": rule["CONFIRMED SHORT"],
+                "CONFIRMED LONG": rule["CONFIRMED LONG"],
+                "CONFIRMED SHORT": rule["CONFIRMED SHORT"],
+            }
+            events = []
+            wkind, wbar = last_watch(pack.get("ann"))
+            if wkind:
+                events.append((wkind, wbar))
+            for kind, bar in events:
+                buy = rule_w[kind]
                 buy_pack = ce if buy == "CE" else pe
                 ts = bar.get("time") if bar else ""
                 if source in ("CE", "PE") and bar.get("price") is not None:
@@ -1257,7 +1316,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    st.caption(f"SETUPS    last updated {_upd}")
+    st.caption(f"SETUPS · LIVE WATCH on last bar    last updated {_upd}")
     if setups:
         sdf = pd.DataFrame(setups)
         if "Bar" in sdf.columns:
