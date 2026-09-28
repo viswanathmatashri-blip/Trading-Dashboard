@@ -1267,9 +1267,13 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         )
     with hL:
         st.markdown(
-            "<div style='font-size:11px;color:#90A4AE;line-height:1.25;'>"
+            "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#B0BEC5;'>Status</b> WATCH · CONFIRMED · TREND DENIED &nbsp;|&nbsp; "
             "<b style='color:#B0BEC5;'>Flow</b> ABSORB |RDI|≥0.40 Disp≤0.20 · EXH |RDI|≤0.10 · ACCEL |RDI|≥0.35 Disp≥0.85"
+            "<br><b style='color:#FFD54F;'>Book</b> "
+            "<span style='color:#69F0AE;'>LT 1/3 + LF 1/3 + SEFI 3/3</span>"
+            " &nbsp;·&nbsp; "
+            "<span style='color:#FF8A80;'>ST 1/3 + SF 1/3 + LEFI 3/3</span>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1511,6 +1515,14 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             if pk:
                 _book, idx, ce, pe, _t, _f = pk
                 r["EFI"] = efi_confluence_at(idx, ce, pe, r.get("Pivot") or r.get("Bar"))
+    def _book_ok(r):
+        t = str(r.get("Trend") or "").upper()
+        f = str(r.get("Flow") or "").upper()
+        e = str(r.get("EFI") or "").upper()
+        a = ("LONG CONFLUENCE 1/3" in t and "LONG FLOW 1/3" in f and "SHORT EFI 3/3" in e)
+        b = ("SHORT CONFLUENCE 1/3" in t and "SHORT FLOW 1/3" in f and "LONG EFI 3/3" in e)
+        return a or b
+    setups = [r for r in setups if _book_ok(r)]
     _send_mis_telegram(live_alerts)
 
     n_watch = max(len(summary), 1)
