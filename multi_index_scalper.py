@@ -1283,7 +1283,7 @@ def run_mis_gemini(packs, books, enabled, names=None, force=True):
     if not key:
         st.session_state["_mis_gemini_err"] = "No GEMINI_API_KEY in secrets"
         return
-    want = [n for n in (names or ORDER) if enabled.get(n) and n in packs]
+    want = [n for n in (names or ORDER) if enabled.get(n, True) and n in packs]
     chunks = []
     for name in want:
         book, idx, ce, pe, t_lab, f_lab = packs[name]
@@ -1308,7 +1308,8 @@ def run_mis_gemini(packs, books, enabled, names=None, force=True):
         "DATA:\n" + "\n---\n".join(chunks)
     )
     txt, err = "", ""
-    for model in ("gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"):
+    st.session_state["_mis_gemini_ts"] = __import__("time").time()
+    for model in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"):
         for ver in ("v1beta", "v1"):
             try:
                 r = requests.post(
@@ -1331,7 +1332,6 @@ def run_mis_gemini(packs, books, enabled, names=None, force=True):
                 err = str(e)[:160]
         if txt:
             break
-    st.session_state["_mis_gemini_ts"] = now
     if not txt:
         st.session_state["_mis_gemini_err"] = err or "Gemini empty"
         return
