@@ -979,7 +979,8 @@ def _send_mis_telegram(setups):
             f"Target : {tgt} ({tgt_pct}%)\n"
             f"SL -{sl} ({sl_pct}%)\n"
             f"Entry Lot Qty = {row.get('Qty')}\n"
-            f"R:R = {row.get('R:R')}"
+            f"R:R = {row.get('R:R')}\n"
+            f"Trend {row.get('Trend')} | Flow {row.get('Flow')} | EFI {row.get('EFI')}"
         )
         try:
             r = requests.post(
@@ -1271,9 +1272,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "<b style='color:#B0BEC5;'>Status</b> WATCH · CONFIRMED · TREND DENIED &nbsp;|&nbsp; "
             "<b style='color:#B0BEC5;'>Flow</b> ABSORB |RDI|≥0.40 Disp≤0.20 · EXH |RDI|≤0.10 · ACCEL |RDI|≥0.35 Disp≥0.85"
             "<br><b style='color:#FFD54F;'>Book</b> "
-            "<span style='color:#69F0AE;'>LT 1/3 + LF 1/3 + SEFI 3/3</span>"
+            "<span style='color:#69F0AE;'>LT 1–2/3 + LF 1/3 + SEFI 3/3</span>"
             " &nbsp;·&nbsp; "
-            "<span style='color:#FF8A80;'>ST 1/3 + SF 1/3 + LEFI 3/3</span>"
+            "<span style='color:#FF8A80;'>ST 1–2/3 + SF 1/3 + LEFI 3/3</span>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1478,8 +1479,6 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                     have_i = next((i for i, r in enumerate(journal) if _dk(r) == row["_jk"]), None)
                     if have_i is None:
                         journal.append(row)
-                        if session_open(name):
-                            live_alerts.append(row)
                     else:
                         old = journal[have_i]
                         old_src = str(old.get("Trigger") or "")
@@ -1519,11 +1518,16 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         t = str(r.get("Trend") or "").upper()
         f = str(r.get("Flow") or "").upper()
         e = str(r.get("EFI") or "").upper()
-        a = ("LONG CONFLUENCE 1/3" in t and "LONG FLOW 1/3" in f and "SHORT EFI 3/3" in e)
-        b = ("SHORT CONFLUENCE 1/3" in t and "SHORT FLOW 1/3" in f and "LONG EFI 3/3" in e)
+        lt = "LONG CONFLUENCE 1/3" in t or "LONG CONFLUENCE 2/3" in t
+        st_ = "SHORT CONFLUENCE 1/3" in t or "SHORT CONFLUENCE 2/3" in t
+        a = lt and "LONG FLOW 1/3" in f and "SHORT EFI 3/3" in e
+        b = st_ and "SHORT FLOW 1/3" in f and "LONG EFI 3/3" in e
         return a or b
     setups = [r for r in setups if _book_ok(r)]
-    _send_mis_telegram(live_alerts)
+    _send_mis_telegram([
+        r for r in setups
+        if session_open(str(r.get("Index") or ""))
+    ])
 
     n_watch = max(len(summary), 1)
     watch_h = min(38 * (n_watch + 1) + 20, 320)
