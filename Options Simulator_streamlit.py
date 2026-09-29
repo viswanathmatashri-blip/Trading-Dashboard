@@ -229,7 +229,7 @@ if "app_view" not in st.session_state:
 
 def active_view() -> str:
     v = str(st.session_state.get("app_view") or "default")
-    if v not in ("default", "multi", "scalper", "miscalper", "crypto"):
+    if v not in ("default", "multi", "scalper", "miscalper", "crypto", "gs"):
         v = "default"
     st.session_state["multi_index_mode"] = v == "multi"
     return v
@@ -1387,14 +1387,14 @@ def process_telegram_alerts(data, dfi, scores, micro, flow, cvd_st, index_name=N
 
 
 GEMINI_TRIGGER_MODELS = [
-    "gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.0-flash-lite",
-    "gemini-2.5-flash-lite", "gemini-1.5-flash", "gemini-1.5-flash-8b",
-    "gemini-3.5-flash", "gemini-3.5-flash-lite",
+    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash",
+    "gemini-2.5-flash", "gemini-2.0-flash",
 ]
 GEMINI_REGULAR_MODELS = [
-    "gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.0-flash-lite",
-    "gemini-2.5-flash-lite", "gemini-1.5-flash", "gemini-1.5-flash-8b",
-    "gemini-3.5-flash-lite", "gemini-3.5-flash",
+    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+    "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3-flash",
+    "gemini-2.5-flash", "gemini-2.0-flash",
 ]
 
 
@@ -4464,10 +4464,11 @@ _view_labels = {
     "scalper": "3. Scalper mode",
     "miscalper": "4. Multi Index Scalper",
     "crypto": "5. Multi Index Crypto Scalper",
+    "gs": "6. Gemini Scalper",
 }
 st.session_state["app_view"] = st.sidebar.radio(
     "View mode",
-    ["default", "multi", "scalper", "miscalper", "crypto"],
+    ["default", "multi", "scalper", "miscalper", "crypto", "gs"],
     format_func=lambda x: _view_labels.get(x, x),
     key="app_view_radio",
 )
@@ -4665,6 +4666,15 @@ elif st.session_state.get("app_view") == "crypto":
         st.session_state["cry_max_loss"] = st.number_input("Max loss (USD)", min_value=50, value=int(st.session_state.get("cry_max_loss") or 2000), step=50)
         if st.button("Seed / refresh crypto tapes"):
             st.session_state["cry_need_seed"] = True
+elif st.session_state.get("app_view") == "gs":
+    with st.sidebar.expander("Gemini Scalper", expanded=True):
+        st.caption("5m + 15m structure, ATM±3 OI, IV/Δ, premium vs VWAP. Other modes stay off.")
+        en = dict(st.session_state.get("gs_enabled") or {n: True for n in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]})
+        for _idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]:
+            en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, True)), key=f"gs_en_{_idx}")
+        st.session_state["gs_enabled"] = en
+        if st.button("Seed / refresh Gemini tapes"):
+            st.session_state["gs_need_seed"] = True
 elif st.session_state.get("app_view") == "scalper":
     st.sidebar.caption("Scalper uses the index + expiry from Market Parameters. ATM PE | Spot | ATM CE.")
     with st.sidebar.expander("6. Gemini analysis", expanded=True):
@@ -8006,7 +8016,9 @@ def _mis_quotes(pairs):
                     continue
                 vol = it.get("tradeVolume") or it.get("opnInterest") or it.get("volume")
                 ltq = it.get("lastTradeQty") or it.get("lastTradedQty") or it.get("ltq")
-                out[tok] = {"ltp": float(ltp), "volume": vol, "ltq": ltq}
+                oi = it.get("opnInterest") or it.get("openInterest") or it.get("oi")
+                doi = it.get("opnInterestChange") or it.get("oiChange") or it.get("oichange")
+                out[tok] = {"ltp": float(ltp), "volume": vol, "ltq": ltq, "oi": oi, "doi": doi}
     return out
 
 
@@ -8017,6 +8029,27 @@ def live_mis_fragment():
     try:
         from multi_index_scalper import render_multi_index_scalper
         render_multi_index_scalper(
+            _mis_fetch, df_master, INDEX_TOKEN_MAP, get_smart_api_client,
+            fut_fn=get_near_month_futures_token,
+            quote_fn=_mis_quotes,
+        )
+    except Exception as e:
+        st.exception(e)
+
+
+@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("gs")) else None)
+def live_gs_fragment():
+    if not view_is("gs"):
+        return
+    try:
+        from gemini_scalper import render_gemini_scalper, seed_gemini_scalper, ORDER as _GS_ORDER
+        if st.session_state.pop("gs_need_seed", False):
+            en = st.session_state.get("gs_enabled") or {n: True for n in _GS_ORDER}
+            seed_gemini_scalper(
+                _mis_fetch, df_master, INDEX_TOKEN_MAP, get_near_month_futures_token,
+                [n for n in _GS_ORDER if en.get(n)],
+            )
+        render_gemini_scalper(
             _mis_fetch, df_master, INDEX_TOKEN_MAP, get_smart_api_client,
             fut_fn=get_near_month_futures_token,
             quote_fn=_mis_quotes,
@@ -9687,6 +9720,8 @@ try:
         live_mis_fragment()
     elif _view_now == "crypto":
         live_crypto_fragment()
+    elif _view_now == "gs":
+        live_gs_fragment()
     else:
         live_dashboard_fragment()
 except Exception as _boot_err:
