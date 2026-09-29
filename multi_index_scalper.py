@@ -1299,9 +1299,12 @@ def run_mis_gemini(packs, books, enabled, names=None, force=True):
         "Use only prices in DATA. If no edge on a side write contract=NO TRADE and rationale why.\n"
         "Return ONLY valid JSON object keyed by index name. Each index:\n"
         '{"CE":{"contract":"22800 CE","entry":"85-90","target":98,"tgt_pct":12.0,'
-        '"sl":78,"sl_pct":-8.0,"lots":4,"max_profit":3200,"max_loss":2000,"rr":1.6,'
-        '"rationale":"short sentences using EFI CVD RDI VWAP WATCH"},'
+        '"tgt_why":"prior swing high on CE tape",'
+        '"sl":78,"sl_pct":-8.0,"sl_why":"prior swing low on CE tape",'
+        '"lots":4,"max_profit":3200,"max_loss":2000,"rr":1.6,'
+        '"rationale":"EFI/CVD/RDI/VWAP/WATCH"},'
         '"PE":{...same keys...}}\n'
+        "tgt_why / sl_why MUST name the level: previous swing high/low, VWAP, VA, EFI flatten.\n"
         "Index keys must be exactly: NIFTY,BANKNIFTY,FINNIFTY,MIDCPNIFTY,SENSEX,GOLDM,CRUDEOIL "
         "(omit a key only if that index is missing from DATA).\n"
         "Entry is a premium zone. Target above entry. SL below entry. lots from MAXLOSS / (entry-sl)/LOT.\n"
@@ -1389,8 +1392,10 @@ def _fmt_gcell(side, cell, book=None):
         f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>"
         f"<b style='color:{col};font-size:13px;'>{cell.get('contract') or side}</b><br>"
         f"Entry Zone : {cell.get('entry') or '—'}<br>"
-        f"Target : {cell.get('target')} ({cell.get('tgt_pct')} %)<br>"
-        f"SL : {cell.get('sl')} ({cell.get('sl_pct')} %)<br>"
+        f"Target : {cell.get('target')} ({cell.get('tgt_pct')} %)"
+        f"{('<br><span style=\"color:#90A4AE;\">Tgt why : ' + str(cell.get('tgt_why')) + '</span>') if cell.get('tgt_why') else ''}<br>"
+        f"SL : {cell.get('sl')} ({cell.get('sl_pct')} %)"
+        f"{('<br><span style=\"color:#90A4AE;\">SL why : ' + str(cell.get('sl_why')) + '</span>') if cell.get('sl_why') else ''}<br>"
         f"Entry Lots : {lots}<br>"
         f"Max Profit : {cell.get('max_profit')}<br>"
         f"Max Loss : {cell.get('max_loss')}<br>"
@@ -1492,6 +1497,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.session_state["enable_main_refresh"] = _mis_auto
         st.rerun()
     _live = st.session_state.get("_mis_live_ts")
+    _pending = st.session_state.get("mis_gemini_run")
+    if _pending:
+        st.info("Gemini loading — reading Fut / CE / PE tapes for " + ", ".join(_pending) + " …")
     if _live:
         st.caption(f"Live tape {_live} · cached history kept · only current 1-min bar updates")
     if st.session_state.get("_mis_live_err"):
@@ -1600,7 +1608,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     _run = st.session_state.pop("mis_gemini_run", None)
     if _run:
         try:
-            with st.spinner("Gemini reading Fut/CE/PE tapes…"):
+            st.info("Gemini loading — " + ", ".join(_run) + " (Fut + CE + PE tapes)…")
+            with st.spinner("Gemini working…"):
                 run_mis_gemini(packs, books, enabled, names=_run, force=True)
         except Exception as e:
             st.session_state["_mis_gemini_err"] = str(e)[:240]
