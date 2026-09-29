@@ -1309,7 +1309,17 @@ def run_mis_gemini(packs, books, enabled, names=None, force=True):
     )
     txt, err = "", ""
     st.session_state["_mis_gemini_ts"] = __import__("time").time()
-    for model in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"):
+    errors = []
+    for model in (
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ):
         for ver in ("v1beta", "v1"):
             try:
                 r = requests.post(
@@ -1320,7 +1330,8 @@ def run_mis_gemini(packs, books, enabled, names=None, force=True):
                     timeout=40,
                 )
                 if r.status_code >= 400:
-                    err = f"{model} {r.status_code}"
+                    err = f"{model} {ver} {r.status_code}"
+                    errors.append(err)
                     continue
                 js = r.json()
                 parts = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
@@ -1333,7 +1344,7 @@ def run_mis_gemini(packs, books, enabled, names=None, force=True):
         if txt:
             break
     if not txt:
-        st.session_state["_mis_gemini_err"] = err or "Gemini empty"
+        st.session_state["_mis_gemini_err"] = (err or "Gemini empty") + ((" | " + " · ".join(errors[-4:])) if errors else "")
         return
     raw = txt
     if "```" in raw:
@@ -1356,6 +1367,7 @@ def run_mis_gemini(packs, books, enabled, names=None, force=True):
     st.session_state["_mis_gemini_book"] = prev
     st.session_state["_mis_gemini_raw"] = txt[:4000]
     st.session_state["_mis_gemini_err"] = ""
+    st.session_state["_mis_gemini_model"] = model
     st.session_state["_mis_gemini_ts"] = __import__("time").time()
 
 
