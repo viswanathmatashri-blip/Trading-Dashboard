@@ -1244,6 +1244,186 @@ def seed_book(name, fetch_fn, df_master, token_map, fut_fn=None):
     return book
 
 
+def _mis_gemini_key():
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        pass
+    return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+
+
+def _pack_digest(name, book, idx, ce, pe, t_lab, f_lab):
+    def _tail(rows, n=8):
+        out = []
+        for r in (rows or [])[-n:]:
+            out.append(
+                f"{r.get('time','')} px={r.get('price')} o={r.get('open')} h={r.get('high')} l={r.get('low')} "
+                f"cvd={r.get('CVD')} efi={r.get('EFI')} sl={r.get('EFI sl')} tag={r.get('EFI tag')} "
+                f"rdi={r.get('RDI')} disp={r.get('Disp')} vwap={r.get('VWAP')} vol={r.get('volume')} "
+                f"flow={r.get('flow')} st={r.get('status') or ''}"
+            )
+        return " | ".join(out) or "NA"
+
+    return "\n".join([
+        f"INDEX {name} spot={book.get('spot')} fut={book.get('fut')} ATM={book.get('atm')} exp={book.get('exp')}",
+        f"TREND {t_lab} FLOW {f_lab}",
+        f"FUT WATCH={idx.get('WATCH')} Flow={idx.get('Flow')} LTP={idx.get('LTP')} RDI={idx.get('RDI')} EFI={idx.get('ann')[-1].get('EFI') if idx.get('ann') else ''} reason={idx.get('Reason')}",
+        f"CE {book.get('ce_sym')} WATCH={ce.get('WATCH')} LTP={ce.get('LTP')} Flow={ce.get('Flow')} reason={ce.get('Reason')}",
+        f"PE {book.get('pe_sym')} WATCH={pe.get('WATCH')} LTP={pe.get('LTP')} Flow={pe.get('Flow')} reason={pe.get('Reason')}",
+        f"FUT TAPE {_tail(idx.get('ann'))}",
+        f"CE TAPE {_tail(ce.get('ann'))}",
+        f"PE TAPE {_tail(pe.get('ann'))}",
+        f"LOT {LOT_SIZES.get(name, 1)} MAXLOSS {st.session_state.get('mis_max_loss') or 2000}",
+    ])
+
+
+def run_mis_gemini(packs, books, enabled, names=None, force=True):
+    key = _mis_gemini_key()
+    if not key:
+        st.session_state["_mis_gemini_err"] = "No GEMINI_API_KEY in secrets"
+        return
+    want = [n for n in (names or ORDER) if enabled.get(n) and n in packs]
+    chunks = []
+    for name in want:
+        book, idx, ce, pe, t_lab, f_lab = packs[name]
+        chunks.append(_pack_digest(name, book, idx, ce, pe, t_lab, f_lab))
+    if not chunks:
+        st.session_state["_mis_gemini_err"] = "No tapes to send"
+        return
+    prompt = (
+        "You are an Indian index options scalper. BUY only — never sell/write premium.\n"
+        "Read the FUT, CE and PE tapes in DATA: price, VWAP, RDI, Disp, EFI, EFI slope, CVD, volume, WATCH/flow.\n"
+        "Decide long (buy CE) vs short (buy PE) from those tapes, not from a canned rule.\n"
+        "For EACH index in DATA produce exactly TWO setups: one BUY CE and one BUY PE.\n"
+        "Use only prices in DATA. If no edge on a side write contract=NO TRADE and rationale why.\n"
+        "Return ONLY valid JSON object keyed by index name. Each index:\n"
+        '{"CE":{"contract":"22800 CE","entry":"85-90","target":98,"tgt_pct":12.0,'
+        '"sl":78,"sl_pct":-8.0,"lots":4,"max_profit":3200,"max_loss":2000,"rr":1.6,'
+        '"rationale":"short sentences using EFI CVD RDI VWAP WATCH"},'
+        '"PE":{...same keys...}}\n'
+        "Index keys must be exactly: NIFTY,BANKNIFTY,FINNIFTY,MIDCPNIFTY,SENSEX,GOLDM,CRUDEOIL "
+        "(omit a key only if that index is missing from DATA).\n"
+        "Entry is a premium zone. Target above entry. SL below entry. lots from MAXLOSS / (entry-sl)/LOT.\n"
+        "DATA:\n" + "\n---\n".join(chunks)
+    )
+    txt, err = "", ""
+    for model in ("gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"):
+        for ver in ("v1beta", "v1"):
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent",
+                    params={"key": key},
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000}},
+                    timeout=40,
+                )
+                if r.status_code >= 400:
+                    err = f"{model} {r.status_code}"
+                    continue
+                js = r.json()
+                parts = (((js.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+                txt = "".join(p.get("text", "") for p in parts).strip()
+                if txt:
+                    err = ""
+                    break
+            except Exception as e:
+                err = str(e)[:160]
+        if txt:
+            break
+    st.session_state["_mis_gemini_ts"] = now
+    if not txt:
+        st.session_state["_mis_gemini_err"] = err or "Gemini empty"
+        return
+    raw = txt
+    if "```" in raw:
+        raw = raw.split("```", 2)[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    import json as _json
+    try:
+        data = _json.loads(raw)
+    except Exception:
+        start, end = raw.find("{"), raw.rfind("}")
+        try:
+            data = _json.loads(raw[start:end + 1]) if start >= 0 and end > start else {}
+        except Exception:
+            data = {}
+            st.session_state["_mis_gemini_err"] = "JSON parse failed"
+    prev = st.session_state.get("_mis_gemini_book") or {}
+    if isinstance(data, dict):
+        prev.update(data)
+    st.session_state["_mis_gemini_book"] = prev
+    st.session_state["_mis_gemini_raw"] = txt[:4000]
+    st.session_state["_mis_gemini_err"] = ""
+    st.session_state["_mis_gemini_ts"] = __import__("time").time()
+
+
+def _fmt_gcell(side, cell, book=None):
+    if not isinstance(cell, dict):
+        return "<div style='color:#78909C;font-size:11px;'>—</div>"
+    if str(cell.get("contract") or "").upper().find("NO TRADE") >= 0:
+        return (
+            f"<div style='font-size:11px;color:#FF8A80;'><b>NO TRADE {side}</b><br>"
+            f"{cell.get('rationale') or ''}</div>"
+        )
+    lot = LOT_SIZES.get((book or {}).get("name") or "", 1)
+    try:
+        lots = int(cell.get("lots") or 0)
+    except Exception:
+        lots = 0
+    col = "#69F0AE" if side == "CE" else "#FF8A80"
+    return (
+        f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>"
+        f"<b style='color:{col};font-size:13px;'>{cell.get('contract') or side}</b><br>"
+        f"Entry Zone : {cell.get('entry') or '—'}<br>"
+        f"Target : {cell.get('target')} ({cell.get('tgt_pct')} %)<br>"
+        f"SL : {cell.get('sl')} ({cell.get('sl_pct')} %)<br>"
+        f"Entry Lots : {lots}<br>"
+        f"Max Profit : {cell.get('max_profit')}<br>"
+        f"Max Loss : {cell.get('max_loss')}<br>"
+        f"R:R : {cell.get('rr')}<br>"
+        f"<span style='color:#90A4AE;'>Rationale : {cell.get('rationale') or ''}</span>"
+        f"</div>"
+    )
+
+
+def render_mis_gemini_table(upd):
+    top = st.columns([2.4, 0.8])
+    with top[0]:
+        st.caption(f"GEMINI SETUPS · click ↻ per index or Run all · last {upd}")
+    with top[1]:
+        if st.button("Run all indexes", key="btn_mis_gemini_all", use_container_width=True):
+            st.session_state["mis_gemini_run"] = list(ORDER)
+            st.rerun()
+    btn_cols = st.columns(len(ORDER))
+    for i, n in enumerate(ORDER):
+        with btn_cols[i]:
+            if st.button(f"↻ {n}", key=f"btn_mis_g_{n}", use_container_width=True):
+                st.session_state["mis_gemini_run"] = [n]
+                st.rerun()
+    if st.session_state.get("_mis_gemini_err"):
+        st.caption(st.session_state.get("_mis_gemini_err"))
+    busy = st.session_state.get("mis_gemini_run")
+    if busy:
+        st.caption("Gemini running: " + ", ".join(busy))
+    book = st.session_state.get("_mis_gemini_book") or {}
+    cols = ORDER
+    ce_cells = [_fmt_gcell("CE", (book.get(n) or {}).get("CE") if isinstance(book.get(n), dict) else None) for n in cols]
+    pe_cells = [_fmt_gcell("PE", (book.get(n) or {}).get("PE") if isinstance(book.get(n), dict) else None) for n in cols]
+    head = "".join(f"<th style='padding:6px;border:1px solid #2a2d33;color:#FFD54F;font-size:11px;'>{n}</th>" for n in cols)
+    def row(cells):
+        return "<tr>" + "".join(
+            f"<td style='vertical-align:top;padding:8px;border:1px solid #2a2d33;width:14%;'>{c}</td>"
+            for c in cells
+        ) + "</tr>"
+    html = (
+        "<table style='width:100%;border-collapse:collapse;background:#0E1117;'>"
+        f"<tr>{head}</tr>{row(ce_cells)}{row(pe_cells)}</table>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None, quote_fn=None):
     a_lab = "ON" if st.session_state.get("_smart_api_obj") and not st.session_state.get("_smart_api_err") else (
         "RATE LIMIT" if st.session_state.get("_angel_rl_ts") else ("DOWN" if st.session_state.get("_smart_api_err") else "IDLE")
@@ -1271,10 +1451,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#B0BEC5;'>Status</b> WATCH · CONFIRMED · TREND DENIED &nbsp;|&nbsp; "
             "<b style='color:#B0BEC5;'>Flow</b> ABSORB |RDI|≥0.40 Disp≤0.20 · EXH |RDI|≤0.10 · ACCEL |RDI|≥0.35 Disp≥0.85"
-            "<br><b style='color:#FFD54F;'>Book</b> "
-            "<span style='color:#69F0AE;'>LT 1–2/3 + LF 1/3 + SEFI 3/3</span>"
-            " &nbsp;·&nbsp; "
-            "<span style='color:#FF8A80;'>ST 1–2/3 + SF 1/3 + LEFI 3/3</span>"
+            "<br><b style='color:#FFD54F;'>Gemini book</b> "
+            "<span style='color:#B0BEC5;'>1 CE buy + 1 PE buy per index from tape EFI/CVD/RDI/VWAP</span>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1403,131 +1581,17 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Flow x/3": confluence_label(f_votes, "FLOW"),
             "Bar": bar_ts,
         })
-        lot = LOT_SIZES.get(name, 1)
-        for source, pack, rule in (
-            ("FUT", idx, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
-            ("CE", ce, {"CONFIRMED LONG": "CE", "CONFIRMED SHORT": "PE"}),
-            ("PE", pe, {"CONFIRMED LONG": "PE", "CONFIRMED SHORT": "CE"}),
-        ):
-            rule_w = {
-                "WATCH LONG": rule["CONFIRMED LONG"],
-                "WATCH SHORT": rule["CONFIRMED SHORT"],
-                "CONFIRMED LONG": rule["CONFIRMED LONG"],
-                "CONFIRMED SHORT": rule["CONFIRMED SHORT"],
-            }
-            raw = book.get("idx_rows") if source == "FUT" else (book.get("ce_rows") if source == "CE" else book.get("pe_rows"))
-            events = [(k, b) for k, b in causal_watch_events(raw) if in_session_ts(name, (b or {}).get("time"))]
-            live_kind, live_bar = last_watch(pack.get("ann"))
-            for kind, bar in events:
-                buy = rule_w[kind]
-                buy_pack = ce if buy == "CE" else pe
-                ts = bar.get("time") if bar else ""
-                if not in_session_ts(name, ts):
-                    continue
-                if source == buy and bar.get("price") is not None:
-                    buy_pack = dict(buy_pack)
-                    buy_pack["_entry_px"] = bar.get("price")
-                fine = book.get("ce_1m_rows") if buy == "CE" else book.get("pe_1m_rows")
-                if fine:
-                    buy_pack = dict(buy_pack)
-                    buy_pack["_acc_ann"] = [
-                        {"time": r.get("time"), "high": r.get("high"), "low": r.get("low"), "price": r.get("price")}
-                        for r in fine
-                    ]
-                hit = _row_at(idx.get("ann") or [], ts)
-                t_at = str((hit or {}).get("Trend") or t_lab or "—")
-                f_at = str((hit or {}).get("Flow x/3") or f_lab or "—")
-                def _efi_side(pack, inv=False):
-                    rr = _row_at(pack.get("ann") or [], ts)
-                    if not rr and pack.get("ann"):
-                        rr = pack["ann"][-1]
-                    if not rr:
-                        return None
-                    try:
-                        sl = float(rr.get("EFI sl") or 0)
-                    except Exception:
-                        sl = 0.0
-                    tag = str(rr.get("EFI tag") or "")
-                    long = sl > 0 or "EFI+" in tag
-                    short = sl < 0 or "EFI-" in tag
-                    if inv:
-                        long, short = short, long
-                    if long and not short:
-                        return "LONG"
-                    if short and not long:
-                        return "SHORT"
-                    return None
-                e_at = confluence_label([
-                    _efi_side(idx, False),
-                    _efi_side(ce, False),
-                    _efi_side(pe, True),
-                ], "EFI")
-                if t_at in ("", "—"):
-                    t_at = "LONG CONFLUENCE 1/3" if "LONG" in kind else "SHORT CONFLUENCE 1/3"
-                tu2, fu2 = t_at.upper(), f_at.upper()
-                row = setup_row(name, f"{source} {kind}", kind, buy, buy_pack, strike, oexp, lot, ts, max_loss)
-                if row:
-                    chk = row.get("Pivot") or row.get("Bar") or ts
-                    if not in_session_ts(name, chk):
-                        continue
-                    row["Trend"] = t_at
-                    row["Flow"] = f_at
-                    row["EFI"] = e_at
-                    row["_jk"] = f"{name}|{str(ts)[:16]}|{str(row.get('Buy') or buy).strip()}"
-                    def _dk(r):
-                        return f"{r.get('Index')}|{str(r.get('Bar') or r.get('Pivot') or '')[:16]}|{str(r.get('Buy') or '').strip()}"
-                    have_i = next((i for i, r in enumerate(journal) if _dk(r) == row["_jk"]), None)
-                    if have_i is None:
-                        journal.append(row)
-                    else:
-                        old = journal[have_i]
-                        old_src = str(old.get("Trigger") or "")
-                        if source in ("CE", "PE") and old_src.startswith("FUT"):
-                            journal[have_i] = row
-                        else:
-                            old["Accuracy"] = row.get("Accuracy")
-                            old["EFI"] = row.get("EFI") or old.get("EFI")
-                            old["Trend"] = row.get("Trend") or old.get("Trend")
-                            old["Flow"] = row.get("Flow") or old.get("Flow")
 
-    compact, seen = [], {}
-    for r in journal:
-        k = f"{r.get('Index')}|{str(r.get('Bar') or r.get('Pivot') or '')[:16]}|{str(r.get('Buy') or '').strip()}"
-        trig = str(r.get("Trigger") or "")
-        if k not in seen:
-            seen[k] = len(compact)
-            r["_jk"] = k
-            compact.append(r)
-        else:
-            prev = compact[seen[k]]
-            if trig.startswith(("CE", "PE")) and str(prev.get("Trigger") or "").startswith("FUT"):
-                r["_jk"] = k
-                compact[seen[k]] = r
-    journal = compact
-    st.session_state["_mis_live_setups"] = journal
-    setups = [dict(r) for r in journal]
-    for r in setups:
-        r.pop("_jk", None)
-        r.setdefault("EFI", "—")
-        if not r.get("EFI") or r.get("EFI") == "—":
-            pk = packs.get(r.get("Index"))
-            if pk:
-                _book, idx, ce, pe, _t, _f = pk
-                r["EFI"] = efi_confluence_at(idx, ce, pe, r.get("Pivot") or r.get("Bar"))
-    def _book_ok(r):
-        t = str(r.get("Trend") or "").upper()
-        f = str(r.get("Flow") or "").upper()
-        e = str(r.get("EFI") or "").upper()
-        lt = "LONG CONFLUENCE 1/3" in t or "LONG CONFLUENCE 2/3" in t
-        st_ = "SHORT CONFLUENCE 1/3" in t or "SHORT CONFLUENCE 2/3" in t
-        a = lt and "LONG FLOW 1/3" in f and "SHORT EFI 3/3" in e
-        b = st_ and "SHORT FLOW 1/3" in f and "LONG EFI 3/3" in e
-        return a or b
-    setups = [r for r in setups if _book_ok(r)]
-    _send_mis_telegram([
-        r for r in setups
-        if session_open(str(r.get("Index") or ""))
-    ])
+    # WATCH journal / book filter removed — Gemini setups only
+    st.session_state["_mis_live_setups"] = []
+    setups = []
+    _run = st.session_state.pop("mis_gemini_run", None)
+    if _run:
+        try:
+            with st.spinner("Gemini reading Fut/CE/PE tapes…"):
+                run_mis_gemini(packs, books, enabled, names=_run, force=True)
+        except Exception as e:
+            st.session_state["_mis_gemini_err"] = str(e)[:240]
 
     n_watch = max(len(summary), 1)
     watch_h = min(38 * (n_watch + 1) + 20, 320)
@@ -1576,29 +1640,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    st.caption(f"SETUPS · causal WATCH at each bar close (no future bars)    last updated {_upd}")
-    if setups:
-        sdf = pd.DataFrame(setups)
-        if "Bar" in sdf.columns:
-            sdf = sdf.sort_values("Bar", ascending=False).reset_index(drop=True)
-        front = [c for c in ("Index", "Trigger", "Confirmed", "Trend", "Flow", "EFI") if c in sdf.columns]
-        rest = [c for c in sdf.columns if c not in front]
-        sdf = sdf[front + rest]
-        try:
-            evs = st.dataframe(
-                style_setups(sdf),
-                use_container_width=True,
-                height=setup_h,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="mis_setup_pick",
-            )
-            _take_index_click(evs, sdf)
-        except TypeError:
-            st.dataframe(style_setups(sdf), use_container_width=True, height=setup_h, hide_index=True)
-    else:
-        st.write("No live WATCH journal yet — Auto-Refresh during session, or last-bar WATCH at the close.")
+    render_mis_gemini_table(_upd)
     st.markdown("</div>", unsafe_allow_html=True)
 
     def draw_tape(title, pack, extra_cols=None):
