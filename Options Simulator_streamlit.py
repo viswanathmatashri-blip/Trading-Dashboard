@@ -2355,8 +2355,8 @@ def render_broker_status_ribbon():
         f"<span style='color:{b_col};'>● AliceBlue {b_lab}</span>"
         f"<span style='color:#90A4AE;font-weight:600;'>last {last}</span>"
         f"<span style='color:#90A4AE;font-weight:600;'>{srcs}</span>"
-        f"{f'<span style=\"color:#78909C;font-weight:500;\">{hint}</span>' if hint else ''}"
-        f"</div>",
+        + (f"<span style='color:#78909C;font-weight:500;'>{hint}</span>" if hint else "")
+        + "</div>",
         unsafe_allow_html=True,
     )
 
@@ -4668,13 +4668,8 @@ elif st.session_state.get("app_view") == "crypto":
             st.session_state["cry_need_seed"] = True
 elif st.session_state.get("app_view") == "gs":
     with st.sidebar.expander("Gemini Scalper", expanded=True):
-        st.caption("5m + 15m structure, ATM±3 OI, IV/Δ, premium vs VWAP. Other modes stay off.")
-        en = dict(st.session_state.get("gs_enabled") or {n: True for n in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]})
-        for _idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]:
-            en[_idx] = st.checkbox(_idx, value=bool(en.get(_idx, True)), key=f"gs_en_{_idx}")
-        st.session_state["gs_enabled"] = en
-        if st.button("Seed / refresh Gemini tapes"):
-            st.session_state["gs_need_seed"] = True
+        st.caption("No API seed. Upload TradingView CE | Spot | PE screenshots. Needs GEMINI_API_KEY.")
+        st.caption("Other modes stay off while this view is selected.")
 elif st.session_state.get("app_view") == "scalper":
     st.sidebar.caption("Scalper uses the index + expiry from Market Parameters. ATM PE | Spot | ATM CE.")
     with st.sidebar.expander("6. Gemini analysis", expanded=True):
@@ -8037,23 +8032,13 @@ def live_mis_fragment():
         st.exception(e)
 
 
-@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("gs")) else None)
+@st.fragment(run_every=None)
 def live_gs_fragment():
     if not view_is("gs"):
         return
     try:
-        from gemini_scalper import render_gemini_scalper, seed_gemini_scalper, ORDER as _GS_ORDER
-        if st.session_state.pop("gs_need_seed", False):
-            en = st.session_state.get("gs_enabled") or {n: True for n in _GS_ORDER}
-            seed_gemini_scalper(
-                _mis_fetch, df_master, INDEX_TOKEN_MAP, get_near_month_futures_token,
-                [n for n in _GS_ORDER if en.get(n)],
-            )
-        render_gemini_scalper(
-            _mis_fetch, df_master, INDEX_TOKEN_MAP, get_smart_api_client,
-            fut_fn=get_near_month_futures_token,
-            quote_fn=_mis_quotes,
-        )
+        from gemini_scalper import render_gemini_scalper
+        render_gemini_scalper()
     except Exception as e:
         st.exception(e)
 
