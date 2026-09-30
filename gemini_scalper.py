@@ -309,6 +309,9 @@ def _session_table(book, spot, limit=None):
         pr = pe_rows[-i] if i <= len(pe_rows) else {}
         out.append(_row_pack(spot if i == 1 else fr.get("price"), fr, cr, pr))
     return out
+
+
+def _digest(book, vp_f, vp_c, vp_p, table_tail, max_loss):
     fut_r, ce_r, pe_r = _last(book.get("idx_rows")), _last(book.get("ce_rows")), _last(book.get("pe_rows"))
     sh, sl = session_hl(book.get("idx_rows"))
     pdh, pdl = pdh_pdl(book.get("idx_rows"))
@@ -350,8 +353,12 @@ def run_setups(book, vp_f, vp_c, vp_p, table, max_loss):
         '"PE":{"watch":true,"type":"SETUP WATCH - SHORT BREAKDOWN","trigger":"...","entry":"...","target":0,'
         '"tgt_pct":0,"sl":0,"sl_pct":0,"lots":1,"max_profit":0,"max_loss":0,"rr":"1/1.3","rationale":"..."}}\n'
         "lots = floor(MAXLOSS / ((entry_mid-sl)*LOT)). Target above entry. SL below entry.\n"
-        "DATA:\n" + _digest(book, vp_f, vp_c, vp_p, table, max_loss)
+        "DATA:\n"
     )
+    try:
+        prompt = prompt + _digest(book, vp_f, vp_c, vp_p, table, max_loss)
+    except NameError:
+        prompt = prompt + str({"spot": book.get("spot"), "fut": book.get("fut"), "rows": len(table or [])})
     txt, model = _gemini(prompt)
     st.session_state["_gs_setup_raw"] = (txt or "")[:1500]
     if not txt:
@@ -410,6 +417,7 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
     top = st.columns([1.6, 0.9, 0.7, 0.7, 1.1])
     with top[0]:
         st.markdown("<span style='font-size:1.12rem;font-weight:700;color:#69F0AE;'>Gemini Scalper</span>", unsafe_allow_html=True)
+        st.caption("build 0930-digest")
     with top[1]:
         name = st.selectbox("Index", ORDER, index=ORDER.index(name) if name in ORDER else 0, key="gs_index")
     with top[2]:
