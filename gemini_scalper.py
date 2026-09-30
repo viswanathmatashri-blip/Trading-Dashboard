@@ -407,26 +407,39 @@ def run_watch(book, pos, vp_f, vp_c, vp_p, table):
 
 
 def _setup_table(ce, pe, max_loss):
-    def cell(b, side):
+    def g(b, k, default=""):
         b = b if isinstance(b, dict) else {}
-        if not b.get("watch") and "NO TRADE" in str(b.get("type") or "").upper():
-            return f"NO TRADE {side}\n{b.get('rationale') or ''}"
-        if not b:
+        v = b.get(k)
+        return default if v is None or v == "" else v
+
+    def tgt(b):
+        b = b if isinstance(b, dict) else {}
+        t, p = b.get("target"), b.get("tgt_pct")
+        if t is None:
             return "—"
-        return (
-            f"{b.get('type') or 'SETUP WATCH'}\n"
-            f"Trigger : {b.get('trigger')}\n"
-            f"Entry : {b.get('entry')}\n"
-            f"Target : {b.get('target')} ({b.get('tgt_pct')} %)\n"
-            f"SL : {b.get('sl')} ({b.get('sl_pct')} %)\n"
-            f"Entry Lot : {b.get('lots')}\n"
-            f"max Profit : {b.get('max_profit')}\n"
-            f"max Loss : {b.get('max_loss') or max_loss}\n"
-            f"Risk / Reward : {b.get('rr')}\n"
-            f"Rationale : {b.get('rationale') or ''}"
-        )
-    df = pd.DataFrame({"CE buy": [cell(ce, "CE")], "PE buy": [cell(pe, "PE")]})
-    st.dataframe(df, use_container_width=True, hide_index=True, height=280)
+        return f"{t} ({p} %)" if p is not None else str(t)
+
+    def sl(b):
+        b = b if isinstance(b, dict) else {}
+        s, p = b.get("sl"), b.get("sl_pct")
+        if s is None:
+            return "—"
+        return f"{s} ({p} %)" if p is not None else str(s)
+
+    rows = [
+        ("SETUP", g(ce, "type", "NO TRADE CE"), g(pe, "type", "NO TRADE PE")),
+        ("Trigger", g(ce, "trigger"), g(pe, "trigger")),
+        ("Entry", g(ce, "entry"), g(pe, "entry")),
+        ("Target", tgt(ce), tgt(pe)),
+        ("SL", sl(ce), sl(pe)),
+        ("Entry Lot", g(ce, "lots"), g(pe, "lots")),
+        ("max Profit", g(ce, "max_profit"), g(pe, "max_profit")),
+        ("max Loss", g(ce, "max_loss", max_loss), g(pe, "max_loss", max_loss)),
+        ("Risk to Reward", g(ce, "rr"), g(pe, "rr")),
+        ("Rationale", g(ce, "rationale"), g(pe, "rationale")),
+    ]
+    df = pd.DataFrame(rows, columns=["", "CE buy", "PE buy"])
+    st.dataframe(df, use_container_width=True, hide_index=True, height=360)
 
 
 def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_client=None, fut_fn=None, quote_fn=None):
