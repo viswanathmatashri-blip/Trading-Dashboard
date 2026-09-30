@@ -171,63 +171,64 @@ def _live_models(key):
     return ordered
 
 
-def _gemini(prompt, max_tokens=4000):
+def _gemini(prompt, max_tokens=2500):
     key = _key()
     if not key:
         return None, "No GEMINI_API_KEY"
+    last = float(st.session_state.get("_gs_call_ts") or 0)
+    wait = 8.0 - (time.time() - last)
+    if wait > 0:
+        time.sleep(min(wait, 8.0))
     hit = st.session_state.get("_gs_ok_model")
-    models = ([hit] if hit else []) + [m for m in _live_models(key) if m != hit]
+    prefer = [
+        "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash",
+        "gemini-3.5-flash",
+    ]
+    models = []
+    if hit:
+        models.append(hit)
+    for m in prefer:
+        if m not in models:
+            models.append(m)
     err = []
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
     }
     headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-    for model in models[:8]:
-        try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                params={"key": key},
-                headers=headers,
-                json=body,
-                timeout=70,
-            )
-            if r.status_code >= 400:
-                err.append(f"{model} {r.status_code}")
-                continue
-            parts = (((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
-            txt = "".join(p.get("text", "") for p in parts).strip()
-            if txt:
-                st.session_state["_gs_ok_model"] = model
-                return txt, model
-            err.append(f"{model} empty")
-        except Exception as e:
-            err.append(f"{model} {str(e)[:50]}")
-    return None, " · ".join(err[-6:]) or "empty"
-    key = _key()
-    if not key:
-        return None, "No GEMINI_API_KEY"
-    err = []
-    for model in MODELS:
-        for ver in ("v1beta", "v1"):
+    # One click = at most two models, one extra try only on 503.
+    for model in models[:2]:
+        tries = 2 if model == models[0] else 1
+        for attempt in range(tries):
             try:
+                st.session_state["_gs_call_ts"] = time.time()
                 r = requests.post(
-                    f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent",
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                     params={"key": key},
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens}},
-                    timeout=50,
+                    headers=headers,
+                    json=body,
+                    timeout=80,
                 )
+                if r.status_code == 503 and attempt == 0:
+                    time.sleep(4)
+                    continue
+                if r.status_code in (429, 503):
+                    err.append(f"{model} {r.status_code} — wait and run once more")
+                    return None, " · ".join(err)
                 if r.status_code >= 400:
                     err.append(f"{model} {r.status_code}")
-                    continue
+                    break
                 parts = (((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
                 txt = "".join(p.get("text", "") for p in parts).strip()
                 if txt:
+                    st.session_state["_gs_ok_model"] = model
                     return txt, model
+                err.append(f"{model} empty")
+                break
             except Exception as e:
-                err.append(str(e)[:80])
-    return None, " · ".join(err[-5:]) or "empty"
+                err.append(f"{model} {str(e)[:50]}")
+                break
+    return None, " · ".join(err[-4:]) or "empty"
 
 
 def _parse_json(txt):
@@ -545,8 +546,20 @@ def _setup_table(ce, pe, max_loss, lot=10):
         ("Risk to Reward", g(ce, "rr"), g(pe, "rr")),
         ("Rationale", g(ce, "rationale"), g(pe, "rationale")),
     ]
-    df = pd.DataFrame(rows, columns=["", "CE buy", "PE buy"])
-    st.dataframe(df, use_container_width=True, hide_index=True, height=340)
+    body = "".join(
+        f"<tr><td style='color:#FFD54F;white-space:nowrap;padding:3px 6px;border:1px solid #2a2d33;font-size:12px;'>{a}</td>"
+        f"<td style='padding:3px 6px;border:1px solid #2a2d33;font-size:12px;color:#ECEFF1;'>{b}</td>"
+        f"<td style='padding:3px 6px;border:1px solid #2a2d33;font-size:12px;color:#ECEFF1;'>{c}</td></tr>"
+        for a, b, c in rows
+    )
+    st.markdown(
+        "<table style='width:100%;border-collapse:collapse;background:#0E1117;'>"
+        "<tr><th style='padding:4px 6px;border:1px solid #2a2d33;color:#90A4AE;font-size:11px;'></th>"
+        "<th style='padding:4px 6px;border:1px solid #2a2d33;color:#69F0AE;font-size:11px;'>CE buy</th>"
+        "<th style='padding:4px 6px;border:1px solid #2a2d33;color:#FF8A80;font-size:11px;'>PE buy</th></tr>"
+        + body + "</table>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_client=None, fut_fn=None, quote_fn=None):
@@ -634,15 +647,25 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
         if st.button("Run Gemini setups", key="gs_run_setup"):
             st.session_state["_gs_setup_go"] = True
 
+    if st.session_state.get("_gs_setup_go") or st.session_state.get("_gs_setup_busy"):
+        st.info("Gemini running — listing a live model, then writing CE/PE setups. 503 = overloaded, retrying…")
+
     if st.session_state.pop("_gs_setup_go", False):
-        with st.spinner("Gemini setups…"):
+        st.session_state["_gs_setup_busy"] = True
+        with st.status("Gemini setups running…", expanded=True) as status:
+            status.write("Sending session tape + VP + PDH/PDL…")
             data, model = run_setups(book, vp_f, vp_c, vp_p, full_table, max_loss)
-        st.session_state["_gs_setups"] = data
-        st.session_state["_gs_setup_model"] = model
+            st.session_state["_gs_setups"] = data
+            st.session_state["_gs_setup_model"] = model
+            if (data.get("CE") or {}).get("watch") or (data.get("PE") or {}).get("watch"):
+                status.update(label=f"Setups ready · {model}", state="complete")
+            else:
+                status.update(label=f"No setups · {model}", state="error")
+        st.session_state["_gs_setup_busy"] = False
 
     setups = st.session_state.get("_gs_setups") or {}
     lot = LOT_SIZES.get(book.get("name") or name, 10)
-    c_set, c_pos, c_an = st.columns(3)
+    c_set, c_pos, c_an = st.columns([0.45, 0.20, 0.35])
     with c_set:
         _setup_table(setups.get("CE"), setups.get("PE"), max_loss, lot)
         if setups.get("_model"):
@@ -668,7 +691,7 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
         if watch and lots and entry:
             last = float(st.session_state.get("_gs_watch_ts") or 0)
             busy = bool(st.session_state.get("_gs_watch_busy"))
-            if (not busy) and (time.time() - last >= 10):
+            if (not busy) and (time.time() - last >= 60):
                 st.session_state["_gs_watch_busy"] = True
                 try:
                     w, model = run_watch(book, pos, vp_f, vp_c, vp_p, full_table)
