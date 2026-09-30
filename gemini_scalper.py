@@ -138,7 +138,72 @@ def _fmt_vp(vp):
     )
 
 
+def _live_models(key):
+    cached = st.session_state.get("_gs_model_ids")
+    if cached:
+        return list(cached)
+    ids = []
+    try:
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"key": key, "pageSize": 100},
+            headers={"x-goog-api-key": key},
+            timeout=20,
+        )
+        for m in (r.json() or {}).get("models") or []:
+            name = str(m.get("name") or "").split("/")[-1]
+            methods = m.get("supportedGenerationMethods") or m.get("supported_generation_methods") or []
+            acts = m.get("supportedActions") or m.get("supported_actions") or []
+            ok = (not methods and not acts) or ("generateContent" in methods) or ("generateContent" in acts)
+            if name.startswith("gemini") and "tts" not in name and "embed" not in name and ok:
+                ids.append(name)
+    except Exception:
+        ids = []
+    prefer = [
+        "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite",
+        "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3-flash",
+        "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest",
+    ]
+    ordered = [p for p in prefer if p in ids] + [i for i in ids if i not in prefer]
+    if not ordered:
+        ordered = prefer
+    st.session_state["_gs_model_ids"] = ordered
+    return ordered
+
+
 def _gemini(prompt, max_tokens=4000):
+    key = _key()
+    if not key:
+        return None, "No GEMINI_API_KEY"
+    hit = st.session_state.get("_gs_ok_model")
+    models = ([hit] if hit else []) + [m for m in _live_models(key) if m != hit]
+    err = []
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
+    }
+    headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+    for model in models[:8]:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                params={"key": key},
+                headers=headers,
+                json=body,
+                timeout=70,
+            )
+            if r.status_code >= 400:
+                err.append(f"{model} {r.status_code}")
+                continue
+            parts = (((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+            txt = "".join(p.get("text", "") for p in parts).strip()
+            if txt:
+                st.session_state["_gs_ok_model"] = model
+                return txt, model
+            err.append(f"{model} empty")
+        except Exception as e:
+            err.append(f"{model} {str(e)[:50]}")
+    return None, " · ".join(err[-6:]) or "empty"
     key = _key()
     if not key:
         return None, "No GEMINI_API_KEY"
