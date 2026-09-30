@@ -138,7 +138,7 @@ def _fmt_vp(vp):
     )
 
 
-def _gemini(prompt, max_tokens=1800):
+def _gemini(prompt, max_tokens=4000):
     key = _key()
     if not key:
         return None, "No GEMINI_API_KEY"
@@ -360,14 +360,28 @@ def run_setups(book, vp_f, vp_c, vp_p, table, max_loss):
     except NameError:
         prompt = prompt + str({"spot": book.get("spot"), "fut": book.get("fut"), "rows": len(table or [])})
     txt, model = _gemini(prompt)
-    st.session_state["_gs_setup_raw"] = (txt or "")[:1500]
+    st.session_state["_gs_setup_raw"] = (txt or str(model) or "")[:2500]
     if not txt:
-        return {}, model or "err"
+        return {"CE": {"watch": False, "type": "NO TRADE", "rationale": str(model)},
+                "PE": {"watch": False, "type": "NO TRADE", "rationale": str(model)},
+                "_model": model}, model or "err"
     data = _parse_json(txt)
+    if not isinstance(data, dict) or not data:
+        low = (txt or "").replace(" ", "")
+        data = {}
+    # accept lowercase / nested
+    if "CE" not in data and "ce" in data:
+        data["CE"] = data.get("ce")
+    if "PE" not in data and "pe" in data:
+        data["PE"] = data.get("pe")
     for side in ("CE", "PE"):
         b = data.get(side)
-        if isinstance(b, dict) and b.get("type") and "NO TRADE" not in str(b.get("type")).upper():
-            b["watch"] = True
+        if isinstance(b, dict):
+            if b.get("entry") or b.get("trigger") or (b.get("type") and "NO TRADE" not in str(b.get("type")).upper()):
+                b["watch"] = True
+    if not data.get("CE") and not data.get("PE"):
+        data["CE"] = {"watch": False, "type": "NO TRADE", "rationale": (txt or "")[:400]}
+        data["PE"] = {"watch": False, "type": "NO TRADE", "rationale": "JSON parse failed"}
     data["_model"] = model
     return data, model
 
@@ -392,23 +406,27 @@ def run_watch(book, pos, vp_f, vp_c, vp_p, table):
     return data, model
 
 
-def _setup_html(side, block, max_loss):
-    if not isinstance(block, dict) or not block.get("watch"):
-        return f"<div style='color:#90A4AE;font-size:13px;'>NO TRADE {side}<br>{(block or {}).get('rationale') or ''}</div>"
-    col = "#69F0AE" if side == "CE" else "#FF8A80"
-    return (
-        f"<div style='font-size:13px;line-height:1.45;color:#ECEFF1;'>"
-        f"<b style='color:{col};'>{block.get('type') or 'SETUP WATCH'}</b><br>"
-        f"Trigger : {block.get('trigger')}<br>"
-        f"Entry : {block.get('entry')}<br>"
-        f"Target : {block.get('target')} ({block.get('tgt_pct')} %)<br>"
-        f"SL : {block.get('sl')} ({block.get('sl_pct')} %)<br>"
-        f"Entry Lot : {block.get('lots')}<br>"
-        f"max Profit : {block.get('max_profit')}<br>"
-        f"max Loss : {block.get('max_loss') or max_loss}<br>"
-        f"Risk / Reward : {block.get('rr')}<br>"
-        f"<span style='color:#90A4AE;'>{block.get('rationale') or ''}</span></div>"
-    )
+def _setup_table(ce, pe, max_loss):
+    def cell(b, side):
+        b = b if isinstance(b, dict) else {}
+        if not b.get("watch") and "NO TRADE" in str(b.get("type") or "").upper():
+            return f"NO TRADE {side}\n{b.get('rationale') or ''}"
+        if not b:
+            return "—"
+        return (
+            f"{b.get('type') or 'SETUP WATCH'}\n"
+            f"Trigger : {b.get('trigger')}\n"
+            f"Entry : {b.get('entry')}\n"
+            f"Target : {b.get('target')} ({b.get('tgt_pct')} %)\n"
+            f"SL : {b.get('sl')} ({b.get('sl_pct')} %)\n"
+            f"Entry Lot : {b.get('lots')}\n"
+            f"max Profit : {b.get('max_profit')}\n"
+            f"max Loss : {b.get('max_loss') or max_loss}\n"
+            f"Risk / Reward : {b.get('rr')}\n"
+            f"Rationale : {b.get('rationale') or ''}"
+        )
+    df = pd.DataFrame({"CE buy": [cell(ce, "CE")], "PE buy": [cell(pe, "PE")]})
+    st.dataframe(df, use_container_width=True, hide_index=True, height=280)
 
 
 def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_client=None, fut_fn=None, quote_fn=None):
@@ -503,16 +521,13 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
         st.session_state["_gs_setup_model"] = model
 
     setups = st.session_state.get("_gs_setups") or {}
-    s1, s2 = st.columns(2)
-    with s1:
-        st.markdown(_setup_html("CE", setups.get("CE"), max_loss), unsafe_allow_html=True)
-    with s2:
-        st.markdown(_setup_html("PE", setups.get("PE"), max_loss), unsafe_allow_html=True)
+    _setup_table(setups.get("CE"), setups.get("PE"), max_loss)
     if setups.get("_model"):
         st.caption("Setups · " + str(setups.get("_model")) + f" · sent full session {len(full_table)} bars + VP + PDH/PDL")
-        raw = st.session_state.get("_gs_setup_raw") or ""
-        if raw and not (setups.get("CE") or {}).get("watch") and not (setups.get("PE") or {}).get("watch"):
-            st.code(raw[:800], language=None)
+    raw = st.session_state.get("_gs_setup_raw") or ""
+    if raw and not (setups.get("CE") or {}).get("watch"):
+        with st.expander("Gemini raw"):
+            st.code(raw[:1200], language=None)
 
     p1, p2 = st.columns([1, 1.2])
     with p1:
