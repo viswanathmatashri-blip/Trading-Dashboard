@@ -193,10 +193,16 @@ class _PasteFile:
         return self._bio.read()
 
 
-def _paste_dock(slot_key, hint):
+def _paste_dock(slot_key, hint, uploader_key):
+    up = st.file_uploader(
+        hint + " file",
+        type=["png", "jpg", "jpeg", "webp"],
+        key=uploader_key,
+        label_visibility="collapsed",
+    )
     components.html(
         f"""
-<div id="dock" style="border:1px dashed #546E7A;border-radius:8px;min-height:88px;
+<div id="dock" style="border:1px dashed #546E7A;border-radius:8px;min-height:92px;
   background:#111418;color:#B0BEC5;font-family:sans-serif;padding:14px 16px;
   outline:none;cursor:text;" tabindex="0">
   <div style="font-size:13px;color:#ECEFF1;font-weight:600;">Click here, then paste (Ctrl+V / Cmd+V)</div>
@@ -204,25 +210,26 @@ def _paste_dock(slot_key, hint):
   <div id="st" style="font-size:12px;color:#69F0AE;margin-top:8px;"></div>
 </div>
 <script>
-const SLOT = {json.dumps(slot_key)};
 const dock = document.getElementById("dock");
-dock.focus();
-function writeParent(dataUrl) {{
+try {{ dock.focus(); }} catch (e) {{}}
+function mark(t) {{ document.getElementById("st").textContent = t; }}
+function pushFile(file) {{
   const doc = window.parent.document;
-  const boxes = [...doc.querySelectorAll("textarea")];
-  const ta = boxes.find(t => (t.getAttribute("aria-label") || "").indexOf(SLOT) >= 0)
-          || boxes.find(t => (t.value || "").startsWith("data:image") === false && (t.getAttribute("aria-label") || "").indexOf("gs_paste") >= 0);
-  const target = boxes.find(t => (t.getAttribute("aria-label") || "") === SLOT) || ta;
-  if (!target) {{
-    document.getElementById("st").textContent = "Paste captured — click Read charts after Streamlit picks it up.";
-    return;
+  const inputs = [...doc.querySelectorAll('input[type=file]')];
+  if (!inputs.length) {{ mark("No drop zone in page"); return false; }}
+  const input = inputs[inputs.length - 1];
+  try {{
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    input.files = dt.files;
+    input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+    input.dispatchEvent(new Event("change", {{ bubbles: true }}));
+    mark("Pasted — preview should appear below. Then click Read charts.");
+    return true;
+  }} catch (err) {{
+    mark("Paste blocked: " + err);
+    return false;
   }}
-  const proto = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
-  if (proto && proto.set) proto.set.call(target, dataUrl);
-  else target.value = dataUrl;
-  target.dispatchEvent(new Event("input", {{ bubbles: true }}));
-  target.dispatchEvent(new Event("change", {{ bubbles: true }}));
-  document.getElementById("st").textContent = "Pasted. If preview is empty, click Read charts once.";
 }}
 function grab(e) {{
   const items = e.clipboardData && e.clipboardData.items;
@@ -230,35 +237,32 @@ function grab(e) {{
   for (const it of items) {{
     if (it.type && it.type.indexOf("image") === 0) {{
       e.preventDefault();
+      e.stopPropagation();
       const file = it.getAsFile();
-      const reader = new FileReader();
-      reader.onload = () => writeParent(reader.result);
-      reader.readAsDataURL(file);
-      document.getElementById("st").textContent = "Reading clipboard…";
+      if (!file) continue;
+      mark("Reading clipboard…");
+      pushFile(file);
       return;
     }}
   }}
 }}
 dock.addEventListener("paste", grab);
-window.addEventListener("paste", grab);
 document.addEventListener("paste", grab);
+window.addEventListener("paste", grab);
 </script>
         """,
-        height=120,
+        height=124,
     )
-    raw = st.text_area(slot_key, key=slot_key, height=1)
-    return _from_data_url(raw)
+    return up
 
 
 def render_gemini_scalper(*_a, **_k):
     st.markdown(
         "<div style='font-size:1.12rem;font-weight:700;color:#69F0AE;'>Gemini Scalper</div>"
         "<div style='font-size:12px;color:#90A4AE;margin-bottom:8px;'>"
-        "Paste TradingView panes (CE left · Spot/Fut centre · PE right). "
-        "Click the box, then Ctrl+V / Cmd+V — no file upload."
-        "</div>"
-        "<style>div[data-testid='stTextArea'] textarea { min-height: 0 !important; height: 0 !important; "
-        "opacity: 0; position: absolute; }</style>",
+        "Click the dashed box, paste the TradingView shot (Ctrl+V / Cmd+V). "
+        "Wait for preview, then Read charts."
+        "</div>",
         unsafe_allow_html=True,
     )
     if not _key():
@@ -273,34 +277,47 @@ def render_gemini_scalper(*_a, **_k):
     )
     files = []
     if mode.startswith("One"):
-        one = _paste_dock("gs_paste_one", "Combined CE | Spot | PE screenshot")
+        one = _paste_dock("gs_paste_one", "Combined CE | Spot | PE", "gs_one")
         if one:
-            files.append(("combined CE|SPOT|PE", _PasteFile(one)))
+            files.append(("combined CE|SPOT|PE", one))
+            st.session_state["_gs_hold_one"] = one.getvalue()
+            st.session_state["_gs_hold_one_type"] = one.type or "image/png"
     else:
         c1, c2, c3 = st.columns(3)
         with c1:
-            ce = _paste_dock("gs_paste_ce", "CE pane")
+            ce = _paste_dock("gs_paste_ce", "CE pane", "gs_ce")
         with c2:
-            sp = _paste_dock("gs_paste_sp", "Spot / Fut pane")
+            sp = _paste_dock("gs_paste_sp", "Spot / Fut pane", "gs_sp")
         with c3:
-            pe = _paste_dock("gs_paste_pe", "PE pane")
+            pe = _paste_dock("gs_paste_pe", "PE pane", "gs_pe")
         if ce:
-            files.append(("CE pane", _PasteFile(ce)))
+            files.append(("CE pane", ce))
         if sp:
-            files.append(("SPOT/FUT pane", _PasteFile(sp)))
+            files.append(("SPOT/FUT pane", sp))
         if pe:
-            files.append(("PE pane", _PasteFile(pe)))
+            files.append(("PE pane", pe))
+
+    if not files and st.session_state.get("_gs_hold_one"):
+        bio = io.BytesIO(st.session_state["_gs_hold_one"])
+        bio.name = "paste.png"
+        bio.type = st.session_state.get("_gs_hold_one_type") or "image/png"
+        files.append(("combined CE|SPOT|PE", _PasteFile(bio)))
 
     note = st.text_input("Optional note (index, TF, strike)", key="gs_note", placeholder="CRUDEOILM 5m 8750 CE/PE")
-    go = st.button("Read charts → watch setups", type="primary", disabled=not files, key="gs_go")
+    go = st.button("Read charts → watch setups", type="primary", key="gs_go")
 
     if files:
         prev = st.columns(len(files))
         for i, (lab, f) in enumerate(files):
             with prev[i]:
                 st.caption(lab)
-                st.image(f.getvalue(), use_container_width=True)
+                try:
+                    st.image(f.getvalue(), use_container_width=True)
+                except Exception:
+                    pass
 
+    if go and not files:
+        st.warning("No image in the app yet. Click the dashed box, paste again, wait for preview, then Read charts.")
     if go and files:
         parts = [{"text": PROMPT + (f"\nNOTE: {note}" if note else "")}]
         for lab, f in files:
@@ -319,7 +336,7 @@ def render_gemini_scalper(*_a, **_k):
         st.error(err)
         return
     if not data:
-        st.caption("No setups yet — drop a screenshot and click Read charts.")
+        st.caption("No setups yet — paste a screenshot, wait for preview, then Read charts.")
         return
 
     ts = st.session_state.get("_gs_vision_ts") or ""
@@ -338,10 +355,10 @@ def render_gemini_scalper(*_a, **_k):
         )
     left, right = st.columns(2)
     with left:
-        st.markdown("**CE watch**", unsafe_allow_html=True)
+        st.markdown("**CE watch**")
         st.markdown(_cell("CE", data.get("CE")), unsafe_allow_html=True)
     with right:
-        st.markdown("**PE watch**", unsafe_allow_html=True)
+        st.markdown("**PE watch**")
         st.markdown(_cell("PE", data.get("PE")), unsafe_allow_html=True)
 
 
