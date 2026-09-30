@@ -2348,15 +2348,15 @@ def render_broker_status_ribbon():
         for lab, key in (("Spot", "_src_spot"), ("PE", "_src_opt_PE"), ("CE", "_src_opt_CE"))
     )
     hint = (ab_err[:90] + "…") if ab_err and len(ab_err) > 90 else ab_err
+    hint_html = f"<span style='color:#78909C;font-weight:500;'>{hint}</span>" if hint else ""
     st.markdown(
-        f"<div style='display:flex;gap:14px;align-items:center;flex-wrap:wrap;"
-        f"font-size:12px;font-weight:700;letter-spacing:0.04em;margin:2px 0 8px 0;'>"
+        "<div style='display:flex;gap:14px;align-items:center;flex-wrap:wrap;"
+        "font-size:12px;font-weight:700;letter-spacing:0.04em;margin:2px 0 8px 0;'>"
         f"<span style='color:{a_col};'>● SmartAPI {a_lab}</span>"
         f"<span style='color:{b_col};'>● AliceBlue {b_lab}</span>"
         f"<span style='color:#90A4AE;font-weight:600;'>last {last}</span>"
         f"<span style='color:#90A4AE;font-weight:600;'>{srcs}</span>"
-        + (f"<span style='color:#78909C;font-weight:500;'>{hint}</span>" if hint else "")
-        + "</div>",
+        f"{hint_html}</div>",
         unsafe_allow_html=True,
     )
 
@@ -8032,7 +8032,7 @@ def live_mis_fragment():
         st.exception(e)
 
 
-@st.fragment(run_every=None)
+@st.fragment
 def live_gs_fragment():
     if not view_is("gs"):
         return
