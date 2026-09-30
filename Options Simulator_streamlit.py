@@ -2824,7 +2824,7 @@ def fetch_candles_with_holiday_fallback(smart_api, spot_token, exchange, api_int
 
 MCX_NAME_ALIASES = {
     "GOLDM": ["GOLDM", "GOLD"],
-    "CRUDEOIL": ["CRUDEOIL", "CRUDE"],
+    "CRUDEOIL": ["CRUDEOILM", "CRUDEOILMINI", "CRUDEOIL", "CRUDE"],
 }
 
 
@@ -2845,10 +2845,15 @@ def get_near_month_futures_token(df_scrip_master, index_name, fut_exch):
                 & df["_sym"].str.startswith(prefixes)
                 & df["_sym"].str.contains("FUT")
             ].copy()
-            # prefer exact product (CRUDEOIL not CRUDEOILM if both exist)
-            exact = fut_scrips[fut_scrips["_sym"].str.startswith(index_name)]
-            if not exact.empty:
-                fut_scrips = exact
+            # Crude Oil Mini first (CRUDEOILM / CRUDEOILMINI), not big Crude
+            if index_name == "CRUDEOIL":
+                mini = fut_scrips[fut_scrips["_sym"].str.startswith(("CRUDEOILM", "CRUDEOILMINI"))]
+                if not mini.empty:
+                    fut_scrips = mini
+            else:
+                exact = fut_scrips[fut_scrips["_sym"].str.startswith(index_name)]
+                if not exact.empty:
+                    fut_scrips = exact
         else:
             segs = [str(fut_exch).upper()] if fut_exch else ["NFO"]
             fut_scrips = df[
