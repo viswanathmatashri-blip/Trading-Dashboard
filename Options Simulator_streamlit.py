@@ -4668,8 +4668,8 @@ elif st.session_state.get("app_view") == "crypto":
             st.session_state["cry_need_seed"] = True
 elif st.session_state.get("app_view") == "gs":
     with st.sidebar.expander("Gemini Scalper", expanded=True):
-        st.caption("No API seed. Upload TradingView CE | Spot | PE screenshots. Needs GEMINI_API_KEY.")
-        st.caption("Other modes stay off while this view is selected.")
+        st.caption("Live tapes + VP + manual Gemini setups. Watch loops on an open position. Other modes off.")
+        st.caption("Needs broker session + GEMINI_API_KEY.")
 elif st.session_state.get("app_view") == "scalper":
     st.sidebar.caption("Scalper uses the index + expiry from Market Parameters. ATM PE | Spot | ATM CE.")
     with st.sidebar.expander("6. Gemini analysis", expanded=True):
@@ -8032,13 +8032,17 @@ def live_mis_fragment():
         st.exception(e)
 
 
-@st.fragment
+@st.fragment(run_every=5 if (st.session_state.get("enable_main_refresh") and view_is("gs")) else None)
 def live_gs_fragment():
     if not view_is("gs"):
         return
     try:
         from gemini_scalper import render_gemini_scalper
-        render_gemini_scalper()
+        render_gemini_scalper(
+            _mis_fetch, df_master, INDEX_TOKEN_MAP, get_smart_api_client,
+            fut_fn=get_near_month_futures_token,
+            quote_fn=_mis_quotes,
+        )
     except Exception as e:
         st.exception(e)
 
