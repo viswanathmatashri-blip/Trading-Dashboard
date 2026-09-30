@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import time
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 MODELS = (
     "gemini-3.8-flash",
@@ -160,13 +162,103 @@ def _cell(side, block):
     )
 
 
+def _from_data_url(s):
+    s = (s or "").strip()
+    if not s.startswith("data:image"):
+        return None
+    try:
+        head, b64 = s.split(",", 1)
+        raw = base64.b64decode(b64)
+        mime = "image/png"
+        if "image/jpeg" in head:
+            mime = "image/jpeg"
+        elif "image/webp" in head:
+            mime = "image/webp"
+        bio = io.BytesIO(raw)
+        bio.name = "paste.png" if "png" in mime else "paste.jpg"
+        bio.type = mime
+        return bio
+    except Exception:
+        return None
+
+
+class _PasteFile:
+    def __init__(self, bio):
+        self._bio = bio
+        self.name = getattr(bio, "name", "paste.png")
+        self.type = getattr(bio, "type", "image/png")
+
+    def getvalue(self):
+        self._bio.seek(0)
+        return self._bio.read()
+
+
+def _paste_dock(slot_key, hint):
+    components.html(
+        f"""
+<div id="dock" style="border:1px dashed #546E7A;border-radius:8px;min-height:88px;
+  background:#111418;color:#B0BEC5;font-family:sans-serif;padding:14px 16px;
+  outline:none;cursor:text;" tabindex="0">
+  <div style="font-size:13px;color:#ECEFF1;font-weight:600;">Click here, then paste (Ctrl+V / Cmd+V)</div>
+  <div style="font-size:12px;margin-top:4px;">{hint}</div>
+  <div id="st" style="font-size:12px;color:#69F0AE;margin-top:8px;"></div>
+</div>
+<script>
+const SLOT = {json.dumps(slot_key)};
+const dock = document.getElementById("dock");
+dock.focus();
+function writeParent(dataUrl) {{
+  const doc = window.parent.document;
+  const boxes = [...doc.querySelectorAll("textarea")];
+  const ta = boxes.find(t => (t.getAttribute("aria-label") || "").indexOf(SLOT) >= 0)
+          || boxes.find(t => (t.value || "").startsWith("data:image") === false && (t.getAttribute("aria-label") || "").indexOf("gs_paste") >= 0);
+  const target = boxes.find(t => (t.getAttribute("aria-label") || "") === SLOT) || ta;
+  if (!target) {{
+    document.getElementById("st").textContent = "Paste captured — click Read charts after Streamlit picks it up.";
+    return;
+  }}
+  const proto = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
+  if (proto && proto.set) proto.set.call(target, dataUrl);
+  else target.value = dataUrl;
+  target.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  target.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  document.getElementById("st").textContent = "Pasted. If preview is empty, click Read charts once.";
+}}
+function grab(e) {{
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  for (const it of items) {{
+    if (it.type && it.type.indexOf("image") === 0) {{
+      e.preventDefault();
+      const file = it.getAsFile();
+      const reader = new FileReader();
+      reader.onload = () => writeParent(reader.result);
+      reader.readAsDataURL(file);
+      document.getElementById("st").textContent = "Reading clipboard…";
+      return;
+    }}
+  }}
+}}
+dock.addEventListener("paste", grab);
+window.addEventListener("paste", grab);
+document.addEventListener("paste", grab);
+</script>
+        """,
+        height=120,
+    )
+    raw = st.text_area(slot_key, key=slot_key, height=1)
+    return _from_data_url(raw)
+
+
 def render_gemini_scalper(*_a, **_k):
     st.markdown(
         "<div style='font-size:1.12rem;font-weight:700;color:#69F0AE;'>Gemini Scalper</div>"
         "<div style='font-size:12px;color:#90A4AE;margin-bottom:8px;'>"
-        "Upload TradingView panes: CE left · Spot/Fut centre · PE right — same layout as your screenshot. "
-        "Gemini reads VWAP, volume profile, EFI, OBV and returns watch setups only."
-        "</div>",
+        "Paste TradingView panes (CE left · Spot/Fut centre · PE right). "
+        "Click the box, then Ctrl+V / Cmd+V — no file upload."
+        "</div>"
+        "<style>div[data-testid='stTextArea'] textarea { min-height: 0 !important; height: 0 !important; "
+        "opacity: 0; position: absolute; }</style>",
         unsafe_allow_html=True,
     )
     if not _key():
@@ -181,23 +273,23 @@ def render_gemini_scalper(*_a, **_k):
     )
     files = []
     if mode.startswith("One"):
-        one = st.file_uploader("Combined screenshot", type=["png", "jpg", "jpeg", "webp"], key="gs_one")
+        one = _paste_dock("gs_paste_one", "Combined CE | Spot | PE screenshot")
         if one:
-            files.append(("combined CE|SPOT|PE", one))
+            files.append(("combined CE|SPOT|PE", _PasteFile(one)))
     else:
         c1, c2, c3 = st.columns(3)
         with c1:
-            ce = st.file_uploader("CE pane", type=["png", "jpg", "jpeg", "webp"], key="gs_ce")
+            ce = _paste_dock("gs_paste_ce", "CE pane")
         with c2:
-            sp = st.file_uploader("Spot / Fut pane", type=["png", "jpg", "jpeg", "webp"], key="gs_sp")
+            sp = _paste_dock("gs_paste_sp", "Spot / Fut pane")
         with c3:
-            pe = st.file_uploader("PE pane", type=["png", "jpg", "jpeg", "webp"], key="gs_pe")
+            pe = _paste_dock("gs_paste_pe", "PE pane")
         if ce:
-            files.append(("CE pane", ce))
+            files.append(("CE pane", _PasteFile(ce)))
         if sp:
-            files.append(("SPOT/FUT pane", sp))
+            files.append(("SPOT/FUT pane", _PasteFile(sp)))
         if pe:
-            files.append(("PE pane", pe))
+            files.append(("PE pane", _PasteFile(pe)))
 
     note = st.text_input("Optional note (index, TF, strike)", key="gs_note", placeholder="CRUDEOILM 5m 8750 CE/PE")
     go = st.button("Read charts → watch setups", type="primary", disabled=not files, key="gs_go")
@@ -207,7 +299,7 @@ def render_gemini_scalper(*_a, **_k):
         for i, (lab, f) in enumerate(files):
             with prev[i]:
                 st.caption(lab)
-                st.image(f, use_container_width=True)
+                st.image(f.getvalue(), use_container_width=True)
 
     if go and files:
         parts = [{"text": PROMPT + (f"\nNOTE: {note}" if note else "")}]
