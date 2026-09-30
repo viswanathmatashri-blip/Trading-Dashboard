@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 ORDER = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]
 LOT_SIZES = {
     "NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120,
-    "SENSEX": 20, "GOLDM": 100, "CRUDEOIL": 100,
+    "SENSEX": 20, "GOLDM": 100, "CRUDEOIL": 10,
 }
 STEP = {
     "NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25,
@@ -1126,7 +1126,9 @@ def _atm_from_master(df_master, name, spot, fo):
     today = dt.datetime.now().date()
     step = STEP.get(name, 50)
     atm = int(round(float(spot) / step) * step)
-    names = ["GOLDM", "GOLD"] if name == "GOLDM" else [name]
+    names = ["GOLDM", "GOLD"] if name == "GOLDM" else (
+        ["CRUDEOILM", "CRUDEOILMINI", "CRUDEOIL"] if name == "CRUDEOIL" else [name]
+    )
     d = df_master.copy()
     d["name_u"] = d["name"].astype(str).str.upper()
     d = d[d["name_u"].isin([x.upper() for x in names])]
@@ -1393,10 +1395,11 @@ def _fmt_gcell(side, cell, book=None):
         f"<b style='color:{col};font-size:13px;'>{cell.get('contract') or side}</b><br>"
         f"Entry Zone : {cell.get('entry') or '—'}<br>"
         f"Target : {cell.get('target')} ({cell.get('tgt_pct')} %)"
-        f"{('<br><span style=\"color:#90A4AE;\">Tgt why : ' + str(cell.get('tgt_why')) + '</span>') if cell.get('tgt_why') else ''}<br>"
-        f"SL : {cell.get('sl')} ({cell.get('sl_pct')} %)"
-        f"{('<br><span style=\"color:#90A4AE;\">SL why : ' + str(cell.get('sl_why')) + '</span>') if cell.get('sl_why') else ''}<br>"
-        f"Entry Lots : {lots}<br>"
+        f"Target : {cell.get('target')} ({cell.get('tgt_pct')} %)<br>"
+        + (f"<span style='color:#90A4AE;'>Tgt why : {cell.get('tgt_why')}</span><br>" if cell.get("tgt_why") else "")
+        + f"SL : {cell.get('sl')} ({cell.get('sl_pct')} %)<br>"
+        + (f"<span style='color:#90A4AE;'>SL why : {cell.get('sl_why')}</span><br>" if cell.get("sl_why") else "")
+        + f"Entry Lots : {lots}<br>"
         f"Max Profit : {cell.get('max_profit')}<br>"
         f"Max Loss : {cell.get('max_loss')}<br>"
         f"R:R : {cell.get('rr')}<br>"
