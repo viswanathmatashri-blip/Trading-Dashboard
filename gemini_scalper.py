@@ -295,7 +295,20 @@ def _color_first(df):
     return df.style.apply(style_row, axis=1)
 
 
-def _digest(book, vp_f, vp_c, vp_p, table_tail, max_loss):
+def _session_table(book, spot, limit=None):
+    fut_rows = _today_rows(book.get("idx_rows") or []) or list(book.get("idx_rows") or [])
+    ce_rows = _today_rows(book.get("ce_rows") or []) or list(book.get("ce_rows") or [])
+    pe_rows = _today_rows(book.get("pe_rows") or []) or list(book.get("pe_rows") or [])
+    n = max(len(fut_rows), len(ce_rows), len(pe_rows))
+    if limit:
+        n = min(n, limit)
+    out = []
+    for i in range(1, n + 1):
+        fr = fut_rows[-i] if i <= len(fut_rows) else {}
+        cr = ce_rows[-i] if i <= len(ce_rows) else {}
+        pr = pe_rows[-i] if i <= len(pe_rows) else {}
+        out.append(_row_pack(spot if i == 1 else fr.get("price"), fr, cr, pr))
+    return out
     fut_r, ce_r, pe_r = _last(book.get("idx_rows")), _last(book.get("ce_rows")), _last(book.get("pe_rows"))
     sh, sl = session_hl(book.get("idx_rows"))
     pdh, pdl = pdh_pdl(book.get("idx_rows"))
@@ -309,30 +322,45 @@ def _digest(book, vp_f, vp_c, vp_p, table_tail, max_loss):
         f"LAST FUT CVD {fut_r.get('CVD')} EFI {fut_r.get('EFI')} OBV {fut_r.get('OBV')} VWAP {fut_r.get('VWAP')}",
         f"LAST CE CVD {ce_r.get('CVD')} EFI {ce_r.get('EFI')} OBV {ce_r.get('OBV')} VWAP {ce_r.get('VWAP')}",
         f"LAST PE EFI {pe_r.get('EFI')} OBV {pe_r.get('OBV')} VWAP {pe_r.get('VWAP')}",
-        "TABLE TAIL (newest first):",
+        f"BARS {len(table_tail)} session rows newest-first",
+        "time S F Fcvd Fefi Fobv Fvw CE CEcvd CEefi CEobv PE PEefi PEobv PEvw",
     ]
-    for r in table_tail[:12]:
-        lines.append(str(r))
+    for r in table_tail:
+        lines.append(
+            f"{r.get('time')} {r.get('Spot')} {r.get('Fut')} "
+            f"{r.get('Fut CVD')} {r.get('Fut EFI')} {r.get('Fut OBV')} {r.get('Fut VWAP')} "
+            f"{r.get('CE LTP')} {r.get('CE CVD')} {r.get('CE EFI')} {r.get('CE OBV')} "
+            f"{r.get('PE LTP')} {r.get('PE EFI')} {r.get('PE OBV')} {r.get('PE VWAP')}"
+        )
     return "\n".join(lines)
 
 
 def run_setups(book, vp_f, vp_c, vp_p, table, max_loss):
     prompt = (
-        "You are an Indian/MCX options scalper. BUY only (CE or PE), never sell premium.\n"
-        "Use DATA: session VP (POC/VAH/VAL/fat/LVN), PDH/PDL, session H/L, tape CVD/EFI/OBV/VWAP.\n"
+        "You are an Indian/MCX options scalper. BUY only — never sell/write premium.\n"
+        "DATA already has live LTPs, VP nodes, session H/L, PDH/PDL, and the last 24 tape rows.\n"
+        "You MUST output one CE buy watch AND one PE buy watch. Do not answer NO TRADE when LTPs exist.\n"
+        "Build trigger from Fut VP / session high or low / PDH-PDL plus option LTP vs its VP/VWAP.\n"
+        "Type examples: SETUP WATCH - LONG BREAKOUT | SETUP WATCH - SHORT BREAKDOWN | SETUP WATCH - MEAN REVERSION.\n"
         "Return ONLY JSON:\n"
-        '{"CE":{"watch":true,"type":"SETUP WATCH - LONG BREAKOUT","trigger":"Fut > 25560 & CE > 220",'
+        '{"CE":{"watch":true,"type":"SETUP WATCH - LONG BREAKOUT","trigger":"Fut > session high & CE > POC",'
         '"entry":"222-224","target":240,"tgt_pct":8.1,"sl":210,"sl_pct":-5.4,'
-        '"lots":2,"max_profit":2600,"max_loss":1400,"rr":"1/1.3","rationale":"..."},'
-        '"PE":{...same keys...}}\n'
-        "If no edge on a side watch=false type=NO TRADE.\n"
-        "lots from MAXLOSS and sl distance. Target above entry. SL below entry.\n"
+        '"lots":2,"max_profit":2600,"max_loss":1400,"rr":"1/1.3",'
+        '"rationale":"cite VP/PDH/EFI/CVD from DATA"},'
+        '"PE":{"watch":true,"type":"SETUP WATCH - SHORT BREAKDOWN","trigger":"...","entry":"...","target":0,'
+        '"tgt_pct":0,"sl":0,"sl_pct":0,"lots":1,"max_profit":0,"max_loss":0,"rr":"1/1.3","rationale":"..."}}\n'
+        "lots = floor(MAXLOSS / ((entry_mid-sl)*LOT)). Target above entry. SL below entry.\n"
         "DATA:\n" + _digest(book, vp_f, vp_c, vp_p, table, max_loss)
     )
     txt, model = _gemini(prompt)
+    st.session_state["_gs_setup_raw"] = (txt or "")[:1500]
     if not txt:
         return {}, model or "err"
     data = _parse_json(txt)
+    for side in ("CE", "PE"):
+        b = data.get(side)
+        if isinstance(b, dict) and b.get("type") and "NO TRADE" not in str(b.get("type")).upper():
+            b["watch"] = True
     data["_model"] = model
     return data, model
 
@@ -441,16 +469,11 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
         unsafe_allow_html=True,
     )
 
-    n = max(len(fut_rows), len(ce_rows), len(pe_rows))
-    table = []
     spot = book.get("spot")
-    for i in range(1, min(n, 80) + 1):
-        fr = fut_rows[-i] if i <= len(fut_rows) else {}
-        cr = ce_rows[-i] if i <= len(ce_rows) else {}
-        pr = pe_rows[-i] if i <= len(pe_rows) else {}
-        table.append(_row_pack(spot if i == 1 else None, fr, cr, pr))
+    full_table = _session_table(book, spot)
+    table = full_table[:80]
     df = pd.DataFrame(table)
-    st.caption(f"Tape {tf} · row 0 is live (green up / red down vs previous bar)")
+    st.caption(f"Tape {tf} · on screen last {len(table)} bars · Gemini gets full session {len(full_table)} bars")
     try:
         st.dataframe(_color_first(df), use_container_width=True, hide_index=True, height=320)
     except Exception:
@@ -467,7 +490,7 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
 
     if st.session_state.pop("_gs_setup_go", False):
         with st.spinner("Gemini setups…"):
-            data, model = run_setups(book, vp_f, vp_c, vp_p, table, max_loss)
+            data, model = run_setups(book, vp_f, vp_c, vp_p, full_table, max_loss)
         st.session_state["_gs_setups"] = data
         st.session_state["_gs_setup_model"] = model
 
@@ -478,7 +501,10 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
     with s2:
         st.markdown(_setup_html("PE", setups.get("PE"), max_loss), unsafe_allow_html=True)
     if setups.get("_model"):
-        st.caption("Setups · " + str(setups.get("_model")))
+        st.caption("Setups · " + str(setups.get("_model")) + f" · sent full session {len(full_table)} bars + VP + PDH/PDL")
+        raw = st.session_state.get("_gs_setup_raw") or ""
+        if raw and not (setups.get("CE") or {}).get("watch") and not (setups.get("PE") or {}).get("watch"):
+            st.code(raw[:800], language=None)
 
     p1, p2 = st.columns([1, 1.2])
     with p1:
@@ -501,7 +527,7 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
             if due:
                 st.session_state["_gs_watch_busy"] = True
                 try:
-                    w, model = run_watch(book, pos, vp_f, vp_c, vp_p, table)
+                    w, model = run_watch(book, pos, vp_f, vp_c, vp_p, full_table)
                     st.session_state["_gs_watch_out"] = w
                     st.session_state["_gs_watch_ts"] = time.time()
                 finally:
