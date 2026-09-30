@@ -406,22 +406,64 @@ def run_watch(book, pos, vp_f, vp_c, vp_p, table):
     return data, model
 
 
-def _setup_table(ce, pe, max_loss):
+def _mid_px(entry):
+    s = str(entry or "").replace(" ", "")
+    if "-" in s:
+        a, b = s.split("-", 1)
+        try:
+            return (float(a) + float(b)) / 2.0
+        except Exception:
+            return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _size_side(b, max_loss, lot):
+    b = dict(b or {})
+    mid = _mid_px(b.get("entry"))
+    try:
+        sl = float(b.get("sl"))
+    except Exception:
+        sl = None
+    try:
+        tgt = float(b.get("target"))
+    except Exception:
+        tgt = None
+    risk = abs(mid - sl) if mid is not None and sl is not None else 0.0
+    per_lot = risk * float(lot or 0)
+    lots = int(float(max_loss) // per_lot) if per_lot else 0
+    qty = lots * int(lot or 0)
+    mx = round(risk * qty, 0) if qty else max_loss
+    mp = round(abs(tgt - mid) * qty, 0) if qty and tgt is not None and mid is not None else None
+    rr = f"1 to {round(abs(tgt - mid) / risk, 2)}" if risk and tgt is not None and mid is not None else b.get("rr")
+    b["qty"] = qty
+    b["lots"] = lots
+    b["max_loss"] = mx
+    if mp is not None:
+        b["max_profit"] = mp
+    if rr:
+        b["rr"] = rr
+    return b
+
+
+def _setup_table(ce, pe, max_loss, lot=10):
+    ce = _size_side(ce if isinstance(ce, dict) else {}, max_loss, lot)
+    pe = _size_side(pe if isinstance(pe, dict) else {}, max_loss, lot)
+
     def g(b, k, default=""):
-        b = b if isinstance(b, dict) else {}
-        v = b.get(k)
+        v = (b or {}).get(k)
         return default if v is None or v == "" else v
 
     def tgt(b):
-        b = b if isinstance(b, dict) else {}
-        t, p = b.get("target"), b.get("tgt_pct")
+        t, p = (b or {}).get("target"), (b or {}).get("tgt_pct")
         if t is None:
             return "—"
         return f"{t} ({p} %)" if p is not None else str(t)
 
     def sl(b):
-        b = b if isinstance(b, dict) else {}
-        s, p = b.get("sl"), b.get("sl_pct")
+        s, p = (b or {}).get("sl"), (b or {}).get("sl_pct")
         if s is None:
             return "—"
         return f"{s} ({p} %)" if p is not None else str(s)
@@ -432,14 +474,14 @@ def _setup_table(ce, pe, max_loss):
         ("Entry", g(ce, "entry"), g(pe, "entry")),
         ("Target", tgt(ce), tgt(pe)),
         ("SL", sl(ce), sl(pe)),
-        ("Entry Lot", g(ce, "lots"), g(pe, "lots")),
+        ("Entry Qty", g(ce, "qty"), g(pe, "qty")),
         ("max Profit", g(ce, "max_profit"), g(pe, "max_profit")),
         ("max Loss", g(ce, "max_loss", max_loss), g(pe, "max_loss", max_loss)),
         ("Risk to Reward", g(ce, "rr"), g(pe, "rr")),
         ("Rationale", g(ce, "rationale"), g(pe, "rationale")),
     ]
     df = pd.DataFrame(rows, columns=["", "CE buy", "PE buy"])
-    st.dataframe(df, use_container_width=True, hide_index=True, height=360)
+    st.dataframe(df, use_container_width=True, hide_index=True, height=340)
 
 
 def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_client=None, fut_fn=None, quote_fn=None):
@@ -518,7 +560,7 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
     except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True, height=320)
 
-    h1, h2, h3 = st.columns([1.6, 0.7, 0.8])
+    h1, h2, h3 = st.columns([1.4, 0.7, 0.8])
     with h1:
         st.markdown("**SETUP WATCH**")
     with h2:
@@ -534,16 +576,17 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
         st.session_state["_gs_setup_model"] = model
 
     setups = st.session_state.get("_gs_setups") or {}
-    _setup_table(setups.get("CE"), setups.get("PE"), max_loss)
-    if setups.get("_model"):
-        st.caption("Setups · " + str(setups.get("_model")) + f" · sent full session {len(full_table)} bars + VP + PDH/PDL")
-    raw = st.session_state.get("_gs_setup_raw") or ""
-    if raw and not (setups.get("CE") or {}).get("watch"):
-        with st.expander("Gemini raw"):
-            st.code(raw[:1200], language=None)
-
-    p1, p2 = st.columns([1, 1.2])
-    with p1:
+    lot = LOT_SIZES.get(book.get("name") or name, 10)
+    c_set, c_pos, c_an = st.columns(3)
+    with c_set:
+        _setup_table(setups.get("CE"), setups.get("PE"), max_loss, lot)
+        if setups.get("_model"):
+            st.caption(str(setups.get("_model")) + f" · {len(full_table)} bars · lot {lot}")
+        raw = st.session_state.get("_gs_setup_raw") or ""
+        if raw and not (setups.get("CE") or {}).get("watch"):
+            with st.expander("Gemini raw"):
+                st.code(raw[:800], language=None)
+    with c_pos:
         st.markdown("**Open position**")
         lots = st.number_input("Entry lots", min_value=0, value=int(st.session_state.get("gs_pos_lots") or 0), step=1, key="gs_pos_lots")
         entry = st.number_input("Entry price", min_value=0.0, value=float(st.session_state.get("gs_pos_entry") or 0.0), step=0.05, key="gs_pos_entry")
@@ -551,16 +594,16 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
         tgt = st.number_input("Target", min_value=0.0, value=float(st.session_state.get("gs_pos_tgt") or 0.0), step=0.05, key="gs_pos_tgt")
         side = st.selectbox("Side", ["CE", "PE"], key="gs_pos_side")
         watch = st.checkbox("Gemini Watch (continuous)", key="gs_watch")
-    with p2:
+        if lots:
+            st.caption(f"Qty {int(lots) * int(lot)}  (lot {lot})")
+    with c_an:
         st.markdown("**Position analysis**")
-        pos = {"lots": lots, "entry": entry, "sl": sl, "target": tgt, "side": side, "max_loss": max_loss,
-               "ltp": (ce_l if side == "CE" else pe_l).get("price")}
-        due = False
+        pos = {"lots": lots, "qty": int(lots) * int(lot), "entry": entry, "sl": sl, "target": tgt, "side": side,
+               "max_loss": max_loss, "ltp": (ce_l if side == "CE" else pe_l).get("price")}
         if watch and lots and entry:
             last = float(st.session_state.get("_gs_watch_ts") or 0)
             busy = bool(st.session_state.get("_gs_watch_busy"))
-            due = (not busy) and (time.time() - last >= 10)
-            if due:
+            if (not busy) and (time.time() - last >= 10):
                 st.session_state["_gs_watch_busy"] = True
                 try:
                     w, model = run_watch(book, pos, vp_f, vp_c, vp_p, full_table)
@@ -581,6 +624,6 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
                 unsafe_allow_html=True,
             )
         elif watch:
-            st.caption("Watch on — first pass starts after seed / 10s.")
+            st.caption("Watch on — first pass after 10s.")
         else:
-            st.caption("Tick Gemini Watch to stream analysis of the open position.")
+            st.caption("Tick Gemini Watch for live position analysis.")
