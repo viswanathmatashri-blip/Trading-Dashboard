@@ -251,3 +251,10 @@ def render_gemini_scalper(*_a, **_k):
     with right:
         st.markdown("**PE watch**", unsafe_allow_html=True)
         st.markdown(_cell("PE", data.get("PE")), unsafe_allow_html=True)
+
+
+ORDER = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "GOLDM", "CRUDEOIL"]
+
+
+def seed_gemini_scalper(*_a, **_k):
+    return {}
