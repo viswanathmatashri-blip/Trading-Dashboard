@@ -7985,10 +7985,44 @@ def _mis_fetch(token, exchange, interval, index_name, kind):
     api = get_smart_api_client()
     if not token:
         return pd.DataFrame(), False
-    return fetch_candles_with_holiday_fallback(
-        api, token, exchange, interval, lookback_days=5,
-        index_name=index_name, cache_kind=kind,
-    )
+    days = int(st.session_state.get("gs_fetch_days") or 5)
+    if days <= 6:
+        return fetch_candles_with_holiday_fallback(
+            api, token, exchange, interval, lookback_days=days,
+            index_name=index_name, cache_kind=kind,
+        )
+    # Intraday history is capped per call. Walk back in 4-day windows.
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.datetime.now(ist)
+    frames = []
+    step = 4
+    for start in range(0, days, step):
+        end = now - datetime.timedelta(days=start)
+        begin = end - datetime.timedelta(days=step)
+        try:
+            res = safe_api_call(api.getCandleData, {
+                "exchange": exchange,
+                "symboltoken": str(token),
+                "interval": interval,
+                "fromdate": begin.strftime("%Y-%m-%d 09:15"),
+                "todate": end.strftime("%Y-%m-%d 15:30"),
+            })
+            data = (res or {}).get("data") or []
+            if data:
+                frames.append(pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"]))
+        except Exception:
+            continue
+        time.sleep(0.15)
+    if not frames:
+        return fetch_candles_with_holiday_fallback(
+            api, token, exchange, interval, lookback_days=5,
+            index_name=index_name, cache_kind=kind,
+        )
+    df = pd.concat(frames, ignore_index=True)
+    df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+    df["time"] = series_to_ist(df["time"])
+    df = df.drop_duplicates(subset=["time"]).sort_values("time")
+    return compute_technical_indicators(df), False
 
 
 def _mis_quotes(pairs):
