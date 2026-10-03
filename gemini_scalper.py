@@ -371,6 +371,8 @@ def _session_table(book, spot, limit=None):
     c9, c21 = _ema(ce_px, 9), _ema(ce_px, 21)
     p9, p21 = _ema(pe_px, 9), _ema(pe_px, 21)
     sx, cx, px = _cross(s9, s21), _cross(c9, c21), _cross(p9, p21)
+    # PE premium up = spot down. Flip so the tag is the spot bias.
+    px = [{"LONG": "SHORT", "SHORT": "LONG"}.get(x, x) for x in px]
     out = []
     for i, fr in enumerate(chrono):
         key = str(fr.get("time"))[:16]
