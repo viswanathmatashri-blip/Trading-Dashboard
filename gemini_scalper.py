@@ -209,13 +209,85 @@ def _ema_setups(table, ce_swings, pe_swings):
     return ce, pe
 
 
+def _walk(rows, i, side, sl):
+    """After trigger index i. side LONG: SL if low<=sl, exit on SHORT cross already tagged in row['x']."""
+    for j in range(i + 1, len(rows)):
+        r = rows[j]
+        px = r.get("low") if side == "LONG" else r.get("high")
+        try:
+            px = float(px if px is not None else r.get("price"))
+            slv = float(sl)
+        except Exception:
+            px = slv = None
+        if px is not None and slv is not None:
+            if side == "LONG" and px <= slv:
+                return "SL hit", r.get("time")
+            if side == "SHORT" and px >= slv:
+                return "SL hit", r.get("time")
+        x = r.get("x")
+        if side == "LONG" and x == "SHORT":
+            return "Exit cross", r.get("time")
+        if side == "SHORT" and x == "LONG":
+            return "Exit cross", r.get("time")
+    return "Open", ""
+
+
+def _spot_backtest(rows, sessions):
+    """Nifty spot 9/21 cross. LONG = CE buy, SHORT = PE buy. No fixed target."""
+    days = sorted({str(r.get("time") or "")[:10] for r in rows if r.get("time")})
+    keep = set(days[-sessions:]) if sessions else set(days)
+    use = [r for r in rows if str(r.get("time") or "")[:10] in keep]
+    px = []
+    for r in use:
+        try:
+            px.append(float(r.get("price")))
+        except Exception:
+            px.append(None)
+    e9, e21 = _ema(px, 9), _ema(px, 21)
+    marks = _cross(e9, e21)
+    swings = []
+    for i in range(2, len(use) - 2):
+        w = use[i - 2:i + 3]
+        hi = float(use[i].get("high") or use[i].get("price") or 0)
+        lo = float(use[i].get("low") or use[i].get("price") or 0)
+        if hi and hi == max(float(x.get("high") or x.get("price") or 0) for x in w):
+            swings.append({"i": i, "side": "SH", "price": hi, "time": use[i].get("time")})
+        if lo and lo == min(float(x.get("low") or x.get("price") or 0) for x in w):
+            swings.append({"i": i, "side": "SL", "price": lo, "time": use[i].get("time")})
+    path = []
+    for i, r in enumerate(use):
+        path.append({"price": r.get("price"), "low": r.get("low"), "high": r.get("high"), "time": r.get("time"), "x": marks[i]})
+    out = []
+    for i, m in enumerate(marks):
+        if m not in ("LONG", "SHORT"):
+            continue
+        ltp = px[i]
+        if ltp is None:
+            continue
+        if m == "LONG":
+            cands = [s for s in swings if s["i"] < i and s["side"] == "SL" and s["price"] < ltp]
+            sl = max(cands, key=lambda s: s["price"]) if cands else None
+            side = "CE Buy"
+        else:
+            cands = [s for s in swings if s["i"] < i and s["side"] == "SH" and s["price"] > ltp]
+            sl = min(cands, key=lambda s: s["price"]) if cands else None
+            side = "PE Buy"
+        res, when = _walk(path, i, m, None if not sl else sl["price"])
+        out.append({
+            "side": side,
+            "trigger": f"Spot 9/21 {m}",
+            "bar": use[i].get("time"),
+            "ltp": round(ltp, 2),
+            "sl": None if not sl else round(sl["price"], 2),
+            "result": res,
+            "hit": when,
+            "target": "none — trailing SL",
+            "exit": "opposite 9/21 cross",
+        })
+    return out
+
+
 def _fmt_vp(vp):
-    if not vp or not vp.get("POC"):
-        return "—"
-    return (
-        f"POC {vp['POC']}  VAL {vp['VAL']}  VAH {vp['VAH']}  "
-        f"fat {vp['fat'] or '—'}  HVN {vp['HVN'] or '—'}  LVN {vp['LVN'] or '—'}"
-    )
     if not vp or not vp.get("POC"):
         return "—"
     return (
@@ -804,11 +876,49 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
     _, ce_sw = _prior_swings(ce_rows, 3)
     _, pe_sw = _prior_swings(pe_rows, 3)
     ce_set, pe_set = _ema_setups(full_table, ce_sw, pe_sw)
+    chrono = list(reversed(full_table))
+    for setup, xkey, side in ((ce_set, "CE X", "LONG"), (pe_set, "PE X", "SHORT")):
+        if not setup or not setup.get("bar"):
+            continue
+        path = []
+        start = None
+        for i, r in enumerate(chrono):
+            path.append({"price": r.get("CE LTP") if side == "LONG" else r.get("PE LTP"),
+                         "low": r.get("CE LTP") if side == "LONG" else r.get("PE LTP"),
+                         "high": r.get("CE LTP") if side == "LONG" else r.get("PE LTP"),
+                         "time": r.get("time"), "x": r.get(xkey)})
+            if str(r.get("time")) == str(setup.get("bar")):
+                start = i
+        if start is not None:
+            res, when = _walk(path, start, "LONG", setup.get("sl"))
+            setup["result"] = res
+            setup["hit"] = when
     st.markdown("**EMA setups**")
     st.dataframe(pd.DataFrame([
-        ce_set or {"side": "CE Buy", "trigger": "waiting CE 9>21", "bar": "", "ltp": "", "sl": "", "target": "none — trailing SL", "exit": "CE 9<21"},
-        pe_set or {"side": "PE Buy", "trigger": "waiting PE 9>21 (spot SHORT)", "bar": "", "ltp": "", "sl": "", "target": "none — trailing SL", "exit": "PE 9<21 (spot LONG)"},
+        ce_set or {"side": "CE Buy", "trigger": "waiting CE 9>21", "bar": "", "ltp": "", "sl": "", "result": "", "hit": "", "target": "none — trailing SL", "exit": "CE 9<21"},
+        pe_set or {"side": "PE Buy", "trigger": "waiting PE 9>21 (spot SHORT)", "bar": "", "ltp": "", "sl": "", "result": "", "hit": "", "target": "none — trailing SL", "exit": "PE 9<21 (spot LONG)"},
     ]), use_container_width=True, hide_index=True)
+
+    bt_on = st.checkbox("Backtest spot 9/21 crosses", key="gs_bt_on")
+    if bt_on:
+        nses = st.selectbox("Sessions", [30, 50, 100], key="gs_bt_n")
+        if st.button("Run backtest", key="gs_bt_go"):
+            st.session_state["gs_fetch_days"] = int(nses * 1.6) + 5
+            with st.spinner(f"Fetching {nses} sessions…"):
+                interval = TF_API.get(tf, "FIVE_MINUTE")
+                tok = book.get("cash_tok") or book.get("idx_tok")
+                exch = book.get("cash_exch") or book.get("idx_exch")
+                dfb, _ = fetch_fn(str(tok), exch, interval, name, "gs_bt")
+                st.session_state["gs_fetch_days"] = 5
+                rows = rows_from_df(dfb)
+            st.session_state["_gs_bt"] = _spot_backtest(rows, int(nses))
+            st.session_state["_gs_bt_n"] = len({str(r.get("time") or "")[:10] for r in rows})
+        bt = st.session_state.get("_gs_bt") or []
+        if bt:
+            sl_n = sum(1 for r in bt if r.get("result") == "SL hit")
+            ex_n = sum(1 for r in bt if r.get("result") == "Exit cross")
+            st.caption(f"{len(bt)} spot crosses · SL hit {sl_n} · exit cross {ex_n} · days loaded {st.session_state.get('_gs_bt_n')}")
+            st.dataframe(pd.DataFrame(bt), use_container_width=True, hide_index=True, height=360)
 
     cool_left = max(0, int((st.session_state.get("_gs_cool_until") or 0) - time.time()))
     h1, h2, h3 = st.columns([1.4, 0.7, 0.8])
