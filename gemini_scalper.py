@@ -129,7 +129,87 @@ def volume_profile(rows, n_bins=24, va_frac=0.70):
     }
 
 
+def volume_profile_mapped(fut_rows, spot_rows, n_bins=24, va_frac=0.70):
+    """Futures volume, binned at the spot price of the same time bar."""
+    by = {str(r.get("time"))[:16]: r for r in (spot_rows or [])}
+    mapped = []
+    for fr in fut_rows or []:
+        sp = by.get(str(fr.get("time"))[:16]) or {}
+        px = sp.get("price")
+        if px is None:
+            px = fr.get("price")
+        mapped.append({"price": px, "volume": fr.get("volume") or 0, "time": fr.get("time")})
+    return volume_profile(mapped, n_bins=n_bins, va_frac=va_frac)
+
+
+def _prior_swings(rows, sessions=3):
+    """Swing highs/lows from the previous N completed sessions."""
+    today = _ist_now().strftime("%Y-%m-%d")
+    days = sorted({str(r.get("time") or "")[:10] for r in (rows or []) if r.get("time") and str(r.get("time"))[:10] < today})
+    days = days[-sessions:]
+    out = []
+    for d in days:
+        chunk = [r for r in rows if str(r.get("time") or "").startswith(d)]
+        if len(chunk) < 5:
+            continue
+        for i in range(2, len(chunk) - 2):
+            w = chunk[i - 2:i + 3]
+            hi = float(chunk[i].get("high") or chunk[i].get("price") or 0)
+            lo = float(chunk[i].get("low") or chunk[i].get("price") or 0)
+            if hi and hi == max(float(x.get("high") or x.get("price") or 0) for x in w):
+                out.append({"day": d, "side": "SH", "price": round(hi, 2), "time": chunk[i].get("time")})
+            if lo and lo == min(float(x.get("low") or x.get("price") or 0) for x in w):
+                out.append({"day": d, "side": "SL", "price": round(lo, 2), "time": chunk[i].get("time")})
+    return days, out
+
+
+def _nearest_sl(swings, ltp):
+    below = [s for s in swings if s.get("side") == "SL" and s.get("price") is not None and float(s["price"]) < float(ltp)]
+    if not below:
+        return None
+    return max(below, key=lambda s: float(s["price"]))
+
+
+def _ema_setups(table, ce_swings, pe_swings):
+    """table is newest-first. CE buy on CE X LONG. PE buy on PE 9 cross above 21, shown as spot SHORT."""
+    ce = pe = None
+    for r in table or []:
+        if ce is None and r.get("CE X") == "LONG" and r.get("CE LTP"):
+            sl = _nearest_sl(ce_swings, r["CE LTP"])
+            ce = {
+                "side": "CE Buy",
+                "trigger": "CE 9 EMA cross above 21 (LONG)",
+                "bar": r.get("time"),
+                "ltp": r.get("CE LTP"),
+                "sl": None if not sl else sl["price"],
+                "sl_at": None if not sl else sl.get("time"),
+                "target": "none — trailing SL",
+                "exit": "CE 9 EMA cross below 21 (SHORT)",
+            }
+        if pe is None and r.get("PE X") == "SHORT" and r.get("PE LTP"):
+            sl = _nearest_sl(pe_swings, r["PE LTP"])
+            pe = {
+                "side": "PE Buy",
+                "trigger": "PE 9 EMA cross above 21 (spot SHORT)",
+                "bar": r.get("time"),
+                "ltp": r.get("PE LTP"),
+                "sl": None if not sl else sl["price"],
+                "sl_at": None if not sl else sl.get("time"),
+                "target": "none — trailing SL",
+                "exit": "PE 9 EMA cross below 21 (spot LONG)",
+            }
+        if ce and pe:
+            break
+    return ce, pe
+
+
 def _fmt_vp(vp):
+    if not vp or not vp.get("POC"):
+        return "—"
+    return (
+        f"POC {vp['POC']}  VAL {vp['VAL']}  VAH {vp['VAH']}  "
+        f"fat {vp['fat'] or '—'}  HVN {vp['HVN'] or '—'}  LVN {vp['LVN'] or '—'}"
+    )
     if not vp or not vp.get("POC"):
         return "—"
     return (
@@ -679,9 +759,10 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
     fut_rows = book.get("idx_rows") or []
     ce_rows = book.get("ce_rows") or []
     pe_rows = book.get("pe_rows") or []
-    vp_f, vp_c, vp_p = volume_profile(fut_rows), volume_profile(ce_rows), volume_profile(pe_rows)
+    vp_spot = volume_profile_mapped(_today_rows(fut_rows) or fut_rows, book.get("spot_rows") or [])
     sh, sl = session_hl(fut_rows)
     pdh, pdl = pdh_pdl(fut_rows)
+    sw_days, sw = _prior_swings(book.get("spot_rows") or fut_rows, 3)
     ce_l, pe_l = _last(ce_rows), _last(pe_rows)
 
     m1, m2, m3, m4 = st.columns(4)
@@ -695,10 +776,11 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
     )
     st.markdown(
         f"<div style='font-size:13px;color:#ECEFF1;line-height:1.55;'>"
-        f"<b>Fut VP</b> {_fmt_vp(vp_f)}<br>"
-        f"<b>CE VP</b> {_fmt_vp(vp_c)}<br>"
-        f"<b>PE VP</b> {_fmt_vp(vp_p)}<br>"
-        f"<b>Fut session</b> high {sh} low {sl} &nbsp; <b>PDH</b> {pdh} &nbsp; <b>PDL</b> {pdl}"
+        f"<b>Spot VP</b> (futures volume at that bar's spot) {_fmt_vp(vp_spot)}<br>"
+        f"<b>Prior {len(sw_days)} sessions</b> {', '.join(sw_days) or '—'}<br>"
+        f"<b>Swing highs</b> {', '.join(str(s['price'])+' @ '+str(s['time'])[5:16] for s in sw if s['side']=='SH') or '—'}<br>"
+        f"<b>Swing lows</b> {', '.join(str(s['price'])+' @ '+str(s['time'])[5:16] for s in sw if s['side']=='SL') or '—'}<br>"
+        f"<b>Session</b> high {sh} low {sl} &nbsp; <b>PDH</b> {pdh} &nbsp; <b>PDL</b> {pdl}"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -712,6 +794,15 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
         st.dataframe(_color_first(df), use_container_width=True, hide_index=True, height=320)
     except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True, height=320)
+
+    _, ce_sw = _prior_swings(ce_rows, 3)
+    _, pe_sw = _prior_swings(pe_rows, 3)
+    ce_set, pe_set = _ema_setups(full_table, ce_sw, pe_sw)
+    st.markdown("**EMA setups**")
+    st.dataframe(pd.DataFrame([
+        ce_set or {"side": "CE Buy", "trigger": "waiting CE 9>21", "bar": "", "ltp": "", "sl": "", "target": "none — trailing SL", "exit": "CE 9<21"},
+        pe_set or {"side": "PE Buy", "trigger": "waiting PE 9>21 (spot SHORT)", "bar": "", "ltp": "", "sl": "", "target": "none — trailing SL", "exit": "PE 9<21 (spot LONG)"},
+    ]), use_container_width=True, hide_index=True)
 
     cool_left = max(0, int((st.session_state.get("_gs_cool_until") or 0) - time.time()))
     h1, h2, h3 = st.columns([1.4, 0.7, 0.8])
@@ -732,7 +823,7 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
             st.info("Gemini running — one call to gemini-3.8-flash…")
             with st.status("Gemini setups running…", expanded=True) as status:
                 status.write("One request. No retries.")
-                data, model = run_setups(book, vp_f, vp_c, vp_p, full_table, max_loss)
+                data, model = run_setups(book, vp_spot, vp_spot, vp_spot, full_table, max_loss)
                 st.session_state["_gs_setups"] = data
                 st.session_state["_gs_setup_model"] = model
                 if (data.get("CE") or {}).get("watch") or (data.get("PE") or {}).get("watch"):
