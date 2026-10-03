@@ -209,27 +209,28 @@ def _ema_setups(table, ce_swings, pe_swings):
     return ce, pe
 
 
-def _walk(rows, i, side, sl):
-    """After trigger index i. side LONG: SL if low<=sl, exit on SHORT cross already tagged in row['x']."""
+def _walk(rows, i, side, sl, entry):
+    """After trigger index i. LONG: SL if low<=sl, exit on SHORT cross. Returns result, time, points."""
     for j in range(i + 1, len(rows)):
         r = rows[j]
-        px = r.get("low") if side == "LONG" else r.get("high")
         try:
-            px = float(px if px is not None else r.get("price"))
-            slv = float(sl)
+            lo = float(r.get("low") if r.get("low") is not None else r.get("price"))
+            hi = float(r.get("high") if r.get("high") is not None else r.get("price"))
+            px = float(r.get("price"))
+            slv = float(sl) if sl is not None else None
+            ent = float(entry)
         except Exception:
-            px = slv = None
-        if px is not None and slv is not None:
-            if side == "LONG" and px <= slv:
-                return "SL hit", r.get("time")
-            if side == "SHORT" and px >= slv:
-                return "SL hit", r.get("time")
+            continue
+        if slv is not None and side == "LONG" and lo <= slv:
+            return "SL hit", r.get("time"), round(slv - ent, 2)
+        if slv is not None and side == "SHORT" and hi >= slv:
+            return "SL hit", r.get("time"), round(ent - slv, 2)
         x = r.get("x")
         if side == "LONG" and x == "SHORT":
-            return "Exit cross", r.get("time")
+            return "Exit cross", r.get("time"), round(px - ent, 2)
         if side == "SHORT" and x == "LONG":
-            return "Exit cross", r.get("time")
-    return "Open", ""
+            return "Exit cross", r.get("time"), round(ent - px, 2)
+    return "Open", "", None
 
 
 def _spot_backtest(rows, sessions):
@@ -272,7 +273,7 @@ def _spot_backtest(rows, sessions):
             cands = [s for s in swings if s["i"] < i and s["side"] == "SH" and s["price"] > ltp]
             sl = min(cands, key=lambda s: s["price"]) if cands else None
             side = "PE Buy"
-        res, when = _walk(path, i, m, None if not sl else sl["price"])
+        res, when, pts = _walk(path, i, m, None if not sl else sl["price"], ltp)
         out.append({
             "side": side,
             "trigger": f"Spot 9/21 {m}",
@@ -281,6 +282,7 @@ def _spot_backtest(rows, sessions):
             "sl": None if not sl else round(sl["price"], 2),
             "result": res,
             "hit": when,
+            "points": pts,
             "target": "none — trailing SL",
             "exit": "opposite 9/21 cross",
         })
@@ -890,9 +892,10 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
             if str(r.get("time")) == str(setup.get("bar")):
                 start = i
         if start is not None:
-            res, when = _walk(path, start, "LONG", setup.get("sl"))
+            res, when, pts = _walk(path, start, "LONG", setup.get("sl"), setup.get("ltp"))
             setup["result"] = res
             setup["hit"] = when
+            setup["points"] = pts
     st.markdown("**EMA setups**")
     st.dataframe(pd.DataFrame([
         ce_set or {"side": "CE Buy", "trigger": "waiting CE 9>21", "bar": "", "ltp": "", "sl": "", "result": "", "hit": "", "target": "none — trailing SL", "exit": "CE 9<21"},
@@ -915,9 +918,11 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
             st.session_state["_gs_bt_n"] = len({str(r.get("time") or "")[:10] for r in rows})
         bt = st.session_state.get("_gs_bt") or []
         if bt:
-            sl_n = sum(1 for r in bt if r.get("result") == "SL hit")
-            ex_n = sum(1 for r in bt if r.get("result") == "Exit cross")
-            st.caption(f"{len(bt)} spot crosses · SL hit {sl_n} · exit cross {ex_n} · days loaded {st.session_state.get('_gs_bt_n')}")
+            closed = [r for r in bt if r.get("result") in ("SL hit", "Exit cross")]
+            wins = [r for r in closed if (r.get("points") or 0) > 0]
+            pts = round(sum(float(r.get("points") or 0) for r in closed), 2)
+            wr = round(100.0 * len(wins) / len(closed), 1) if closed else 0
+            st.markdown(f"**Win rate {wr}% · total points {pts} · {len(bt)} crosses · days loaded {st.session_state.get('_gs_bt_n')}**")
             st.dataframe(pd.DataFrame(bt), use_container_width=True, hide_index=True, height=360)
 
     cool_left = max(0, int((st.session_state.get("_gs_cool_until") or 0) - time.time()))
