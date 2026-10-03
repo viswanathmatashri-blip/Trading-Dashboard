@@ -180,25 +180,27 @@ def _ema_setups(table, ce_swings, pe_swings):
     """table is newest-first. CE buy on CE X LONG. PE buy on PE 9 cross above 21, shown as spot SHORT."""
     ce = pe = None
     for r in table or []:
-        if ce is None and r.get("CE X") == "LONG" and r.get("CE LTP"):
+        if ce is None and r.get("CE X") == "LONG" and r.get("CE LTP") and (r.get("Spot RSI") or 0) > 65:
             sl = _nearest_sl(ce_swings, r["CE LTP"])
             ce = {
                 "side": "CE Buy",
-                "trigger": "CE 9 EMA cross above 21 (LONG)",
+                "trigger": "CE 9 EMA cross above 21 and Spot RSI>65",
                 "bar": r.get("time"),
                 "ltp": r.get("CE LTP"),
+                "rsi": r.get("Spot RSI"),
                 "sl": None if not sl else sl["price"],
                 "sl_at": None if not sl else sl.get("time"),
                 "target": "none — trailing SL",
                 "exit": "CE 9 EMA cross below 21 (SHORT)",
             }
-        if pe is None and r.get("PE X") == "SHORT" and r.get("PE LTP"):
+        if pe is None and r.get("PE X") == "SHORT" and r.get("PE LTP") and (r.get("Spot RSI") or 100) < 35:
             sl = _nearest_sl(pe_swings, r["PE LTP"])
             pe = {
                 "side": "PE Buy",
-                "trigger": "PE 9 EMA cross above 21 (spot SHORT)",
+                "trigger": "PE 9 EMA cross above 21 and Spot RSI<35",
                 "bar": r.get("time"),
                 "ltp": r.get("PE LTP"),
+                "rsi": r.get("Spot RSI"),
                 "sl": None if not sl else sl["price"],
                 "sl_at": None if not sl else sl.get("time"),
                 "target": "none — trailing SL",
@@ -245,6 +247,7 @@ def _spot_backtest(rows, sessions):
         except Exception:
             px.append(None)
     e9, e21 = _ema(px, 9), _ema(px, 21)
+    rsi = _rsi(px, 14)
     marks = _cross(e9, e21)
     swings = []
     for i in range(2, len(use) - 2):
@@ -262,6 +265,11 @@ def _spot_backtest(rows, sessions):
     for i, m in enumerate(marks):
         if m not in ("LONG", "SHORT"):
             continue
+        rv = rsi[i]
+        if m == "LONG" and not (rv is not None and rv > 65):
+            continue
+        if m == "SHORT" and not (rv is not None and rv < 35):
+            continue
         ltp = px[i]
         if ltp is None:
             continue
@@ -276,7 +284,7 @@ def _spot_backtest(rows, sessions):
         res, when, pts = _walk(path, i, m, None if not sl else sl["price"], ltp)
         out.append({
             "side": side,
-            "trigger": f"Spot 9/21 {m}",
+            "trigger": f"Spot 9/21 {m} RSI {rv}",
             "bar": use[i].get("time"),
             "ltp": round(ltp, 2),
             "sl": None if not sl else round(sl["price"], 2),
@@ -464,6 +472,26 @@ def live_tick(book, quote_fn):
     return book
 
 
+def _rsi(vals, n=14):
+    out = [None] * len(vals)
+    gain = loss = 0.0
+    for i in range(1, len(vals)):
+        if vals[i] is None or vals[i - 1] is None:
+            continue
+        ch = vals[i] - vals[i - 1]
+        gain += max(ch, 0)
+        loss += max(-ch, 0)
+        if i < n:
+            continue
+        if i == n:
+            ag, al = gain / n, loss / n
+        else:
+            ag = (ag * (n - 1) + max(ch, 0)) / n
+            al = (al * (n - 1) + max(-ch, 0)) / n
+        out[i] = 100.0 if al == 0 else round(100 - 100 / (1 + ag / al), 1)
+    return out
+
+
 def _ema(vals, n):
     out = [None] * len(vals)
     k = 2.0 / (n + 1)
@@ -528,6 +556,7 @@ def _session_table(book, spot, limit=None):
         except Exception:
             pe_px.append(None)
     s9, s21 = _ema(spots, 9), _ema(spots, 21)
+    rsi = _rsi(spots, 14)
     c9, c21 = _ema(ce_px, 9), _ema(ce_px, 21)
     p9, p21 = _ema(pe_px, 9), _ema(pe_px, 21)
     sx, cx, px = _cross(s9, s21), _cross(c9, c21), _cross(p9, p21)
@@ -544,6 +573,7 @@ def _session_table(book, spot, limit=None):
             "Spot VWAP": vwaps[i],
             "Spot 21 EMA": s21[i],
             "Spot 9 EMA": s9[i],
+            "Spot RSI": rsi[i],
             "Spot X": sx[i],
             "CE LTP": ce_px[i] if ce_px[i] is not None else cr.get("price"),
             "CE 21 EMA": c21[i],
