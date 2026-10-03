@@ -84,8 +84,8 @@ def volume_profile(rows, n_bins=24, va_frac=0.70):
     rs = _today_rows(rows) or list(rows or [])
     if len(rs) < 3:
         return {"POC": None, "VAH": None, "VAL": None, "HVN": [], "LVN": [], "fat": []}
-    lo = min(float(r["low"]) for r in rs)
-    hi = max(float(r["high"]) for r in rs)
+    lo = min(float(r.get("low") if r.get("low") is not None else r.get("price") or 0) for r in rs)
+    hi = max(float(r.get("high") if r.get("high") is not None else r.get("price") or 0) for r in rs)
     if hi <= lo:
         return {"POC": round(hi, 2), "VAH": round(hi, 2), "VAL": round(lo, 2), "HVN": [], "LVN": [], "fat": []}
     width = (hi - lo) / n_bins
@@ -138,7 +138,13 @@ def volume_profile_mapped(fut_rows, spot_rows, n_bins=24, va_frac=0.70):
         px = sp.get("price")
         if px is None:
             px = fr.get("price")
-        mapped.append({"price": px, "volume": fr.get("volume") or 0, "time": fr.get("time")})
+        mapped.append({
+            "price": px,
+            "low": sp.get("low", px),
+            "high": sp.get("high", px),
+            "volume": fr.get("volume") or 0,
+            "time": fr.get("time"),
+        })
     return volume_profile(mapped, n_bins=n_bins, va_frac=va_frac)
 
 
