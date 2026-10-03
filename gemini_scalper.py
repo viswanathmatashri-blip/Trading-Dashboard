@@ -179,7 +179,7 @@ def _gemini(prompt, max_tokens=2500):
     now = time.time()
     if now < cool:
         return None, f"cooldown {int(cool - now)}s — last call was 429/503"
-    model = st.session_state.get("_gs_ok_model") or "gemini-3.8-flash"
+    model = st.session_state.get("_gs_ok_model") or "gemini-3.5-flash-lite"
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
@@ -195,11 +195,18 @@ def _gemini(prompt, max_tokens=2500):
         )
     except Exception as e:
         return None, str(e)[:80]
+    detail = ""
+    try:
+        errj = r.json()
+        detail = str(((errj.get("error") or {}).get("message") or errj))[:240]
+    except Exception:
+        detail = (r.text or "")[:180]
+    st.session_state["_gs_http"] = f"{model} HTTP {r.status_code} {detail}"
     if r.status_code in (429, 503):
         st.session_state["_gs_cool_until"] = time.time() + 90
-        return None, f"{model} {r.status_code} — cooling 90s, do not click again"
+        return None, f"{model} {r.status_code} {detail}"
     if r.status_code >= 400:
-        return None, f"{model} {r.status_code}"
+        return None, f"{model} {r.status_code} {detail}"
     parts = (((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
     txt = "".join(p.get("text", "") for p in parts).strip()
     if txt:
@@ -242,6 +249,15 @@ def seed_gs(name, fetch_fn, df_master, token_map, fut_fn, tf_lab):
             st.session_state["_mis_books"] = hold
     for k in ("idx_rows", "ce_rows", "pe_rows"):
         book[k] = attach_obv(attach_efi(list(book.get(k) or [])))
+    if fetch_fn and book.get("cash_tok"):
+        try:
+            interval = TF_API.get(tf_lab, "FIVE_MINUTE")
+            dspot, _ = fetch_fn(str(book["cash_tok"]), book.get("cash_exch") or "NSE", interval, name, "gs_spot")
+            book["spot_rows"] = rows_from_df(dspot)
+            if book["spot_rows"]:
+                book["spot"] = book["spot_rows"][-1]["price"]
+        except Exception:
+            book["spot_rows"] = []
     st.session_state["_gs_book"] = book
     st.session_state["_gs_seed_ts"] = _ist_now().strftime("%H:%M:%S")
     return book
@@ -288,24 +304,99 @@ def live_tick(book, quote_fn):
     return book
 
 
-def _row_pack(spot, fut_r, ce_r, pe_r):
-    return {
-        "time": fut_r.get("time") or "",
-        "Spot": spot if spot is not None else fut_r.get("price"),
-        "Fut": fut_r.get("price"),
-        "Fut CVD": fut_r.get("CVD"),
-        "Fut EFI": fut_r.get("EFI"),
-        "Fut OBV": fut_r.get("OBV"),
-        "Fut VWAP": fut_r.get("VWAP"),
-        "CE LTP": ce_r.get("price"),
-        "CE CVD": ce_r.get("CVD"),
-        "CE EFI": ce_r.get("EFI"),
-        "CE OBV": ce_r.get("OBV"),
-        "PE LTP": pe_r.get("price"),
-        "PE EFI": pe_r.get("EFI"),
-        "PE OBV": pe_r.get("OBV"),
-        "PE VWAP": pe_r.get("VWAP"),
-    }
+def _ema(vals, n):
+    out = [None] * len(vals)
+    k = 2.0 / (n + 1)
+    ema = None
+    for i, v in enumerate(vals):
+        if v is None:
+            out[i] = ema
+            continue
+        ema = v if ema is None else (v * k + ema * (1 - k))
+        out[i] = round(ema, 2)
+    return out
+
+
+def _cross(e9, e21):
+    marks = [""] * len(e9)
+    for i in range(1, len(e9)):
+        a, b, pa, pb = e9[i], e21[i], e9[i - 1], e21[i - 1]
+        if None in (a, b, pa, pb):
+            continue
+        if pa <= pb and a > b:
+            marks[i] = "LONG"
+        elif pa >= pb and a < b:
+            marks[i] = "SHORT"
+    return marks
+
+
+def _session_table(book, spot, limit=None):
+    fut_rows = _today_rows(book.get("idx_rows") or []) or list(book.get("idx_rows") or [])
+    ce_rows = _today_rows(book.get("ce_rows") or []) or list(book.get("ce_rows") or [])
+    pe_rows = _today_rows(book.get("pe_rows") or []) or list(book.get("pe_rows") or [])
+    sp_rows = _today_rows(book.get("spot_rows") or []) or list(book.get("spot_rows") or [])
+    by_ce = {str(r.get("time"))[:16]: r for r in ce_rows}
+    by_pe = {str(r.get("time"))[:16]: r for r in pe_rows}
+    by_sp = {str(r.get("time"))[:16]: r for r in sp_rows}
+    chrono = list(fut_rows)
+    if limit:
+        chrono = chrono[-limit:]
+    spots, ce_px, pe_px = [], [], []
+    pv = vv = 0.0
+    vwaps = []
+    for fr in chrono:
+        key = str(fr.get("time"))[:16]
+        sp = by_sp.get(key) or {}
+        cr = by_ce.get(key) or {}
+        pr = by_pe.get(key) or {}
+        try:
+            s = float(sp.get("price")) if sp.get("price") is not None else float(fr.get("price"))
+        except Exception:
+            s = None
+        v = float(fr.get("volume") or 0)
+        if s is not None and v:
+            pv += s * v
+            vv += v
+        vwaps.append(round(pv / vv, 2) if vv else None)
+        spots.append(s)
+        try:
+            ce_px.append(float(cr.get("price")) if cr.get("price") is not None else None)
+        except Exception:
+            ce_px.append(None)
+        try:
+            pe_px.append(float(pr.get("price")) if pr.get("price") is not None else None)
+        except Exception:
+            pe_px.append(None)
+    s9, s21 = _ema(spots, 9), _ema(spots, 21)
+    c9, c21 = _ema(ce_px, 9), _ema(ce_px, 21)
+    p9, p21 = _ema(pe_px, 9), _ema(pe_px, 21)
+    sx, cx, px = _cross(s9, s21), _cross(c9, c21), _cross(p9, p21)
+    out = []
+    for i, fr in enumerate(chrono):
+        key = str(fr.get("time"))[:16]
+        cr = by_ce.get(key) or {}
+        pr = by_pe.get(key) or {}
+        out.append({
+            "time": fr.get("time"),
+            "Spot": spots[i],
+            "Spot VWAP": vwaps[i],
+            "Spot 21 EMA": s21[i],
+            "Spot 9 EMA": s9[i],
+            "Spot X": sx[i],
+            "CE LTP": ce_px[i] if ce_px[i] is not None else cr.get("price"),
+            "CE 21 EMA": c21[i],
+            "CE 9 EMA": c9[i],
+            "CE X": cx[i],
+            "PE LTP": pe_px[i] if pe_px[i] is not None else pr.get("price"),
+            "PE 21 EMA": p21[i],
+            "PE 9 EMA": p9[i],
+            "PE X": px[i],
+            "Fut": fr.get("price"),
+        })
+    out.reverse()
+    if spot is not None and out:
+        out[0]["Spot"] = spot
+    return out
 
 
 def _color_first(df):
@@ -336,22 +427,6 @@ def _color_first(df):
         return out
 
     return df.style.apply(style_row, axis=1)
-
-
-def _session_table(book, spot, limit=None):
-    fut_rows = _today_rows(book.get("idx_rows") or []) or list(book.get("idx_rows") or [])
-    ce_rows = _today_rows(book.get("ce_rows") or []) or list(book.get("ce_rows") or [])
-    pe_rows = _today_rows(book.get("pe_rows") or []) or list(book.get("pe_rows") or [])
-    n = max(len(fut_rows), len(ce_rows), len(pe_rows))
-    if limit:
-        n = min(n, limit)
-    out = []
-    for i in range(1, n + 1):
-        fr = fut_rows[-i] if i <= len(fut_rows) else {}
-        cr = ce_rows[-i] if i <= len(ce_rows) else {}
-        pr = pe_rows[-i] if i <= len(pe_rows) else {}
-        out.append(_row_pack(spot if i == 1 else fr.get("price"), fr, cr, pr))
-    return out
 
 
 def _digest(book, vp_f, vp_c, vp_p, table_tail, max_loss):
@@ -392,10 +467,9 @@ def _digest(book, vp_f, vp_c, vp_p, table_tail, max_loss):
         slim.append(r)
     for r in slim:
         lines.append(
-            f"{r.get('time')} {r.get('Spot')} {r.get('Fut')} "
-            f"{r.get('Fut CVD')} {r.get('Fut EFI')} {r.get('Fut OBV')} {r.get('Fut VWAP')} "
-            f"{r.get('CE LTP')} {r.get('CE CVD')} {r.get('CE EFI')} {r.get('CE OBV')} "
-            f"{r.get('PE LTP')} {r.get('PE EFI')} {r.get('PE OBV')} {r.get('PE VWAP')}"
+            f"{r.get('time')} Spot={r.get('Spot')} Svw={r.get('Spot VWAP')} S9={r.get('Spot 9 EMA')} S21={r.get('Spot 21 EMA')} Sx={r.get('Spot X')} "
+            f"CE={r.get('CE LTP')} CE9={r.get('CE 9 EMA')} CE21={r.get('CE 21 EMA')} CEx={r.get('CE X')} "
+            f"PE={r.get('PE LTP')} PE9={r.get('PE 9 EMA')} PE21={r.get('PE 21 EMA')} PEx={r.get('PE X')}"
         )
     return "\n".join(lines)
 
@@ -560,6 +634,8 @@ def _setup_table(ce, pe, max_loss, lot=10):
 
 def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_client=None, fut_fn=None, quote_fn=None):
     st.session_state["gemini_enabled"] = False
+    if st.session_state.get("_gs_ok_model") == "gemini-3.8-flash":
+        st.session_state["_gs_ok_model"] = "gemini-3.5-flash-lite"
     name = st.session_state.get("gs_index") or "NIFTY"
     tf = st.session_state.get("gs_tf") or "5 min"
     top = st.columns([1.6, 0.9, 0.7, 0.7, 1.1])
@@ -629,7 +705,7 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
     full_table = _session_table(book, spot)
     table = full_table[:80]
     df = pd.DataFrame(table)
-    st.caption(f"Tape {tf} · on screen last {len(table)} bars · Gemini gets full session {len(full_table)} bars")
+    st.caption(f"Tape {tf} · Spot VWAP uses futures volume · 9/21 EMA cross = LONG/SHORT")
     try:
         st.dataframe(_color_first(df), use_container_width=True, hide_index=True, height=320)
     except Exception:
@@ -668,7 +744,10 @@ def render_gemini_scalper(fetch_fn=None, df_master=None, token_map=None, get_cli
     with c_set:
         _setup_table(setups.get("CE"), setups.get("PE"), max_loss, lot)
         if setups.get("_model"):
-            st.caption(str(setups.get("_model")) + f" · {len(full_table)} bars · lot {lot}")
+            st.caption(str(setups.get("_model")) + f" · lot {lot}")
+        http = st.session_state.get("_gs_http") or ""
+        if http:
+            st.caption(http)
         raw = st.session_state.get("_gs_setup_raw") or ""
         if raw and not (setups.get("CE") or {}).get("watch"):
             with st.expander("Gemini raw"):
