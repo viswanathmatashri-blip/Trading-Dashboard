@@ -1555,7 +1555,9 @@ def _confluence_entries(rows, side="CE", window=3):
     """One entry per EMA+DI pair, on the first bar where ADX slope>0 1σ is also inside the window.
     CE = 4>9 and +DI>-DI. PE = 4<9 and -DI>+DI. Today's session only."""
     today = _ist_now().strftime("%Y-%m-%d")
-    rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(today)]
+    days = sorted({str(r.get("time") or "")[:10] for r in (rows or []) if r.get("time")})
+    use_day = today if any(str(r.get("time") or "").startswith(today) for r in (rows or [])) else (days[-1] if days else today)
+    rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(use_day)]
     # Drop bars whose price is not the same contract (mixed strike / bad tick).
     px = [float(r["price"]) for r in rows if r.get("price")]
     if len(px) >= 5:
@@ -1593,7 +1595,7 @@ def _confluence_entries(rows, side="CE", window=3):
 
 
 def render_rule_setups(books, upd):
-    st.caption(f"SETUPS · 4/9 cross + DI cross + ADX slope>0 1σ within 3 bars (10–15 min) · last {upd}")
+    st.caption(f"SETUPS · 4/9 cross + DI cross + ADX slope>0 1σ within 3 bars · last session if market closed · {upd}")
     ce_cells, pe_cells = [], []
     for n in ORDER:
         book = (books or {}).get(n) or {}
