@@ -1597,19 +1597,19 @@ def render_rule_setups(books, upd):
         ce_hit = _confluence_entries(ce5, "CE")
         pe_hit = _confluence_entries(pe5, "PE")
         def cell(hits, color, label):
-            if not hits:
+            today = _ist_now().strftime("%Y-%m-%d")
+            todays = [h for h in hits if str(h.get("entry_time") or "").startswith(today)] or hits[-6:]
+            if not todays:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
-            h = hits[-1]
-            return (
-                f"<div style='font-size:11px;line-height:1.4;color:#ECEFF1;'>"
-                f"<b style='color:{color};font-size:13px;'>{label} {book.get('atm') or ''} {h['side']}</b><br>"
-                f"Entry : {h.get('entry_px')} @ {str(h.get('entry_time') or '')[11:16]}<br>"
-                f"EMA X : {str(h.get('ema_at') or '')[11:16]}<br>"
-                f"DI X : {str(h.get('di_at') or '')[11:16]}<br>"
-                f"ADX sl : {h.get('adx')} {h.get('flag') or ''}<br>"
-                f"<span style='color:#90A4AE;'>{len(hits)} today</span>"
-                f"</div>"
-            )
+            bits = [f"<b style='color:{color};font-size:12px;'>{label} {book.get('atm') or ''} · {len(todays)} today</b>"]
+            for h in reversed(todays):
+                bits.append(
+                    f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
+                    f"{str(h.get('entry_time') or '')[11:16]} · {h.get('entry_px')}<br>"
+                    f"EMA {str(h.get('ema_at') or '')[11:16]} · DI {str(h.get('di_at') or '')[11:16]} · "
+                    f"sl {h.get('adx')} {h.get('flag') or ''}</div>"
+                )
+            return f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>{''.join(bits)}</div>"
         ce_cells.append(cell(ce_hit, "#69F0AE", "CE BUY"))
         pe_cells.append(cell(pe_hit, "#FF8A80", "PE BUY"))
     head = "".join(f"<th style='padding:6px;border:1px solid #2a2d33;color:#FFD54F;font-size:11px;'>{n}</th>" for n in ORDER)
