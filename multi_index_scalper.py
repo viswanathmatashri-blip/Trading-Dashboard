@@ -1568,8 +1568,8 @@ def _session_day(rows):
     return prior[-1] if prior else days[-1]
 
 
-def _confluence_entries(rows, side="CE", window=3):
-    """One entry per EMA+DI pair, on the first bar where ADX slope>0 1σ is also inside the window."""
+def _confluence_entries(rows, window=3):
+    """Long option buy only: 4>9 and +DI>-DI, with ADX slope>0 inside the same 3 bars."""
     use_day = _session_day(rows)
     rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(use_day)] if use_day else list(rows or [])
     px = [float(r["price"]) for r in rows if r.get("price")]
@@ -1577,13 +1577,11 @@ def _confluence_entries(rows, side="CE", window=3):
         med = sorted(px)[len(px) // 2]
         rows = [r for r in rows if r.get("price") and 0.35 * med <= float(r["price"]) <= 2.8 * med]
     out, seen = [], set()
-    ema_key = "4>9 LONG" if side == "CE" else "4<9 SHORT"
-    di_key = "+DI LONG" if side == "CE" else "-DI SHORT"
     for i in range(len(rows)):
         lo = max(0, i - window + 1)
         chunk = rows[lo:i + 1]
-        ema = next((r for r in reversed(chunk) if r.get("EMA X") == ema_key), None)
-        di = next((r for r in reversed(chunk) if r.get("DI X") == di_key), None)
+        ema = next((r for r in reversed(chunk) if r.get("EMA X") == "4>9 LONG"), None)
+        di = next((r for r in reversed(chunk) if r.get("DI X") == "+DI LONG"), None)
         adx = next((r for r in reversed(chunk) if "ADX sl>0" in str(r.get("ADX flag") or "")), None)
         if not (ema and di and adx):
             continue
@@ -1594,12 +1592,27 @@ def _confluence_entries(rows, side="CE", window=3):
             continue
         seen.add(key)
         out.append({
-            "side": side, "day": use_day,
+            "day": use_day,
             "entry_time": rows[i].get("time"), "entry_px": rows[i].get("price"),
             "ema_at": ema.get("time"), "di_at": di.get("time"), "adx_at": adx.get("time"),
             "adx": adx.get("ADX sl"), "flag": adx.get("ADX flag"),
         })
     return out
+
+
+def _drop_same_bar(ce_hits, pe_hits, window_min=15):
+    """Option buyer: drop a CE buy and a PE buy that land in the same window."""
+    def near(a, b):
+        ta, tb = _parse_bar(a), _parse_bar(b)
+        if not ta or not tb:
+            return str(a)[:16] == str(b)[:16]
+        return abs((ta - tb).total_seconds()) <= window_min * 60
+    ce_bad = {i for i, h in enumerate(ce_hits) if any(near(h.get("entry_time"), p.get("entry_time")) for p in pe_hits)}
+    pe_bad = {i for i, h in enumerate(pe_hits) if any(near(h.get("entry_time"), c.get("entry_time")) for c in ce_hits)}
+    return (
+        [h for i, h in enumerate(ce_hits) if i not in ce_bad],
+        [h for i, h in enumerate(pe_hits) if i not in pe_bad],
+    )
 
 
 def render_rule_setups(books, upd):
@@ -1613,8 +1626,7 @@ def render_rule_setups(books, upd):
         book = (books or {}).get(n) or {}
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
-        ce_hit = _confluence_entries(ce5, "CE")
-        pe_hit = _confluence_entries(pe5, "PE")
+        ce_hit, pe_hit = _drop_same_bar(_confluence_entries(ce5), _confluence_entries(pe5))
         def cell(hits, color, label):
             if not hits:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
