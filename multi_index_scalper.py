@@ -1547,40 +1547,77 @@ def _fmt_gcell(side, cell, book=None):
     )
 
 
-def render_mis_gemini_table(upd):
-    top = st.columns([2.4, 0.8])
-    with top[0]:
-        st.caption(f"GEMINI SETUPS · click ↻ per index or Run all · last {upd}")
-    with top[1]:
-        if st.button("Run all indexes", key="btn_mis_gemini_all", use_container_width=True):
-            st.session_state["mis_gemini_run"] = list(ORDER)
-            st.rerun()
-    btn_cols = st.columns(len(ORDER))
-    for i, n in enumerate(ORDER):
-        with btn_cols[i]:
-            if st.button(f"↻ {n}", key=f"btn_mis_g_{n}", use_container_width=True):
-                st.session_state["mis_gemini_run"] = [n]
-                st.rerun()
-    if st.session_state.get("_mis_gemini_err"):
-        st.caption(st.session_state.get("_mis_gemini_err"))
-    busy = st.session_state.get("mis_gemini_run")
-    if busy:
-        st.caption("Gemini running: " + ", ".join(busy))
-    book = st.session_state.get("_mis_gemini_book") or {}
-    cols = ORDER
-    ce_cells = [_fmt_gcell("CE", (book.get(n) or {}).get("CE") if isinstance(book.get(n), dict) else None) for n in cols]
-    pe_cells = [_fmt_gcell("PE", (book.get(n) or {}).get("PE") if isinstance(book.get(n), dict) else None) for n in cols]
-    head = "".join(f"<th style='padding:6px;border:1px solid #2a2d33;color:#FFD54F;font-size:11px;'>{n}</th>" for n in cols)
+def _confluence_entries(rows, side="CE", window=3):
+    """Entry when EMA cross, DI cross and ADX>20 1σ all land within `window` 5-min bars.
+    CE = 4>9 and +DI>-DI. PE = 4<9 and -DI>+DI."""
+    rows = list(rows or [])
+    out = []
+    fired = set()
+    ema_key = "4>9 LONG" if side == "CE" else "4<9 SHORT"
+    di_key = "+DI LONG" if side == "CE" else "-DI SHORT"
+    for i in range(len(rows)):
+        lo = max(0, i - window + 1)
+        chunk = rows[lo:i + 1]
+        ema = next((r for r in reversed(chunk) if r.get("EMA X") == ema_key), None)
+        di = next((r for r in reversed(chunk) if r.get("DI X") == di_key), None)
+        adx = next((r for r in reversed(chunk) if r.get("ADX flag")), None)
+        if not (ema and di and adx):
+            continue
+        key = (ema.get("time"), di.get("time"), adx.get("time"))
+        if key in fired:
+            continue
+        # only print on the bar that completed the set
+        if rows[i].get("time") not in (ema.get("time"), di.get("time"), adx.get("time")):
+            continue
+        fired.add(key)
+        out.append({
+            "side": side,
+            "entry_time": rows[i].get("time"),
+            "entry_px": rows[i].get("price"),
+            "ema_at": ema.get("time"),
+            "di_at": di.get("time"),
+            "adx_at": adx.get("time"),
+            "adx": adx.get("ADX"),
+            "flag": adx.get("ADX flag"),
+        })
+    return out
+
+
+def render_rule_setups(books, upd):
+    st.caption(f"SETUPS · 4/9 cross + DI cross + ADX>20 1σ within 3 bars (10–15 min) · last {upd}")
+    ce_cells, pe_cells = [], []
+    for n in ORDER:
+        book = (books or {}).get(n) or {}
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
+        ce_hit = _confluence_entries(ce5, "CE")
+        pe_hit = _confluence_entries(pe5, "PE")
+        def cell(hits, color, label):
+            if not hits:
+                return "<div style='color:#78909C;font-size:11px;'>—</div>"
+            h = hits[-1]
+            return (
+                f"<div style='font-size:11px;line-height:1.4;color:#ECEFF1;'>"
+                f"<b style='color:{color};font-size:13px;'>{label} {book.get('atm') or ''} {h['side']}</b><br>"
+                f"Entry : {h.get('entry_px')} @ {str(h.get('entry_time') or '')[11:16]}<br>"
+                f"EMA X : {str(h.get('ema_at') or '')[11:16]}<br>"
+                f"DI X : {str(h.get('di_at') or '')[11:16]}<br>"
+                f"ADX : {h.get('adx')} {h.get('flag') or ''}<br>"
+                f"<span style='color:#90A4AE;'>{len(hits)} today</span>"
+                f"</div>"
+            )
+        ce_cells.append(cell(ce_hit, "#69F0AE", "CE BUY"))
+        pe_cells.append(cell(pe_hit, "#FF8A80", "PE BUY"))
+    head = "".join(f"<th style='padding:6px;border:1px solid #2a2d33;color:#FFD54F;font-size:11px;'>{n}</th>" for n in ORDER)
     def row(cells):
         return "<tr>" + "".join(
-            f"<td style='vertical-align:top;padding:8px;border:1px solid #2a2d33;width:14%;'>{c}</td>"
-            for c in cells
+            f"<td style='vertical-align:top;padding:8px;border:1px solid #2a2d33;width:14%;'>{c}</td>" for c in cells
         ) + "</tr>"
-    html = (
+    st.markdown(
         "<table style='width:100%;border-collapse:collapse;background:#0E1117;'>"
-        f"<tr>{head}</tr>{row(ce_cells)}{row(pe_cells)}</table>"
+        f"<tr>{head}</tr>{row(ce_cells)}{row(pe_cells)}</table>",
+        unsafe_allow_html=True,
     )
-    st.markdown(html, unsafe_allow_html=True)
 
 
 def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None, quote_fn=None):
@@ -1638,9 +1675,6 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.session_state["enable_main_refresh"] = _mis_auto
         st.rerun()
     _live = st.session_state.get("_mis_live_ts")
-    _pending = st.session_state.get("mis_gemini_run")
-    if _pending:
-        st.info("Gemini loading — reading Fut / CE / PE tapes for " + ", ".join(_pending) + " …")
     if _live:
         st.caption(f"Live tape {_live} · cached history kept · only current 1-min bar updates")
     if st.session_state.get("_mis_live_err"):
@@ -1756,17 +1790,8 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Bar": (cl.get("time") or bar_ts),
         })
 
-    # WATCH journal / book filter removed — Gemini setups only
     st.session_state["_mis_live_setups"] = []
     setups = []
-    _run = st.session_state.pop("mis_gemini_run", None)
-    if _run:
-        try:
-            st.info("Gemini loading — " + ", ".join(_run) + " (Fut + CE + PE tapes)…")
-            with st.spinner("Gemini working…"):
-                run_mis_gemini(packs, books, enabled, names=_run, force=True)
-        except Exception as e:
-            st.session_state["_mis_gemini_err"] = str(e)[:240]
 
     n_watch = max(len(summary), 1)
     watch_h = min(38 * (n_watch + 1) + 20, 320)
@@ -1815,7 +1840,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
     else:
         st.info("Seed 1-min tapes in the sidebar.")
-    render_mis_gemini_table(_upd)
+    render_rule_setups(books, _upd)
     st.markdown("</div>", unsafe_allow_html=True)
 
     def draw_tape(title, pack, extra_cols=None):
