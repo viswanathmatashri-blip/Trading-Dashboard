@@ -1551,14 +1551,27 @@ def _fmt_gcell(side, cell, book=None):
     )
 
 
-def _confluence_entries(rows, side="CE", window=3):
-    """One entry per EMA+DI pair, on the first bar where ADX slope>0 1σ is also inside the window.
-    CE = 4>9 and +DI>-DI. PE = 4<9 and -DI>+DI. Today's session only."""
+def _session_day(rows):
+    """Last day with a real tape. Weekend / empty today falls back to the previous session."""
+    by = {}
+    for r in rows or []:
+        d = str(r.get("time") or "")[:10]
+        if len(d) == 10:
+            by[d] = by.get(d, 0) + 1
+    days = [d for d, n in sorted(by.items()) if n >= 8]
+    if not days:
+        return ""
     today = _ist_now().strftime("%Y-%m-%d")
-    days = sorted({str(r.get("time") or "")[:10] for r in (rows or []) if r.get("time")})
-    use_day = today if any(str(r.get("time") or "").startswith(today) for r in (rows or [])) else (days[-1] if days else today)
-    rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(use_day)]
-    # Drop bars whose price is not the same contract (mixed strike / bad tick).
+    if today in days and _ist_now().weekday() < 5:
+        return today
+    prior = [d for d in days if d < today]
+    return prior[-1] if prior else days[-1]
+
+
+def _confluence_entries(rows, side="CE", window=3):
+    """One entry per EMA+DI pair, on the first bar where ADX slope>0 1σ is also inside the window."""
+    use_day = _session_day(rows)
+    rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(use_day)] if use_day else list(rows or [])
     px = [float(r["price"]) for r in rows if r.get("price")]
     if len(px) >= 5:
         med = sorted(px)[len(px) // 2]
@@ -1571,31 +1584,30 @@ def _confluence_entries(rows, side="CE", window=3):
         chunk = rows[lo:i + 1]
         ema = next((r for r in reversed(chunk) if r.get("EMA X") == ema_key), None)
         di = next((r for r in reversed(chunk) if r.get("DI X") == di_key), None)
-        adx = next((r for r in reversed(chunk) if "1σ" in str(r.get("ADX flag") or "")), None)
+        adx = next((r for r in reversed(chunk) if "ADX sl>0" in str(r.get("ADX flag") or "")), None)
         if not (ema and di and adx):
             continue
         key = (ema.get("time"), di.get("time"))
         if key in seen:
             continue
-        # fire only on the bar that completes the trio
         if rows[i].get("time") not in (ema.get("time"), di.get("time"), adx.get("time")):
             continue
         seen.add(key)
         out.append({
-            "side": side,
-            "entry_time": rows[i].get("time"),
-            "entry_px": rows[i].get("price"),
-            "ema_at": ema.get("time"),
-            "di_at": di.get("time"),
-            "adx_at": adx.get("time"),
-            "adx": adx.get("ADX sl"),
-            "flag": adx.get("ADX flag"),
+            "side": side, "day": use_day,
+            "entry_time": rows[i].get("time"), "entry_px": rows[i].get("price"),
+            "ema_at": ema.get("time"), "di_at": di.get("time"), "adx_at": adx.get("time"),
+            "adx": adx.get("ADX sl"), "flag": adx.get("ADX flag"),
         })
     return out
 
 
 def render_rule_setups(books, upd):
-    st.caption(f"SETUPS · 4/9 cross + DI cross + ADX slope>0 1σ within 3 bars · last session if market closed · {upd}")
+    sess = ""
+    for n in ORDER:
+        b = (books or {}).get(n) or {}
+        sess = _session_day(to_5min(b.get("ce_rows") or [])) or sess
+    st.caption(f"SETUPS · last session {sess or '—'} (weekend uses previous trading day) · 4/9 + DI + ADX slope in 3 bars · {upd}")
     ce_cells, pe_cells = [], []
     for n in ORDER:
         book = (books or {}).get(n) or {}
@@ -1604,12 +1616,12 @@ def render_rule_setups(books, upd):
         ce_hit = _confluence_entries(ce5, "CE")
         pe_hit = _confluence_entries(pe5, "PE")
         def cell(hits, color, label):
-            today = _ist_now().strftime("%Y-%m-%d")
-            todays = [h for h in hits if str(h.get("entry_time") or "").startswith(today)] or hits[-6:]
-            if not todays:
+            if not hits:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
-            bits = [f"<b style='color:{color};font-size:12px;'>{label} {book.get('ce_sym') if 'CE' in label else book.get('pe_sym') or book.get('atm') or ''} · {len(todays)} today</b>"]
-            for h in reversed(todays):
+            day = str(hits[-1].get("day") or "")[5:]
+            sym = book.get("ce_sym") if "CE" in label else book.get("pe_sym")
+            bits = [f"<b style='color:{color};font-size:12px;'>{label} {sym or book.get('atm') or ''} · {day} · {len(hits)}</b>"]
+            for h in reversed(hits):
                 bits.append(
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
                     f"{str(h.get('entry_time') or '')[11:16]} · {h.get('entry_px')}<br>"
