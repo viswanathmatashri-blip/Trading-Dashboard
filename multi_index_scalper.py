@@ -1568,14 +1568,22 @@ def _session_day(rows):
     return prior[-1] if prior else days[-1]
 
 
-def _confluence_entries(rows, window=3):
-    """Long option buy only: 4>9 and +DI>-DI, with ADX slope>0 inside the same 3 bars."""
+def _confluence_entries(rows, window=3, open_hm=(9, 15), close_hm=(15, 30)):
+    """Every long buy in the session: 4>9 and +DI>-DI with ADX slope>0 inside 3 bars.
+    One print per EMA cross. Bars outside the session are ignored."""
     use_day = _session_day(rows)
     rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(use_day)] if use_day else list(rows or [])
+    def in_sess(t):
+        p = _parse_bar(t)
+        if not p:
+            return False
+        m = p.hour * 60 + p.minute
+        return open_hm[0] * 60 + open_hm[1] <= m <= close_hm[0] * 60 + close_hm[1]
+    rows = [r for r in rows if in_sess(r.get("time"))]
     px = [float(r["price"]) for r in rows if r.get("price")]
     if len(px) >= 5:
         med = sorted(px)[len(px) // 2]
-        rows = [r for r in rows if r.get("price") and 0.35 * med <= float(r["price"]) <= 2.8 * med]
+        rows = [r for r in rows if r.get("price") and 0.4 * med <= float(r["price"]) <= 2.5 * med]
     out, seen = [], set()
     for i in range(len(rows)):
         lo = max(0, i - window + 1)
@@ -1585,7 +1593,7 @@ def _confluence_entries(rows, window=3):
         adx = next((r for r in reversed(chunk) if "ADX sl>0" in str(r.get("ADX flag") or "")), None)
         if not (ema and di and adx):
             continue
-        key = (ema.get("time"), di.get("time"))
+        key = rows[i].get("time")
         if key in seen:
             continue
         if rows[i].get("time") not in (ema.get("time"), di.get("time"), adx.get("time")):
@@ -1597,23 +1605,7 @@ def _confluence_entries(rows, window=3):
             "ema_at": ema.get("time"), "di_at": di.get("time"), "adx_at": adx.get("time"),
             "adx": adx.get("ADX sl"), "flag": adx.get("ADX flag"),
         })
-    # also keep a later re-entry if the long cross happens again
     return out
-
-
-def _drop_same_bar(ce_hits, pe_hits, window_min=15):
-    """Option buyer: drop a CE buy and a PE buy that land in the same window."""
-    def near(a, b):
-        ta, tb = _parse_bar(a), _parse_bar(b)
-        if not ta or not tb:
-            return str(a)[:16] == str(b)[:16]
-        return abs((ta - tb).total_seconds()) <= window_min * 60
-    ce_bad = {i for i, h in enumerate(ce_hits) if any(near(h.get("entry_time"), p.get("entry_time")) for p in pe_hits)}
-    pe_bad = {i for i, h in enumerate(pe_hits) if any(near(h.get("entry_time"), c.get("entry_time")) for c in ce_hits)}
-    return (
-        [h for i, h in enumerate(ce_hits) if i not in ce_bad],
-        [h for i, h in enumerate(pe_hits) if i not in pe_bad],
-    )
 
 
 def render_rule_setups(books, upd):
@@ -1627,7 +1619,10 @@ def render_rule_setups(books, upd):
         book = (books or {}).get(n) or {}
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
-        ce_hit, pe_hit = _drop_same_bar(_confluence_entries(ce5), _confluence_entries(pe5))
+        mcx = n in ("CRUDEOIL", "GOLDM")
+        bounds = ((9, 0), (23, 30)) if mcx else ((9, 15), (15, 30))
+        ce_hit = _confluence_entries(ce5, open_hm=bounds[0], close_hm=bounds[1])
+        pe_hit = _confluence_entries(pe5, open_hm=bounds[0], close_hm=bounds[1])
         def cell(hits, color, label):
             if not hits:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
