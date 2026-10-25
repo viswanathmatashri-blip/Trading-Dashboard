@@ -1597,6 +1597,7 @@ def _confluence_entries(rows, window=3):
             "ema_at": ema.get("time"), "di_at": di.get("time"), "adx_at": adx.get("time"),
             "adx": adx.get("ADX sl"), "flag": adx.get("ADX flag"),
         })
+    # also keep a later re-entry if the long cross happens again
     return out
 
 
