@@ -595,6 +595,135 @@ def efi_confluence_at(idx, ce, pe, ts):
     return confluence_label([side(idx, False), side(ce, False), side(pe, True)], "EFI")
 
 
+def _ema_list(vals, n):
+    out, ema, k = [None] * len(vals), None, 2.0 / (n + 1)
+    for i, v in enumerate(vals):
+        if v is None:
+            out[i] = ema
+            continue
+        ema = v if ema is None else (v * k + ema * (1 - k))
+        out[i] = round(ema, 2)
+    return out
+
+
+def to_5min(rows):
+    """Resample chronological bars to 5-minute OHLC."""
+    if not rows:
+        return []
+    buckets = {}
+    for r in rows:
+        t = _parse_bar(r.get("time"))
+        if t is None:
+            continue
+        key = t.replace(minute=(t.minute // 5) * 5, second=0, microsecond=0)
+        b = buckets.get(key)
+        if b is None:
+            buckets[key] = {
+                "time": key.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": r.get("open"), "high": r.get("high"),
+                "low": r.get("low"), "price": r.get("price"),
+                "volume": float(r.get("volume") or 0),
+            }
+        else:
+            b["high"] = max(float(b["high"] or 0), float(r.get("high") or 0))
+            b["low"] = min(float(b["low"] or 1e18), float(r.get("low") or 1e18))
+            b["price"] = r.get("price")
+            b["volume"] += float(r.get("volume") or 0)
+    return [buckets[k] for k in sorted(buckets)]
+
+
+def attach_ema_adx(rows, n=14):
+    """4/9 EMA crosses, Wilder ADX/+DI/-DI crosses, ADX>20 with 1-sigma flag."""
+    rows = list(rows or [])
+    if not rows:
+        return rows
+    closes = [float(r["price"]) if r.get("price") is not None else None for r in rows]
+    e4, e9 = _ema_list(closes, 4), _ema_list(closes, 9)
+    trs, pdm, mdm = [], [], []
+    for i, r in enumerate(rows):
+        h = float(r.get("high") or r.get("price") or 0)
+        l = float(r.get("low") or r.get("price") or 0)
+        c = float(r.get("price") or 0)
+        if i == 0:
+            trs.append(max(h - l, 0))
+            pdm.append(0.0)
+            mdm.append(0.0)
+            continue
+        pc = float(rows[i - 1].get("price") or c)
+        ph = float(rows[i - 1].get("high") or pc)
+        pl = float(rows[i - 1].get("low") or pc)
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        up, dn = h - ph, pl - l
+        pdm.append(up if up > dn and up > 0 else 0.0)
+        mdm.append(dn if dn > up and dn > 0 else 0.0)
+
+    def wilder(seq):
+        out = [None] * len(seq)
+        if len(seq) <= n:
+            return out
+        s = sum(seq[1:n + 1])
+        out[n] = s
+        for i in range(n + 1, len(seq)):
+            s = s - s / n + seq[i]
+            out[i] = s
+        return out
+
+    atr, spdm, smdm = wilder(trs), wilder(pdm), wilder(mdm)
+    pdi, mdi, dx = [None] * len(rows), [None] * len(rows), [None] * len(rows)
+    for i in range(len(rows)):
+        if atr[i] and atr[i] > 0 and spdm[i] is not None:
+            pdi[i] = 100.0 * spdm[i] / atr[i]
+            mdi[i] = 100.0 * smdm[i] / atr[i]
+            den = pdi[i] + mdi[i]
+            dx[i] = 100.0 * abs(pdi[i] - mdi[i]) / den if den else 0.0
+    adx = [None] * len(rows)
+    first = [i for i, v in enumerate(dx) if v is not None]
+    if len(first) >= n:
+        start = first[n - 1]
+        seed = sum(dx[first[0]:first[0] + n]) / n
+        adx[start] = seed
+        prev = seed
+        for i in range(start + 1, len(rows)):
+            if dx[i] is None:
+                continue
+            prev = (prev * (n - 1) + dx[i]) / n
+            adx[i] = prev
+    hist = []
+    for i, r in enumerate(rows):
+        r["EMA4"] = e4[i]
+        r["EMA9"] = e9[i]
+        ex = ""
+        if i and None not in (e4[i], e9[i], e4[i - 1], e9[i - 1]):
+            if e4[i - 1] <= e9[i - 1] and e4[i] > e9[i]:
+                ex = "4>9 LONG"
+            elif e4[i - 1] >= e9[i - 1] and e4[i] < e9[i]:
+                ex = "4<9 SHORT"
+        r["EMA X"] = ex
+        r["+DI"] = None if pdi[i] is None else round(pdi[i], 1)
+        r["-DI"] = None if mdi[i] is None else round(mdi[i], 1)
+        r["ADX"] = None if adx[i] is None else round(adx[i], 1)
+        dix = ""
+        if i and None not in (pdi[i], mdi[i], pdi[i - 1], mdi[i - 1]):
+            if pdi[i - 1] <= mdi[i - 1] and pdi[i] > mdi[i]:
+                dix = "+DI LONG"
+            elif pdi[i - 1] >= mdi[i - 1] and pdi[i] < mdi[i]:
+                dix = "-DI SHORT"
+        r["DI X"] = dix
+        flag = ""
+        if adx[i] is not None:
+            hist.append(adx[i])
+            win = hist[-20:]
+            if len(win) >= 8:
+                mu = sum(win) / len(win)
+                sig = (sum((x - mu) ** 2 for x in win) / len(win)) ** 0.5
+                if adx[i] > 20 and adx[i] >= mu + sig:
+                    flag = "ADX>20 1σ"
+            elif adx[i] > 20:
+                flag = "ADX>20"
+        r["ADX flag"] = flag
+    return rows
+
+
 def last_pack(rows, swings, ltp=None, symbol=""):
     ann = annotate_bars(rows or [], swings or [])
     last = ann[-1] if ann else {}
@@ -1040,15 +1169,18 @@ def style_watch(df):
 
 
 def _cell_css(col, val):
-    if col in ("Trend", "Flow x/3"):
-        return confluence_css(val)
-    if "WATCH" in str(col).upper():
-        return watch_css(val)
+    t = str(val or "").upper()
+    if "LONG" in t:
+        return "background-color:#2e7d32;color:#fff;font-weight:700;"
+    if "SHORT" in t:
+        return "background-color:#c62828;color:#fff;font-weight:700;"
+    if "ADX>20" in t:
+        return "background-color:#1565c0;color:#fff;font-weight:700;"
     return ""
 
 
 def watch_log_html(df: pd.DataFrame) -> str:
-    gold = {"Idx WATCH", "CE WATCH", "PE WATCH"}
+    gold = {"CE EMA X", "CE DI X", "CE ADX flag", "PE EMA X", "PE DI X", "PE ADX flag"}
     rows = []
     rows.append("<thead><tr>")
     for c in df.columns:
@@ -1131,7 +1263,14 @@ def _atm_from_master(df_master, name, spot, fo):
     )
     d = df_master.copy()
     d["name_u"] = d["name"].astype(str).str.upper()
-    d = d[d["name_u"].isin([x.upper() for x in names])]
+    d["_sym"] = d["symbol"].astype(str).str.upper() if "symbol" in d.columns else d["name_u"]
+    if name == "CRUDEOIL":
+        mini = d[d["_sym"].str.startswith("CRUDEOILM") | d["_sym"].str.contains("CRUDEOILMINI", na=False)]
+        d = mini if not mini.empty else d[d["name_u"].isin(["CRUDEOILM", "CRUDEOILMINI"])]
+    elif name == "GOLDM":
+        d = d[d["name_u"].isin(["GOLDM", "GOLD"]) | d["_sym"].str.startswith("GOLDM")]
+    else:
+        d = d[d["name_u"].isin([x.upper() for x in names])]
     if "exch_seg" in d.columns:
         d = d[d["exch_seg"].astype(str) == str(fo)]
     if "instrumenttype" in d.columns:
@@ -1469,10 +1608,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
     with hL:
         st.markdown(
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
-            "<b style='color:#B0BEC5;'>Status</b> WATCH · CONFIRMED · TREND DENIED &nbsp;|&nbsp; "
-            "<b style='color:#B0BEC5;'>Flow</b> ABSORB |RDI|≥0.40 Disp≤0.20 · EXH |RDI|≤0.10 · ACCEL |RDI|≥0.35 Disp≥0.85"
-            "<br><b style='color:#FFD54F;'>Gemini book</b> "
-            "<span style='color:#B0BEC5;'>1 CE buy + 1 PE buy per index from tape EFI/CVD/RDI/VWAP</span>"
+            "<b style='color:#FFD54F;'>Watches</b> "
+            "4/9 EMA cross · ADX +DI/-DI cross · ADX>20 with 1σ "
+            "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -1592,17 +1730,30 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         bar_ts = idx["Bar"]
         if not session_open(name):
             bar_ts = last_session_bar(name, book.get("idx_rows") or [], bar_ts)
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
+        def _last_x(rows, key):
+            return next((r.get(key) for r in reversed(rows) if r.get(key)), "—")
+        cl, pl = (ce5[-1] if ce5 else {}), (pe5[-1] if pe5 else {})
         summary.append({
             "Index": name,
             "Spot": book.get("spot") if book.get("spot") is not None else "—",
-            "Fut LTP": book.get("fut") if book.get("fut") is not None else "—",
             "ATM": strike, "Opt exp": oexp,
-            "Idx WATCH": idx["WATCH"], "Idx Flow": idx["Flow"], "Idx Reason": idx["Reason"],
-            "CE WATCH": ce["WATCH"], "CE Flow": ce["Flow"], "CE Reason": ce["Reason"], "CE LTP": ce["LTP"],
-            "PE WATCH": pe["WATCH"], "PE Flow": pe["Flow"], "PE Reason": pe["Reason"], "PE LTP": pe["LTP"],
-            "Trend": confluence_label(t_votes, "TREND"),
-            "Flow x/3": confluence_label(f_votes, "FLOW"),
-            "Bar": bar_ts,
+            "CE LTP": cl.get("price") or ce.get("LTP"),
+            "CE EMA X": _last_x(ce5, "EMA X"),
+            "CE ADX": cl.get("ADX") or "—",
+            "CE +DI": cl.get("+DI") or "—",
+            "CE -DI": cl.get("-DI") or "—",
+            "CE DI X": _last_x(ce5, "DI X"),
+            "CE ADX flag": cl.get("ADX flag") or "—",
+            "PE LTP": pl.get("price") or pe.get("LTP"),
+            "PE EMA X": _last_x(pe5, "EMA X"),
+            "PE ADX": pl.get("ADX") or "—",
+            "PE +DI": pl.get("+DI") or "—",
+            "PE -DI": pl.get("-DI") or "—",
+            "PE DI X": _last_x(pe5, "DI X"),
+            "PE ADX flag": pl.get("ADX flag") or "—",
+            "Bar": (cl.get("time") or bar_ts),
         })
 
     # WATCH journal / book filter removed — Gemini setups only
@@ -1671,13 +1822,14 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(f"**{title}**  ·  last updated {_upd}")
         if pack["ann"]:
             df = pd.DataFrame(pack["ann"][::-1])
-            cols = [c for c in ["time", "status", "flow", "Trend", "Flow x/3", "watch_reason", "price", "CVD", "EFI", "EFI sl", "EFI tag", "RDI", "Disp", "volume", "VWAP"] if c in df.columns]
+            base = ["time", "status", "flow", "Trend", "Flow x/3", "watch_reason", "price", "CVD", "EFI", "EFI sl", "EFI tag", "RDI", "Disp", "volume", "VWAP"]
+            cols = [c for c in (extra_cols or base) if c in df.columns]
             if extra_cols:
-                cols = extra_cols + [c for c in cols if c not in extra_cols]
+                cols = [c for c in extra_cols if c in df.columns] + [c for c in base if c in df.columns and c not in extra_cols]
             sty = df[cols].style
-            extra = [c for c in ("Trend", "Flow x/3") if c in df.columns]
+            extra = [c for c in ("Trend", "Flow x/3", "EMA X", "DI X", "ADX flag") if c in df.columns]
             if extra:
-                sty = sty.map(confluence_css, subset=extra)
+                sty = sty.map(confluence_css, subset=[c for c in extra if c in ("Trend", "Flow x/3")])
             st.dataframe(sty.hide(axis="index"), use_container_width=True, height=260)
         else:
             st.write("No bars.")
@@ -1703,21 +1855,21 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
 
         st.markdown(
             f"<div id='mis-sec-{name}' style='display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
-            f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · {st.session_state.get('mis_tf') or '1 min'}</span>"
+            f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · 5 min</span>"
             f"<span style='color:#78909C;font-size:11px;'>last updated {_upd}</span>"
-            f"<span style='color:#B0BEC5;font-size:13px;'>Spot <b style='color:#EEE;'>{book.get('spot') or '—'}</b></span>"
-            f"<span style='color:#B0BEC5;font-size:13px;'>Fut <b style='color:#EEE;'>{book.get('fut') or '—'}</b></span>"
             f"<span style='color:#B0BEC5;font-size:13px;'>ATM <b style='color:#EEE;'>{strike}</b> {oexp}</span>"
-            f"<span style='color:#B0BEC5;font-size:13px;'>CE/PE <b style='color:#69F0AE;'>{ce['LTP']}</b> / <b style='color:#FF8A80;'>{pe['LTP']}</b></span>"
+            f"<span style='color:#B0BEC5;font-size:13px;'>CE/PE <b style='color:#69F0AE;'>{ce.get('LTP')}</b> / <b style='color:#FF8A80;'>{pe.get('LTP')}</b></span>"
             f"</div>",
             unsafe_allow_html=True,
         )
-        draw_tape("Index / Fut", idx)
-        c1, c2 = st.columns(2)
-        with c1:
-            draw_tape(book.get("ce_sym") or f"{strike} CE", ce)
-        with c2:
-            draw_tape(book.get("pe_sym") or f"{strike} PE", pe)
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
+        ind = ["time", "price", "EMA4", "EMA9", "EMA X", "ADX", "+DI", "-DI", "DI X", "ADX flag"]
+        d1, d2 = st.columns(2)
+        with d1:
+            draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
+        with d2:
+            draw_tape(f"{strike} PE · 5m", {"ann": pe5}, ind)
         st.divider()
 
     jump = str(st.session_state.get("mis_jump") or "")
