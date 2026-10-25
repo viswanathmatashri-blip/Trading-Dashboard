@@ -633,7 +633,7 @@ def to_5min(rows):
 
 
 def attach_ema_adx(rows, n=14):
-    """4/9 EMA crosses, Wilder ADX/+DI/-DI crosses, ADX>20 with 1-sigma flag."""
+    """4/9 EMA crosses, Wilder ADX/+DI/-DI crosses, ADX slope>0 with 1-sigma flag."""
     rows = list(rows or [])
     if not rows:
         return rows
@@ -702,6 +702,10 @@ def attach_ema_adx(rows, n=14):
         r["+DI"] = None if pdi[i] is None else round(pdi[i], 1)
         r["-DI"] = None if mdi[i] is None else round(mdi[i], 1)
         r["ADX"] = None if adx[i] is None else round(adx[i], 1)
+        slope = None
+        if i >= 3 and None not in (adx[i], adx[i - 1], adx[i - 2], adx[i - 3]):
+            slope = (adx[i] - adx[i - 3]) / 3.0
+        r["ADX sl"] = None if slope is None else round(slope, 3)
         dix = ""
         if i and None not in (pdi[i], mdi[i], pdi[i - 1], mdi[i - 1]):
             if pdi[i - 1] <= mdi[i - 1] and pdi[i] > mdi[i]:
@@ -710,16 +714,16 @@ def attach_ema_adx(rows, n=14):
                 dix = "-DI SHORT"
         r["DI X"] = dix
         flag = ""
-        if adx[i] is not None:
-            hist.append(adx[i])
+        if slope is not None:
+            hist.append(slope)
             win = hist[-20:]
             if len(win) >= 8:
                 mu = sum(win) / len(win)
                 sig = (sum((x - mu) ** 2 for x in win) / len(win)) ** 0.5
-                if adx[i] > 20 and adx[i] >= mu + sig:
-                    flag = "ADX>20 1σ"
-            elif adx[i] > 20:
-                flag = "ADX>20"
+                if slope > 0 and slope >= mu + sig:
+                    flag = "ADX sl>0 1σ"
+            elif slope > 0:
+                flag = "ADX sl>0"
         r["ADX flag"] = flag
     return rows
 
@@ -1548,7 +1552,7 @@ def _fmt_gcell(side, cell, book=None):
 
 
 def _confluence_entries(rows, side="CE", window=3):
-    """Entry when EMA cross, DI cross and ADX>20 1σ all land within `window` 5-min bars.
+    """Entry when EMA cross, DI cross and ADX slope>0 1σ all land within `window` 5-min bars.
     CE = 4>9 and +DI>-DI. PE = 4<9 and -DI>+DI."""
     rows = list(rows or [])
     out = []
@@ -1577,14 +1581,14 @@ def _confluence_entries(rows, side="CE", window=3):
             "ema_at": ema.get("time"),
             "di_at": di.get("time"),
             "adx_at": adx.get("time"),
-            "adx": adx.get("ADX"),
+            "adx": adx.get("ADX sl"),
             "flag": adx.get("ADX flag"),
         })
     return out
 
 
 def render_rule_setups(books, upd):
-    st.caption(f"SETUPS · 4/9 cross + DI cross + ADX>20 1σ within 3 bars (10–15 min) · last {upd}")
+    st.caption(f"SETUPS · 4/9 cross + DI cross + ADX slope>0 1σ within 3 bars (10–15 min) · last {upd}")
     ce_cells, pe_cells = [], []
     for n in ORDER:
         book = (books or {}).get(n) or {}
@@ -1602,7 +1606,7 @@ def render_rule_setups(books, upd):
                 f"Entry : {h.get('entry_px')} @ {str(h.get('entry_time') or '')[11:16]}<br>"
                 f"EMA X : {str(h.get('ema_at') or '')[11:16]}<br>"
                 f"DI X : {str(h.get('di_at') or '')[11:16]}<br>"
-                f"ADX : {h.get('adx')} {h.get('flag') or ''}<br>"
+                f"ADX sl : {h.get('adx')} {h.get('flag') or ''}<br>"
                 f"<span style='color:#90A4AE;'>{len(hits)} today</span>"
                 f"</div>"
             )
@@ -1646,7 +1650,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#FFD54F;'>Watches</b> "
-            "4/9 EMA cross · ADX +DI/-DI cross · ADX>20 with 1σ "
+            "4/9 EMA cross · ADX +DI/-DI cross · ADX slope>0 with 1σ "
             "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
             "</div>",
             unsafe_allow_html=True,
@@ -1889,7 +1893,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         )
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
-        ind = ["time", "price", "EMA4", "EMA9", "EMA X", "ADX", "+DI", "-DI", "DI X", "ADX flag"]
+        ind = ["time", "price", "EMA4", "EMA9", "EMA X", "ADX", "ADX sl", "+DI", "-DI", "DI X", "ADX flag"]
         d1, d2 = st.columns(2)
         with d1:
             draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
