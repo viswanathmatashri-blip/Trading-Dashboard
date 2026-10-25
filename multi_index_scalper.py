@@ -1552,11 +1552,16 @@ def _fmt_gcell(side, cell, book=None):
 
 
 def _confluence_entries(rows, side="CE", window=3):
-    """Entry when EMA cross, DI cross and ADX slope>0 1σ all land within `window` 5-min bars.
-    CE = 4>9 and +DI>-DI. PE = 4<9 and -DI>+DI."""
-    rows = list(rows or [])
-    out = []
-    fired = set()
+    """One entry per EMA+DI pair, on the first bar where ADX slope>0 1σ is also inside the window.
+    CE = 4>9 and +DI>-DI. PE = 4<9 and -DI>+DI. Today's session only."""
+    today = _ist_now().strftime("%Y-%m-%d")
+    rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(today)]
+    # Drop bars whose price is not the same contract (mixed strike / bad tick).
+    px = [float(r["price"]) for r in rows if r.get("price")]
+    if len(px) >= 5:
+        med = sorted(px)[len(px) // 2]
+        rows = [r for r in rows if r.get("price") and 0.35 * med <= float(r["price"]) <= 2.8 * med]
+    out, seen = [], set()
     ema_key = "4>9 LONG" if side == "CE" else "4<9 SHORT"
     di_key = "+DI LONG" if side == "CE" else "-DI SHORT"
     for i in range(len(rows)):
@@ -1564,16 +1569,16 @@ def _confluence_entries(rows, side="CE", window=3):
         chunk = rows[lo:i + 1]
         ema = next((r for r in reversed(chunk) if r.get("EMA X") == ema_key), None)
         di = next((r for r in reversed(chunk) if r.get("DI X") == di_key), None)
-        adx = next((r for r in reversed(chunk) if r.get("ADX flag")), None)
+        adx = next((r for r in reversed(chunk) if "1σ" in str(r.get("ADX flag") or "")), None)
         if not (ema and di and adx):
             continue
-        key = (ema.get("time"), di.get("time"), adx.get("time"))
-        if key in fired:
+        key = (ema.get("time"), di.get("time"))
+        if key in seen:
             continue
-        # only print on the bar that completed the set
+        # fire only on the bar that completes the trio
         if rows[i].get("time") not in (ema.get("time"), di.get("time"), adx.get("time")):
             continue
-        fired.add(key)
+        seen.add(key)
         out.append({
             "side": side,
             "entry_time": rows[i].get("time"),
@@ -1601,7 +1606,7 @@ def render_rule_setups(books, upd):
             todays = [h for h in hits if str(h.get("entry_time") or "").startswith(today)] or hits[-6:]
             if not todays:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
-            bits = [f"<b style='color:{color};font-size:12px;'>{label} {book.get('atm') or ''} · {len(todays)} today</b>"]
+            bits = [f"<b style='color:{color};font-size:12px;'>{label} {book.get('ce_sym') if 'CE' in label else book.get('pe_sym') or book.get('atm') or ''} · {len(todays)} today</b>"]
             for h in reversed(todays):
                 bits.append(
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
