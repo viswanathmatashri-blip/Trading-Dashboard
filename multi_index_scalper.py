@@ -607,7 +607,7 @@ def _ema_list(vals, n):
 
 
 def to_5min(rows):
-    """Resample chronological bars to 5-minute OHLC."""
+    """Resample to 5-minute OHLC, keeping session VWAP and cumulative CVD."""
     if not rows:
         return []
     buckets = {}
@@ -623,22 +623,54 @@ def to_5min(rows):
                 "open": r.get("open"), "high": r.get("high"),
                 "low": r.get("low"), "price": r.get("price"),
                 "volume": float(r.get("volume") or 0),
+                "CVD": r.get("CVD"), "VWAP": r.get("VWAP"),
             }
         else:
             b["high"] = max(float(b["high"] or 0), float(r.get("high") or 0))
             b["low"] = min(float(b["low"] or 1e18), float(r.get("low") or 1e18))
             b["price"] = r.get("price")
             b["volume"] += float(r.get("volume") or 0)
+            if r.get("CVD") is not None:
+                b["CVD"] = r.get("CVD")
+            if r.get("VWAP") is not None:
+                b["VWAP"] = r.get("VWAP")
     return [buckets[k] for k in sorted(buckets)]
 
 
-def attach_ema_adx(rows, n=14):
-    """4/9 EMA crosses, Wilder ADX/+DI/-DI crosses, ADX slope>0 with 1-sigma flag."""
+def attach_ema_adx(rows, n=7):
+    """3/8 EMA of session VWAP, 3/8 EMA of CVD, Wilder ADX/+DI/-DI period 7."""
     rows = list(rows or [])
     if not rows:
         return rows
-    closes = [float(r["price"]) if r.get("price") is not None else None for r in rows]
-    e4, e9 = _ema_list(closes, 4), _ema_list(closes, 9)
+    # session VWAP and CVD, rebuilt per day if the source bar has none
+    pv = vv = 0.0
+    cvd = 0.0
+    day = ""
+    for i, r in enumerate(rows):
+        d = str(r.get("time") or "")[:10]
+        if d != day:
+            day, pv, vv, cvd = d, 0.0, 0.0, 0.0
+        c = float(r.get("price") or 0)
+        v = float(r.get("volume") or 0)
+        o = float(r.get("open") or c)
+        h = float(r.get("high") or c)
+        l = float(r.get("low") or c)
+        if r.get("VWAP") is None:
+            pv += c * v
+            vv += v
+            r["VWAP"] = round(pv / vv, 2) if vv else round(c, 2)
+        if r.get("CVD") is None:
+            sf = loc_flow(o, h, l, c, v)
+            if sf == 0 and v:
+                sf = signed_delta(o, c, v)
+            cvd += sf
+            r["CVD"] = round(cvd, 2)
+        else:
+            cvd = float(r.get("CVD") or 0)
+    vw = [float(r["VWAP"]) if r.get("VWAP") is not None else None for r in rows]
+    cv = [float(r["CVD"]) if r.get("CVD") is not None else None for r in rows]
+    v3, v8 = _ema_list(vw, 3), _ema_list(vw, 8)
+    c3, c8 = _ema_list(cv, 3), _ema_list(cv, 8)
     trs, pdm, mdm = [], [], []
     for i, r in enumerate(rows):
         h = float(r.get("high") or r.get("price") or 0)
@@ -688,24 +720,29 @@ def attach_ema_adx(rows, n=14):
                 continue
             prev = (prev * (n - 1) + dx[i]) / n
             adx[i] = prev
-    hist = []
     for i, r in enumerate(rows):
-        r["EMA4"] = e4[i]
-        r["EMA9"] = e9[i]
-        ex = ""
-        if i and None not in (e4[i], e9[i], e4[i - 1], e9[i - 1]):
-            if e4[i - 1] <= e9[i - 1] and e4[i] > e9[i]:
-                ex = "4>9 LONG"
-            elif e4[i - 1] >= e9[i - 1] and e4[i] < e9[i]:
-                ex = "4<9 SHORT"
-        r["EMA X"] = ex
+        r["VWAP 3"] = v3[i]
+        r["VWAP 8"] = v8[i]
+        r["CVD 3"] = c3[i]
+        r["CVD 8"] = c8[i]
+        vx = ""
+        if i and None not in (v3[i], v8[i], v3[i - 1], v8[i - 1]):
+            if v3[i - 1] <= v8[i - 1] and v3[i] > v8[i]:
+                vx = "3>8 LONG"
+            elif v3[i - 1] >= v8[i - 1] and v3[i] < v8[i]:
+                vx = "3<8 SHORT"
+        r["VWAP X"] = vx
+        cx = ""
+        if i and None not in (c3[i], c8[i], c3[i - 1], c8[i - 1]):
+            if c3[i - 1] <= c8[i - 1] and c3[i] > c8[i]:
+                cx = "3>8 LONG"
+            elif c3[i - 1] >= c8[i - 1] and c3[i] < c8[i]:
+                cx = "3<8 SHORT"
+        r["CVD X"] = cx
         r["+DI"] = None if pdi[i] is None else round(pdi[i], 1)
         r["-DI"] = None if mdi[i] is None else round(mdi[i], 1)
         r["ADX"] = None if adx[i] is None else round(adx[i], 1)
-        slope = None
-        if i >= 3 and None not in (adx[i], adx[i - 1], adx[i - 2], adx[i - 3]):
-            slope = (adx[i] - adx[i - 3]) / 3.0
-        r["ADX sl"] = None if slope is None else round(slope, 3)
+        r["ADX>25"] = "ADX>25" if adx[i] is not None and adx[i] > 25 else ""
         dix = ""
         if i and None not in (pdi[i], mdi[i], pdi[i - 1], mdi[i - 1]):
             if pdi[i - 1] <= mdi[i - 1] and pdi[i] > mdi[i]:
@@ -713,18 +750,6 @@ def attach_ema_adx(rows, n=14):
             elif pdi[i - 1] >= mdi[i - 1] and pdi[i] < mdi[i]:
                 dix = "-DI SHORT"
         r["DI X"] = dix
-        flag = ""
-        if slope is not None:
-            hist.append(slope)
-            win = hist[-20:]
-            if len(win) >= 8:
-                mu = sum(win) / len(win)
-                sig = (sum((x - mu) ** 2 for x in win) / len(win)) ** 0.5
-                if slope > 0 and slope >= mu + sig:
-                    flag = "ADX sl>0 1σ"
-            elif slope > 0:
-                flag = "ADX sl>0"
-        r["ADX flag"] = flag
     return rows
 
 
@@ -1178,13 +1203,13 @@ def _cell_css(col, val):
         return "background-color:#2e7d32;color:#fff;font-weight:700;"
     if "SHORT" in t:
         return "background-color:#c62828;color:#fff;font-weight:700;"
-    if "ADX>20" in t:
+    if "ADX>25" in t or "ADX>20" in t:
         return "background-color:#1565c0;color:#fff;font-weight:700;"
     return ""
 
 
 def watch_log_html(df: pd.DataFrame) -> str:
-    gold = {"CE EMA X", "CE DI X", "CE ADX flag", "PE EMA X", "PE DI X", "PE ADX flag"}
+    gold = {"CE CVD X", "CE VWAP X", "CE ADX>25", "PE CVD X", "PE VWAP X", "PE ADX>25"}
     rows = []
     rows.append("<thead><tr>")
     for c in df.columns:
@@ -1568,9 +1593,9 @@ def _session_day(rows):
     return prior[-1] if prior else days[-1]
 
 
-def _confluence_entries(rows, window=3, open_hm=(9, 15), close_hm=(15, 30)):
-    """Every long buy in the session: 4>9 and +DI>-DI with ADX slope>0 inside 3 bars.
-    One print per EMA cross. Bars outside the session are ignored."""
+def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30)):
+    """LONG when all four hold: CVD 3>8, ADX>25, VWAP 3>8, +DI>-DI.
+    One print per episode."""
     use_day = _session_day(rows)
     rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(use_day)] if use_day else list(rows or [])
     def in_sess(t):
@@ -1583,28 +1608,29 @@ def _confluence_entries(rows, window=3, open_hm=(9, 15), close_hm=(15, 30)):
     px = [float(r["price"]) for r in rows if r.get("price")]
     if len(px) >= 5:
         med = sorted(px)[len(px) // 2]
-        rows = [r for r in rows if r.get("price") and 0.4 * med <= float(r["price"]) <= 2.5 * med]
-    out, seen = [], set()
-    for i in range(len(rows)):
-        lo = max(0, i - window + 1)
-        chunk = rows[lo:i + 1]
-        ema = next((r for r in reversed(chunk) if r.get("EMA X") == "4>9 LONG"), None)
-        di = next((r for r in reversed(chunk) if r.get("DI X") == "+DI LONG"), None)
-        adx = next((r for r in reversed(chunk) if "ADX sl>0" in str(r.get("ADX flag") or "")), None)
-        if not (ema and di and adx):
-            continue
-        key = rows[i].get("time")
-        if key in seen:
-            continue
-        if rows[i].get("time") not in (ema.get("time"), di.get("time"), adx.get("time")):
-            continue
-        seen.add(key)
-        out.append({
-            "day": use_day,
-            "entry_time": rows[i].get("time"), "entry_px": rows[i].get("price"),
-            "ema_at": ema.get("time"), "di_at": di.get("time"), "adx_at": adx.get("time"),
-            "adx": adx.get("ADX sl"), "flag": adx.get("ADX flag"),
-        })
+        rows = [r for r in rows if r.get("price") and 0.25 * med <= float(r["price"]) <= 4.0 * med]
+    out, on = [], False
+    for r in rows:
+        c3, c8 = r.get("CVD 3"), r.get("CVD 8")
+        v3, v8 = r.get("VWAP 3"), r.get("VWAP 8")
+        adx = r.get("ADX")
+        pdi, mdi = r.get("+DI"), r.get("-DI")
+        armed = (
+            c3 is not None and c8 is not None and c3 > c8
+            and adx is not None and adx > 25
+            and v3 is not None and v8 is not None and v3 > v8
+            and pdi is not None and mdi is not None and pdi > mdi
+        )
+        if armed and not on:
+            out.append({
+                "day": use_day,
+                "entry_time": r.get("time"), "entry_px": r.get("price"),
+                "cvd": f"{c3}/{c8}", "vwap": f"{v3}/{v8}",
+                "adx": adx, "di": f"{pdi}/{mdi}",
+            })
+            on = True
+        elif not armed:
+            on = False
     return out
 
 
@@ -1613,7 +1639,7 @@ def render_rule_setups(books, upd):
     for n in ORDER:
         b = (books or {}).get(n) or {}
         sess = _session_day(to_5min(b.get("ce_rows") or [])) or sess
-    st.caption(f"SETUPS · last session {sess or '—'} (weekend uses previous trading day) · 4/9 + DI + ADX slope in 3 bars · {upd}")
+    st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD 3>8 · ADX>25 · VWAP 3>8 · +DI>-DI · {upd}")
     ce_cells, pe_cells = [], []
     for n in ORDER:
         book = (books or {}).get(n) or {}
@@ -1633,8 +1659,8 @@ def render_rule_setups(books, upd):
                 bits.append(
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
                     f"{str(h.get('entry_time') or '')[11:16]} · {h.get('entry_px')}<br>"
-                    f"EMA {str(h.get('ema_at') or '')[11:16]} · DI {str(h.get('di_at') or '')[11:16]} · "
-                    f"sl {h.get('adx')} {h.get('flag') or ''}</div>"
+                    f"CVD 3/8 {h.get('cvd')} · VWAP 3/8 {h.get('vwap')}<br>"
+                    f"ADX {h.get('adx')} · DI {h.get('di')}</div>"
                 )
             return f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>{''.join(bits)}</div>"
         ce_cells.append(cell(ce_hit, "#69F0AE", "CE BUY"))
@@ -1677,7 +1703,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#FFD54F;'>Watches</b> "
-            "4/9 EMA cross · ADX +DI/-DI cross · ADX slope>0 with 1σ "
+            "CVD 3/8 · VWAP 3/8 · ADX>25 · +DI>-DI (period 7) "
             "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
             "</div>",
             unsafe_allow_html=True,
@@ -1805,19 +1831,19 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Spot": book.get("spot") if book.get("spot") is not None else "—",
             "ATM": strike, "Opt exp": oexp,
             "CE LTP": cl.get("price") or ce.get("LTP"),
-            "CE EMA X": _last_x(ce5, "EMA X"),
+            "CE CVD X": _last_x(ce5, "CVD X"),
+            "CE VWAP X": _last_x(ce5, "VWAP X"),
             "CE ADX": cl.get("ADX") or "—",
             "CE +DI": cl.get("+DI") or "—",
             "CE -DI": cl.get("-DI") or "—",
-            "CE DI X": _last_x(ce5, "DI X"),
-            "CE ADX flag": cl.get("ADX flag") or "—",
+            "CE ADX>25": cl.get("ADX>25") or "—",
             "PE LTP": pl.get("price") or pe.get("LTP"),
-            "PE EMA X": _last_x(pe5, "EMA X"),
+            "PE CVD X": _last_x(pe5, "CVD X"),
+            "PE VWAP X": _last_x(pe5, "VWAP X"),
             "PE ADX": pl.get("ADX") or "—",
             "PE +DI": pl.get("+DI") or "—",
             "PE -DI": pl.get("-DI") or "—",
-            "PE DI X": _last_x(pe5, "DI X"),
-            "PE ADX flag": pl.get("ADX flag") or "—",
+            "PE ADX>25": pl.get("ADX>25") or "—",
             "Bar": (cl.get("time") or bar_ts),
         })
 
@@ -1920,7 +1946,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         )
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
-        ind = ["time", "price", "EMA4", "EMA9", "EMA X", "ADX", "ADX sl", "+DI", "-DI", "DI X", "ADX flag"]
+        ind = ["time", "price", "VWAP", "VWAP 3", "VWAP 8", "VWAP X", "CVD", "CVD 3", "CVD 8", "CVD X", "ADX", "+DI", "-DI", "ADX>25"]
         d1, d2 = st.columns(2)
         with d1:
             draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
