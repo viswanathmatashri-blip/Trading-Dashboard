@@ -638,7 +638,7 @@ def to_5min(rows):
 
 
 def attach_ema_adx(rows, n=7):
-    """3/8 EMA of session VWAP, 3/8 EMA of CVD, Wilder ADX/+DI/-DI period 7."""
+    """3/8 EMA of session VWAP, CVD vs session VWMA, Wilder ADX/+DI/-DI period 7."""
     rows = list(rows or [])
     if not rows:
         return rows
@@ -667,10 +667,20 @@ def attach_ema_adx(rows, n=7):
             r["CVD"] = round(cvd, 2)
         else:
             cvd = float(r.get("CVD") or 0)
+    # session volume-weighted moving average of CVD, reset each day
+    wc = wv = 0.0
+    day2 = ""
+    for r in rows:
+        d = str(r.get("time") or "")[:10]
+        if d != day2:
+            day2, wc, wv = d, 0.0, 0.0
+        v = float(r.get("volume") or 0)
+        cvd_v = float(r.get("CVD") or 0)
+        wc += cvd_v * v
+        wv += v
+        r["CVD WMA"] = round(wc / wv, 2) if wv else round(cvd_v, 2)
     vw = [float(r["VWAP"]) if r.get("VWAP") is not None else None for r in rows]
-    cv = [float(r["CVD"]) if r.get("CVD") is not None else None for r in rows]
     v3, v8 = _ema_list(vw, 3), _ema_list(vw, 8)
-    c3, c8 = _ema_list(cv, 3), _ema_list(cv, 8)
     trs, pdm, mdm = [], [], []
     for i, r in enumerate(rows):
         h = float(r.get("high") or r.get("price") or 0)
@@ -723,8 +733,6 @@ def attach_ema_adx(rows, n=7):
     for i, r in enumerate(rows):
         r["VWAP 3"] = v3[i]
         r["VWAP 8"] = v8[i]
-        r["CVD 3"] = c3[i]
-        r["CVD 8"] = c8[i]
         vx = ""
         if i and None not in (v3[i], v8[i], v3[i - 1], v8[i - 1]):
             if v3[i - 1] <= v8[i - 1] and v3[i] > v8[i]:
@@ -732,13 +740,19 @@ def attach_ema_adx(rows, n=7):
             elif v3[i - 1] >= v8[i - 1] and v3[i] < v8[i]:
                 vx = "3<8 SHORT"
         r["VWAP X"] = vx
+        cvd_v = float(r.get("CVD") or 0)
+        wma = r.get("CVD WMA")
         cx = ""
-        if i and None not in (c3[i], c8[i], c3[i - 1], c8[i - 1]):
-            if c3[i - 1] <= c8[i - 1] and c3[i] > c8[i]:
-                cx = "3>8 LONG"
-            elif c3[i - 1] >= c8[i - 1] and c3[i] < c8[i]:
-                cx = "3<8 SHORT"
+        if i and wma is not None:
+            prev = float(rows[i - 1].get("CVD") or 0)
+            pw = rows[i - 1].get("CVD WMA")
+            if pw is not None:
+                if prev <= float(pw) and cvd_v > float(wma):
+                    cx = "CVD>WMA LONG"
+                elif prev >= float(pw) and cvd_v < float(wma):
+                    cx = "CVD<WMA SHORT"
         r["CVD X"] = cx
+        r["CVD vs WMA"] = "LONG" if wma is not None and cvd_v > float(wma) else ("SHORT" if wma is not None else "")
         r["+DI"] = None if pdi[i] is None else round(pdi[i], 1)
         r["-DI"] = None if mdi[i] is None else round(mdi[i], 1)
         r["ADX"] = None if adx[i] is None else round(adx[i], 1)
@@ -1594,7 +1608,7 @@ def _session_day(rows):
 
 
 def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30)):
-    """LONG when all four hold: CVD 3>8, ADX>25, VWAP 3>8, +DI>-DI.
+    """LONG when all four hold: CVD above session WMA, ADX>25, VWAP 3>8, +DI>-DI.
     One print per episode."""
     use_day = _session_day(rows)
     rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(use_day)] if use_day else list(rows or [])
@@ -1611,12 +1625,13 @@ def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30)):
         rows = [r for r in rows if r.get("price") and 0.25 * med <= float(r["price"]) <= 4.0 * med]
     out, on = [], False
     for r in rows:
-        c3, c8 = r.get("CVD 3"), r.get("CVD 8")
+        cvd_v = float(r.get("CVD") or 0)
+        wma = r.get("CVD WMA")
         v3, v8 = r.get("VWAP 3"), r.get("VWAP 8")
         adx = r.get("ADX")
         pdi, mdi = r.get("+DI"), r.get("-DI")
         armed = (
-            c3 is not None and c8 is not None and c3 > c8
+            wma is not None and cvd_v > float(wma)
             and adx is not None and adx > 25
             and v3 is not None and v8 is not None and v3 > v8
             and pdi is not None and mdi is not None and pdi > mdi
@@ -1625,7 +1640,7 @@ def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30)):
             out.append({
                 "day": use_day,
                 "entry_time": r.get("time"), "entry_px": r.get("price"),
-                "cvd": f"{c3}/{c8}", "vwap": f"{v3}/{v8}",
+                "cvd": f"{round(cvd_v, 1)}/{wma}", "vwap": f"{v3}/{v8}",
                 "adx": adx, "di": f"{pdi}/{mdi}",
             })
             on = True
@@ -1639,7 +1654,7 @@ def render_rule_setups(books, upd):
     for n in ORDER:
         b = (books or {}).get(n) or {}
         sess = _session_day(to_5min(b.get("ce_rows") or [])) or sess
-    st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD 3>8 · ADX>25 · VWAP 3>8 · +DI>-DI · {upd}")
+    st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD>session WMA · ADX>25 · VWAP 3>8 · +DI>-DI · {upd}")
     ce_cells, pe_cells = [], []
     for n in ORDER:
         book = (books or {}).get(n) or {}
@@ -1659,7 +1674,7 @@ def render_rule_setups(books, upd):
                 bits.append(
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
                     f"{str(h.get('entry_time') or '')[11:16]} · {h.get('entry_px')}<br>"
-                    f"CVD 3/8 {h.get('cvd')} · VWAP 3/8 {h.get('vwap')}<br>"
+                    f"CVD/WMA {h.get('cvd')} · VWAP 3/8 {h.get('vwap')}<br>"
                     f"ADX {h.get('adx')} · DI {h.get('di')}</div>"
                 )
             return f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>{''.join(bits)}</div>"
@@ -1703,7 +1718,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#FFD54F;'>Watches</b> "
-            "CVD 3/8 · VWAP 3/8 · ADX>25 · +DI>-DI (period 7) "
+            "CVD vs session WMA · VWAP 3/8 · ADX>25 · +DI>-DI (period 7) "
             "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
             "</div>",
             unsafe_allow_html=True,
@@ -1946,7 +1961,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         )
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
-        ind = ["time", "price", "VWAP", "VWAP 3", "VWAP 8", "VWAP X", "CVD", "CVD 3", "CVD 8", "CVD X", "ADX", "+DI", "-DI", "ADX>25"]
+        ind = ["time", "price", "VWAP", "VWAP 3", "VWAP 8", "VWAP X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX>25"]
         d1, d2 = st.columns(2)
         with d1:
             draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
