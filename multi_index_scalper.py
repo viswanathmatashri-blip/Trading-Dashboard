@@ -595,6 +595,20 @@ def efi_confluence_at(idx, ce, pe, ts):
     return confluence_label([side(idx, False), side(ce, False), side(pe, True)], "EFI")
 
 
+def _vwma(rows, n):
+    """n-period volume-weighted moving average of price."""
+    out = [None] * len(rows)
+    for i in range(len(rows)):
+        lo = max(0, i - n + 1)
+        chunk = rows[lo:i + 1]
+        if len(chunk) < n:
+            continue
+        pv = sum(float(r.get("price") or 0) * float(r.get("volume") or 0) for r in chunk)
+        vv = sum(float(r.get("volume") or 0) for r in chunk)
+        out[i] = round(pv / vv, 2) if vv else round(float(chunk[-1].get("price") or 0), 2)
+    return out
+
+
 def _ema_list(vals, n):
     out, ema, k = [None] * len(vals), None, 2.0 / (n + 1)
     for i, v in enumerate(vals):
@@ -679,8 +693,7 @@ def attach_ema_adx(rows, n=7):
         wc += cvd_v * v
         wv += v
         r["CVD WMA"] = round(wc / wv, 2) if wv else round(cvd_v, 2)
-    vw = [float(r["VWAP"]) if r.get("VWAP") is not None else None for r in rows]
-    v3, v8 = _ema_list(vw, 3), _ema_list(vw, 8)
+    v3, v8 = _vwma(rows, 3), _vwma(rows, 8)
     trs, pdm, mdm = [], [], []
     for i, r in enumerate(rows):
         h = float(r.get("high") or r.get("price") or 0)
@@ -731,15 +744,15 @@ def attach_ema_adx(rows, n=7):
             prev = (prev * (n - 1) + dx[i]) / n
             adx[i] = prev
     for i, r in enumerate(rows):
-        r["VWAP 3"] = v3[i]
-        r["VWAP 8"] = v8[i]
+        r["VWMA 3"] = v3[i]
+        r["VWMA 8"] = v8[i]
         vx = ""
         if i and None not in (v3[i], v8[i], v3[i - 1], v8[i - 1]):
             if v3[i - 1] <= v8[i - 1] and v3[i] > v8[i]:
                 vx = "3>8 LONG"
             elif v3[i - 1] >= v8[i - 1] and v3[i] < v8[i]:
                 vx = "3<8 SHORT"
-        r["VWAP X"] = vx
+        r["VWMA X"] = vx
         cvd_v = float(r.get("CVD") or 0)
         wma = r.get("CVD WMA")
         cx = ""
@@ -1223,7 +1236,7 @@ def _cell_css(col, val):
 
 
 def watch_log_html(df: pd.DataFrame) -> str:
-    gold = {"CE CVD X", "CE VWAP X", "CE ADX>25", "PE CVD X", "PE VWAP X", "PE ADX>25"}
+    gold = {"CE CVD X", "CE VWMA X", "CE ADX>25", "PE CVD X", "PE VWMA X", "PE ADX>25"}
     rows = []
     rows.append("<thead><tr>")
     for c in df.columns:
@@ -1608,7 +1621,7 @@ def _session_day(rows):
 
 
 def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30)):
-    """LONG when all four hold: CVD above session WMA, ADX>25, VWAP 3>8, +DI>-DI.
+    """LONG when all four hold: CVD above session WMA, ADX>25, VWMA 3>8, +DI>-DI.
     One print per episode."""
     use_day = _session_day(rows)
     rows = [r for r in (rows or []) if str(r.get("time") or "").startswith(use_day)] if use_day else list(rows or [])
@@ -1627,7 +1640,7 @@ def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30)):
     for r in rows:
         cvd_v = float(r.get("CVD") or 0)
         wma = r.get("CVD WMA")
-        v3, v8 = r.get("VWAP 3"), r.get("VWAP 8")
+        v3, v8 = r.get("VWMA 3"), r.get("VWMA 8")
         adx = r.get("ADX")
         pdi, mdi = r.get("+DI"), r.get("-DI")
         armed = (
@@ -1654,7 +1667,7 @@ def render_rule_setups(books, upd):
     for n in ORDER:
         b = (books or {}).get(n) or {}
         sess = _session_day(to_5min(b.get("ce_rows") or [])) or sess
-    st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD>session WMA · ADX>25 · VWAP 3>8 · +DI>-DI · {upd}")
+    st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD>session WMA · ADX>25 · VWMA 3>8 · +DI>-DI · {upd}")
     ce_cells, pe_cells = [], []
     for n in ORDER:
         book = (books or {}).get(n) or {}
@@ -1674,7 +1687,7 @@ def render_rule_setups(books, upd):
                 bits.append(
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
                     f"{str(h.get('entry_time') or '')[11:16]} · {h.get('entry_px')}<br>"
-                    f"CVD/WMA {h.get('cvd')} · VWAP 3/8 {h.get('vwap')}<br>"
+                    f"CVD/WMA {h.get('cvd')} · VWMA 3/8 {h.get('vwap')}<br>"
                     f"ADX {h.get('adx')} · DI {h.get('di')}</div>"
                 )
             return f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>{''.join(bits)}</div>"
@@ -1718,7 +1731,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#FFD54F;'>Watches</b> "
-            "CVD vs session WMA · VWAP 3/8 · ADX>25 · +DI>-DI (period 7) "
+            "CVD vs session WMA · VWMA 3/8 · ADX>25 · +DI>-DI (period 7) "
             "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
             "</div>",
             unsafe_allow_html=True,
@@ -1847,14 +1860,14 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "ATM": strike, "Opt exp": oexp,
             "CE LTP": cl.get("price") or ce.get("LTP"),
             "CE CVD X": _last_x(ce5, "CVD X"),
-            "CE VWAP X": _last_x(ce5, "VWAP X"),
+            "CE VWMA X": _last_x(ce5, "VWMA X"),
             "CE ADX": cl.get("ADX") or "—",
             "CE +DI": cl.get("+DI") or "—",
             "CE -DI": cl.get("-DI") or "—",
             "CE ADX>25": cl.get("ADX>25") or "—",
             "PE LTP": pl.get("price") or pe.get("LTP"),
             "PE CVD X": _last_x(pe5, "CVD X"),
-            "PE VWAP X": _last_x(pe5, "VWAP X"),
+            "PE VWMA X": _last_x(pe5, "VWMA X"),
             "PE ADX": pl.get("ADX") or "—",
             "PE +DI": pl.get("+DI") or "—",
             "PE -DI": pl.get("-DI") or "—",
@@ -1961,7 +1974,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         )
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
-        ind = ["time", "price", "VWAP", "VWAP 3", "VWAP 8", "VWAP X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX>25"]
+        ind = ["time", "price", "VWMA 3", "VWMA 8", "VWMA X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX>25"]
         d1, d2 = st.columns(2)
         with d1:
             draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
