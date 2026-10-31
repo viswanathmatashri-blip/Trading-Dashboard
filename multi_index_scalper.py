@@ -651,7 +651,7 @@ def to_5min(rows):
     return [buckets[k] for k in sorted(buckets)]
 
 
-def attach_ema_adx(rows, n=7):
+def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
     """3/8 EMA of session VWAP, CVD vs session VWMA, Wilder ADX/+DI/-DI period 7."""
     rows = list(rows or [])
     if not rows:
@@ -681,19 +681,17 @@ def attach_ema_adx(rows, n=7):
             r["CVD"] = round(cvd, 2)
         else:
             cvd = float(r.get("CVD") or 0)
-    # session volume-weighted moving average of CVD, reset each day
-    wc = wv = 0.0
-    day2 = ""
-    for r in rows:
-        d = str(r.get("time") or "")[:10]
-        if d != day2:
-            day2, wc, wv = d, 0.0, 0.0
-        v = float(r.get("volume") or 0)
-        cvd_v = float(r.get("CVD") or 0)
-        wc += cvd_v * v
-        wv += v
-        r["CVD WMA"] = round(wc / wv, 2) if wv else round(cvd_v, 2)
-    v3, v8 = _vwma(rows, 3), _vwma(rows, 8)
+    # n-period volume-weighted MA of CVD
+    for i, r in enumerate(rows):
+        lo = max(0, i - cvd_n + 1)
+        chunk = rows[lo:i + 1]
+        if len(chunk) < cvd_n:
+            r["CVD WMA"] = None
+            continue
+        wc = sum(float(x.get("CVD") or 0) * float(x.get("volume") or 0) for x in chunk)
+        wv = sum(float(x.get("volume") or 0) for x in chunk)
+        r["CVD WMA"] = round(wc / wv, 2) if wv else round(float(chunk[-1].get("CVD") or 0), 2)
+    v3, v8 = _vwma(rows, fast), _vwma(rows, slow)
     trs, pdm, mdm = [], [], []
     for i, r in enumerate(rows):
         h = float(r.get("high") or r.get("price") or 0)
@@ -769,7 +767,7 @@ def attach_ema_adx(rows, n=7):
         r["+DI"] = None if pdi[i] is None else round(pdi[i], 1)
         r["-DI"] = None if mdi[i] is None else round(mdi[i], 1)
         r["ADX"] = None if adx[i] is None else round(adx[i], 1)
-        r["ADX>25"] = "ADX>25" if adx[i] is not None and adx[i] > 25 else ""
+        r["ADX>25"] = f"ADX>{adx_lvl}" if adx[i] is not None and adx[i] > adx_lvl else ""
         dix = ""
         if i and None not in (pdi[i], mdi[i], pdi[i - 1], mdi[i - 1]):
             if pdi[i - 1] <= mdi[i - 1] and pdi[i] > mdi[i]:
@@ -1620,7 +1618,7 @@ def _session_day(rows):
     return prior[-1] if prior else days[-1]
 
 
-def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30)):
+def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30), adx_lvl=20):
     """LONG when all four hold: CVD above session WMA, ADX>25, VWMA 3>8, +DI>-DI.
     One print per episode."""
     use_day = _session_day(rows)
@@ -1645,7 +1643,7 @@ def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30)):
         pdi, mdi = r.get("+DI"), r.get("-DI")
         armed = (
             wma is not None and cvd_v > float(wma)
-            and adx is not None and adx > 25
+            and adx is not None and adx > adx_lvl
             and v3 is not None and v8 is not None and v3 > v8
             and pdi is not None and mdi is not None and pdi > mdi
         )
@@ -1667,16 +1665,18 @@ def render_rule_setups(books, upd):
     for n in ORDER:
         b = (books or {}).get(n) or {}
         sess = _session_day(to_5min(b.get("ce_rows") or [])) or sess
-    st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD>session WMA · ADX>25 · VWMA 3>8 · +DI>-DI · {upd}")
+    p0 = _ind_params()
+    st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD>{p0['cvd']} WMA · ADX>{p0['adx']} · VWMA {p0['fast']}/{p0['slow']} · +DI>-DI · {upd}")
     ce_cells, pe_cells = [], []
     for n in ORDER:
         book = (books or {}).get(n) or {}
-        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
-        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
+        p = _ind_params(n)
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         mcx = n in ("CRUDEOIL", "GOLDM")
         bounds = ((9, 0), (23, 30)) if mcx else ((9, 15), (15, 30))
-        ce_hit = _confluence_entries(ce5, open_hm=bounds[0], close_hm=bounds[1])
-        pe_hit = _confluence_entries(pe5, open_hm=bounds[0], close_hm=bounds[1])
+        ce_hit = _confluence_entries(ce5, open_hm=bounds[0], close_hm=bounds[1], adx_lvl=p["adx"])
+        pe_hit = _confluence_entries(pe5, open_hm=bounds[0], close_hm=bounds[1], adx_lvl=p["adx"])
         def cell(hits, color, label):
             if not hits:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
@@ -1705,7 +1705,48 @@ def render_rule_setups(books, upd):
     )
 
 
+def _ind_params(name=None):
+    base = st.session_state.get("mis_ind") or {"fast": 3, "slow": 8, "adx": 20, "di": 7, "cvd": 8}
+    out = dict(base)
+    out["fast"] = int(out.get("fast") or 3)
+    out["slow"] = int(out.get("slow") or 8)
+    out["adx"] = int(out.get("adx") or 20)
+    out["di"] = int(out.get("di") or 7)
+    out["cvd"] = int(out.get("cvd") or 8)
+    return out
+
+
+def _render_ind_dock():
+    st.markdown(
+        """
+<style>
+.block-container { padding-right: 268px !important; }
+div[data-testid="stVerticalBlock"] > div:has(.mis-dock-anchor) {
+  position: fixed; right: 10px; top: 62px; width: 244px; z-index: 500;
+  background: #111318; border: 1px solid #2a2d33; border-radius: 8px;
+  padding: 8px 10px 12px 10px; max-height: 90vh; overflow: auto;
+}
+</style>
+<span class="mis-dock-anchor"></span>
+""",
+        unsafe_allow_html=True,
+    )
+    st.markdown("**Indicators**")
+    cur = _ind_params()
+    fast = st.number_input("VWMA fast", 2, 30, int(cur["fast"]), key="ind_fast")
+    slow = st.number_input("VWMA slow", 3, 60, int(cur["slow"]), key="ind_slow")
+    cvd_n = st.number_input("CVD WMA", 2, 60, int(cur["cvd"]), key="ind_cvd")
+    adx = st.number_input("ADX >", 5, 60, int(cur["adx"]), key="ind_adx")
+    di = st.number_input("+DI / -DI period", 5, 30, int(cur["di"]), key="ind_di")
+    st.session_state["mis_ind"] = {
+        "fast": int(fast), "slow": int(slow), "cvd": int(cvd_n),
+        "adx": int(adx), "di": int(di),
+    }
+    st.caption(f"VWMA {int(fast)}/{int(slow)} · CVD vs {int(cvd_n)} WMA · ADX>{int(adx)} · DI {int(di)}")
+
+
 def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None, quote_fn=None):
+    _render_ind_dock()
     a_lab = "ON" if st.session_state.get("_smart_api_obj") and not st.session_state.get("_smart_api_err") else (
         "RATE LIMIT" if st.session_state.get("_angel_rl_ts") else ("DOWN" if st.session_state.get("_smart_api_err") else "IDLE")
     )
@@ -1731,7 +1772,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#FFD54F;'>Watches</b> "
-            "CVD vs session WMA · VWMA 3/8 · ADX>25 · +DI>-DI (period 7) "
+            f"CVD vs {_ind_params()['cvd']} WMA · VWMA {_ind_params()['fast']}/{_ind_params()['slow']} · ADX>{_ind_params()['adx']} · +DI>-DI (period {_ind_params()['di']}) "
             "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
             "</div>",
             unsafe_allow_html=True,
@@ -1849,8 +1890,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         bar_ts = idx["Bar"]
         if not session_open(name):
             bar_ts = last_session_bar(name, book.get("idx_rows") or [], bar_ts)
-        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
-        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
+        p = _ind_params(name)
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         def _last_x(rows, key):
             return next((r.get(key) for r in reversed(rows) if r.get(key)), "—")
         cl, pl = (ce5[-1] if ce5 else {}), (pe5[-1] if pe5 else {})
@@ -1972,8 +2014,9 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             f"</div>",
             unsafe_allow_html=True,
         )
-        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []))
-        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []))
+        p = _ind_params(name)
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         ind = ["time", "price", "VWMA 3", "VWMA 8", "VWMA X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX>25"]
         d1, d2 = st.columns(2)
         with d1:
