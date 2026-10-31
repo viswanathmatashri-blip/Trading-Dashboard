@@ -1734,17 +1734,6 @@ def _render_ind_dock():
         "fast": int(fast), "slow": int(slow), "cvd": int(cvd_n),
         "adx": int(adx), "di": int(di),
     }
-    st.markdown("**Indicators**")
-    cur = _ind_params()
-    fast = st.number_input("VWMA fast", 2, 30, int(cur["fast"]), key="ind_fast")
-    slow = st.number_input("VWMA slow", 3, 60, int(cur["slow"]), key="ind_slow")
-    cvd_n = st.number_input("CVD WMA", 2, 60, int(cur["cvd"]), key="ind_cvd")
-    adx = st.number_input("ADX >", 5, 60, int(cur["adx"]), key="ind_adx")
-    di = st.number_input("+DI / -DI period", 5, 30, int(cur["di"]), key="ind_di")
-    st.session_state["mis_ind"] = {
-        "fast": int(fast), "slow": int(slow), "cvd": int(cvd_n),
-        "adx": int(adx), "di": int(di),
-    }
     st.caption(f"VWMA {int(fast)}/{int(slow)} · CVD vs {int(cvd_n)} WMA · ADX>{int(adx)} · DI {int(di)}")
 
 
