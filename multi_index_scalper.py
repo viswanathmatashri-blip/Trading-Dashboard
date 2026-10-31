@@ -1719,6 +1719,23 @@ def _ind_params(name=None):
 def _render_ind_dock():
     st.markdown("**Indicators**")
     cur = _ind_params()
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        fast = st.number_input("VWMA fast", 2, 30, int(cur["fast"]), key="ind_fast")
+    with c2:
+        slow = st.number_input("VWMA slow", 3, 60, int(cur["slow"]), key="ind_slow")
+    with c3:
+        cvd_n = st.number_input("CVD WMA", 2, 60, int(cur["cvd"]), key="ind_cvd")
+    with c4:
+        adx = st.number_input("ADX >", 5, 60, int(cur["adx"]), key="ind_adx")
+    with c5:
+        di = st.number_input("+DI / -DI", 5, 30, int(cur["di"]), key="ind_di")
+    st.session_state["mis_ind"] = {
+        "fast": int(fast), "slow": int(slow), "cvd": int(cvd_n),
+        "adx": int(adx), "di": int(di),
+    }
+    st.markdown("**Indicators**")
+    cur = _ind_params()
     fast = st.number_input("VWMA fast", 2, 30, int(cur["fast"]), key="ind_fast")
     slow = st.number_input("VWMA slow", 3, 60, int(cur["slow"]), key="ind_slow")
     cvd_n = st.number_input("CVD WMA", 2, 60, int(cur["cvd"]), key="ind_cvd")
@@ -1732,292 +1749,289 @@ def _render_ind_dock():
 
 
 def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None, quote_fn=None):
-    main, dock = st.columns([5.6, 1.15])
-    with dock:
-        _render_ind_dock()
-    with main:
-        a_lab = "ON" if st.session_state.get("_smart_api_obj") and not st.session_state.get("_smart_api_err") else (
-            "RATE LIMIT" if st.session_state.get("_angel_rl_ts") else ("DOWN" if st.session_state.get("_smart_api_err") else "IDLE")
-        )
-        a_col = {"ON": "#00E676", "RATE LIMIT": "#FFB300", "DOWN": "#FF5252"}.get(a_lab, "#90A4AE")
-        if st.session_state.get("_ab_session"):
-            b_lab, b_col = "ON", "#00E676"
-        elif st.session_state.get("_ab_err"):
-            b_lab, b_col = "DOWN", "#FF5252"
-        else:
-            b_lab, b_col = "STANDBY", "#FFB300"
-        last = st.session_state.get("_last_broker") or "—"
-        h1, hL, h2, hTf, h3 = st.columns([1.7, 2.0, 0.85, 0.22, 0.55])
-        with h1:
-            st.markdown(
-                f"<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;'>"
-                f"<span style='font-size:1.12rem;font-weight:700;color:#69F0AE;'>Multi Index Scalper</span>"
-                f"<span style='color:{a_col};font-size:11px;font-weight:700;'>● SmartAPI {a_lab}</span>"
-                f"<span style='color:{b_col};font-size:11px;font-weight:700;'>● AliceBlue {b_lab}</span>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-        with hL:
-            st.markdown(
-                "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
-                "<b style='color:#FFD54F;'>Watches</b> "
-                f"CVD vs {_ind_params()['cvd']} WMA · VWMA {_ind_params()['fast']}/{_ind_params()['slow']} · ADX>{_ind_params()['adx']} · +DI>-DI (period {_ind_params()['di']}) "
-                "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-        with h2:
-            _mis_auto = st.checkbox(
-                "Auto-Refresh 5s",
-                value=bool(st.session_state.get("enable_main_refresh")),
-                key="cb_mis_refresh_main",
-            )
-        with hTf:
-            st.markdown("<div style='padding-top:8px;font-size:12px;color:#B0BEC5;font-weight:700;'>TF</div>", unsafe_allow_html=True)
-        with h3:
-            _tfs = ["1 min", "2 min", "3 min", "5 min", "15 min"]
-            _cur = st.session_state.get("mis_tf") or "1 min"
-            if _cur not in _tfs:
-                _cur = "1 min"
-            _tf = st.selectbox("TF", _tfs, index=_tfs.index(_cur), key="mis_tf_sel", label_visibility="collapsed")
-            if _tf != st.session_state.get("mis_tf"):
-                st.session_state["mis_tf"] = _tf
-                st.session_state["mis_need_seed"] = True
-                st.session_state["_mis_books"] = {}
-                st.rerun()
-            st.session_state["mis_tf"] = _tf
-        if _mis_auto != bool(st.session_state.get("enable_main_refresh")):
-            st.session_state["enable_main_refresh"] = _mis_auto
-            st.rerun()
-        _live = st.session_state.get("_mis_live_ts")
-        if _live:
-            st.caption(f"Live tape {_live} · cached history kept · only current 1-min bar updates")
-        if st.session_state.get("_mis_live_err"):
-            st.caption(f"Quote tick: {st.session_state.get('_mis_live_err')}")
-        enabled = dict(st.session_state.get("mis_enabled") or {n: True for n in ORDER})
-        max_loss = float(st.session_state.get("mis_max_loss") or 2000)
-        books = st.session_state.get("_mis_books") or {}
-        if st.session_state.get("mis_need_seed"):
-            names = [n for n in ORDER if enabled.get(n)]
-            _tf_lab = st.session_state.get("mis_tf") or "1 min"
-            bar = st.progress(0.0, text=f"Seeding {_tf_lab} tapes…")
-            for i, n in enumerate(names):
-                try:
-                    seed_book(n, fetch_fn, df_master, token_map, fut_fn=fut_fn)
-                except Exception as e:
-                    books = st.session_state.get("_mis_books") or {}
-                    books[n] = {"name": n, "err": str(e), "idx_rows": []}
-                    st.session_state["_mis_books"] = books
-                bar.progress((i + 1) / max(len(names), 1), text=f"Seeded {n}")
-            bar.empty()
-            st.session_state["mis_need_seed"] = False
-            books = st.session_state.get("_mis_books") or {}
-
-        live_ok = any(session_open(n) for n in ORDER if enabled.get(n))
-        if st.session_state.get("enable_main_refresh") and books and quote_fn and live_ok:
-            try:
-                toks = []
-                for n, book in books.items():
-                    if not enabled.get(n) or not session_open(n):
-                        continue
-                    for k, exch_k in (("idx_tok", "idx_exch"), ("cash_tok", "cash_exch"), ("ce_tok", "idx_exch"), ("pe_tok", "idx_exch")):
-                        tok = book.get(k)
-                        if tok:
-                            toks.append((str(book.get(exch_k) or "NFO"), str(tok)))
-                quotes = quote_fn(toks) or {}
-                books = live_apply_quotes(books, enabled, quotes)
-                st.session_state["_mis_books"] = books
-                st.session_state["_mis_live_ts"] = dt.datetime.now().strftime("%H:%M:%S")
-            except Exception as e:
-                st.session_state["_mis_live_err"] = str(e)[:180]
-
-        for _n, _b in list(books.items()):
-            if isinstance(_b, dict):
-                books[_n] = clip_book_session(_b)
-        st.session_state["_mis_books"] = books
-
-        if not books:
-            st.info("Click Seed / refresh tapes in the sidebar.")
-            return
-
-        summary, live_alerts = [], []
-        journal = st.session_state.setdefault("_mis_live_setups", [])
-        packs = {}
-        for name in ORDER:
-            if not enabled.get(name):
-                continue
-            book = books.get(name)
-            if not book:
-                continue
-            idx = last_pack(book.get("idx_rows"), book.get("idx_sw"), book.get("fut"))
-            ce = last_pack(book.get("ce_rows"), book.get("ce_sw"), None, book.get("ce_sym"))
-            pe = last_pack(book.get("pe_rows"), book.get("pe_sw"), None, book.get("pe_sym"))
-            idx["ann"] = attach_bar_confluence(idx.get("ann"), ce.get("ann"), pe.get("ann"))
-            t_lab = confluence_label([
-                _vote_status(idx["WATCH"], invert=False),
-                _vote_status(ce["WATCH"], invert=False),
-                _vote_status(pe["WATCH"], invert=True),
-            ], "TREND")
-            f_lab = confluence_label([
-                _vote_flow(idx, invert=False),
-                _vote_flow(ce, invert=False),
-                _vote_flow(pe, invert=True),
-            ], "FLOW")
-            packs[name] = (book, idx, ce, pe, t_lab, f_lab)
-            strike = book.get("atm") or "—"
-            oexp = book.get("exp") or "—"
-            t_votes = [
-                _vote_status(idx["WATCH"], invert=False),
-                _vote_status(ce["WATCH"], invert=False),
-                _vote_status(pe["WATCH"], invert=True),
-            ]
-            f_votes = [
-                _vote_flow(idx, invert=False),
-                _vote_flow(ce, invert=False),
-                _vote_flow(pe, invert=True),
-            ]
-            bar_ts = idx["Bar"]
-            if not session_open(name):
-                bar_ts = last_session_bar(name, book.get("idx_rows") or [], bar_ts)
-            p = _ind_params(name)
-            ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
-            pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
-            def _last_x(rows, key):
-                return next((r.get(key) for r in reversed(rows) if r.get(key)), "—")
-            cl, pl = (ce5[-1] if ce5 else {}), (pe5[-1] if pe5 else {})
-            summary.append({
-                "Index": name,
-                "Spot": book.get("spot") if book.get("spot") is not None else "—",
-                "ATM": strike, "Opt exp": oexp,
-                "CE LTP": cl.get("price") or ce.get("LTP"),
-                "CE CVD X": _last_x(ce5, "CVD X"),
-                "CE VWMA X": _last_x(ce5, "VWMA X"),
-                "CE ADX": cl.get("ADX") or "—",
-                "CE +DI": cl.get("+DI") or "—",
-                "CE -DI": cl.get("-DI") or "—",
-                "CE ADX>25": cl.get("ADX>25") or "—",
-                "PE LTP": pl.get("price") or pe.get("LTP"),
-                "PE CVD X": _last_x(pe5, "CVD X"),
-                "PE VWMA X": _last_x(pe5, "VWMA X"),
-                "PE ADX": pl.get("ADX") or "—",
-                "PE +DI": pl.get("+DI") or "—",
-                "PE -DI": pl.get("-DI") or "—",
-                "PE ADX>25": pl.get("ADX>25") or "—",
-                "Bar": (cl.get("time") or bar_ts),
-            })
-
-        st.session_state["_mis_live_setups"] = []
-        setups = []
-
-        n_watch = max(len(summary), 1)
-        watch_h = min(38 * (n_watch + 1) + 20, 320)
-        setup_h = 38 * 8 + 20
+    _render_ind_dock()
+    a_lab = "ON" if st.session_state.get("_smart_api_obj") and not st.session_state.get("_smart_api_err") else (
+        "RATE LIMIT" if st.session_state.get("_angel_rl_ts") else ("DOWN" if st.session_state.get("_smart_api_err") else "IDLE")
+    )
+    a_col = {"ON": "#00E676", "RATE LIMIT": "#FFB300", "DOWN": "#FF5252"}.get(a_lab, "#90A4AE")
+    if st.session_state.get("_ab_session"):
+        b_lab, b_col = "ON", "#00E676"
+    elif st.session_state.get("_ab_err"):
+        b_lab, b_col = "DOWN", "#FF5252"
+    else:
+        b_lab, b_col = "STANDBY", "#FFB300"
+    last = st.session_state.get("_last_broker") or "—"
+    h1, hL, h2, hTf, h3 = st.columns([1.7, 2.0, 0.85, 0.22, 0.55])
+    with h1:
         st.markdown(
-            f"""
+            f"<div style='display:flex;align-items:center;gap:10px;flex-wrap:wrap;'>"
+            f"<span style='font-size:1.12rem;font-weight:700;color:#69F0AE;'>Multi Index Scalper</span>"
+            f"<span style='color:{a_col};font-size:11px;font-weight:700;'>● SmartAPI {a_lab}</span>"
+            f"<span style='color:{b_col};font-size:11px;font-weight:700;'>● AliceBlue {b_lab}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with hL:
+        st.markdown(
+            "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
+            "<b style='color:#FFD54F;'>Watches</b> "
+            f"CVD vs {_ind_params()['cvd']} WMA · VWMA {_ind_params()['fast']}/{_ind_params()['slow']} · ADX>{_ind_params()['adx']} · +DI>-DI (period {_ind_params()['di']}) "
+            "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    with h2:
+        _mis_auto = st.checkbox(
+            "Auto-Refresh 5s",
+            value=bool(st.session_state.get("enable_main_refresh")),
+            key="cb_mis_refresh_main",
+        )
+    with hTf:
+        st.markdown("<div style='padding-top:8px;font-size:12px;color:#B0BEC5;font-weight:700;'>TF</div>", unsafe_allow_html=True)
+    with h3:
+        _tfs = ["1 min", "2 min", "3 min", "5 min", "15 min"]
+        _cur = st.session_state.get("mis_tf") or "1 min"
+        if _cur not in _tfs:
+            _cur = "1 min"
+        _tf = st.selectbox("TF", _tfs, index=_tfs.index(_cur), key="mis_tf_sel", label_visibility="collapsed")
+        if _tf != st.session_state.get("mis_tf"):
+            st.session_state["mis_tf"] = _tf
+            st.session_state["mis_need_seed"] = True
+            st.session_state["_mis_books"] = {}
+            st.rerun()
+        st.session_state["mis_tf"] = _tf
+    if _mis_auto != bool(st.session_state.get("enable_main_refresh")):
+        st.session_state["enable_main_refresh"] = _mis_auto
+        st.rerun()
+    _live = st.session_state.get("_mis_live_ts")
+    if _live:
+        st.caption(f"Live tape {_live} · cached history kept · only current 1-min bar updates")
+    if st.session_state.get("_mis_live_err"):
+        st.caption(f"Quote tick: {st.session_state.get('_mis_live_err')}")
+    enabled = dict(st.session_state.get("mis_enabled") or {n: True for n in ORDER})
+    max_loss = float(st.session_state.get("mis_max_loss") or 2000)
+    books = st.session_state.get("_mis_books") or {}
+    if st.session_state.get("mis_need_seed"):
+        names = [n for n in ORDER if enabled.get(n)]
+        _tf_lab = st.session_state.get("mis_tf") or "1 min"
+        bar = st.progress(0.0, text=f"Seeding {_tf_lab} tapes…")
+        for i, n in enumerate(names):
+            try:
+                seed_book(n, fetch_fn, df_master, token_map, fut_fn=fut_fn)
+            except Exception as e:
+                books = st.session_state.get("_mis_books") or {}
+                books[n] = {"name": n, "err": str(e), "idx_rows": []}
+                st.session_state["_mis_books"] = books
+            bar.progress((i + 1) / max(len(names), 1), text=f"Seeded {n}")
+        bar.empty()
+        st.session_state["mis_need_seed"] = False
+        books = st.session_state.get("_mis_books") or {}
+
+    live_ok = any(session_open(n) for n in ORDER if enabled.get(n))
+    if st.session_state.get("enable_main_refresh") and books and quote_fn and live_ok:
+        try:
+            toks = []
+            for n, book in books.items():
+                if not enabled.get(n) or not session_open(n):
+                    continue
+                for k, exch_k in (("idx_tok", "idx_exch"), ("cash_tok", "cash_exch"), ("ce_tok", "idx_exch"), ("pe_tok", "idx_exch")):
+                    tok = book.get(k)
+                    if tok:
+                        toks.append((str(book.get(exch_k) or "NFO"), str(tok)))
+            quotes = quote_fn(toks) or {}
+            books = live_apply_quotes(books, enabled, quotes)
+            st.session_state["_mis_books"] = books
+            st.session_state["_mis_live_ts"] = dt.datetime.now().strftime("%H:%M:%S")
+        except Exception as e:
+            st.session_state["_mis_live_err"] = str(e)[:180]
+
+    for _n, _b in list(books.items()):
+        if isinstance(_b, dict):
+            books[_n] = clip_book_session(_b)
+    st.session_state["_mis_books"] = books
+
+    if not books:
+        st.info("Click Seed / refresh tapes in the sidebar.")
+        return
+
+    summary, live_alerts = [], []
+    journal = st.session_state.setdefault("_mis_live_setups", [])
+    packs = {}
+    for name in ORDER:
+        if not enabled.get(name):
+            continue
+        book = books.get(name)
+        if not book:
+            continue
+        idx = last_pack(book.get("idx_rows"), book.get("idx_sw"), book.get("fut"))
+        ce = last_pack(book.get("ce_rows"), book.get("ce_sw"), None, book.get("ce_sym"))
+        pe = last_pack(book.get("pe_rows"), book.get("pe_sw"), None, book.get("pe_sym"))
+        idx["ann"] = attach_bar_confluence(idx.get("ann"), ce.get("ann"), pe.get("ann"))
+        t_lab = confluence_label([
+            _vote_status(idx["WATCH"], invert=False),
+            _vote_status(ce["WATCH"], invert=False),
+            _vote_status(pe["WATCH"], invert=True),
+        ], "TREND")
+        f_lab = confluence_label([
+            _vote_flow(idx, invert=False),
+            _vote_flow(ce, invert=False),
+            _vote_flow(pe, invert=True),
+        ], "FLOW")
+        packs[name] = (book, idx, ce, pe, t_lab, f_lab)
+        strike = book.get("atm") or "—"
+        oexp = book.get("exp") or "—"
+        t_votes = [
+            _vote_status(idx["WATCH"], invert=False),
+            _vote_status(ce["WATCH"], invert=False),
+            _vote_status(pe["WATCH"], invert=True),
+        ]
+        f_votes = [
+            _vote_flow(idx, invert=False),
+            _vote_flow(ce, invert=False),
+            _vote_flow(pe, invert=True),
+        ]
+        bar_ts = idx["Bar"]
+        if not session_open(name):
+            bar_ts = last_session_bar(name, book.get("idx_rows") or [], bar_ts)
+        p = _ind_params(name)
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        def _last_x(rows, key):
+            return next((r.get(key) for r in reversed(rows) if r.get(key)), "—")
+        cl, pl = (ce5[-1] if ce5 else {}), (pe5[-1] if pe5 else {})
+        summary.append({
+            "Index": name,
+            "Spot": book.get("spot") if book.get("spot") is not None else "—",
+            "ATM": strike, "Opt exp": oexp,
+            "CE LTP": cl.get("price") or ce.get("LTP"),
+            "CE CVD X": _last_x(ce5, "CVD X"),
+            "CE VWMA X": _last_x(ce5, "VWMA X"),
+            "CE ADX": cl.get("ADX") or "—",
+            "CE +DI": cl.get("+DI") or "—",
+            "CE -DI": cl.get("-DI") or "—",
+            "CE ADX>25": cl.get("ADX>25") or "—",
+            "PE LTP": pl.get("price") or pe.get("LTP"),
+            "PE CVD X": _last_x(pe5, "CVD X"),
+            "PE VWMA X": _last_x(pe5, "VWMA X"),
+            "PE ADX": pl.get("ADX") or "—",
+            "PE +DI": pl.get("+DI") or "—",
+            "PE -DI": pl.get("-DI") or "—",
+            "PE ADX>25": pl.get("ADX>25") or "—",
+            "Bar": (cl.get("time") or bar_ts),
+        })
+
+    st.session_state["_mis_live_setups"] = []
+    setups = []
+
+    n_watch = max(len(summary), 1)
+    watch_h = min(38 * (n_watch + 1) + 20, 320)
+    setup_h = 38 * 8 + 20
+    st.markdown(
+        f"""
     <style>
       html, body, [data-testid="stAppViewContainer"],
       [data-testid="stAppViewContainer"] > .main,
       .main .block-container {{
-        overflow: visible !important;
+    overflow: visible !important;
       }}
       .main .block-container {{ padding-top: 0.4rem; max-width: 100%; }}
       .mis-pin {{
-        position: sticky;
-        top: 0;
-        z-index: 200;
-        background: #0E1117;
-        border-bottom: 1px solid #2a2d33;
-        padding: 2px 0 8px 0;
-        box-shadow: 0 10px 18px rgba(0,0,0,0.5);
+    position: sticky;
+    top: 0;
+    z-index: 200;
+    background: #0E1117;
+    border-bottom: 1px solid #2a2d33;
+    padding: 2px 0 8px 0;
+    box-shadow: 0 10px 18px rgba(0,0,0,0.5);
       }}
     </style>
     <div class="mis-pin">
     """,
+        unsafe_allow_html=True,
+    )
+    def _take_index_click(ev, df):
+        try:
+            rows = list((ev.selection or {}).get("rows") or ev.selection.rows)
+        except Exception:
+            try:
+                rows = list(ev.selection.rows)
+            except Exception:
+                rows = []
+        if rows and df is not None and "Index" in df.columns:
+            try:
+                st.session_state["mis_jump"] = str(df.iloc[int(rows[0])]["Index"])
+            except Exception:
+                pass
+
+    _upd = _ist_now().strftime("%d-%m-%Y %H:%M:%S")
+    st.caption(f"WATCH LOG    last updated {_upd}")
+    if summary:
+        wdf = pd.DataFrame(summary)
+        st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
+    else:
+        st.info("Seed 1-min tapes in the sidebar.")
+    render_rule_setups(books, _upd)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    def draw_tape(title, pack, extra_cols=None):
+        st.markdown(f"**{title}**  ·  last updated {_upd}")
+        if pack["ann"]:
+            df = pd.DataFrame(pack["ann"][::-1])
+            base = ["time", "status", "flow", "Trend", "Flow x/3", "watch_reason", "price", "CVD", "EFI", "EFI sl", "EFI tag", "RDI", "Disp", "volume", "VWAP"]
+            cols = [c for c in (extra_cols or base) if c in df.columns]
+            if extra_cols:
+                cols = [c for c in extra_cols if c in df.columns] + [c for c in base if c in df.columns and c not in extra_cols]
+            sty = df[cols].style
+            extra = [c for c in ("Trend", "Flow x/3", "EMA X", "DI X", "ADX flag") if c in df.columns]
+            if extra:
+                sty = sty.map(confluence_css, subset=[c for c in extra if c in ("Trend", "Flow x/3")])
+            st.dataframe(sty.hide(axis="index"), use_container_width=True, height=260)
+        else:
+            st.write("No bars.")
+
+    tape_box = st.container(height=640)
+    with tape_box:
+      for name in ORDER:
+        if name not in packs:
+            continue
+        book, idx, ce, pe, t_lab, f_lab = packs[name]
+        strike = book.get("atm") or "—"
+        oexp = book.get("exp") or "—"
+        if book.get("err"):
+            st.caption(book["err"])
+
+        def _pill(txt):
+            u = str(txt or "").upper()
+            bg = "#2e7d32" if u.startswith("LONG") else ("#c62828" if u.startswith("SHORT") else ("#00838f" if u.startswith("CONFLICT") else "#37474f"))
+            return (
+                f"<span style='background:{bg};color:#fff;font-size:11px;font-weight:700;"
+                f"padding:2px 8px;border-radius:10px;letter-spacing:0.02em;'>{txt}</span>"
+            )
+
+        st.markdown(
+            f"<div id='mis-sec-{name}' style='display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
+            f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · 5 min</span>"
+            f"<span style='color:#78909C;font-size:11px;'>last updated {_upd}</span>"
+            f"<span style='color:#B0BEC5;font-size:13px;'>ATM <b style='color:#EEE;'>{strike}</b> {oexp}</span>"
+            f"<span style='color:#B0BEC5;font-size:13px;'>CE/PE <b style='color:#69F0AE;'>{ce.get('LTP')}</b> / <b style='color:#FF8A80;'>{pe.get('LTP')}</b></span>"
+            f"</div>",
             unsafe_allow_html=True,
         )
-        def _take_index_click(ev, df):
-            try:
-                rows = list((ev.selection or {}).get("rows") or ev.selection.rows)
-            except Exception:
-                try:
-                    rows = list(ev.selection.rows)
-                except Exception:
-                    rows = []
-            if rows and df is not None and "Index" in df.columns:
-                try:
-                    st.session_state["mis_jump"] = str(df.iloc[int(rows[0])]["Index"])
-                except Exception:
-                    pass
+        p = _ind_params(name)
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        ind = ["time", "price", "VWMA 3", "VWMA 8", "VWMA X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX>25"]
+        d1, d2 = st.columns(2)
+        with d1:
+            draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
+        with d2:
+            draw_tape(f"{strike} PE · 5m", {"ann": pe5}, ind)
+        st.divider()
 
-        _upd = _ist_now().strftime("%d-%m-%Y %H:%M:%S")
-        st.caption(f"WATCH LOG    last updated {_upd}")
-        if summary:
-            wdf = pd.DataFrame(summary)
-            st.markdown(watch_log_html(wdf), unsafe_allow_html=True)
-        else:
-            st.info("Seed 1-min tapes in the sidebar.")
-        render_rule_setups(books, _upd)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        def draw_tape(title, pack, extra_cols=None):
-            st.markdown(f"**{title}**  ·  last updated {_upd}")
-            if pack["ann"]:
-                df = pd.DataFrame(pack["ann"][::-1])
-                base = ["time", "status", "flow", "Trend", "Flow x/3", "watch_reason", "price", "CVD", "EFI", "EFI sl", "EFI tag", "RDI", "Disp", "volume", "VWAP"]
-                cols = [c for c in (extra_cols or base) if c in df.columns]
-                if extra_cols:
-                    cols = [c for c in extra_cols if c in df.columns] + [c for c in base if c in df.columns and c not in extra_cols]
-                sty = df[cols].style
-                extra = [c for c in ("Trend", "Flow x/3", "EMA X", "DI X", "ADX flag") if c in df.columns]
-                if extra:
-                    sty = sty.map(confluence_css, subset=[c for c in extra if c in ("Trend", "Flow x/3")])
-                st.dataframe(sty.hide(axis="index"), use_container_width=True, height=260)
-            else:
-                st.write("No bars.")
-
-        tape_box = st.container(height=640)
-        with tape_box:
-          for name in ORDER:
-            if name not in packs:
-                continue
-            book, idx, ce, pe, t_lab, f_lab = packs[name]
-            strike = book.get("atm") or "—"
-            oexp = book.get("exp") or "—"
-            if book.get("err"):
-                st.caption(book["err"])
-
-            def _pill(txt):
-                u = str(txt or "").upper()
-                bg = "#2e7d32" if u.startswith("LONG") else ("#c62828" if u.startswith("SHORT") else ("#00838f" if u.startswith("CONFLICT") else "#37474f"))
-                return (
-                    f"<span style='background:{bg};color:#fff;font-size:11px;font-weight:700;"
-                    f"padding:2px 8px;border-radius:10px;letter-spacing:0.02em;'>{txt}</span>"
-                )
-
-            st.markdown(
-                f"<div id='mis-sec-{name}' style='display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:8px 0 4px 0;'>"
-                f"<span style='font-size:1.05rem;font-weight:700;color:#69F0AE;'>{name} · 5 min</span>"
-                f"<span style='color:#78909C;font-size:11px;'>last updated {_upd}</span>"
-                f"<span style='color:#B0BEC5;font-size:13px;'>ATM <b style='color:#EEE;'>{strike}</b> {oexp}</span>"
-                f"<span style='color:#B0BEC5;font-size:13px;'>CE/PE <b style='color:#69F0AE;'>{ce.get('LTP')}</b> / <b style='color:#FF8A80;'>{pe.get('LTP')}</b></span>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-            p = _ind_params(name)
-            ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
-            pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
-            ind = ["time", "price", "VWMA 3", "VWMA 8", "VWMA X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX>25"]
-            d1, d2 = st.columns(2)
-            with d1:
-                draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
-            with d2:
-                draw_tape(f"{strike} PE · 5m", {"ann": pe5}, ind)
-            st.divider()
-
-        jump = str(st.session_state.get("mis_jump") or "")
-        if jump:
-            components.html(
-                f"""
+    jump = str(st.session_state.get("mis_jump") or "")
+    if jump:
+        components.html(
+            f"""
     <script>
     const id = "mis-sec-{jump}";
     const doc = window.parent.document;
@@ -2026,16 +2040,16 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
       el.scrollIntoView({{behavior: "smooth", block: "start"}});
       let p = el.parentElement;
       while (p) {{
-        const oy = window.parent.getComputedStyle(p).overflowY;
-        if (oy === "auto" || oy === "scroll") {{
-          const top = el.getBoundingClientRect().top - p.getBoundingClientRect().top + p.scrollTop - 8;
-          p.scrollTo({{top: top, behavior: "smooth"}});
-          break;
-        }}
-        p = p.parentElement;
+    const oy = window.parent.getComputedStyle(p).overflowY;
+    if (oy === "auto" || oy === "scroll") {{
+      const top = el.getBoundingClientRect().top - p.getBoundingClientRect().top + p.scrollTop - 8;
+      p.scrollTo({{top: top, behavior: "smooth"}});
+      break;
+    }}
+    p = p.parentElement;
       }}
     }}
     </script>
     """,
-                height=0,
-            )
+            height=0,
+        )
