@@ -1747,6 +1747,37 @@ def _watch_row(name, book, rows, side, adx_lvl):
     }
 
 
+def _day_stats(books):
+    scored = []
+    for n in ORDER:
+        book = (books or {}).get(n) or {}
+        if not book:
+            continue
+        p = _ind_params(n)
+        for side, key in (("CE BUY", "ce_rows"), ("PE BUY", "pe_rows")):
+            series = attach_ema_adx(to_5min(book.get(key) or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+            hits = _store_triggers(n, side, book.get("ce_sym" if side == "CE BUY" else "pe_sym"), book.get("atm"), series, p["adx"])
+            for h in hits:
+                tr = _trail_result(series, h.get("time"), h.get("px"))
+                h["points"] = tr.get("points")
+                h["status"] = tr.get("status")
+                scored.append(h)
+    pts = [float(h.get("points")) for h in scored if h.get("points") is not None]
+    wins = sum(1 for p in pts if p > 0)
+    sl_hit = sum(1 for h in scored if h.get("status") == "SL HIT")
+    n = len(pts)
+    total = round(sum(pts), 2) if pts else 0
+    return {
+        "trades": n,
+        "wins": wins,
+        "sl_hit": sl_hit,
+        "win_rate": round(100.0 * wins / n, 1) if n else 0,
+        "points": total,
+        "avg": round(total / n, 2) if n else 0,
+        "effective": round(total - 4 * n, 2),
+    }
+
+
 def render_watch_table(books):
     rows = []
     for n in ORDER:
@@ -1765,9 +1796,21 @@ def render_watch_table(books):
             pe["Signal"] = "PE BUY WATCH"
             rows.append(pe)
     st.caption("WATCH · only active · cross time blue · WAIT yellow")
-    if not rows:
-        st.caption("No active watch")
-        return
+    stats = _day_stats(books)
+    srows = [
+        ("Trades", stats["trades"]),
+        ("Win", stats["wins"]),
+        ("SL Hit", stats["sl_hit"]),
+        ("Win rate %", stats["win_rate"]),
+        ("Total pts", stats["points"]),
+        ("Avg pts", stats["avg"]),
+        ("Effective pts", stats["effective"]),
+    ]
+    stable = "".join(
+        f"<tr><td style='padding:4px 8px;color:#FFD54F;font-weight:700;'>{k}</td>"
+        f"<td style='padding:4px 8px;color:#ECEFF1;font-weight:700;text-align:right;'>{v}</td></tr>"
+        for k, v in srows
+    )
     cols = ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX")
     def cell(v):
         t = str(v or "")
@@ -1777,10 +1820,15 @@ def render_watch_table(books):
         if t and t[0].isdigit():
             return f"<td style='{base}background:#1565C0;color:#fff;'>{t}</td>"
         return f"<td style='{base}color:#ECEFF1;'>{t}</td>"
-    head = "".join(f"<th style='padding:6px 10px;background:#C9A227;color:#111;font-size:14px;font-weight:800;white-space:nowrap;'>{c}</th>" for c in cols)
-    body = "".join("<tr>" + "".join(cell(r.get(c)) for c in cols) + "</tr>" for r in rows)
+    if rows:
+        head = "".join(f"<th style='padding:6px 10px;background:#C9A227;color:#111;font-size:14px;font-weight:800;white-space:nowrap;'>{c}</th>" for c in cols)
+        body = "".join("<tr>" + "".join(cell(r.get(c)) for c in cols) + "</tr>" for r in rows)
+        watch = f"<table style='border-collapse:collapse;background:#0E1117;width:auto;'><tr>{head}</tr>{body}</table>"
+    else:
+        watch = "<div style='color:#90A4AE;padding:8px;'>No active watch</div>"
+    summary = f"<table style='border-collapse:collapse;background:#111318;border:1px solid #2a2d33;font-size:13px;'>{stable}</table>"
     st.markdown(
-        f"<table style='border-collapse:collapse;background:#0E1117;width:auto;'><tr>{head}</tr>{body}</table>",
+        f"<div style='display:flex;gap:18px;align-items:flex-start;'>{watch}{summary}</div>",
         unsafe_allow_html=True,
     )
 
@@ -1825,7 +1873,8 @@ def _trail_result(rows, entry_time, entry_px):
     for r in rows[idx + 1:]:
         low = float(r.get("low") or r.get("price") or 0)
         if low <= sl:
-            return {"sl": round(sl, 2), "status": "SL HIT", "points": round(sl - entry, 2), "exit": str(r.get("time") or "")[11:16]}
+            kind = "TRAIL HIT" if sl > entry else "SL HIT"
+            return {"sl": round(sl, 2), "status": kind, "points": round(sl - entry, 2), "exit": str(r.get("time") or "")[11:16]}
         if _bar_closed(r.get("time"), 5):
             body = min(float(r.get("open") or r.get("price") or sl), float(r.get("price") or sl))
             sl = max(sl, body)
@@ -1876,10 +1925,13 @@ def render_rule_setups(books, upd):
         pe_cells.append(cell(pe_hit, "#FF8A80", "PE BUY", pe5))
         scored.extend(ce_hit + pe_hit)
     pts = [float(h.get("points")) for h in scored if h.get("points") is not None]
-    wins = sum(1 for p in pts if p > 0)
+    wins = sum(1 for h in scored if (h.get("points") or 0) > 0)
+    sl_hit = sum(1 for h in scored if h.get("status") == "SL HIT")
     total = round(sum(pts), 2) if pts else 0
     wr = round(100.0 * wins / len(pts), 1) if pts else 0
-    st.caption(f"Trades {len(pts)} · Win rate {wr}% · Points {total}")
+    avg = round(total / len(pts), 2) if pts else 0
+    eff = round(total - 4 * len(pts), 2)
+    st.caption(f"Trades {len(pts)} · Win {wins} · SL Hit {sl_hit} · Win rate {wr}% · Points {total} · Avg {avg} · Effective {eff}")
     head = "".join(f"<th style='padding:6px;border:1px solid #2a2d33;color:#FFD54F;font-size:11px;'>{n}</th>" for n in ORDER)
     def row(cells):
         return "<tr>" + "".join(
