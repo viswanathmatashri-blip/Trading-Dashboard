@@ -1168,6 +1168,7 @@ def _live_alerts(name, side, sym, rows, adx_lvl, minutes=5):
     if not rows:
         return []
     kind = "LONG"
+    hits = _cross_triggers(rows, kind, adx_lvl)
     last = hits[-1] if hits else None
     r = rows[-1]
     out = []
