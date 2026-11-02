@@ -1843,8 +1843,13 @@ def render_watch_table(books):
 
 def _cross_triggers(rows, side, adx_lvl):
     """Trigger is the later of DI and VWMA crossovers when they land within 2 bars.
-    ATR>EMA and ADX>level are filters only, never the trigger."""
+    ATR>EMA and ADX>level are filters only, never the trigger.
+    Only the current session, and only prices that belong to this option series."""
     rows = list(rows or [])
+    use_day = _session_day(rows)
+    rows = [r for r in rows if str(r.get("time") or "").startswith(use_day)] if use_day else rows
+    px = [float(r["price"]) for r in rows if r.get("price")]
+    med = sorted(px)[len(px) // 2] if px else 0
     out = []
     want_v = "LONG" if side == "LONG" else "SHORT"
     want_d = "+DI" if side == "LONG" else "-DI"
@@ -1868,6 +1873,9 @@ def _cross_triggers(rows, side, adx_lvl):
         flags, atr, ema, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
         atr_ok = flags["ATR>EMA"] if side == "LONG" else (not flags["ATR>EMA"] and r.get("ATR EMA") is not None)
         if not (atr_ok and flags["ADX"]):
+            continue
+        price = float(r.get("price") or 0)
+        if med and not (0.35 * med <= price <= 2.8 * med):
             continue
         out.append({
             "time": r.get("time"), "px": r.get("price"),
@@ -1940,6 +1948,15 @@ def render_rule_setups(books, upd):
         p = _ind_params(n)
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        ce_px = [float(r["price"]) for r in ce5 if r.get("price")]
+        pe_px = [float(r["price"]) for r in pe5 if r.get("price")]
+        ce_med = sorted(ce_px)[len(ce_px) // 2] if ce_px else 0
+        pe_med = sorted(pe_px)[len(pe_px) // 2] if pe_px else 0
+        if ce_med and pe_med and max(ce_med, pe_med) > 8 * min(ce_med, pe_med):
+            if pe_med > ce_med:
+                pe5 = []
+            else:
+                ce5 = []
         mcx = n in ("CRUDEOIL", "GOLDM")
         bounds = ((9, 0), (23, 30)) if mcx else ((9, 15), (15, 30))
         ce_hit = _store_triggers(n, "CE BUY", book.get("ce_sym"), book.get("atm"), ce5, p["adx"])
@@ -1950,7 +1967,7 @@ def render_rule_setups(books, upd):
             if not hits:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
             day = str(hits[-1].get("time") or "")[5:10]
-            sym = hits[-1].get("sym") or book.get("atm") or ""
+            sym = book.get("ce_sym") if "CE" in label else book.get("pe_sym")
             bits = [f"<b style='color:{color};font-size:12px;'>{label} {sym} · {day} · {len(hits)}</b>"]
             for h in reversed(hits):
                 tr = _trail_result(series, h.get("time"), h.get("px"))
