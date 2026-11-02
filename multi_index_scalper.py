@@ -1126,7 +1126,72 @@ def setup_row(index, source, confirmed, buy_side, buy_pack, strike, oexp, lot, t
     return row
 
 
-def _send_mis_telegram(setups):
+def _bar_closed(ts, minutes=5):
+    t = _parse_bar(ts)
+    if not t:
+        return False
+    now = _ist_now().replace(tzinfo=None)
+    try:
+        t = t.replace(tzinfo=None)
+    except Exception:
+        pass
+    return now >= t + dt.timedelta(minutes=minutes)
+
+
+def _four_state(r, adx_lvl):
+    cvd_v = float(r.get("CVD") or 0)
+    wma = r.get("CVD WMA")
+    v3, v8 = r.get("VWMA 3"), r.get("VWMA 8")
+    adx = r.get("ADX")
+    pdi, mdi = r.get("+DI"), r.get("-DI")
+    flags = {
+        "CVD>WMA": wma is not None and cvd_v > float(wma),
+        "ADX": adx is not None and adx > adx_lvl,
+        "VWMA": v3 is not None and v8 is not None and v3 > v8,
+        "+DI>-DI": pdi is not None and mdi is not None and pdi > mdi,
+    }
+    return flags, cvd_v, wma, v3, v8, adx, pdi, mdi
+
+
+def _live_alerts(name, side, sym, rows, adx_lvl, minutes=5):
+    """WATCH if 3 of 4 are true, or all 4 on a still-open candle. TRIGGER on a closed bar."""
+    if not rows:
+        return []
+    r = rows[-1]
+    flags, cvd_v, wma, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
+    ntrue = sum(1 for v in flags.values() if v)
+    missing = [k for k, v in flags.items() if not v]
+    ts = r.get("time")
+    px = r.get("price")
+    closed = _bar_closed(ts, minutes)
+    have = ", ".join(k for k, v in flags.items() if v) or "—"
+    wait = ", ".join(missing) or "—"
+    base = (
+        f"{name}\n{side} {sym or ''}\n"
+        f"LTP {px} @ {str(ts)[11:16]}\n"
+        f"CVD {round(cvd_v, 1)}/{wma} · VWMA {v3}/{v8}\n"
+        f"ADX {adx} · DI {pdi}/{mdi}"
+    )
+    out = []
+    if ntrue == 4 and closed:
+        out.append({
+            "key": f"TR|{name}|{side}|{ts}",
+            "msg": f"TRIGGER\n{base}\nAll 4 closed",
+        })
+    elif ntrue == 4 and not closed:
+        out.append({
+            "key": f"WOPEN|{name}|{side}|{ts}",
+            "msg": f"WATCH\n{base}\nAll 4 live — waiting candle close",
+        })
+    elif ntrue == 3:
+        out.append({
+            "key": f"W3|{name}|{side}|{ts}|{wait}",
+            "msg": f"WATCH\n{base}\n3/4 in ({have})\nWaiting: {wait}",
+        })
+    return out
+
+
+def _send_rule_telegram(alerts):
     def _sec(k, alt=""):
         try:
             if k in st.secrets:
@@ -1137,38 +1202,20 @@ def _send_mis_telegram(setups):
 
     tok = _sec("TELE_BOTTOKEN", "TELEGRAM_BOT_TOKEN")
     chat = _sec("TELE_CHATID", "TELEGRAM_CHAT_ID")
-    if not tok or not chat or not setups:
+    if not tok or not chat or not alerts:
         return
     sent = st.session_state.setdefault("_mis_tg_sent", set())
     if not isinstance(sent, set):
         sent = set(sent)
         st.session_state["_mis_tg_sent"] = sent
-    for row in setups:
-        conf = str(row.get("Confirmed") or "")
-        if not any(x in conf for x in ("CONFIRMED LONG", "CONFIRMED SHORT", "WATCH LONG", "WATCH SHORT")):
+    for a in alerts:
+        key = a.get("key")
+        if not key or key in sent:
             continue
-        key = f"{row.get('Index')}|{row.get('Trigger')}|{row.get('Bar')}|{row.get('Buy')}"
-        if key in sent:
-            continue
-        tgt = row.get("Target")
-        tgt_pct = row.get("Target %")
-        sl = row.get("SL")
-        sl_pct = row.get("SL %")
-        msg = (
-            f"{row.get('Index')}\n"
-            f"{row.get('Trigger')}\n"
-            f"{row.get('Buy')}\n"
-            f"Buy : {row.get('LTP')}\n"
-            f"Target : {tgt} ({tgt_pct}%)\n"
-            f"SL -{sl} ({sl_pct}%)\n"
-            f"Entry Lot Qty = {row.get('Qty')}\n"
-            f"R:R = {row.get('R:R')}\n"
-            f"Trend {row.get('Trend')} | Flow {row.get('Flow')} | EFI {row.get('EFI')}"
-        )
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{tok}/sendMessage",
-                json={"chat_id": chat, "text": msg, "disable_web_page_preview": True},
+                json={"chat_id": chat, "text": a.get("msg") or "", "disable_web_page_preview": True},
                 timeout=8,
             )
             if r.ok:
@@ -1667,7 +1714,8 @@ def render_rule_setups(books, upd):
         sess = _session_day(to_5min(b.get("ce_rows") or [])) or sess
     p0 = _ind_params()
     st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD>{p0['cvd']} WMA · ADX>{p0['adx']} · VWMA {p0['fast']}/{p0['slow']} · +DI>-DI · {upd}")
-    ce_cells, pe_cells = [], []
+    ce_cells, pe_cells, alerts = [], [], []
+    tfm = _tf_minutes() or 5
     for n in ORDER:
         book = (books or {}).get(n) or {}
         p = _ind_params(n)
@@ -1677,6 +1725,8 @@ def render_rule_setups(books, upd):
         bounds = ((9, 0), (23, 30)) if mcx else ((9, 15), (15, 30))
         ce_hit = _confluence_entries(ce5, open_hm=bounds[0], close_hm=bounds[1], adx_lvl=p["adx"])
         pe_hit = _confluence_entries(pe5, open_hm=bounds[0], close_hm=bounds[1], adx_lvl=p["adx"])
+        alerts += _live_alerts(n, "CE BUY", book.get("ce_sym"), ce5, p["adx"], tfm)
+        alerts += _live_alerts(n, "PE BUY", book.get("pe_sym"), pe5, p["adx"], tfm)
         def cell(hits, color, label):
             if not hits:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
@@ -1703,9 +1753,7 @@ def render_rule_setups(books, upd):
         f"<tr>{head}</tr>{row(ce_cells)}{row(pe_cells)}</table>",
         unsafe_allow_html=True,
     )
-
-
-def _ind_params(name=None):
+    _send_rule_telegram(alerts)
     base = st.session_state.get("mis_ind") or {"fast": 3, "slow": 8, "adx": 20, "di": 7, "cvd": 8}
     out = dict(base)
     out["fast"] = int(out.get("fast") or 3)
