@@ -1772,6 +1772,9 @@ def render_watch_table(books):
     head = "".join(f"<th style='padding:6px 8px;background:#C9A227;color:#111;font-weight:800;'>{c}</th>" for c in ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX"))
     body = "".join("<tr>" + "".join(cell(r.get(c)) for c in ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX")) + "</tr>" for r in rows)
     st.caption("WATCH · CE BUY WATCH / PE BUY WATCH · 3 of 4, or all 4 before candle close · cross time blue · WAIT yellow")
+    if not rows:
+        st.caption("No active watch")
+        return
     st.markdown(
         f"<table style='width:100%;border-collapse:collapse;background:#0E1117;font-size:12px;'><tr>{head}</tr>{body}</table>",
         unsafe_allow_html=True,
