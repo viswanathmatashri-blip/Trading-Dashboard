@@ -1785,6 +1785,33 @@ def render_watch_table(books):
     )
 
 
+def _store_triggers(name, side, sym, strike, rows, adx_lvl):
+    """Keep every closed all-4 bar for the session. Never drop on refresh."""
+    store = st.session_state.setdefault("_mis_triggers", {})
+    if not isinstance(store, dict):
+        store = {}
+        st.session_state["_mis_triggers"] = store
+    on = False
+    for r in rows or []:
+        if not _bar_closed(r.get("time"), 5):
+            continue
+        flags, cvd_v, wma, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
+        armed = all(flags.values())
+        if armed and not on:
+            key = f"{name}|{side}|{r.get('time')}"
+            store.setdefault(key, {
+                "index": name, "side": side, "sym": sym or "",
+                "strike": strike or "", "time": r.get("time"),
+                "px": r.get("price"), "cvd": f"{round(cvd_v, 1)}/{wma}",
+                "vwma": f"{v3}/{v8}", "adx": adx, "di": f"{pdi}/{mdi}",
+            })
+            on = True
+        elif not armed:
+            on = False
+    st.session_state["_mis_triggers"] = store
+    return [v for k, v in store.items() if k.startswith(f"{name}|{side}|")]
+
+
 def render_rule_setups(books, upd):
     sess = ""
     for n in ORDER:
@@ -1801,21 +1828,21 @@ def render_rule_setups(books, upd):
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         mcx = n in ("CRUDEOIL", "GOLDM")
         bounds = ((9, 0), (23, 30)) if mcx else ((9, 15), (15, 30))
-        ce_hit = _confluence_entries(ce5, open_hm=bounds[0], close_hm=bounds[1], adx_lvl=p["adx"])
-        pe_hit = _confluence_entries(pe5, open_hm=bounds[0], close_hm=bounds[1], adx_lvl=p["adx"])
+        ce_hit = _store_triggers(n, "CE BUY", book.get("ce_sym"), book.get("atm"), ce5, p["adx"])
+        pe_hit = _store_triggers(n, "PE BUY", book.get("pe_sym"), book.get("atm"), pe5, p["adx"])
         alerts += _live_alerts(n, "CE BUY", book.get("ce_sym"), ce5, p["adx"], tfm)
         alerts += _live_alerts(n, "PE BUY", book.get("pe_sym"), pe5, p["adx"], tfm)
         def cell(hits, color, label):
             if not hits:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
-            day = str(hits[-1].get("day") or "")[5:]
-            sym = book.get("ce_sym") if "CE" in label else book.get("pe_sym")
-            bits = [f"<b style='color:{color};font-size:12px;'>{label} {sym or book.get('atm') or ''} · {day} · {len(hits)}</b>"]
+            day = str(hits[-1].get("time") or "")[5:10]
+            sym = hits[-1].get("sym") or book.get("atm") or ""
+            bits = [f"<b style='color:{color};font-size:12px;'>{label} {sym} · {day} · {len(hits)}</b>"]
             for h in reversed(hits):
                 bits.append(
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
-                    f"{str(h.get('entry_time') or '')[11:16]} · {h.get('entry_px')}<br>"
-                    f"CVD/WMA {h.get('cvd')} · VWMA 3/8 {h.get('vwap')}<br>"
+                    f"{str(h.get('time') or '')[11:16]} · {h.get('px')}<br>"
+                    f"CVD/WMA {h.get('cvd')} · VWMA {h.get('vwma')}<br>"
                     f"ADX {h.get('adx')} · DI {h.get('di')}</div>"
                 )
             return f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>{''.join(bits)}</div>"
@@ -1832,14 +1859,6 @@ def render_rule_setups(books, upd):
         unsafe_allow_html=True,
     )
     _send_rule_telegram(alerts)
-    base = st.session_state.get("mis_ind") or {"fast": 3, "slow": 8, "adx": 20, "di": 7, "cvd": 8}
-    out = dict(base)
-    out["fast"] = int(out.get("fast") or 3)
-    out["slow"] = int(out.get("slow") or 8)
-    out["adx"] = int(out.get("adx") or 20)
-    out["di"] = int(out.get("di") or 7)
-    out["cvd"] = int(out.get("cvd") or 8)
-    return out
 
 
 def _ind_params(name=None):
