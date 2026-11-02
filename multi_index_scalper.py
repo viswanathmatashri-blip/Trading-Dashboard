@@ -703,19 +703,19 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
         pdm.append(up if up > dn and up > 0 else 0.0)
         mdm.append(dn if dn > up and dn > 0 else 0.0)
 
-    def rma(seq, length):
-        """Wilder RMA as used by TradingView / GoCharting: SMA seed, then (prev*(n-1)+x)/n."""
+    def wilder_sum(seq, length):
+        """TA-Lib / GoCharting: first value is the sum of `length` bars, then prev - prev/n + current."""
         out = [None] * len(seq)
         if len(seq) < length:
             return out
-        s = sum(seq[:length]) / length
+        s = sum(seq[:length])
         out[length - 1] = s
         for i in range(length, len(seq)):
-            s = (s * (length - 1) + seq[i]) / length
+            s = s - (s / length) + seq[i]
             out[i] = s
         return out
 
-    atr_w, spdm, smdm = rma(trs, n), rma(pdm, n), rma(mdm, n)
+    atr_w, spdm, smdm = wilder_sum(trs, n), wilder_sum(pdm, n), wilder_sum(mdm, n)
     pdi, mdi, dx = [None] * len(rows), [None] * len(rows), [None] * len(rows)
     for i in range(len(rows)):
         if atr_w[i] and atr_w[i] > 0 and spdm[i] is not None:
