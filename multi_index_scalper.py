@@ -1832,6 +1832,9 @@ def _trail_result(rows, entry_time, entry_px):
     last = rows[-1]
     mark = float(last.get("price") or entry)
     return {"sl": round(sl, 2), "status": "OPEN", "points": round(mark - entry, 2), "exit": ""}
+
+
+def render_rule_setups(books, upd):
     sess = ""
     for n in ORDER:
         b = (books or {}).get(n) or {}
