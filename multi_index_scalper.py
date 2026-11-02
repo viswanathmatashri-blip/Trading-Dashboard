@@ -1764,6 +1764,17 @@ def render_rule_setups(books, upd):
     return out
 
 
+def _ind_params(name=None):
+    base = st.session_state.get("mis_ind") or {"fast": 3, "slow": 8, "adx": 20, "di": 7, "cvd": 8}
+    out = dict(base)
+    out["fast"] = int(out.get("fast") or 3)
+    out["slow"] = int(out.get("slow") or 8)
+    out["adx"] = int(out.get("adx") or 20)
+    out["di"] = int(out.get("di") or 7)
+    out["cvd"] = int(out.get("cvd") or 8)
+    return out
+
+
 def _render_ind_dock():
     st.markdown("**Indicators**")
     cur = _ind_params()
