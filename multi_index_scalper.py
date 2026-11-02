@@ -1161,40 +1161,25 @@ def _four_state(r, adx_lvl):
 
 
 def _live_alerts(name, side, sym, rows, adx_lvl, minutes=5):
-    """WATCH if 3 of 4 are true, or all 4 on a still-open candle. TRIGGER on a closed bar."""
+    """WATCH if one of DI/VWMA has crossed and the other is due. TRIGGER on the later cross once closed."""
     if not rows:
         return []
+    kind = "LONG" if "CE" in side else "SHORT"
+    hits = _cross_triggers(rows, kind, adx_lvl)
+    last = hits[-1] if hits else None
     r = rows[-1]
-    flags, atr, ema, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
-    ntrue = sum(1 for v in flags.values() if v)
-    missing = [k for k, v in flags.items() if not v]
-    ts = r.get("time")
-    px = r.get("price")
-    closed = _bar_closed(ts, minutes)
-    have = ", ".join(k for k, v in flags.items() if v) or "—"
-    wait = ", ".join(missing) or "—"
-    base = (
-        f"{name}\n{side} {sym or ''}\n"
-        f"LTP {px} @ {str(ts)[11:16]}\n"
-        f"ATR {atr}/{ema} · VWMA {v3}/{v8}\n"
-        f"ADX {adx} · DI {pdi}/{mdi}"
-    )
     out = []
-    if ntrue == 4 and closed:
-        out.append({
-            "key": f"TR|{name}|{side}|{ts}",
-            "msg": f"TRIGGER\n{base}\nAll 4 closed",
-        })
-    elif ntrue == 4 and not closed:
-        out.append({
-            "key": f"WOPEN|{name}|{side}|{ts}",
-            "msg": f"WATCH\n{base}\nAll 4 live — waiting candle close",
-        })
-    elif ntrue == 3:
-        out.append({
-            "key": f"W3|{name}|{side}|{ts}|{wait}",
-            "msg": f"WATCH\n{base}\n3/4 in ({have})\nWaiting: {wait}",
-        })
+    if last and last.get("time") == r.get("time"):
+        closed = _bar_closed(r.get("time"), minutes)
+        msg = (
+            f"{name}\n{side} {sym or ''}\n"
+            f"LTP {r.get('price')} @ {str(r.get('time'))[11:16]}\n"
+            f"Trigger {last.get('via')} · ATR {last.get('atr')} · ADX {last.get('adx')}"
+        )
+        if closed:
+            out.append({"key": f"TR|{name}|{side}|{r.get('time')}", "msg": f"TRIGGER\n{msg}"})
+        else:
+            out.append({"key": f"WOPEN|{name}|{side}|{r.get('time')}", "msg": f"WATCH\n{msg}\nWaiting candle close"})
     return out
 
 
@@ -1722,35 +1707,34 @@ def _last_cross(rows, key, want):
 
 
 def _watch_row(name, book, rows, side, adx_lvl):
-    """WATCH LONG on CE long-state, WATCH SHORT on PE short-state. 3 of 4, or 4 open."""
+    """WATCH when one of DI / VWMA has crossed and the other is still due within 2 bars.
+    ATR and ADX are filters only."""
     if not rows:
         return None
     r = rows[-1]
+    want_v = "LONG" if side == "LONG" else "SHORT"
+    want_d = "+DI" if side == "LONG" else "-DI"
+    window = rows[-2:]
+    v_hit = next((x for x in reversed(window) if want_v in str(x.get("VWMA X") or "")), None)
+    d_hit = next((x for x in reversed(window) if want_d in str(x.get("DI X") or "")), None)
     flags, *_ = _four_state(r, adx_lvl)
-    if side == "SHORT":
-        flags = {
-            "ATR>EMA": not flags["ATR>EMA"] and r.get("ATR EMA") is not None,
-            "ADX": flags["ADX"],
-            "VWMA": not flags["VWMA"] and r.get("VWMA 3") is not None,
-            "+DI>-DI": not flags["+DI>-DI"] and r.get("+DI") is not None,
-        }
-    ntrue = sum(1 for v in flags.values() if v)
-    closed = _bar_closed(r.get("time"), _tf_minutes() or 5)
-    if ntrue < 3 or (ntrue == 4 and closed):
+    atr_ok = flags["ATR>EMA"] if side == "LONG" else (not flags["ATR>EMA"] and r.get("ATR EMA") is not None)
+    if not (atr_ok and flags["ADX"]):
         return None
-    vwma_t = _last_cross(rows, "VWMA X", "LONG" if side == "LONG" else "SHORT")
-    di_t = _last_cross(rows, "DI X", "+DI" if side == "LONG" else "-DI")
-    atr_t = _last_cross(rows, "ATR X", "LONG" if side == "LONG" else "SHORT")
+    if v_hit and d_hit:
+        return None
+    if not v_hit and not d_hit:
+        return None
     strike = book.get("atm") or ""
     leg = "CE BUY" if side == "LONG" else "PE BUY"
     return {
         "Index": name,
         "Signal": f"WATCH {side}",
         "Strike": f"{strike} {leg}".strip(),
-        "VWMA": vwma_t or "WAIT",
-        "DI": di_t or "WAIT",
-        "CVD": atr_t or "WAIT",
-        "ADX": f">{adx_lvl}" if flags["ADX"] else f"<{adx_lvl}",
+        "VWMA": (str(v_hit.get("time"))[11:16] if v_hit else "WAIT"),
+        "DI": (str(d_hit.get("time"))[11:16] if d_hit else "WAIT"),
+        "ATR": "FILTER",
+        "ADX": f">{adx_lvl}",
     }
 
 
@@ -1857,29 +1841,61 @@ def render_watch_table(books):
     )
 
 
+def _cross_triggers(rows, side, adx_lvl):
+    """Trigger is the later of DI and VWMA crossovers when they land within 2 bars.
+    ATR>EMA and ADX>level are filters only, never the trigger."""
+    rows = list(rows or [])
+    out = []
+    want_v = "LONG" if side == "LONG" else "SHORT"
+    want_d = "+DI" if side == "LONG" else "-DI"
+    for i, r in enumerate(rows):
+        vx = str(r.get("VWMA X") or "")
+        dx = str(r.get("DI X") or "")
+        v_here = want_v in vx
+        d_here = want_d in dx
+        if not (v_here or d_here):
+            continue
+        window = rows[max(0, i - 1):i + 1]
+        v_hit = next((x for x in reversed(window) if want_v in str(x.get("VWMA X") or "")), None)
+        d_hit = next((x for x in reversed(window) if want_d in str(x.get("DI X") or "")), None)
+        if not v_hit or not d_hit:
+            continue
+        # this bar must be the later of the two, or both on this bar
+        if r.get("time") not in (v_hit.get("time"), d_hit.get("time")):
+            continue
+        if v_hit.get("time") != r.get("time") and d_hit.get("time") != r.get("time"):
+            continue
+        flags, atr, ema, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
+        atr_ok = flags["ATR>EMA"] if side == "LONG" else (not flags["ATR>EMA"] and r.get("ATR EMA") is not None)
+        if not (atr_ok and flags["ADX"]):
+            continue
+        out.append({
+            "time": r.get("time"), "px": r.get("price"),
+            "atr": f"{atr}/{ema}", "vwma": f"{v3}/{v8}",
+            "adx": adx, "di": f"{pdi}/{mdi}",
+            "via": "BOTH" if v_here and d_here else ("VWMA" if v_here else "DI"),
+        })
+    return out
+
+
 def _store_triggers(name, side, sym, strike, rows, adx_lvl):
-    """Keep every closed all-4 bar for the session. Never drop on refresh."""
+    """Persist the later of DI / VWMA crosses. ATR and ADX are filters only."""
     store = st.session_state.setdefault("_mis_triggers", {})
     if not isinstance(store, dict):
         store = {}
         st.session_state["_mis_triggers"] = store
-    on = False
-    for r in rows or []:
-        if not _bar_closed(r.get("time"), 5):
+    kind = "LONG" if "CE" in side else "SHORT"
+    for h in _cross_triggers(rows, kind, adx_lvl):
+        if not _bar_closed(h.get("time"), 5):
             continue
-        flags, cvd_v, wma, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
-        armed = all(flags.values())
-        if armed and not on:
-            key = f"{name}|{side}|{r.get('time')}"
-            store.setdefault(key, {
-                "index": name, "side": side, "sym": sym or "",
-                "strike": strike or "", "time": r.get("time"),
-                "px": r.get("price"), "cvd": f"{round(cvd_v, 1)}/{wma}",
-                "vwma": f"{v3}/{v8}", "adx": adx, "di": f"{pdi}/{mdi}",
-            })
-            on = True
-        elif not armed:
-            on = False
+        key = f"{name}|{side}|{h.get('time')}"
+        store.setdefault(key, {
+            "index": name, "side": side, "sym": sym or "",
+            "strike": strike or "", "time": h.get("time"),
+            "px": h.get("px"), "cvd": h.get("atr"),
+            "vwma": h.get("vwma"), "adx": h.get("adx"), "di": h.get("di"),
+            "via": h.get("via"),
+        })
     st.session_state["_mis_triggers"] = store
     return [v for k, v in store.items() if k.startswith(f"{name}|{side}|")]
 
@@ -1913,7 +1929,7 @@ def render_rule_setups(books, upd):
         b = (books or {}).get(n) or {}
         sess = _session_day(to_5min(b.get("ce_rows") or [])) or sess
     p0 = _ind_params()
-    st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD>{p0['cvd']} WMA · ADX>{p0['adx']} · VWMA {p0['fast']}/{p0['slow']} · +DI>-DI · {upd}")
+    st.caption(f"SETUPS · trigger = later of DI / VWMA cross within 2 bars · filters ATR>EMA · ADX>{p0['adx']} · {upd}")
     ce_cells, pe_cells, alerts, scored = [], [], [], []
     tfm = _tf_minutes() or 5
     for n in ORDER:
