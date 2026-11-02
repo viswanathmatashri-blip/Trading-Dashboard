@@ -1167,8 +1167,7 @@ def _live_alerts(name, side, sym, rows, adx_lvl, minutes=5):
     """WATCH if one of DI/VWMA has crossed and the other is due. TRIGGER on the later cross once closed."""
     if not rows:
         return []
-    kind = "LONG" if "CE" in side else "SHORT"
-    hits = _cross_triggers(rows, kind, adx_lvl)
+    kind = "LONG"
     last = hits[-1] if hits else None
     r = rows[-1]
     out = []
@@ -1899,7 +1898,7 @@ def _store_triggers(name, side, sym, strike, rows, adx_lvl):
     prefix = f"{name}|{side}|"
     for k in [k for k in store if str(k).startswith(prefix)]:
         store.pop(k, None)
-    kind = "LONG" if "CE" in side else "SHORT"
+    kind = "LONG"
     for h in _cross_triggers(rows, kind, adx_lvl):
         if not _bar_closed(h.get("time"), 5):
             continue
@@ -1915,23 +1914,27 @@ def _store_triggers(name, side, sym, strike, rows, adx_lvl):
 
 
 def _trail_result(rows, entry_time, entry_px):
-    """SL = previous body bottom, then trail up to each later body bottom.
-    A hit is the bar low trading through the SL, not the close."""
+    """Long only. SL starts at the previous bar low, always below entry, then trails up to later body bottoms."""
     rows = list(rows or [])
     idx = next((i for i, r in enumerate(rows) if r.get("time") == entry_time), None)
     if idx is None or not entry_px:
         return {"sl": None, "status": "—", "points": None, "exit": ""}
     entry = float(entry_px)
     prev = rows[idx - 1] if idx else rows[idx]
-    sl = min(float(prev.get("open") or prev.get("price") or entry), float(prev.get("price") or entry))
+    sl = float(prev.get("low") or prev.get("price") or entry)
+    if sl >= entry:
+        sl = float(rows[idx].get("low") or entry)
+    if sl >= entry:
+        sl = round(entry * 0.97, 2)
     for r in rows[idx + 1:]:
         low = float(r.get("low") or r.get("price") or 0)
         if low <= sl:
-            kind = "TRAIL HIT" if sl > entry else "SL HIT"
+            kind = "TRAIL HIT" if sl > float(prev.get("low") or sl) else "SL HIT"
             return {"sl": round(sl, 2), "status": kind, "points": round(sl - entry, 2), "exit": str(r.get("time") or "")[11:16]}
         if _bar_closed(r.get("time"), 5):
             body = min(float(r.get("open") or r.get("price") or sl), float(r.get("price") or sl))
-            sl = max(sl, body)
+            if body > sl and body < float(r.get("price") or entry):
+                sl = body
     last = rows[-1]
     mark = float(last.get("price") or entry)
     return {"sl": round(sl, 2), "status": "OPEN", "points": round(mark - entry, 2), "exit": ""}
