@@ -681,16 +681,7 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
             r["CVD"] = round(cvd, 2)
         else:
             cvd = float(r.get("CVD") or 0)
-    # n-period volume-weighted MA of CVD
-    for i, r in enumerate(rows):
-        lo = max(0, i - cvd_n + 1)
-        chunk = rows[lo:i + 1]
-        if len(chunk) < cvd_n:
-            r["CVD WMA"] = None
-            continue
-        wc = sum(float(x.get("CVD") or 0) * float(x.get("volume") or 0) for x in chunk)
-        wv = sum(float(x.get("volume") or 0) for x in chunk)
-        r["CVD WMA"] = round(wc / wv, 2) if wv else round(float(chunk[-1].get("CVD") or 0), 2)
+    # n-period volume-weighted MA of CVD removed — ATR(3) vs EMA is computed after TR
     v3, v8 = _vwma(rows, fast), _vwma(rows, slow)
     trs, pdm, mdm = [], [], []
     for i, r in enumerate(rows):
@@ -721,12 +712,12 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
             out[i] = s
         return out
 
-    atr, spdm, smdm = wilder(trs), wilder(pdm), wilder(mdm)
+    atr_w, spdm, smdm = wilder(trs), wilder(pdm), wilder(mdm)
     pdi, mdi, dx = [None] * len(rows), [None] * len(rows), [None] * len(rows)
     for i in range(len(rows)):
-        if atr[i] and atr[i] > 0 and spdm[i] is not None:
-            pdi[i] = 100.0 * spdm[i] / atr[i]
-            mdi[i] = 100.0 * smdm[i] / atr[i]
+        if atr_w[i] and atr_w[i] > 0 and spdm[i] is not None:
+            pdi[i] = 100.0 * spdm[i] / atr_w[i]
+            mdi[i] = 100.0 * smdm[i] / atr_w[i]
             den = pdi[i] + mdi[i]
             dx[i] = 100.0 * abs(pdi[i] - mdi[i]) / den if den else 0.0
     adx = [None] * len(rows)
@@ -741,6 +732,21 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
                 continue
             prev = (prev * (n - 1) + dx[i]) / n
             adx[i] = prev
+    atr3 = [None] * len(rows)
+    if len(trs) >= 3:
+        s = sum(trs[:3]) / 3
+        atr3[2] = s
+        for i in range(3, len(trs)):
+            s = (s * 2 + trs[i]) / 3
+            atr3[i] = s
+    atr_ema = [None] * len(rows)
+    k = 2.0 / (cvd_n + 1)
+    prev_e = None
+    for i, v in enumerate(atr3):
+        if v is None:
+            continue
+        prev_e = v if prev_e is None else v * k + prev_e * (1 - k)
+        atr_ema[i] = prev_e
     for i, r in enumerate(rows):
         r["VWMA 3"] = v3[i]
         r["VWMA 8"] = v8[i]
@@ -751,19 +757,20 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
             elif v3[i - 1] >= v8[i - 1] and v3[i] < v8[i]:
                 vx = "3<8 SHORT"
         r["VWMA X"] = vx
-        cvd_v = float(r.get("CVD") or 0)
-        wma = r.get("CVD WMA")
-        cx = ""
-        if i and wma is not None:
-            prev = float(rows[i - 1].get("CVD") or 0)
-            pw = rows[i - 1].get("CVD WMA")
-            if pw is not None:
-                if prev <= float(pw) and cvd_v > float(wma):
-                    cx = "CVD>WMA LONG"
-                elif prev >= float(pw) and cvd_v < float(wma):
-                    cx = "CVD<WMA SHORT"
-        r["CVD X"] = cx
-        r["CVD vs WMA"] = "LONG" if wma is not None and cvd_v > float(wma) else ("SHORT" if wma is not None else "")
+        r["ATR"] = None if atr3[i] is None else round(atr3[i], 2)
+        r["ATR EMA"] = None if atr_ema[i] is None else round(atr_ema[i], 2)
+        ax = ""
+        if i and None not in (atr3[i], atr_ema[i], atr3[i - 1], atr_ema[i - 1]):
+            if atr3[i - 1] <= atr_ema[i - 1] and atr3[i] > atr_ema[i]:
+                ax = "ATR>EMA LONG"
+            elif atr3[i - 1] >= atr_ema[i - 1] and atr3[i] < atr_ema[i]:
+                ax = "ATR<EMA SHORT"
+        r["ATR X"] = ax
+        r["ATR vs EMA"] = "LONG" if atr3[i] is not None and atr_ema[i] is not None and atr3[i] > atr_ema[i] else (
+            "SHORT" if atr3[i] is not None and atr_ema[i] is not None else ""
+        )
+        r["CVD X"] = ax
+        r["CVD vs WMA"] = r["ATR vs EMA"]
         r["+DI"] = None if pdi[i] is None else round(pdi[i], 1)
         r["-DI"] = None if mdi[i] is None else round(mdi[i], 1)
         r["ADX"] = None if adx[i] is None else round(adx[i], 1)
@@ -1139,18 +1146,18 @@ def _bar_closed(ts, minutes=5):
 
 
 def _four_state(r, adx_lvl):
-    cvd_v = float(r.get("CVD") or 0)
-    wma = r.get("CVD WMA")
+    atr = r.get("ATR")
+    ema = r.get("ATR EMA")
     v3, v8 = r.get("VWMA 3"), r.get("VWMA 8")
     adx = r.get("ADX")
     pdi, mdi = r.get("+DI"), r.get("-DI")
     flags = {
-        "CVD>WMA": wma is not None and cvd_v > float(wma),
+        "ATR>EMA": atr is not None and ema is not None and float(atr) > float(ema),
         "ADX": adx is not None and adx > adx_lvl,
         "VWMA": v3 is not None and v8 is not None and v3 > v8,
         "+DI>-DI": pdi is not None and mdi is not None and pdi > mdi,
     }
-    return flags, cvd_v, wma, v3, v8, adx, pdi, mdi
+    return flags, atr, ema, v3, v8, adx, pdi, mdi
 
 
 def _live_alerts(name, side, sym, rows, adx_lvl, minutes=5):
@@ -1158,7 +1165,7 @@ def _live_alerts(name, side, sym, rows, adx_lvl, minutes=5):
     if not rows:
         return []
     r = rows[-1]
-    flags, cvd_v, wma, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
+    flags, atr, ema, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
     ntrue = sum(1 for v in flags.values() if v)
     missing = [k for k, v in flags.items() if not v]
     ts = r.get("time")
@@ -1169,7 +1176,7 @@ def _live_alerts(name, side, sym, rows, adx_lvl, minutes=5):
     base = (
         f"{name}\n{side} {sym or ''}\n"
         f"LTP {px} @ {str(ts)[11:16]}\n"
-        f"CVD {round(cvd_v, 1)}/{wma} · VWMA {v3}/{v8}\n"
+        f"ATR {atr}/{ema} · VWMA {v3}/{v8}\n"
         f"ADX {adx} · DI {pdi}/{mdi}"
     )
     out = []
@@ -1281,7 +1288,7 @@ def _cell_css(col, val):
 
 
 def watch_log_html(df: pd.DataFrame) -> str:
-    gold = {"CE CVD X", "CE VWMA X", "CE ADX>25", "PE CVD X", "PE VWMA X", "PE ADX>25"}
+    gold = {"CE ATR X", "CE VWMA X", "CE ADX>25", "PE ATR X", "PE VWMA X", "PE ADX>25"}
     rows = []
     rows.append("<thead><tr>")
     for c in df.columns:
@@ -1722,7 +1729,7 @@ def _watch_row(name, book, rows, side, adx_lvl):
     flags, *_ = _four_state(r, adx_lvl)
     if side == "SHORT":
         flags = {
-            "CVD>WMA": not flags["CVD>WMA"] and r.get("CVD WMA") is not None,
+            "ATR>EMA": not flags["ATR>EMA"] and r.get("ATR EMA") is not None,
             "ADX": flags["ADX"],
             "VWMA": not flags["VWMA"] and r.get("VWMA 3") is not None,
             "+DI>-DI": not flags["+DI>-DI"] and r.get("+DI") is not None,
@@ -1733,7 +1740,7 @@ def _watch_row(name, book, rows, side, adx_lvl):
         return None
     vwma_t = _last_cross(rows, "VWMA X", "LONG" if side == "LONG" else "SHORT")
     di_t = _last_cross(rows, "DI X", "+DI" if side == "LONG" else "-DI")
-    cvd_t = _last_cross(rows, "CVD X", "LONG" if side == "LONG" else "SHORT")
+    atr_t = _last_cross(rows, "ATR X", "LONG" if side == "LONG" else "SHORT")
     strike = book.get("atm") or ""
     leg = "CE BUY" if side == "LONG" else "PE BUY"
     return {
@@ -1742,7 +1749,7 @@ def _watch_row(name, book, rows, side, adx_lvl):
         "Strike": f"{strike} {leg}".strip(),
         "VWMA": vwma_t or "WAIT",
         "DI": di_t or "WAIT",
-        "CVD": cvd_t or "WAIT",
+        "CVD": atr_t or "WAIT",
         "ADX": f">{adx_lvl}" if flags["ADX"] else f"<{adx_lvl}",
     }
 
@@ -1814,7 +1821,7 @@ def render_watch_table(books):
         f"<td style='padding:4px 8px;color:#ECEFF1;font-weight:700;text-align:right;'>{v}</td></tr>"
         for k, v in srows
     )
-    cols = ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX")
+    cols = ("Index", "Signal", "Strike", "VWMA", "DI", "ATR", "ADX")
     def cell(v):
         t = str(v or "")
         base = "padding:6px 10px;font-size:15px;font-weight:700;white-space:nowrap;"
@@ -1982,7 +1989,7 @@ def _render_ind_dock():
     with c2:
         slow = st.number_input("VWMA slow", 3, 60, int(cur["slow"]), key="ind_slow")
     with c3:
-        cvd_n = st.number_input("CVD WMA", 2, 60, int(cur["cvd"]), key="ind_cvd")
+        cvd_n = st.number_input("ATR EMA", 2, 60, int(cur["cvd"]), key="ind_cvd")
     with c4:
         adx = st.number_input("ADX >", 5, 60, int(cur["adx"]), key="ind_adx")
     with c5:
@@ -1991,7 +1998,7 @@ def _render_ind_dock():
         "fast": int(fast), "slow": int(slow), "cvd": int(cvd_n),
         "adx": int(adx), "di": int(di),
     }
-    st.caption(f"VWMA {int(fast)}/{int(slow)} · CVD vs {int(cvd_n)} WMA · ADX>{int(adx)} · DI {int(di)}")
+    st.caption(f"VWMA {int(fast)}/{int(slow)} · ATR(3) vs {int(cvd_n)} EMA · ADX>{int(adx)} · DI {int(di)}")
 
 
 def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_fn=None, quote_fn=None):
@@ -2021,7 +2028,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         st.markdown(
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#FFD54F;'>Watches</b> "
-            f"CVD vs {_ind_params()['cvd']} WMA · VWMA {_ind_params()['fast']}/{_ind_params()['slow']} · ADX>{_ind_params()['adx']} · +DI>-DI (period {_ind_params()['di']}) "
+            f"ATR(3) vs {_ind_params()['cvd']} EMA · VWMA {_ind_params()['fast']}/{_ind_params()['slow']} · ADX>{_ind_params()['adx']} · +DI>-DI (period {_ind_params()['di']}) "
             "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
             "</div>",
             unsafe_allow_html=True,
@@ -2150,14 +2157,14 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "Spot": book.get("spot") if book.get("spot") is not None else "—",
             "ATM": strike, "Opt exp": oexp,
             "CE LTP": cl.get("price") or ce.get("LTP"),
-            "CE CVD X": _last_x(ce5, "CVD X"),
+            "CE ATR X": _last_x(ce5, "ATR X"),
             "CE VWMA X": _last_x(ce5, "VWMA X"),
             "CE ADX": cl.get("ADX") or "—",
             "CE +DI": cl.get("+DI") or "—",
             "CE -DI": cl.get("-DI") or "—",
             "CE ADX>25": cl.get("ADX>25") or "—",
             "PE LTP": pl.get("price") or pe.get("LTP"),
-            "PE CVD X": _last_x(pe5, "CVD X"),
+            "PE ATR X": _last_x(pe5, "ATR X"),
             "PE VWMA X": _last_x(pe5, "VWMA X"),
             "PE ADX": pl.get("ADX") or "—",
             "PE +DI": pl.get("+DI") or "—",
