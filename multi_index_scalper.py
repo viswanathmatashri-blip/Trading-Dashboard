@@ -1707,7 +1707,72 @@ def _confluence_entries(rows, open_hm=(9, 15), close_hm=(15, 30), adx_lvl=20):
     return out
 
 
-def render_rule_setups(books, upd):
+def _last_cross(rows, key, want):
+    for r in reversed(rows or []):
+        if want in str(r.get(key) or ""):
+            return str(r.get("time") or "")[11:16]
+    return ""
+
+
+def _watch_row(name, book, rows, side, adx_lvl):
+    """WATCH LONG on CE long-state, WATCH SHORT on PE short-state. 3 of 4, or 4 open."""
+    if not rows:
+        return None
+    r = rows[-1]
+    flags, *_ = _four_state(r, adx_lvl)
+    if side == "SHORT":
+        flags = {
+            "CVD>WMA": not flags["CVD>WMA"] and r.get("CVD WMA") is not None,
+            "ADX": flags["ADX"],
+            "VWMA": not flags["VWMA"] and r.get("VWMA 3") is not None,
+            "+DI>-DI": not flags["+DI>-DI"] and r.get("+DI") is not None,
+        }
+    ntrue = sum(1 for v in flags.values() if v)
+    closed = _bar_closed(r.get("time"), _tf_minutes() or 5)
+    if ntrue < 3 or (ntrue == 4 and closed):
+        return None
+    vwma_t = _last_cross(rows, "VWMA X", "LONG" if side == "LONG" else "SHORT")
+    di_t = _last_cross(rows, "DI X", "+DI" if side == "LONG" else "-DI")
+    cvd_t = _last_cross(rows, "CVD X", "LONG" if side == "LONG" else "SHORT")
+    strike = book.get("atm") or ""
+    leg = "CE BUY" if side == "LONG" else "PE BUY"
+    return {
+        "Index": name,
+        "Signal": f"WATCH {side}",
+        "Strike": f"{strike} {leg}".strip(),
+        "VWMA": vwma_t or "WAIT",
+        "DI": di_t or "WAIT",
+        "CVD": cvd_t or "WAIT",
+        "ADX": f">{adx_lvl}" if flags["ADX"] else f"<{adx_lvl}",
+    }
+
+
+def render_watch_table(books):
+    rows = []
+    for n in ORDER:
+        book = (books or {}).get(n) or {}
+        if not book:
+            rows.append({"Index": n, "Signal": "", "Strike": "", "VWMA": "", "DI": "", "CVD": "", "ADX": ""})
+            continue
+        p = _ind_params(n)
+        ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
+        hit = _watch_row(n, book, ce5, "LONG", p["adx"]) or _watch_row(n, book, pe5, "SHORT", p["adx"])
+        rows.append(hit or {"Index": n, "Signal": "", "Strike": "", "VWMA": "", "DI": "", "CVD": "", "ADX": ""})
+    def cell(v):
+        t = str(v or "")
+        if t == "WAIT":
+            return f"<td style='padding:5px 8px;background:#F9A825;color:#111;font-weight:700;'>{t}</td>"
+        if t and t[0].isdigit():
+            return f"<td style='padding:5px 8px;background:#1565C0;color:#fff;font-weight:700;'>{t}</td>"
+        return f"<td style='padding:5px 8px;color:#ECEFF1;'>{t}</td>"
+    head = "".join(f"<th style='padding:6px 8px;background:#C9A227;color:#111;font-weight:800;'>{c}</th>" for c in ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX"))
+    body = "".join("<tr>" + "".join(cell(r.get(c)) for c in ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX")) + "</tr>" for r in rows)
+    st.caption("WATCH · 3 of 4, or all 4 before candle close · cross time blue · WAIT yellow")
+    st.markdown(
+        f"<table style='width:100%;border-collapse:collapse;background:#0E1117;font-size:12px;'><tr>{head}</tr>{body}</table>",
+        unsafe_allow_html=True,
+    )
     sess = ""
     for n in ORDER:
         b = (books or {}).get(n) or {}
@@ -2012,6 +2077,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
                 pass
 
     _upd = _ist_now().strftime("%d-%m-%Y %H:%M:%S")
+    render_watch_table(books)
     st.caption(f"WATCH LOG    last updated {_upd}")
     if summary:
         wdf = pd.DataFrame(summary)
