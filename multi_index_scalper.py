@@ -640,8 +640,10 @@ def to_5min(rows):
                 "CVD": r.get("CVD"), "VWAP": r.get("VWAP"),
             }
         else:
-            b["high"] = max(float(b["high"] or 0), float(r.get("high") or 0))
-            b["low"] = min(float(b["low"] or 1e18), float(r.get("low") or 1e18))
+            hi = float(r.get("high") or r.get("price") or b["high"] or 0)
+            lo = float(r.get("low") or r.get("price") or b["low"] or hi)
+            b["high"] = max(float(b["high"] or hi), hi)
+            b["low"] = min(float(b["low"] or lo), lo)
             b["price"] = r.get("price")
             b["volume"] += float(r.get("volume") or 0)
             if r.get("CVD") is not None:
@@ -772,8 +774,8 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
         )
         r["CVD X"] = ax
         r["CVD vs WMA"] = r["ATR vs EMA"]
-        r["+DI"] = None if pdi[i] is None else round(pdi[i], 1)
-        r["-DI"] = None if mdi[i] is None else round(mdi[i], 1)
+        r["+DI"] = None if pdi[i] is None else round(pdi[i], 2)
+        r["-DI"] = None if mdi[i] is None else round(mdi[i], 2)
         r["ADX"] = None if adx[i] is None else round(adx[i], 1)
         r["ADX>25"] = f"ADX>{adx_lvl}" if adx[i] is not None and adx[i] > adx_lvl else ""
         dix = ""
@@ -2030,7 +2032,7 @@ def _render_ind_dock():
     with c4:
         adx = st.number_input("ADX >", 5, 60, int(cur["adx"]), key="ind_adx")
     with c5:
-        di = st.number_input("+DI / -DI", 5, 30, int(cur["di"]), key="ind_di")
+        di = st.number_input("DI period", 5, 30, int(cur["di"]), key="ind_di")
     st.session_state["mis_ind"] = {
         "fast": int(fast), "slow": int(slow), "cvd": int(cvd_n),
         "adx": int(adx), "di": int(di),
