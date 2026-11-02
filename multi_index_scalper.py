@@ -1874,6 +1874,8 @@ def _cross_triggers(rows, side, adx_lvl):
             "atr": f"{atr}/{ema}", "vwma": f"{v3}/{v8}",
             "adx": adx, "di": f"{pdi}/{mdi}",
             "via": "BOTH" if v_here and d_here else ("VWMA" if v_here else "DI"),
+            "vwma_t": str(v_hit.get("time") or "")[11:16],
+            "di_t": str(d_hit.get("time") or "")[11:16],
         })
     return out
 
@@ -1895,7 +1897,7 @@ def _store_triggers(name, side, sym, strike, rows, adx_lvl):
             "strike": strike or "", "time": h.get("time"),
             "px": h.get("px"), "cvd": h.get("atr"),
             "vwma": h.get("vwma"), "adx": h.get("adx"), "di": h.get("di"),
-            "via": h.get("via"),
+            "via": h.get("via"), "vwma_t": h.get("vwma_t"), "di_t": h.get("di_t"),
         }
     st.session_state["_mis_triggers"] = store
     return [v for k, v in store.items() if str(k).startswith(prefix)]
@@ -1958,7 +1960,7 @@ def render_rule_setups(books, upd):
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
                     f"{str(h.get('time') or '')[11:16]} · {h.get('px')}<br>"
                     f"SL {tr.get('sl')} · {tr.get('status')} {tr.get('exit')}<br>"
-                    f"Pts {tr.get('points')} · via {h.get('via')}<br>"
+                    f"Pts {tr.get('points')} · via {h.get('via')} · VWMA {h.get('vwma_t')} · DI {h.get('di_t')}<br>"
                     f"CVD/WMA {h.get('cvd')} · VWMA {h.get('vwma')}</div>"
                 )
             return f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>{''.join(bits)}</div>"
