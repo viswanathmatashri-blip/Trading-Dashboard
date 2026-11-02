@@ -1812,14 +1812,33 @@ def _store_triggers(name, side, sym, strike, rows, adx_lvl):
     return [v for k, v in store.items() if k.startswith(f"{name}|{side}|")]
 
 
-def render_rule_setups(books, upd):
+def _trail_result(rows, entry_time, entry_px):
+    """SL = previous body bottom, then trail up to each later body bottom.
+    A hit is the bar low trading through the SL, not the close."""
+    rows = list(rows or [])
+    idx = next((i for i, r in enumerate(rows) if r.get("time") == entry_time), None)
+    if idx is None or not entry_px:
+        return {"sl": None, "status": "—", "points": None, "exit": ""}
+    entry = float(entry_px)
+    prev = rows[idx - 1] if idx else rows[idx]
+    sl = min(float(prev.get("open") or prev.get("price") or entry), float(prev.get("price") or entry))
+    for r in rows[idx + 1:]:
+        low = float(r.get("low") or r.get("price") or 0)
+        if low <= sl:
+            return {"sl": round(sl, 2), "status": "SL HIT", "points": round(sl - entry, 2), "exit": str(r.get("time") or "")[11:16]}
+        if _bar_closed(r.get("time"), 5):
+            body = min(float(r.get("open") or r.get("price") or sl), float(r.get("price") or sl))
+            sl = max(sl, body)
+    last = rows[-1]
+    mark = float(last.get("price") or entry)
+    return {"sl": round(sl, 2), "status": "OPEN", "points": round(mark - entry, 2), "exit": ""}
     sess = ""
     for n in ORDER:
         b = (books or {}).get(n) or {}
         sess = _session_day(to_5min(b.get("ce_rows") or [])) or sess
     p0 = _ind_params()
     st.caption(f"SETUPS · last session {sess or '—'} · LONG = CVD>{p0['cvd']} WMA · ADX>{p0['adx']} · VWMA {p0['fast']}/{p0['slow']} · +DI>-DI · {upd}")
-    ce_cells, pe_cells, alerts = [], [], []
+    ce_cells, pe_cells, alerts, scored = [], [], [], []
     tfm = _tf_minutes() or 5
     for n in ORDER:
         book = (books or {}).get(n) or {}
@@ -1832,22 +1851,32 @@ def render_rule_setups(books, upd):
         pe_hit = _store_triggers(n, "PE BUY", book.get("pe_sym"), book.get("atm"), pe5, p["adx"])
         alerts += _live_alerts(n, "CE BUY", book.get("ce_sym"), ce5, p["adx"], tfm)
         alerts += _live_alerts(n, "PE BUY", book.get("pe_sym"), pe5, p["adx"], tfm)
-        def cell(hits, color, label):
+        def cell(hits, color, label, series):
             if not hits:
                 return "<div style='color:#78909C;font-size:11px;'>—</div>"
             day = str(hits[-1].get("time") or "")[5:10]
             sym = hits[-1].get("sym") or book.get("atm") or ""
             bits = [f"<b style='color:{color};font-size:12px;'>{label} {sym} · {day} · {len(hits)}</b>"]
             for h in reversed(hits):
+                tr = _trail_result(series, h.get("time"), h.get("px"))
+                h["points"] = tr.get("points")
+                h["status"] = tr.get("status")
                 bits.append(
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
                     f"{str(h.get('time') or '')[11:16]} · {h.get('px')}<br>"
-                    f"CVD/WMA {h.get('cvd')} · VWMA {h.get('vwma')}<br>"
-                    f"ADX {h.get('adx')} · DI {h.get('di')}</div>"
+                    f"SL {tr.get('sl')} · {tr.get('status')} {tr.get('exit')}<br>"
+                    f"Pts {tr.get('points')}<br>"
+                    f"CVD/WMA {h.get('cvd')} · VWMA {h.get('vwma')}</div>"
                 )
             return f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>{''.join(bits)}</div>"
-        ce_cells.append(cell(ce_hit, "#69F0AE", "CE BUY"))
-        pe_cells.append(cell(pe_hit, "#FF8A80", "PE BUY"))
+        ce_cells.append(cell(ce_hit, "#69F0AE", "CE BUY", ce5))
+        pe_cells.append(cell(pe_hit, "#FF8A80", "PE BUY", pe5))
+        scored.extend(ce_hit + pe_hit)
+    pts = [float(h.get("points")) for h in scored if h.get("points") is not None]
+    wins = sum(1 for p in pts if p > 0)
+    total = round(sum(pts), 2) if pts else 0
+    wr = round(100.0 * wins / len(pts), 1) if pts else 0
+    st.caption(f"Trades {len(pts)} · Win rate {wr}% · Points {total}")
     head = "".join(f"<th style='padding:6px;border:1px solid #2a2d33;color:#FFD54F;font-size:11px;'>{n}</th>" for n in ORDER)
     def row(cells):
         return "<tr>" + "".join(
