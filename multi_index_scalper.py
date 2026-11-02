@@ -1751,32 +1751,36 @@ def render_watch_table(books):
     rows = []
     for n in ORDER:
         book = (books or {}).get(n) or {}
+        if not book:
+            continue
         p = _ind_params(n)
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         ce = _watch_row(n, book, ce5, "LONG", p["adx"])
         pe = _watch_row(n, book, pe5, "SHORT", p["adx"])
-        ce_row = ce or {"Index": n, "Signal": "CE BUY WATCH", "Strike": "", "VWMA": "", "DI": "", "CVD": "", "ADX": ""}
-        pe_row = pe or {"Index": n, "Signal": "PE BUY WATCH", "Strike": "", "VWMA": "", "DI": "", "CVD": "", "ADX": ""}
-        ce_row["Signal"] = "CE BUY WATCH"
-        pe_row["Signal"] = "PE BUY WATCH"
-        rows.append(ce_row)
-        rows.append(pe_row)
-    def cell(v):
-        t = str(v or "")
-        if t == "WAIT":
-            return f"<td style='padding:5px 8px;background:#F9A825;color:#111;font-weight:700;'>{t}</td>"
-        if t and t[0].isdigit():
-            return f"<td style='padding:5px 8px;background:#1565C0;color:#fff;font-weight:700;'>{t}</td>"
-        return f"<td style='padding:5px 8px;color:#ECEFF1;'>{t}</td>"
-    head = "".join(f"<th style='padding:6px 8px;background:#C9A227;color:#111;font-weight:800;'>{c}</th>" for c in ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX"))
-    body = "".join("<tr>" + "".join(cell(r.get(c)) for c in ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX")) + "</tr>" for r in rows)
-    st.caption("WATCH · CE BUY WATCH / PE BUY WATCH · 3 of 4, or all 4 before candle close · cross time blue · WAIT yellow")
+        if ce:
+            ce["Signal"] = "CE BUY WATCH"
+            rows.append(ce)
+        if pe:
+            pe["Signal"] = "PE BUY WATCH"
+            rows.append(pe)
+    st.caption("WATCH · only active · cross time blue · WAIT yellow")
     if not rows:
         st.caption("No active watch")
         return
+    cols = ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX")
+    def cell(v):
+        t = str(v or "")
+        base = "padding:6px 10px;font-size:15px;font-weight:700;white-space:nowrap;"
+        if t == "WAIT":
+            return f"<td style='{base}background:#F9A825;color:#111;'>{t}</td>"
+        if t and t[0].isdigit():
+            return f"<td style='{base}background:#1565C0;color:#fff;'>{t}</td>"
+        return f"<td style='{base}color:#ECEFF1;'>{t}</td>"
+    head = "".join(f"<th style='padding:6px 10px;background:#C9A227;color:#111;font-size:14px;font-weight:800;white-space:nowrap;'>{c}</th>" for c in cols)
+    body = "".join("<tr>" + "".join(cell(r.get(c)) for c in cols) + "</tr>" for r in rows)
     st.markdown(
-        f"<table style='width:100%;border-collapse:collapse;background:#0E1117;font-size:12px;'><tr>{head}</tr>{body}</table>",
+        f"<table style='border-collapse:collapse;background:#0E1117;width:auto;'><tr>{head}</tr>{body}</table>",
         unsafe_allow_html=True,
     )
 
