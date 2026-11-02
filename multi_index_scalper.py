@@ -1751,14 +1751,17 @@ def render_watch_table(books):
     rows = []
     for n in ORDER:
         book = (books or {}).get(n) or {}
-        if not book:
-            rows.append({"Index": n, "Signal": "", "Strike": "", "VWMA": "", "DI": "", "CVD": "", "ADX": ""})
-            continue
         p = _ind_params(n)
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
-        hit = _watch_row(n, book, ce5, "LONG", p["adx"]) or _watch_row(n, book, pe5, "SHORT", p["adx"])
-        rows.append(hit or {"Index": n, "Signal": "", "Strike": "", "VWMA": "", "DI": "", "CVD": "", "ADX": ""})
+        ce = _watch_row(n, book, ce5, "LONG", p["adx"])
+        pe = _watch_row(n, book, pe5, "SHORT", p["adx"])
+        ce_row = ce or {"Index": n, "Signal": "CE BUY WATCH", "Strike": "", "VWMA": "", "DI": "", "CVD": "", "ADX": ""}
+        pe_row = pe or {"Index": n, "Signal": "PE BUY WATCH", "Strike": "", "VWMA": "", "DI": "", "CVD": "", "ADX": ""}
+        ce_row["Signal"] = "CE BUY WATCH"
+        pe_row["Signal"] = "PE BUY WATCH"
+        rows.append(ce_row)
+        rows.append(pe_row)
     def cell(v):
         t = str(v or "")
         if t == "WAIT":
@@ -1768,11 +1771,14 @@ def render_watch_table(books):
         return f"<td style='padding:5px 8px;color:#ECEFF1;'>{t}</td>"
     head = "".join(f"<th style='padding:6px 8px;background:#C9A227;color:#111;font-weight:800;'>{c}</th>" for c in ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX"))
     body = "".join("<tr>" + "".join(cell(r.get(c)) for c in ("Index", "Signal", "Strike", "VWMA", "DI", "CVD", "ADX")) + "</tr>" for r in rows)
-    st.caption("WATCH · 3 of 4, or all 4 before candle close · cross time blue · WAIT yellow")
+    st.caption("WATCH · CE BUY WATCH / PE BUY WATCH · 3 of 4, or all 4 before candle close · cross time blue · WAIT yellow")
     st.markdown(
         f"<table style='width:100%;border-collapse:collapse;background:#0E1117;font-size:12px;'><tr>{head}</tr>{body}</table>",
         unsafe_allow_html=True,
     )
+
+
+def render_rule_setups(books, upd):
     sess = ""
     for n in ORDER:
         b = (books or {}).get(n) or {}
