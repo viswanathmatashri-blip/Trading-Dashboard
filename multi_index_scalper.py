@@ -1879,25 +1879,26 @@ def _cross_triggers(rows, side, adx_lvl):
 
 
 def _store_triggers(name, side, sym, strike, rows, adx_lvl):
-    """Persist the later of DI / VWMA crosses. ATR and ADX are filters only."""
+    """Rebuild from the current rule so old all-4 triggers cannot linger."""
     store = st.session_state.setdefault("_mis_triggers", {})
     if not isinstance(store, dict):
         store = {}
-        st.session_state["_mis_triggers"] = store
+    prefix = f"{name}|{side}|"
+    for k in [k for k in store if str(k).startswith(prefix)]:
+        store.pop(k, None)
     kind = "LONG" if "CE" in side else "SHORT"
     for h in _cross_triggers(rows, kind, adx_lvl):
         if not _bar_closed(h.get("time"), 5):
             continue
-        key = f"{name}|{side}|{h.get('time')}"
-        store.setdefault(key, {
+        store[f"{prefix}{h.get('time')}"] = {
             "index": name, "side": side, "sym": sym or "",
             "strike": strike or "", "time": h.get("time"),
             "px": h.get("px"), "cvd": h.get("atr"),
             "vwma": h.get("vwma"), "adx": h.get("adx"), "di": h.get("di"),
             "via": h.get("via"),
-        })
+        }
     st.session_state["_mis_triggers"] = store
-    return [v for k, v in store.items() if k.startswith(f"{name}|{side}|")]
+    return [v for k, v in store.items() if str(k).startswith(prefix)]
 
 
 def _trail_result(rows, entry_time, entry_px):
@@ -1957,7 +1958,7 @@ def render_rule_setups(books, upd):
                     f"<div style='margin-top:4px;border-top:1px solid #2a2d33;padding-top:3px;'>"
                     f"{str(h.get('time') or '')[11:16]} · {h.get('px')}<br>"
                     f"SL {tr.get('sl')} · {tr.get('status')} {tr.get('exit')}<br>"
-                    f"Pts {tr.get('points')}<br>"
+                    f"Pts {tr.get('points')} · via {h.get('via')}<br>"
                     f"CVD/WMA {h.get('cvd')} · VWMA {h.get('vwma')}</div>"
                 )
             return f"<div style='font-size:11px;line-height:1.35;color:#ECEFF1;'>{''.join(bits)}</div>"
