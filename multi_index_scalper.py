@@ -1747,9 +1747,12 @@ def _watch_row(name, book, rows, side, adx_lvl):
     }
 
 
-def _day_stats(books):
+def _day_stats(books, names=None):
     scored = []
+    use = set(names) if names else set(ORDER)
     for n in ORDER:
+        if n not in use:
+            continue
         book = (books or {}).get(n) or {}
         if not book:
             continue
@@ -1826,9 +1829,23 @@ def render_watch_table(books):
         watch = f"<table style='border-collapse:collapse;background:#0E1117;width:auto;'><tr>{head}</tr>{body}</table>"
     else:
         watch = "<div style='color:#90A4AE;padding:8px;'>No active watch</div>"
-    summary = f"<table style='border-collapse:collapse;background:#111318;border:1px solid #2a2d33;font-size:13px;'>{stable}</table>"
+    summary = f"<table style='border-collapse:collapse;background:#111318;border:1px solid #2a2d33;font-size:13px;'><tr><th colspan='2' style='padding:4px 8px;color:#FFD54F;'>ALL</th></tr>{stable}</table>"
+    sn, sc = _day_stats(books, ["NIFTY"]), _day_stats(books, ["CRUDEOIL"])
+    fhead = "".join(f"<th style='padding:4px 8px;color:#FFD54F;'>{n}</th>" for n in ("", "NIFTY", "CRUDEOIL"))
+    def pair(label, a, b):
+        return f"<tr><td style='padding:4px 8px;color:#FFD54F;font-weight:700;'>{label}</td><td style='padding:4px 8px;text-align:right;color:#ECEFF1;font-weight:700;'>{a}</td><td style='padding:4px 8px;text-align:right;color:#ECEFF1;font-weight:700;'>{b}</td></tr>"
+    fbody = "".join([
+        pair("Trades", sn["trades"], sc["trades"]),
+        pair("Win", sn["wins"], sc["wins"]),
+        pair("SL Hit", sn["sl_hit"], sc["sl_hit"]),
+        pair("Win rate %", sn["win_rate"], sc["win_rate"]),
+        pair("Total pts", sn["points"], sc["points"]),
+        pair("Avg pts", sn["avg"], sc["avg"]),
+        pair("Effective pts", sn["effective"], sc["effective"]),
+    ])
+    focus_tbl = f"<table style='border-collapse:collapse;background:#111318;border:1px solid #2a2d33;font-size:13px;'><tr>{fhead}</tr>{fbody}</table>"
     st.markdown(
-        f"<div style='display:flex;gap:18px;align-items:flex-start;'>{watch}{summary}</div>",
+        f"<div style='display:flex;gap:18px;align-items:flex-start;'>{watch}{summary}{focus_tbl}</div>",
         unsafe_allow_html=True,
     )
 
