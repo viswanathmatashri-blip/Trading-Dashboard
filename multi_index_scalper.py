@@ -754,7 +754,9 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
     efi = [0.0] * len(rows)
     for i in range(1, len(rows)):
         vol = float(rows[i].get("volume") or 0)
-        efi[i] = vol * (closes[i] - closes[i - 1])
+        c = float(rows[i].get("price") or 0)
+        pc = float(rows[i - 1].get("price") or c)
+        efi[i] = vol * (c - pc)
 
     def ema_of(seq, length):
         out = [None] * len(seq)
