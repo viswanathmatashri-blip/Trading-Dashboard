@@ -790,7 +790,12 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
                 sum_tr = sum(trs[j] for j in range(i - cn + 1, i + 1))
                 chop = round(100.0 * math.log10(sum_tr / span) / math.log10(cn), 1)
         r["CHOP"] = chop
-        r["CHOP state"] = "TREND" if chop is not None and chop < 40 else ("CHOPPY" if chop is not None else "")
+        prev_chop = rows[i - 1].get("CHOP") if i else None
+        drop = None
+        if chop is not None and prev_chop:
+            drop = round(100.0 * (float(prev_chop) - float(chop)) / float(prev_chop), 1)
+        r["CHOP drop"] = drop
+        r["CHOP state"] = "TREND" if (chop is not None and (chop < 40 or (drop is not None and drop > 10))) else ("CHOPPY" if chop is not None else "")
         dix = ""
         if i and None not in (pdi[i], mdi[i], pdi[i - 1], mdi[i - 1]):
             if pdi[i - 1] <= mdi[i - 1] and pdi[i] > mdi[i]:
@@ -1735,7 +1740,7 @@ def _watch_row(name, book, rows, side, adx_lvl):
     d_hit = next((x for x in reversed(window) if want_d in str(x.get("DI X") or "")), None)
     flags, *_ = _four_state(r, adx_lvl)
     atr_ok = flags["ATR>EMA"]
-    chop_ok = r.get("CHOP") is not None and float(r.get("CHOP")) < 40
+    chop_ok = r.get("CHOP state") == "TREND"
     if not (atr_ok and flags["ADX"] and chop_ok):
         return None
     if v_hit and d_hit:
@@ -1889,7 +1894,7 @@ def _cross_triggers(rows, side, adx_lvl):
             continue
         flags, atr, ema, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
         atr_ok = flags["ATR>EMA"]
-        chop_ok = r.get("CHOP") is not None and float(r.get("CHOP")) < 40
+        chop_ok = r.get("CHOP state") == "TREND"
         if not (atr_ok and flags["ADX"] and chop_ok):
             continue
         price = float(r.get("price") or 0)
@@ -2087,7 +2092,11 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "<div style='font-size:10px;color:#90A4AE;line-height:1.2;'>"
             "<b style='color:#FFD54F;'>Watches</b> "
             f"ATR(3) vs {_ind_params()['cvd']} EMA · VWMA {_ind_params()['fast']}/{_ind_params()['slow']} · ADX>{_ind_params()['adx']} · +DI>-DI (period {_ind_params()['di']}) "
-            "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span>"
+            "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span><br>"
+            "<span style='color:#78909C;'>Trigger = later of VWMA 3/8 cross and +DI/−DI cross, within 2 bars. "
+            "Filters only: ATR(3) above its EMA, ADX above the level, and CHOP<40 or CHOP drop >10% on the bar. "
+            "ATR below EMA never starts a short. CE and PE both use the long cross on their own chart. "
+            "Stop is the previous bar low, always below entry, then trailed up.</span>"
             "</div>",
             unsafe_allow_html=True,
         )
