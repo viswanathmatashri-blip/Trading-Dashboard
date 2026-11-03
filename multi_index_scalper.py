@@ -1935,27 +1935,32 @@ def _store_triggers(name, side, sym, strike, rows, adx_lvl):
 
 
 def _trail_result(rows, entry_time, entry_px):
-    """Long only. SL starts at the previous bar low, always below entry, then trails up to later body bottoms."""
+    """Long only. SL is the previous candle body bottom, always below entry, then trailed up to later body bottoms."""
     rows = list(rows or [])
     idx = next((i for i, r in enumerate(rows) if r.get("time") == entry_time), None)
     if idx is None or not entry_px:
         return {"sl": None, "status": "—", "points": None, "exit": ""}
     entry = float(entry_px)
+
+    def body(bar, fallback):
+        return min(float(bar.get("open") or fallback), float(bar.get("price") or fallback))
+
     prev = rows[idx - 1] if idx else rows[idx]
-    sl = float(prev.get("low") or prev.get("price") or entry)
+    sl = body(prev, entry)
     if sl >= entry:
-        sl = float(rows[idx].get("low") or entry)
+        sl = body(rows[idx], entry)
     if sl >= entry:
         sl = round(entry * 0.97, 2)
+    start = sl
     for r in rows[idx + 1:]:
         low = float(r.get("low") or r.get("price") or 0)
         if low <= sl:
-            kind = "TRAIL HIT" if sl > float(prev.get("low") or sl) else "SL HIT"
+            kind = "TRAIL HIT" if sl > start else "SL HIT"
             return {"sl": round(sl, 2), "status": kind, "points": round(sl - entry, 2), "exit": str(r.get("time") or "")[11:16]}
         if _bar_closed(r.get("time"), 5):
-            body = min(float(r.get("open") or r.get("price") or sl), float(r.get("price") or sl))
-            if body > sl and body < float(r.get("price") or entry):
-                sl = body
+            btm = body(r, sl)
+            if start < btm < float(r.get("price") or entry):
+                sl = btm
     last = rows[-1]
     mark = float(last.get("price") or entry)
     return {"sl": round(sl, 2), "status": "OPEN", "points": round(mark - entry, 2), "exit": ""}
