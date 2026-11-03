@@ -750,7 +750,36 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
             continue
         prev_e = v if prev_e is None else v * k + prev_e * (1 - k)
         atr_ema[i] = prev_e
+    # Force Index: volume * (close - prev close), then 3 and 8 EMA.
+    efi = [0.0] * len(rows)
+    for i in range(1, len(rows)):
+        vol = float(rows[i].get("volume") or 0)
+        efi[i] = vol * (closes[i] - closes[i - 1])
+
+    def ema_of(seq, length):
+        out = [None] * len(seq)
+        k = 2.0 / (length + 1)
+        prev = None
+        for i, v in enumerate(seq):
+            prev = v if prev is None else v * k + prev * (1 - k)
+            out[i] = prev if i >= length - 1 else None
+        return out
+
+    efi3, efi8 = ema_of(efi, 3), ema_of(efi, 8)
     for i, r in enumerate(rows):
+        r["EFI"] = round(efi[i], 2)
+        r["EFI 3"] = None if efi3[i] is None else round(efi3[i], 2)
+        r["EFI 8"] = None if efi8[i] is None else round(efi8[i], 2)
+        ex = ""
+        if i and None not in (efi3[i], efi8[i], efi3[i - 1], efi8[i - 1]):
+            if efi3[i - 1] <= efi8[i - 1] and efi3[i] > efi8[i]:
+                ex = "3>8 LONG"
+            elif efi3[i - 1] >= efi8[i - 1] and efi3[i] < efi8[i]:
+                ex = "3<8 SHORT"
+        r["EFI X"] = ex
+        r["EFI vs"] = "LONG" if efi3[i] is not None and efi8[i] is not None and efi3[i] > efi8[i] else (
+            "SHORT" if efi3[i] is not None and efi8[i] is not None else ""
+        )
         r["VWMA 3"] = v3[i]
         r["VWMA 8"] = v8[i]
         vx = ""
@@ -1741,7 +1770,8 @@ def _watch_row(name, book, rows, side, adx_lvl):
     flags, *_ = _four_state(r, adx_lvl)
     atr_ok = flags["ATR>EMA"]
     chop_ok = r.get("CHOP state") == "TREND"
-    if not (atr_ok and flags["ADX"] and chop_ok):
+    efi_ok = r.get("EFI vs") == "LONG"
+    if not (atr_ok and flags["ADX"] and chop_ok and efi_ok):
         return None
     if v_hit and d_hit:
         return None
@@ -1895,7 +1925,8 @@ def _cross_triggers(rows, side, adx_lvl):
         flags, atr, ema, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
         atr_ok = flags["ATR>EMA"]
         chop_ok = r.get("CHOP state") == "TREND"
-        if not (atr_ok and flags["ADX"] and chop_ok):
+        efi_ok = r.get("EFI vs") == "LONG"
+        if not (atr_ok and flags["ADX"] and chop_ok and efi_ok):
             continue
         price = float(r.get("price") or 0)
         if med and not (0.35 * med <= price <= 2.8 * med):
@@ -2099,7 +2130,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             f"ATR(3) vs {_ind_params()['cvd']} EMA · VWMA {_ind_params()['fast']}/{_ind_params()['slow']} · ADX>{_ind_params()['adx']} · +DI>-DI (period {_ind_params()['di']}) "
             "<span style='color:#B0BEC5;'>on ATM CE and PE, 5-min</span><br>"
             "<span style='color:#78909C;'>Trigger = later of VWMA 3/8 cross and +DI/−DI cross, within 2 bars. "
-            "Filters only: ATR(3) above its EMA, ADX above the level, and CHOP<40 or CHOP drop >10% on the bar. "
+            "Filters only: ATR(3) above its EMA, ADX above the level, CHOP<40 or CHOP drop >10%, and EFI 3 EMA above EFI 8 EMA. "
             "ATR below EMA never starts a short. CE and PE both use the long cross on their own chart. "
             "Stop is the previous bar low, always below entry, then trailed up.</span>"
             "</div>",
@@ -2346,7 +2377,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         p = _ind_params(name)
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
-        ind = ["time", "price", "VWMA 3", "VWMA 8", "VWMA X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX flag", "CHOP", "CHOP state"]
+        ind = ["time", "price", "VWMA 3", "VWMA 8", "VWMA X", "EFI", "EFI 3", "EFI 8", "EFI X", "EFI vs", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX flag", "CHOP", "CHOP state"]
         d1, d2 = st.columns(2)
         with d1:
             draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
