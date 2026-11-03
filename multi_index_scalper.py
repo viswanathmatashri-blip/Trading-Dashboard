@@ -778,6 +778,19 @@ def attach_ema_adx(rows, n=7, fast=3, slow=8, adx_lvl=20, cvd_n=8):
         r["-DI"] = None if mdi[i] is None else round(mdi[i], 2)
         r["ADX"] = None if adx[i] is None else round(adx[i], 1)
         r["ADX>25"] = f"ADX>{adx_lvl}" if adx[i] is not None and adx[i] > adx_lvl else ""
+        r["ADX flag"] = r["ADX>25"]
+        # Choppiness Index, 7-period. Below 40 is trending, above 40 is choppy.
+        cn = 7
+        chop = None
+        if i >= cn - 1:
+            hh = max(float(rows[j].get("high") or rows[j].get("price") or 0) for j in range(i - cn + 1, i + 1))
+            ll = min(float(rows[j].get("low") or rows[j].get("price") or 0) for j in range(i - cn + 1, i + 1))
+            span = hh - ll
+            if span > 0:
+                sum_tr = sum(trs[j] for j in range(i - cn + 1, i + 1))
+                chop = round(100.0 * math.log10(sum_tr / span) / math.log10(cn), 1)
+        r["CHOP"] = chop
+        r["CHOP state"] = "TREND" if chop is not None and chop < 40 else ("CHOPPY" if chop is not None else "")
         dix = ""
         if i and None not in (pdi[i], mdi[i], pdi[i - 1], mdi[i - 1]):
             if pdi[i - 1] <= mdi[i - 1] and pdi[i] > mdi[i]:
@@ -1276,7 +1289,7 @@ def _cell_css(col, val):
 
 
 def watch_log_html(df: pd.DataFrame) -> str:
-    gold = {"CE ATR X", "CE VWMA X", "CE ADX>25", "PE ATR X", "PE VWMA X", "PE ADX>25"}
+    gold = {c for c in df.columns if "ADX>" in str(c) or c in ("CE ATR X", "CE VWMA X", "PE ATR X", "PE VWMA X")}
     rows = []
     rows.append("<thead><tr>")
     for c in df.columns:
@@ -1721,8 +1734,9 @@ def _watch_row(name, book, rows, side, adx_lvl):
     v_hit = next((x for x in reversed(window) if want_v in str(x.get("VWMA X") or "")), None)
     d_hit = next((x for x in reversed(window) if want_d in str(x.get("DI X") or "")), None)
     flags, *_ = _four_state(r, adx_lvl)
-    atr_ok = flags["ATR>EMA"] if side == "LONG" else (not flags["ATR>EMA"] and r.get("ATR EMA") is not None)
-    if not (atr_ok and flags["ADX"]):
+    atr_ok = flags["ATR>EMA"]
+    chop_ok = r.get("CHOP") is not None and float(r.get("CHOP")) < 40
+    if not (atr_ok and flags["ADX"] and chop_ok):
         return None
     if v_hit and d_hit:
         return None
@@ -1785,7 +1799,7 @@ def render_watch_table(books):
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         ce = _watch_row(n, book, ce5, "LONG", p["adx"])
-        pe = _watch_row(n, book, pe5, "SHORT", p["adx"])
+        pe = _watch_row(n, book, pe5, "LONG", p["adx"])
         if ce:
             ce["Signal"] = "CE BUY WATCH"
             rows.append(ce)
@@ -1874,8 +1888,9 @@ def _cross_triggers(rows, side, adx_lvl):
         if v_hit.get("time") != r.get("time") and d_hit.get("time") != r.get("time"):
             continue
         flags, atr, ema, v3, v8, adx, pdi, mdi = _four_state(r, adx_lvl)
-        atr_ok = flags["ATR>EMA"] if side == "LONG" else (not flags["ATR>EMA"] and r.get("ATR EMA") is not None)
-        if not (atr_ok and flags["ADX"]):
+        atr_ok = flags["ATR>EMA"]
+        chop_ok = r.get("CHOP") is not None and float(r.get("CHOP")) < 40
+        if not (atr_ok and flags["ADX"] and chop_ok):
             continue
         price = float(r.get("price") or 0)
         if med and not (0.35 * med <= price <= 2.8 * med):
@@ -2205,14 +2220,14 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
             "CE ADX": cl.get("ADX") or "—",
             "CE +DI": cl.get("+DI") or "—",
             "CE -DI": cl.get("-DI") or "—",
-            "CE ADX>25": cl.get("ADX>25") or "—",
+            f"CE ADX>{p['adx']}": cl.get("ADX>25") or "—",
             "PE LTP": pl.get("price") or pe.get("LTP"),
             "PE ATR X": _last_x(pe5, "ATR X"),
             "PE VWMA X": _last_x(pe5, "VWMA X"),
             "PE ADX": pl.get("ADX") or "—",
             "PE +DI": pl.get("+DI") or "—",
             "PE -DI": pl.get("-DI") or "—",
-            "PE ADX>25": pl.get("ADX>25") or "—",
+            f"PE ADX>{p['adx']}": pl.get("ADX>25") or "—",
             "Bar": (cl.get("time") or bar_ts),
         })
 
@@ -2317,7 +2332,7 @@ def render_multi_index_scalper(fetch_fn, df_master, token_map, get_client, fut_f
         p = _ind_params(name)
         ce5 = attach_ema_adx(to_5min(book.get("ce_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
         pe5 = attach_ema_adx(to_5min(book.get("pe_rows") or []), n=p["di"], fast=p["fast"], slow=p["slow"], adx_lvl=p["adx"], cvd_n=p["cvd"])
-        ind = ["time", "price", "VWMA 3", "VWMA 8", "VWMA X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX>25"]
+        ind = ["time", "price", "VWMA 3", "VWMA 8", "VWMA X", "CVD", "CVD WMA", "CVD X", "CVD vs WMA", "ADX", "+DI", "-DI", "ADX flag", "CHOP", "CHOP state"]
         d1, d2 = st.columns(2)
         with d1:
             draw_tape(f"{strike} CE · 5m", {"ann": ce5}, ind)
